@@ -1,2 +1,2 @@
 # hydra-lsp
-Language Server Protocol for Hydra
+Language Server Protocol for Hydra!
