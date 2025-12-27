@@ -1,0 +1,44 @@
+[package]
+name = "hydra-lsp"
+version = "0.1.0"
+edition = "2021"
+authors = ["hydra-lsp contributors"]
+description = "Language Server Protocol implementation for Hydra configuration files"
+license = "MIT"
+repository = "https://github.com/m-lyon/hydra-lsp"
+
+[dependencies]
+# LSP framework
+tower-lsp = "0.20"
+tokio = { version = "1.42", features = ["full"] }
+
+# Async utilities
+async-trait = "0.1"
+
+# State management
+dashmap = "6.1"
+parking_lot = "0.12"
+
+# YAML parsing
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+
+# Python parsing and analysis
+# Note: ruff and ty crates are not published to crates.io yet
+# To use them, add as git dependencies:
+# ruff_python_parser = { git = "https://github.com/astral-sh/ruff", tag = "v0.9.0" }
+# ruff_python_ast = { git = "https://github.com/astral-sh/ruff", tag = "v0.9.0" }
+# ruff_text_size = { git = "https://github.com/astral-sh/ruff", tag = "v0.9.0" }
+# ty_module_resolver = { git = "https://github.com/astral-sh/ruff" }
+# ty_python_semantic = { git = "https://github.com/astral-sh/ruff" }
+# ty_project = { git = "https://github.com/astral-sh/ruff" }
+# ty = { git = "https://github.com/astral-sh/ruff" }
+
+# Utilities
+anyhow = "1.0"
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+[dev-dependencies]
+tokio-test = "0.4"

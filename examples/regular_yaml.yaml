@@ -1,0 +1,10 @@
+# Not a Hydra configuration file
+# This file should NOT be detected as Hydra
+
+server:
+  host: 0.0.0.0
+  port: 8080
+  
+logging:
+  level: INFO
+  format: json

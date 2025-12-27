@@ -1,0 +1,37 @@
+# @hydra
+# Example Hydra configuration file
+
+# Model configuration
+model:
+  _target_: myproject.models.transformer.TransformerModel
+  hidden_size: 256
+  num_layers: 12
+  num_heads: 8
+  dropout: 0.1
+  activation: relu
+
+# Optimizer configuration
+optimizer:
+  _target_: torch.optim.Adam
+  lr: 0.001
+  betas: [0.9, 0.999]
+  weight_decay: 0.0001
+
+# Data configuration
+data:
+  _target_: myproject.data.DataLoader
+  batch_size: 32
+  num_workers: 4
+  shuffle: true
+
+# Nested configuration example
+trainer:
+  _target_: myproject.training.Trainer
+  max_epochs: 100
+  callbacks:
+    - _target_: myproject.callbacks.EarlyStopping
+      patience: 10
+      monitor: val_loss
+    - _target_: myproject.callbacks.ModelCheckpoint
+      save_top_k: 3
+      monitor: val_accuracy

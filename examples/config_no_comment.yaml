@@ -1,0 +1,16 @@
+# Example without @hydra comment
+# This file should still be detected as a Hydra config due to _target_ keyword
+
+database:
+  _target_: myapp.database.PostgresConnection
+  host: localhost
+  port: 5432
+  database: myapp
+  user: admin
+  password: secret
+
+cache:
+  _target_: myapp.cache.RedisCache
+  host: localhost
+  port: 6379
+  db: 0
