@@ -5,7 +5,7 @@ use tower_lsp::{Client, LanguageServer};
 
 use crate::diagnostics::DiagnosticsEngine;
 use crate::document::DocumentStore;
-use crate::python_analyzer::{DefinitionInfo, PythonAnalyzer};
+use crate::python_analyzer::PythonAnalyzer;
 use crate::yaml_parser::YamlParser;
 
 #[derive(Debug)]
@@ -87,11 +87,13 @@ impl LanguageServer for HydraLspBackend {
 
         // Full sync: take the first change which is the entire document
         if let Some(change) = params.content_changes.into_iter().next() {
-            self.documents.update(uri.clone(), change.text.clone(), version);
+            self.documents
+                .update(uri.clone(), change.text.clone(), version);
 
             // Re-publish diagnostics if this is a Hydra file
             if YamlParser::is_hydra_file(&change.text) {
-                self.publish_diagnostics_for_document(&uri, &change.text).await;
+                self.publish_diagnostics_for_document(&uri, &change.text)
+                    .await;
             }
 
             self.client
@@ -146,7 +148,7 @@ impl LanguageServer for HydraLspBackend {
         };
 
         // Split target into module and symbol
-        let (module_path, symbol_name) = match PythonAnalyzer::split_target(&target_info.target_value) {
+        let (module_path, symbol_name) = match PythonAnalyzer::split_target(&target_info.value) {
             Ok(parts) => parts,
             Err(e) => {
                 self.client
@@ -192,7 +194,10 @@ impl LanguageServer for HydraLspBackend {
             Ok(ctx) => ctx,
             Err(e) => {
                 self.client
-                    .log_message(MessageType::ERROR, format!("Completion context error: {}", e))
+                    .log_message(
+                        MessageType::ERROR,
+                        format!("Completion context error: {}", e),
+                    )
                     .await;
                 return Ok(None);
             }

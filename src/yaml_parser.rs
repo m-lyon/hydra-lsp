@@ -2,12 +2,11 @@ use serde_yaml::Value;
 use std::collections::HashMap;
 use tower_lsp::lsp_types::Position;
 
-#[derive(Debug, Clone)]
 pub struct TargetInfo {
-    pub target_value: String,
+    pub value: String,
     pub parameters: HashMap<String, Value>,
-    pub target_line: u32,
-    pub target_col: u32,
+    pub line: u32,
+    pub col: u32,
 }
 
 #[derive(Debug)]
@@ -17,7 +16,7 @@ impl YamlParser {
     /// Parse YAML content and extract all _target_ references with their parameters
     pub fn parse(content: &str) -> Result<Vec<TargetInfo>, serde_yaml::Error> {
         let value: Value = serde_yaml::from_str(content)?;
-        let mut targets = Vec::new();
+        let mut targets: Vec<TargetInfo> = Vec::new();
         Self::extract_targets(&value, &mut targets, 0, 0);
         Ok(targets)
     }
@@ -48,7 +47,7 @@ impl YamlParser {
             })
     }
 
-    /// Check if content contains _target_ keyword
+    /// Check if content contains `_target_` keyword
     fn has_target_keyword(content: &str) -> bool {
         content.contains("_target_")
     }
@@ -63,7 +62,7 @@ impl YamlParser {
         // Find the target that contains this position
         // For now, do a simple line-based search
         for target in targets {
-            if target.target_line == position.line {
+            if target.line == position.line {
                 return Ok(Some(target));
             }
         }
@@ -72,34 +71,27 @@ impl YamlParser {
     }
 
     /// Recursively extract all _target_ references from YAML value
-    fn extract_targets(
-        value: &Value,
-        targets: &mut Vec<TargetInfo>,
-        _line: u32,
-        _col: u32,
-    ) {
+    fn extract_targets(value: &Value, targets: &mut Vec<TargetInfo>, _line: u32, _col: u32) {
         match value {
             Value::Mapping(map) => {
                 // Check if this mapping has a _target_ key
-                if let Some(target_value) = map.get(&Value::String("_target_".to_string())) {
-                    if let Value::String(target_str) = target_value {
-                        // Extract parameters (all keys except _target_)
-                        let mut parameters = HashMap::new();
-                        for (key, val) in map {
-                            if let Value::String(key_str) = key {
-                                if key_str != "_target_" {
-                                    parameters.insert(key_str.clone(), val.clone());
-                                }
+                if let Some(Value::String(target_str)) = map.get("_target_") {
+                    // Extract parameters (all keys except _target_)
+                    let mut parameters = HashMap::new();
+                    for (key, val) in map {
+                        if let Value::String(key_str) = key {
+                            if key_str != "_target_" {
+                                parameters.insert(key_str.clone(), val.clone());
                             }
                         }
-
-                        targets.push(TargetInfo {
-                            target_value: target_str.clone(),
-                            parameters,
-                            target_line: _line, // TODO: Get actual line number
-                            target_col: _col,   // TODO: Get actual column number
-                        });
                     }
+
+                    targets.push(TargetInfo {
+                        value: target_str.clone(),
+                        parameters,
+                        line: _line, // TODO: Get actual line number
+                        col: _col,   // TODO: Get actual column number
+                    });
                 }
 
                 // Recursively process nested mappings
@@ -146,7 +138,7 @@ impl YamlParser {
             let trimmed = prefix.trim();
             if !trimmed.is_empty() && !trimmed.ends_with(':') {
                 return Ok(CompletionContext::ParameterKey {
-                    target: target_info.target_value,
+                    target: target_info.value,
                     partial: trimmed.to_string(),
                 });
             }
@@ -184,10 +176,10 @@ impl YamlParser {
                 if let Some(value_start) = line.find("_target_:") {
                     let value = line[value_start + "_target_:".len()..].trim();
                     return Ok(Some(TargetInfo {
-                        target_value: value.trim_matches('"').trim_matches('\'').to_string(),
+                        value: value.trim_matches('"').trim_matches('\'').to_string(),
                         parameters: HashMap::new(),
-                        target_line: i as u32,
-                        target_col: value_start as u32,
+                        line: i as u32,
+                        col: value_start as u32,
                     }));
                 }
             }
@@ -210,7 +202,7 @@ mod tests {
 
     #[test]
     fn test_is_hydra_file_with_comment() {
-        let content = "# @hydra\nmodel:\n  _target_: my.Model";
+        let content = "# @hydra\nmodel:\n  value: my.Model";
         assert!(YamlParser::is_hydra_file(content));
     }
 
@@ -230,8 +222,10 @@ model:
 "#;
         let targets = YamlParser::parse(content).unwrap();
         assert_eq!(targets.len(), 1);
-        assert_eq!(targets[0].target_value, "myproject.Model");
+        assert_eq!(targets[0].value, "myproject.Model");
         assert_eq!(targets[0].parameters.len(), 2);
+        assert_eq!(targets[0].line, 2);
+        assert_eq!(targets[0].col, 2);
     }
 
     #[test]
@@ -242,8 +236,26 @@ model:
   encoder:
     _target_: myproject.Encoder
     layers: 6
+  decoder:
+    _target_: myproject.Decoder
+    layers: 6
 "#;
         let targets = YamlParser::parse(content).unwrap();
-        assert_eq!(targets.len(), 2);
+        assert_eq!(targets.len(), 3);
+        // First target
+        assert_eq!(targets[0].value, "myproject.Model");
+        assert_eq!(targets[0].parameters.len(), 2);
+        assert_eq!(targets[0].line, 2);
+        assert_eq!(targets[0].col, 2);
+        // Second target
+        assert_eq!(targets[1].value, "myproject.Encoder");
+        assert_eq!(targets[2].parameters.len(), 1);
+        assert_eq!(targets[1].line, 4);
+        assert_eq!(targets[1].col, 4);
+        // Third target
+        assert_eq!(targets[2].value, "myproject.Decoder");
+        assert_eq!(targets[2].parameters.len(), 1);
+        assert_eq!(targets[2].line, 7);
+        assert_eq!(targets[2].col, 4);
     }
 }

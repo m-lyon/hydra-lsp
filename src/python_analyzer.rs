@@ -1,8 +1,11 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::path::PathBuf;
 
-// Note: Python parsing is currently disabled because ruff crates are not published to crates.io
-// To enable full Python analysis, add ruff and ty as git dependencies in Cargo.toml
+// NOTE: The following imports from ruff/ty are available but not yet used in the implementation
+// use ruff_db::files::{system_path_to_file, File};
+// use ruff_db::parsed::parsed_module;
+// use ruff_python_ast::{self as ast, visitor::Visitor, Stmt};
+// use ty_python_semantic::{Program, ProgramSettings, SemanticModel};
 
 #[derive(Debug, Clone)]
 pub struct FunctionSignature {
@@ -54,11 +57,41 @@ impl PythonAnalyzer {
     }
 
     /// Resolve a Python module path to a file path
-    /// This is a simplified version - full implementation would use ty_module_resolver
+    /// Note: This is a simplified placeholder implementation
+    /// Full implementation would use ty_module_resolver with proper search paths
     pub fn resolve_module(_module_path: &str) -> Result<PathBuf> {
         // TODO: Implement proper module resolution using ty_module_resolver
-        // For now, return a placeholder error
-        anyhow::bail!("Module resolution not yet implemented - requires ruff/ty dependencies")
+        // This would involve:
+        // 1. Creating a Database with proper search paths
+        // 2. Using resolve_module() to find the module
+        // 3. Returning the file path from the resolved module
+        anyhow::bail!("Module resolution not yet fully implemented - requires workspace context")
+    }
+
+    /// Extract function signature from a parsed Python AST
+    /// This is a simplified extraction that visits the AST to find function definitions
+    pub fn extract_function_signature(
+        _module_path: &str,
+        _function_name: &str,
+    ) -> Result<FunctionSignature> {
+        // TODO: Full implementation would:
+        // 1. Parse the Python file at module_path
+        // 2. Visit the AST to find the function definition
+        // 3. Extract parameters, type annotations, and docstring
+        // 4. Return FunctionSignature
+
+        anyhow::bail!("Function signature extraction requires full implementation")
+    }
+
+    /// Extract class information from a parsed Python AST
+    pub fn extract_class_info(_module_path: &str, _class_name: &str) -> Result<ClassInfo> {
+        // TODO: Full implementation would:
+        // 1. Parse the Python file at module_path
+        // 2. Visit the AST to find the class definition
+        // 3. Extract __init__ method signature if present
+        // 4. Return ClassInfo
+
+        anyhow::bail!("Class extraction requires full implementation")
     }
 
     /// Format a function signature for display (e.g., in hover)

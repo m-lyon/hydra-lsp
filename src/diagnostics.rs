@@ -1,6 +1,6 @@
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 
-use crate::python_analyzer::{DefinitionInfo, FunctionSignature, PythonAnalyzer};
+use crate::python_analyzer::{FunctionSignature, PythonAnalyzer};
 use crate::yaml_parser::TargetInfo;
 
 pub struct DiagnosticsEngine;
@@ -11,46 +11,44 @@ impl DiagnosticsEngine {
         let mut diagnostics = Vec::new();
 
         // Split target to validate format
-        let (module_path, symbol_name) =
-            match PythonAnalyzer::split_target(&target_info.target_value) {
-                Ok(parts) => parts,
-                Err(_) => {
-                    // Invalid target format
-                    diagnostics.push(Diagnostic {
-                        range: Range {
-                            start: Position {
-                                line: target_info.target_line,
-                                character: target_info.target_col,
-                            },
-                            end: Position {
-                                line: target_info.target_line,
-                                character: target_info.target_col
-                                    + target_info.target_value.len() as u32,
-                            },
+        let (module_path, symbol_name) = match PythonAnalyzer::split_target(&target_info.value) {
+            Ok(parts) => parts,
+            Err(_) => {
+                // Invalid target format
+                diagnostics.push(Diagnostic {
+                    range: Range {
+                        start: Position {
+                            line: target_info.line,
+                            character: target_info.col,
                         },
-                        severity: Some(DiagnosticSeverity::ERROR),
-                        code: Some(tower_lsp::lsp_types::NumberOrString::String(
-                            "invalid-target".to_string(),
-                        )),
-                        source: Some("hydra-lsp".to_string()),
-                        message: format!("Invalid _target_ format: {}", target_info.target_value),
-                        ..Default::default()
-                    });
-                    return diagnostics;
-                }
-            };
+                        end: Position {
+                            line: target_info.line,
+                            character: target_info.col + target_info.value.len() as u32,
+                        },
+                    },
+                    severity: Some(DiagnosticSeverity::ERROR),
+                    code: Some(tower_lsp::lsp_types::NumberOrString::String(
+                        "invalid-target".to_string(),
+                    )),
+                    source: Some("hydra-lsp".to_string()),
+                    message: format!("Invalid _target_ format: {}", target_info.value),
+                    ..Default::default()
+                });
+                return diagnostics;
+            }
+        };
 
         // TODO: Try to resolve the module and get the actual definition
         // For now, we'll create a placeholder diagnostic
         let _module_diagnostic = Diagnostic {
             range: Range {
                 start: Position {
-                    line: target_info.target_line,
-                    character: target_info.target_col,
+                    line: target_info.line,
+                    character: target_info.col,
                 },
                 end: Position {
-                    line: target_info.target_line,
-                    character: target_info.target_col + target_info.target_value.len() as u32,
+                    line: target_info.line,
+                    character: target_info.col + target_info.value.len() as u32,
                 },
             },
             severity: Some(DiagnosticSeverity::INFORMATION),
@@ -94,11 +92,11 @@ impl DiagnosticsEngine {
                 diagnostics.push(Diagnostic {
                     range: Range {
                         start: Position {
-                            line: target_info.target_line + 1, // Approximate line
+                            line: target_info.line + 1, // Approximate line
                             character: 0,
                         },
                         end: Position {
-                            line: target_info.target_line + 1,
+                            line: target_info.line + 1,
                             character: yaml_param.len() as u32,
                         },
                     },
@@ -124,11 +122,11 @@ impl DiagnosticsEngine {
                 diagnostics.push(Diagnostic {
                     range: Range {
                         start: Position {
-                            line: target_info.target_line,
+                            line: target_info.line,
                             character: 0,
                         },
                         end: Position {
-                            line: target_info.target_line,
+                            line: target_info.line,
                             character: 10, // Length of "_target_:"
                         },
                     },
@@ -158,11 +156,11 @@ impl DiagnosticsEngine {
                     diagnostics.push(Diagnostic {
                         range: Range {
                             start: Position {
-                                line: target_info.target_line + 1,
+                                line: target_info.line + 1,
                                 character: 0,
                             },
                             end: Position {
-                                line: target_info.target_line + 1,
+                                line: target_info.line + 1,
                                 character: param.len() as u32,
                             },
                         },
@@ -203,10 +201,10 @@ mod tests {
     #[test]
     fn test_validate_missing_required_param() {
         let target_info = TargetInfo {
-            target_value: "my.Class".to_string(),
+            value: "my.Class".to_string(),
             parameters: std::collections::HashMap::new(),
-            target_line: 0,
-            target_col: 0,
+            line: 0,
+            col: 0,
         };
 
         let signature = FunctionSignature {
@@ -248,10 +246,10 @@ mod tests {
         params.insert("unknown_param".to_string(), serde_yaml::Value::Null);
 
         let target_info = TargetInfo {
-            target_value: "my.Class".to_string(),
+            value: "my.Class".to_string(),
             parameters: params,
-            target_line: 0,
-            target_col: 0,
+            line: 0,
+            col: 0,
         };
 
         let signature = FunctionSignature {
@@ -280,10 +278,10 @@ mod tests {
         params.insert("any_param".to_string(), serde_yaml::Value::Null);
 
         let target_info = TargetInfo {
-            target_value: "my.Class".to_string(),
+            value: "my.Class".to_string(),
             parameters: params,
-            target_line: 0,
-            target_col: 0,
+            line: 0,
+            col: 0,
         };
 
         let signature = FunctionSignature {
