@@ -9,16 +9,44 @@ pub struct TargetInfo {
     pub col: u32,
 }
 
+impl TargetInfo {
+    fn new(value: String, parameters: HashMap<String, Value>) -> Self {
+        Self {
+            value,
+            parameters,
+            line: 0,
+            col: 0,
+        }
+    }
+
+    fn with_all(value: String, parameters: HashMap<String, Value>, line: u32, col: u32) -> Self {
+        Self {
+            value,
+            parameters,
+            line,
+            col,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct YamlParser;
 
 impl YamlParser {
     /// Parse YAML content and extract all _target_ references with their parameters
-    pub fn parse(content: &str) -> Result<Vec<TargetInfo>, serde_yaml::Error> {
+    pub fn parse(content: &str) -> Result<HashMap<u32, TargetInfo>, serde_yaml::Error> {
         let value: Value = serde_yaml::from_str(content)?;
         let mut targets: Vec<TargetInfo> = Vec::new();
-        Self::extract_targets(&value, &mut targets, 0, 0);
-        Ok(targets)
+        Self::extract_targets(&value, &mut targets);
+        Self::find_positions(content, &mut targets);
+
+        // Convert Vec to HashMap keyed by line number
+        let mut target_map = HashMap::new();
+        for target in targets {
+            target_map.insert(target.line, target);
+        }
+
+        Ok(target_map)
     }
 
     /// Check if a YAML file is a Hydra configuration file
@@ -57,21 +85,26 @@ impl YamlParser {
         content: &str,
         position: Position,
     ) -> Result<Option<TargetInfo>, serde_yaml::Error> {
-        let targets = Self::parse(content)?;
+        let mut target_map = Self::parse(content)?;
 
-        // Find the target that contains this position
-        // For now, do a simple line-based search
-        for target in targets {
-            if target.line == position.line {
-                return Ok(Some(target));
+        // Direct HashMap lookup by line number
+        match target_map.remove(&position.line) {
+            Some(target_info) => {
+                // Check if the column is within the _target_ key
+                if position.character >= target_info.col
+                    && position.character <= target_info.col + "_target_:".len() as u32
+                {
+                    Ok(Some(target_info))
+                } else {
+                    Ok(None)
+                }
             }
+            None => Ok(None),
         }
-
-        Ok(None)
     }
 
-    /// Recursively extract all _target_ references from YAML value
-    fn extract_targets(value: &Value, targets: &mut Vec<TargetInfo>, _line: u32, _col: u32) {
+    /// Recursively extract all `_target_` references from YAML value
+    fn extract_targets(value: &Value, targets: &mut Vec<TargetInfo>) {
         match value {
             Value::Mapping(map) => {
                 // Check if this mapping has a _target_ key
@@ -86,26 +119,40 @@ impl YamlParser {
                         }
                     }
 
-                    targets.push(TargetInfo {
-                        value: target_str.clone(),
-                        parameters,
-                        line: _line, // TODO: Get actual line number
-                        col: _col,   // TODO: Get actual column number
-                    });
+                    targets.push(TargetInfo::new(target_str.clone(), parameters));
                 }
 
                 // Recursively process nested mappings
                 for (_key, val) in map {
-                    Self::extract_targets(val, targets, _line, _col);
+                    Self::extract_targets(val, targets);
                 }
             }
             Value::Sequence(seq) => {
                 // Recursively process sequences
                 for item in seq {
-                    Self::extract_targets(item, targets, _line, _col);
+                    Self::extract_targets(item, targets);
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Find the actual line and column positions of `_target_` occurrences in the text
+    fn find_positions(content: &str, targets: &mut [TargetInfo]) {
+        let mut target_idx = 0;
+
+        for (line_num, line) in content.lines().enumerate() {
+            if target_idx >= targets.len() {
+                break;
+            }
+
+            // Look for _target_: in this line
+            if let Some(col) = line.find("_target_:") {
+                // Found a _target_, assign position to the next unassigned target
+                targets[target_idx].line = line_num as u32;
+                targets[target_idx].col = col as u32;
+                target_idx += 1;
+            }
         }
     }
 
@@ -123,8 +170,8 @@ impl YamlParser {
         let prefix = &line[..position.character.min(line.len() as u32) as usize];
 
         // Check if we're completing a _target_ value
-        if prefix.contains("_target_:") {
-            let value_start = prefix.find("_target_:").unwrap() + "_target_:".len();
+        if let Some(target_pos) = prefix.find("_target_:") {
+            let value_start = target_pos + "_target_:".len();
             let partial = prefix[value_start..].trim();
             return Ok(CompletionContext::TargetValue {
                 partial: partial.to_string(),
@@ -133,25 +180,38 @@ impl YamlParser {
 
         // Check if we're completing a parameter key
         // Look for _target_ in previous lines to get context
-        if let Ok(Some(target_info)) = Self::find_target_in_scope(content, position) {
+        if let Ok(Some(target_value)) = Self::find_target_in_scope(content, position) {
             // We're in a scope with a _target_, so we might be completing parameters
             let trimmed = prefix.trim();
-            if !trimmed.is_empty() && !trimmed.ends_with(':') {
-                return Ok(CompletionContext::ParameterKey {
-                    target: target_info.value,
-                    partial: trimmed.to_string(),
-                });
+            if !trimmed.is_empty() {
+                if trimmed.contains(':') {
+                    // Likely completing a parameter value
+                    let parts: Vec<&str> = trimmed.splitn(2, ':').collect();
+                    let param_key = parts[0].trim();
+                    let partial_value = parts[1].trim();
+                    return Ok(CompletionContext::ParameterValue {
+                        target: target_value.to_string(),
+                        parameter: param_key.to_string(),
+                        partial: partial_value.to_string(),
+                    });
+                } else {
+                    // Completing a parameter key
+                    return Ok(CompletionContext::ParameterKey {
+                        target: target_value.to_string(),
+                        partial: trimmed.to_string(),
+                    });
+                }
             }
         }
 
         Ok(CompletionContext::Unknown)
     }
 
-    /// Find the _target_ value in the current scope (same indentation level)
+    /// Find the `_target_` value in the current scope (same indentation level)
     fn find_target_in_scope(
         content: &str,
         position: Position,
-    ) -> Result<Option<TargetInfo>, serde_yaml::Error> {
+    ) -> Result<Option<&str>, serde_yaml::Error> {
         let lines: Vec<&str> = content.lines().collect();
         if position.line as usize >= lines.len() {
             return Ok(None);
@@ -161,7 +221,7 @@ impl YamlParser {
         let current_line = lines[position.line as usize];
         let current_indent = current_line.len() - current_line.trim_start().len();
 
-        // Search backwards for _target_ at same or less indentation
+        // Search backwards for _target_ at same indentation
         for i in (0..=position.line as usize).rev() {
             let line = lines[i];
             let line_indent = line.len() - line.trim_start().len();
@@ -172,15 +232,10 @@ impl YamlParser {
             }
 
             // Check if this line has _target_
-            if line.contains("_target_:") && line_indent == current_indent {
-                if let Some(value_start) = line.find("_target_:") {
+            if let Some(value_start) = line.find("_target_:") {
+                if line_indent == current_indent {
                     let value = line[value_start + "_target_:".len()..].trim();
-                    return Ok(Some(TargetInfo {
-                        value: value.trim_matches('"').trim_matches('\'').to_string(),
-                        parameters: HashMap::new(),
-                        line: i as u32,
-                        col: value_start as u32,
-                    }));
+                    return Ok(Some(value.trim_matches('"').trim_matches('\'')));
                 }
             }
         }
@@ -189,10 +244,22 @@ impl YamlParser {
     }
 }
 
+/// Represents the context for code completion in a YAML file. The context can be
+/// either completing a target value, a parameter key for a specific target, or unknown.
 #[derive(Debug)]
 pub enum CompletionContext {
-    TargetValue { partial: String },
-    ParameterKey { target: String, partial: String },
+    TargetValue {
+        partial: String,
+    },
+    ParameterKey {
+        target: String,
+        partial: String,
+    },
+    ParameterValue {
+        target: String,
+        parameter: String,
+        partial: String,
+    },
     Unknown,
 }
 
@@ -220,12 +287,13 @@ model:
   hidden_size: 256
   num_layers: 12
 "#;
-        let targets = YamlParser::parse(content).unwrap();
-        assert_eq!(targets.len(), 1);
-        assert_eq!(targets[0].value, "myproject.Model");
-        assert_eq!(targets[0].parameters.len(), 2);
-        assert_eq!(targets[0].line, 2);
-        assert_eq!(targets[0].col, 2);
+        let target_map = YamlParser::parse(content).unwrap();
+        assert_eq!(target_map.len(), 1);
+        let target = target_map.get(&2).unwrap();
+        assert_eq!(target.value, "myproject.Model");
+        assert_eq!(target.parameters.len(), 2);
+        assert_eq!(target.line, 2);
+        assert_eq!(target.col, 2);
     }
 
     #[test]
@@ -240,22 +308,138 @@ model:
     _target_: myproject.Decoder
     layers: 6
 "#;
-        let targets = YamlParser::parse(content).unwrap();
-        assert_eq!(targets.len(), 3);
-        // First target
-        assert_eq!(targets[0].value, "myproject.Model");
-        assert_eq!(targets[0].parameters.len(), 2);
-        assert_eq!(targets[0].line, 2);
-        assert_eq!(targets[0].col, 2);
-        // Second target
-        assert_eq!(targets[1].value, "myproject.Encoder");
-        assert_eq!(targets[2].parameters.len(), 1);
-        assert_eq!(targets[1].line, 4);
-        assert_eq!(targets[1].col, 4);
-        // Third target
-        assert_eq!(targets[2].value, "myproject.Decoder");
-        assert_eq!(targets[2].parameters.len(), 1);
-        assert_eq!(targets[2].line, 7);
-        assert_eq!(targets[2].col, 4);
+        let target_map = YamlParser::parse(content).unwrap();
+        assert_eq!(target_map.len(), 3);
+
+        let target1 = target_map.get(&2).unwrap();
+        assert_eq!(target1.value, "myproject.Model");
+        assert_eq!(target1.parameters.len(), 2);
+        assert_eq!(target1.line, 2);
+        assert_eq!(target1.col, 2);
+
+        let target2 = target_map.get(&4).unwrap();
+        assert_eq!(target2.value, "myproject.Encoder");
+        assert_eq!(target2.parameters.len(), 1);
+        assert_eq!(target2.line, 4);
+        assert_eq!(target2.col, 4);
+
+        let target3 = target_map.get(&7).unwrap();
+        assert_eq!(target3.value, "myproject.Decoder");
+        assert_eq!(target3.parameters.len(), 1);
+        assert_eq!(target3.line, 7);
+        assert_eq!(target3.col, 4);
+    }
+
+    #[test]
+    fn test_find_target_at_position_positive() {
+        let content = r#"
+model:
+  _target_: myproject.Model
+  hidden_size: 256
+  num_layers: 12
+"#;
+        let position = Position::new(2, 5);
+        let target_info = YamlParser::find_target_at_position(content, position)
+            .unwrap()
+            .unwrap();
+        assert_eq!(target_info.value, "myproject.Model");
+        assert_eq!(target_info.line, 2);
+        assert_eq!(target_info.col, 2);
+    }
+
+    #[test]
+    fn test_find_target_at_position_negative_line() {
+        let content = r#"
+model:
+  _target_: myproject.Model
+  hidden_size: 256
+  num_layers: 12
+"#;
+        let position = Position::new(1, 2); // Line without _target_
+        let target_info = YamlParser::find_target_at_position(content, position).unwrap();
+        assert!(target_info.is_none());
+    }
+
+    #[test]
+    fn test_find_target_at_position_negative_col_before() {
+        let content = r#"
+model:
+  _target_: myproject.Model
+  hidden_size: 256
+  num_layers: 12
+"#;
+        let position = Position::new(2, 1); // Column before _target_
+        let target_info = YamlParser::find_target_at_position(content, position).unwrap();
+        assert!(target_info.is_none());
+    }
+
+    #[test]
+    fn test_find_target_at_position_negative_col_after() {
+        let content = r#"
+model:
+  _target_: myproject.Model
+  hidden_size: 256
+  num_layers: 12
+"#;
+        let position = Position::new(2, 12); // Column after _target_
+        let target_info = YamlParser::find_target_at_position(content, position).unwrap();
+        assert!(target_info.is_none());
+    }
+
+    #[test]
+    fn test_get_completion_context_target_value() {
+        let content = r#"
+model:
+  _target_: myproject.Model
+  hidden_size: 256
+"#;
+        let position = Position::new(2, 15); // After _target_:
+        let context = YamlParser::get_completion_context(content, position).unwrap();
+        match context {
+            CompletionContext::TargetValue { partial } => {
+                assert_eq!(partial, "myp");
+            }
+            _ => panic!("Expected TargetValue context"),
+        }
+    }
+
+    #[test]
+    fn test_get_completion_context_parameter_key() {
+        let content = r#"
+model:
+  _target_: myproject.Model
+  hidden_size: 256
+"#;
+        let position = Position::new(3, 6); // On hidden_size key
+        let context = YamlParser::get_completion_context(content, position).unwrap();
+        match context {
+            CompletionContext::ParameterKey { target, partial } => {
+                assert_eq!(target, "myproject.Model");
+                assert_eq!(partial, "hidd");
+            }
+            _ => panic!("Expected ParameterKey context"),
+        }
+    }
+    #[test]
+    fn test_get_completion_context_parameter_value() {
+        let content = r#"
+model:
+  _target_: myproject.Model
+  hidden_size: 256
+"#;
+        let position = Position::new(3, 17);
+        let context = YamlParser::get_completion_context(content, position).unwrap();
+        match context {
+            CompletionContext::ParameterValue {
+                target,
+                parameter,
+                partial,
+            } => {
+                assert_eq!(target, "myproject.Model");
+                assert_eq!(parameter, "hidden_size");
+                assert_eq!(partial, "25");
+            }
+            _ => panic!("Expected ParameterValue context"),
+        }
     }
 }
