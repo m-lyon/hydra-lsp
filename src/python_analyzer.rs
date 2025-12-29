@@ -42,7 +42,7 @@ pub enum DefinitionInfo {
 pub struct PythonAnalyzer;
 
 impl PythonAnalyzer {
-    /// Split a _target_ string into module path and symbol name
+    /// Split a `_target_` string into module path and symbol name
     /// Example: "myproject.models.MyClass" -> ("myproject.models", "MyClass")
     pub fn split_target(target: &str) -> Result<(String, String)> {
         let parts: Vec<&str> = target.split('.').collect();

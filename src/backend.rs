@@ -3,10 +3,10 @@ use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
 
-use crate::diagnostics::DiagnosticsEngine;
+use crate::diagnostics;
 use crate::document::DocumentStore;
 use crate::python_analyzer::PythonAnalyzer;
-use crate::yaml_parser::YamlParser;
+use crate::yaml_parser::{CompletionContext, YamlParser};
 
 #[derive(Debug)]
 pub struct HydraLspBackend {
@@ -204,7 +204,7 @@ impl LanguageServer for HydraLspBackend {
         };
 
         match context {
-            crate::yaml_parser::CompletionContext::TargetValue { partial } => {
+            CompletionContext::TargetValue { partial } => {
                 // TODO: Implement module/class completion
                 // For now, return placeholder completions
                 self.client
@@ -229,7 +229,7 @@ impl LanguageServer for HydraLspBackend {
                     },
                 ])))
             }
-            crate::yaml_parser::CompletionContext::ParameterKey { target, partial } => {
+            CompletionContext::ParameterKey { target, partial } => {
                 // TODO: Resolve target and get parameter completions
                 self.client
                     .log_message(
@@ -260,6 +260,38 @@ impl LanguageServer for HydraLspBackend {
                     },
                 ])))
             }
+            CompletionContext::ParameterValue {
+                target,
+                parameter,
+                partial,
+            } => {
+                // TODO: Resolve target and parameter type to provide value completions
+                self.client
+                    .log_message(
+                        MessageType::INFO,
+                        format!(
+                            "Parameter value completion requested for target: {}, parameter: {}, partial: {}",
+                            target, parameter, partial
+                        ),
+                    )
+                    .await;
+
+                // For demonstration, return some placeholder value completions
+                Ok(Some(CompletionResponse::Array(vec![
+                    CompletionItem {
+                        label: "true".to_string(),
+                        kind: Some(CompletionItemKind::VALUE),
+                        detail: Some("Boolean value".to_string()),
+                        ..Default::default()
+                    },
+                    CompletionItem {
+                        label: "false".to_string(),
+                        kind: Some(CompletionItemKind::VALUE),
+                        detail: Some("Boolean value".to_string()),
+                        ..Default::default()
+                    },
+                ])))
+            }
             crate::yaml_parser::CompletionContext::Unknown => Ok(None),
         }
     }
@@ -269,8 +301,8 @@ impl HydraLspBackend {
     /// Publish diagnostics for a document
     async fn publish_diagnostics_for_document(&self, uri: &Url, content: &str) {
         match YamlParser::parse(content) {
-            Ok(targets) => {
-                let diagnostics = DiagnosticsEngine::validate_document(targets);
+            Ok(target_map) => {
+                let diagnostics = diagnostics::validate_document(target_map);
                 self.client
                     .publish_diagnostics(uri.clone(), diagnostics, None)
                     .await;

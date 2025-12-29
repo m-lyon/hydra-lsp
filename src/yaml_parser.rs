@@ -18,15 +18,6 @@ impl TargetInfo {
             col: 0,
         }
     }
-
-    fn with_all(value: String, parameters: HashMap<String, Value>, line: u32, col: u32) -> Self {
-        Self {
-            value,
-            parameters,
-            line,
-            col,
-        }
-    }
 }
 
 #[derive(Debug)]

@@ -20,7 +20,7 @@ async fn main() {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 
-    let (service, socket) = LspService::new(|client| HydraLspBackend::new(client));
+    let (service, socket) = LspService::new(HydraLspBackend::new);
 
     // Start the server
     tracing::info!("Starting Hydra LSP server");
