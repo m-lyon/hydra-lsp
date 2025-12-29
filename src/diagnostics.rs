@@ -175,24 +175,40 @@ pub fn validate_parameters(
 }
 
 /// Validate all targets in a document
-pub fn validate_document(targets: std::collections::HashMap<u32, TargetInfo>) -> Vec<Diagnostic> {
+pub fn validate_document(
+    targets: std::collections::HashMap<u32, TargetInfo>,
+    workspace_root: Option<&std::path::Path>,
+    python_interpreter: Option<&str>,
+) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
 
     for target in targets.values() {
         let target_diagnostics = validate_target(target);
         diagnostics.extend(target_diagnostics);
 
-        // If we successfully resolve the target, validate parameters
-        // TODO: Implement logic to check whether we've resolved the target
-        // TODO: Implement target resolution to get actual signatures
-        let signature = FunctionSignature {
-            name: "Placeholder".to_string(),
-            parameters: vec![],
-            return_type: None,
-            docstring: None,
-        };
-        let parameter_diagnostics = validate_parameters(target, &signature);
-        diagnostics.extend(parameter_diagnostics);
+        // Try to resolve the target and validate parameters
+        if let Ok(definition_info) = PythonAnalyzer::extract_definition_info(
+            &target.value,
+            workspace_root,
+            python_interpreter,
+        ) {
+            let signature = match definition_info {
+                crate::python_analyzer::DefinitionInfo::Function(sig) => sig,
+                crate::python_analyzer::DefinitionInfo::Class(class_info) => {
+                    // For classes, use the __init__ signature if available
+                    if let Some(init_sig) = class_info.init_signature {
+                        init_sig
+                    } else {
+                        // Class with no __init__, no parameters to validate
+                        continue;
+                    }
+                }
+            };
+
+            let parameter_diagnostics = validate_parameters(target, &signature);
+            diagnostics.extend(parameter_diagnostics);
+        }
+        // If Python analysis fails, we've already added a basic validation diagnostic above
     }
 
     diagnostics

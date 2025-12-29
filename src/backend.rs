@@ -1,3 +1,4 @@
+use parking_lot::RwLock;
 use std::sync::Arc;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
@@ -12,6 +13,7 @@ use crate::yaml_parser::{CompletionContext, YamlParser};
 pub struct HydraLspBackend {
     pub client: Client,
     pub documents: Arc<DocumentStore>,
+    pub python_interpreter: Arc<RwLock<Option<String>>>,
 }
 
 impl HydraLspBackend {
@@ -19,6 +21,7 @@ impl HydraLspBackend {
         Self {
             client,
             documents: Arc::new(DocumentStore::new()),
+            python_interpreter: Arc::new(RwLock::new(None)),
         }
     }
 }
@@ -189,20 +192,62 @@ impl LanguageServer for HydraLspBackend {
             }
         };
 
-        // For now, create a mock response since module resolution isn't fully implemented
-        // TODO: Implement full Python module resolution and analysis
-        let hover_content = format!(
-            "**Hydra Target**\n\nModule: `{}`\n\nSymbol: `{}`\n\n---\n\n*Note: Full Python analysis not yet implemented. This is a placeholder hover.*",
-            module_path, symbol_name
-        );
+        // Try to get the workspace root from the URI
+        let workspace_root = uri
+            .to_file_path()
+            .ok()
+            .and_then(|path| path.parent().map(|p| p.to_path_buf()));
 
-        Ok(Some(Hover {
-            contents: HoverContents::Markup(MarkupContent {
-                kind: MarkupKind::Markdown,
-                value: hover_content,
-            }),
-            range: None,
-        }))
+        // Get the python interpreter path
+        let python_interpreter = self.python_interpreter.read().clone();
+
+        // Try to extract Python definition information
+        match PythonAnalyzer::extract_definition_info(
+            &target_info.value,
+            workspace_root.as_deref(),
+            python_interpreter.as_deref(),
+        ) {
+            Ok(definition_info) => {
+                let hover_content = match definition_info {
+                    crate::python_analyzer::DefinitionInfo::Function(sig) => {
+                        PythonAnalyzer::format_signature(&sig)
+                    }
+                    crate::python_analyzer::DefinitionInfo::Class(class_info) => {
+                        PythonAnalyzer::format_class(&class_info)
+                    }
+                };
+
+                Ok(Some(Hover {
+                    contents: HoverContents::Markup(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: hover_content,
+                    }),
+                    range: None,
+                }))
+            }
+            Err(e) => {
+                // If Python analysis fails, show a basic hover with error info
+                self.client
+                    .log_message(
+                        MessageType::WARNING,
+                        format!("Python analysis failed: {}", e),
+                    )
+                    .await;
+
+                let hover_content = format!(
+                    "**Hydra Target**\n\nModule: `{}`\n\nSymbol: `{}`\n\n---\n\n*Could not analyze Python definition: {}*",
+                    module_path, symbol_name, e
+                );
+
+                Ok(Some(Hover {
+                    contents: HoverContents::Markup(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: hover_content,
+                    }),
+                    range: None,
+                }))
+            }
+        }
     }
 
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
@@ -355,7 +400,7 @@ impl LanguageServer for HydraLspBackend {
         };
 
         // Split target into module and symbol
-        let (module_path, symbol_name) = match PythonAnalyzer::split_target(&target_info.value) {
+        let (_module_path, _symbol_name) = match PythonAnalyzer::split_target(&target_info.value) {
             Ok(parts) => parts,
             Err(e) => {
                 self.client
@@ -365,40 +410,156 @@ impl LanguageServer for HydraLspBackend {
             }
         };
 
-        // TODO: Get actual function signature from Python analysis
-        // For now, create a placeholder signature
-        let signature_label = format!("{}(param1: int, param2: str)", symbol_name);
-        let signature_doc = format!(
-            "Function/Class from module `{}`\n\nFull Python analysis not yet implemented.",
-            module_path
-        );
+        // Try to get the workspace root from the URI
+        let workspace_root = uri
+            .to_file_path()
+            .ok()
+            .and_then(|path| path.parent().map(|p| p.to_path_buf()));
 
-        Ok(Some(SignatureHelp {
-            signatures: vec![SignatureInformation {
-                label: signature_label,
-                documentation: Some(Documentation::MarkupContent(MarkupContent {
-                    kind: MarkupKind::Markdown,
-                    value: signature_doc,
-                })),
-                parameters: Some(vec![
-                    ParameterInformation {
-                        label: ParameterLabel::Simple("param1: int".to_string()),
-                        documentation: Some(Documentation::String(
-                            "Example parameter (placeholder)".to_string(),
-                        )),
-                    },
-                    ParameterInformation {
-                        label: ParameterLabel::Simple("param2: str".to_string()),
-                        documentation: Some(Documentation::String(
-                            "Example parameter (placeholder)".to_string(),
-                        )),
-                    },
-                ]),
-                active_parameter: None,
-            }],
-            active_signature: Some(0),
-            active_parameter: None,
-        }))
+        // Get the python interpreter path
+        let python_interpreter = self.python_interpreter.read().clone();
+
+        // Try to extract Python definition information
+        match PythonAnalyzer::extract_definition_info(
+            &target_info.value,
+            workspace_root.as_deref(),
+            python_interpreter.as_deref(),
+        ) {
+            Ok(definition_info) => {
+                let (signature_label, parameters, doc_string) = match definition_info {
+                    crate::python_analyzer::DefinitionInfo::Function(sig) => {
+                        let param_strs: Vec<String> = sig
+                            .parameters
+                            .iter()
+                            .map(|p| {
+                                let mut s = String::new();
+                                if p.is_variadic {
+                                    s.push('*');
+                                } else if p.is_variadic_keyword {
+                                    s.push_str("**");
+                                }
+                                s.push_str(&p.name);
+                                if let Some(type_ann) = &p.type_annotation {
+                                    s.push_str(&format!(": {}", type_ann));
+                                }
+                                s
+                            })
+                            .collect();
+
+                        let label = format!("{}({})", sig.name, param_strs.join(", "));
+
+                        let params = sig
+                            .parameters
+                            .iter()
+                            .map(|p| {
+                                let mut label = String::new();
+                                if p.is_variadic {
+                                    label.push('*');
+                                } else if p.is_variadic_keyword {
+                                    label.push_str("**");
+                                }
+                                label.push_str(&p.name);
+                                if let Some(type_ann) = &p.type_annotation {
+                                    label.push_str(&format!(": {}", type_ann));
+                                }
+
+                                ParameterInformation {
+                                    label: ParameterLabel::Simple(label),
+                                    documentation: p.default_value.as_ref().map(|dv| {
+                                        Documentation::String(format!("Default: {}", dv))
+                                    }),
+                                }
+                            })
+                            .collect();
+
+                        (label, params, sig.docstring.clone())
+                    }
+                    crate::python_analyzer::DefinitionInfo::Class(class_info) => {
+                        if let Some(init_sig) = &class_info.init_signature {
+                            let param_strs: Vec<String> = init_sig
+                                .parameters
+                                .iter()
+                                .filter(|p| p.name != "self")
+                                .map(|p| {
+                                    let mut s = String::new();
+                                    if p.is_variadic {
+                                        s.push('*');
+                                    } else if p.is_variadic_keyword {
+                                        s.push_str("**");
+                                    }
+                                    s.push_str(&p.name);
+                                    if let Some(type_ann) = &p.type_annotation {
+                                        s.push_str(&format!(": {}", type_ann));
+                                    }
+                                    s
+                                })
+                                .collect();
+
+                            let label = format!("{}({})", class_info.name, param_strs.join(", "));
+
+                            let params = init_sig
+                                .parameters
+                                .iter()
+                                .filter(|p| p.name != "self")
+                                .map(|p| {
+                                    let mut label = String::new();
+                                    if p.is_variadic {
+                                        label.push('*');
+                                    } else if p.is_variadic_keyword {
+                                        label.push_str("**");
+                                    }
+                                    label.push_str(&p.name);
+                                    if let Some(type_ann) = &p.type_annotation {
+                                        label.push_str(&format!(": {}", type_ann));
+                                    }
+
+                                    ParameterInformation {
+                                        label: ParameterLabel::Simple(label),
+                                        documentation: p.default_value.as_ref().map(|dv| {
+                                            Documentation::String(format!("Default: {}", dv))
+                                        }),
+                                    }
+                                })
+                                .collect();
+
+                            (label, params, class_info.docstring.clone())
+                        } else {
+                            let label = format!("{}()", class_info.name);
+                            (label, vec![], class_info.docstring.clone())
+                        }
+                    }
+                };
+
+                Ok(Some(SignatureHelp {
+                    signatures: vec![SignatureInformation {
+                        label: signature_label,
+                        documentation: doc_string.map(|ds| {
+                            Documentation::MarkupContent(MarkupContent {
+                                kind: MarkupKind::Markdown,
+                                value: ds,
+                            })
+                        }),
+                        parameters: if parameters.is_empty() {
+                            None
+                        } else {
+                            Some(parameters)
+                        },
+                        active_parameter: None,
+                    }],
+                    active_signature: Some(0),
+                    active_parameter: None,
+                }))
+            }
+            Err(e) => {
+                self.client
+                    .log_message(
+                        MessageType::WARNING,
+                        format!("Python analysis failed for signature help: {}", e),
+                    )
+                    .await;
+                Ok(None)
+            }
+        }
     }
 
     async fn goto_definition(
@@ -432,7 +593,7 @@ impl LanguageServer for HydraLspBackend {
         };
 
         // Split target into module and symbol
-        let (module_path, symbol_name) = match PythonAnalyzer::split_target(&target_info.value) {
+        let (module_path, _symbol_name) = match PythonAnalyzer::split_target(&target_info.value) {
             Ok(parts) => parts,
             Err(e) => {
                 self.client
@@ -442,28 +603,62 @@ impl LanguageServer for HydraLspBackend {
             }
         };
 
-        // TODO: Implement actual module resolution and file path lookup
-        // For now, log the attempt
-        self.client
-            .log_message(
-                MessageType::INFO,
-                format!(
-                    "Go to definition requested for {}.{} (not yet implemented)",
-                    module_path, symbol_name
-                ),
-            )
-            .await;
+        // Try to get the workspace root from the URI
+        let workspace_root = uri
+            .to_file_path()
+            .ok()
+            .and_then(|path| path.parent().map(|p| p.to_path_buf()));
 
-        // Would return something like:
-        // Ok(Some(GotoDefinitionResponse::Scalar(Location {
-        //     uri: Url::from_file_path("/path/to/module.py").unwrap(),
-        //     range: Range {
-        //         start: Position { line: 10, character: 0 },
-        //         end: Position { line: 10, character: 10 },
-        //     },
-        // })))
+        // Get the python interpreter path
+        let python_interpreter = self.python_interpreter.read().clone();
 
-        Ok(None)
+        // Try to resolve the module to a file
+        let file_path = match PythonAnalyzer::resolve_module(
+            &module_path,
+            workspace_root.as_deref(),
+            python_interpreter.as_deref(),
+        ) {
+            Ok(path) => path,
+            Err(e) => {
+                self.client
+                    .log_message(
+                        MessageType::WARNING,
+                        format!("Could not resolve module {}: {}", module_path, e),
+                    )
+                    .await;
+                return Ok(None);
+            }
+        };
+
+        // Convert file path to URI
+        let target_uri = match Url::from_file_path(&file_path) {
+            Ok(uri) => uri,
+            Err(_) => {
+                self.client
+                    .log_message(
+                        MessageType::ERROR,
+                        format!("Could not convert path to URI: {}", file_path.display()),
+                    )
+                    .await;
+                return Ok(None);
+            }
+        };
+
+        // For now, just navigate to the file (line 0)
+        // TODO: Find the exact line number of the definition
+        Ok(Some(GotoDefinitionResponse::Scalar(Location {
+            uri: target_uri,
+            range: Range {
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: 0,
+                    character: 0,
+                },
+            },
+        })))
     }
 
     async fn semantic_tokens_full(
@@ -512,9 +707,21 @@ impl LanguageServer for HydraLspBackend {
 impl HydraLspBackend {
     /// Publish diagnostics for a document
     async fn publish_diagnostics_for_document(&self, uri: &Url, content: &str) {
+        let workspace_root = uri
+            .to_file_path()
+            .ok()
+            .and_then(|path| path.parent().map(|p| p.to_path_buf()));
+
+        // Get the python interpreter path
+        let python_interpreter = self.python_interpreter.read().clone();
+
         match YamlParser::parse(content) {
             Ok(target_map) => {
-                let diagnostics = diagnostics::validate_document(target_map);
+                let diagnostics = diagnostics::validate_document(
+                    target_map,
+                    workspace_root.as_deref(),
+                    python_interpreter.as_deref(),
+                );
                 self.client
                     .publish_diagnostics(uri.clone(), diagnostics, None)
                     .await;
