@@ -37,6 +37,37 @@ impl LanguageServer for HydraLspBackend {
                     resolve_provider: Some(false),
                     ..Default::default()
                 }),
+                signature_help_provider: Some(SignatureHelpOptions {
+                    trigger_characters: Some(vec!["(".to_string(), ",".to_string()]),
+                    retrigger_characters: None,
+                    work_done_progress_options: WorkDoneProgressOptions::default(),
+                }),
+                definition_provider: Some(OneOf::Left(true)),
+                semantic_tokens_provider: Some(
+                    SemanticTokensServerCapabilities::SemanticTokensOptions(
+                        SemanticTokensOptions {
+                            legend: SemanticTokensLegend {
+                                token_types: vec![
+                                    SemanticTokenType::NAMESPACE,
+                                    SemanticTokenType::CLASS,
+                                    SemanticTokenType::FUNCTION,
+                                    SemanticTokenType::PARAMETER,
+                                    SemanticTokenType::PROPERTY,
+                                    SemanticTokenType::VARIABLE,
+                                    SemanticTokenType::STRING,
+                                    SemanticTokenType::NUMBER,
+                                ],
+                                token_modifiers: vec![
+                                    SemanticTokenModifier::DECLARATION,
+                                    SemanticTokenModifier::DEFINITION,
+                                ],
+                            },
+                            range: Some(false),
+                            full: Some(SemanticTokensFullOptions::Bool(true)),
+                            ..Default::default()
+                        },
+                    ),
+                ),
                 diagnostic_provider: Some(DiagnosticServerCapabilities::Options(
                     DiagnosticOptions {
                         identifier: Some("hydra-lsp".to_string()),
@@ -294,6 +325,187 @@ impl LanguageServer for HydraLspBackend {
             }
             crate::yaml_parser::CompletionContext::Unknown => Ok(None),
         }
+    }
+
+    async fn signature_help(&self, params: SignatureHelpParams) -> Result<Option<SignatureHelp>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+
+        // Get document content
+        let document = match self.documents.get(&uri) {
+            Some(doc) => doc,
+            None => return Ok(None),
+        };
+
+        // Check if this is a Hydra file
+        if !YamlParser::is_hydra_file(&document.content) {
+            return Ok(None);
+        }
+
+        // Find _target_ at or near cursor position to get context
+        let target_info = match YamlParser::find_target_at_position(&document.content, position) {
+            Ok(Some(info)) => info,
+            Ok(None) => return Ok(None),
+            Err(e) => {
+                self.client
+                    .log_message(MessageType::ERROR, format!("YAML parse error: {}", e))
+                    .await;
+                return Ok(None);
+            }
+        };
+
+        // Split target into module and symbol
+        let (module_path, symbol_name) = match PythonAnalyzer::split_target(&target_info.value) {
+            Ok(parts) => parts,
+            Err(e) => {
+                self.client
+                    .log_message(MessageType::ERROR, format!("Invalid target: {}", e))
+                    .await;
+                return Ok(None);
+            }
+        };
+
+        // TODO: Get actual function signature from Python analysis
+        // For now, create a placeholder signature
+        let signature_label = format!("{}(param1: int, param2: str)", symbol_name);
+        let signature_doc = format!(
+            "Function/Class from module `{}`\n\nFull Python analysis not yet implemented.",
+            module_path
+        );
+
+        Ok(Some(SignatureHelp {
+            signatures: vec![SignatureInformation {
+                label: signature_label,
+                documentation: Some(Documentation::MarkupContent(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value: signature_doc,
+                })),
+                parameters: Some(vec![
+                    ParameterInformation {
+                        label: ParameterLabel::Simple("param1: int".to_string()),
+                        documentation: Some(Documentation::String(
+                            "Example parameter (placeholder)".to_string(),
+                        )),
+                    },
+                    ParameterInformation {
+                        label: ParameterLabel::Simple("param2: str".to_string()),
+                        documentation: Some(Documentation::String(
+                            "Example parameter (placeholder)".to_string(),
+                        )),
+                    },
+                ]),
+                active_parameter: None,
+            }],
+            active_signature: Some(0),
+            active_parameter: None,
+        }))
+    }
+
+    async fn goto_definition(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> Result<Option<GotoDefinitionResponse>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+
+        // Get document content
+        let document = match self.documents.get(&uri) {
+            Some(doc) => doc,
+            None => return Ok(None),
+        };
+
+        // Check if this is a Hydra file
+        if !YamlParser::is_hydra_file(&document.content) {
+            return Ok(None);
+        }
+
+        // Find _target_ at cursor position
+        let target_info = match YamlParser::find_target_at_position(&document.content, position) {
+            Ok(Some(info)) => info,
+            Ok(None) => return Ok(None),
+            Err(e) => {
+                self.client
+                    .log_message(MessageType::ERROR, format!("YAML parse error: {}", e))
+                    .await;
+                return Ok(None);
+            }
+        };
+
+        // Split target into module and symbol
+        let (module_path, symbol_name) = match PythonAnalyzer::split_target(&target_info.value) {
+            Ok(parts) => parts,
+            Err(e) => {
+                self.client
+                    .log_message(MessageType::ERROR, format!("Invalid target: {}", e))
+                    .await;
+                return Ok(None);
+            }
+        };
+
+        // TODO: Implement actual module resolution and file path lookup
+        // For now, log the attempt
+        self.client
+            .log_message(
+                MessageType::INFO,
+                format!(
+                    "Go to definition requested for {}.{} (not yet implemented)",
+                    module_path, symbol_name
+                ),
+            )
+            .await;
+
+        // Would return something like:
+        // Ok(Some(GotoDefinitionResponse::Scalar(Location {
+        //     uri: Url::from_file_path("/path/to/module.py").unwrap(),
+        //     range: Range {
+        //         start: Position { line: 10, character: 0 },
+        //         end: Position { line: 10, character: 10 },
+        //     },
+        // })))
+
+        Ok(None)
+    }
+
+    async fn semantic_tokens_full(
+        &self,
+        params: SemanticTokensParams,
+    ) -> Result<Option<SemanticTokensResult>> {
+        let uri = params.text_document.uri;
+
+        // Get document content
+        let document = match self.documents.get(&uri) {
+            Some(doc) => doc,
+            None => return Ok(None),
+        };
+
+        // Check if this is a Hydra file
+        if !YamlParser::is_hydra_file(&document.content) {
+            return Ok(None);
+        }
+
+        // TODO: Implement semantic token generation
+        // This would involve:
+        // 1. Parse YAML to find all _target_ values
+        // 2. Identify parameter keys associated with targets
+        // 3. Generate semantic tokens for:
+        //    - Module paths (NAMESPACE)
+        //    - Class/function names (CLASS/FUNCTION)
+        //    - Parameter names (PARAMETER/PROPERTY)
+        //    - Values (STRING/NUMBER/etc)
+        // 4. Return tokens in the LSP delta format
+
+        self.client
+            .log_message(
+                MessageType::INFO,
+                "Semantic tokens requested (not yet fully implemented)".to_string(),
+            )
+            .await;
+
+        // Placeholder: return empty token list
+        Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
+            result_id: None,
+            data: vec![],
+        })))
     }
 }
 

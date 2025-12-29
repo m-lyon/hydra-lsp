@@ -33,7 +33,7 @@ A Language Server Protocol implementation for [Hydra](https://hydra.cc/) configu
 
 ## Architecture
 
-```
+```bash
 hydra-lsp/
 ├── src/
 │   ├── main.rs              # LSP server entry point
@@ -101,7 +101,7 @@ client.start();
 
 Currently, Python analysis is disabled because the `ruff` and `ty` crates are not published to crates.io. To enable full Python analysis:
 
-1. **Add git dependencies to `Cargo.toml`**:
+**Add git dependencies to `Cargo.toml`**:
 
 ```toml
 [dependencies]
@@ -119,9 +119,9 @@ ty_project = { git = "https://github.com/astral-sh/ty" }
 ty = { git = "https://github.com/astral-sh/ty" }
 ```
 
-2. **Uncomment Python analysis code in `src/python_analyzer.rs`**
+**Uncomment Python analysis code in `src/python_analyzer.rs`**
 
-3. **Implement the full analysis pipeline** as documented in `PYTHON_ANALYSIS_TOOLS.md`
+**Implement the full analysis pipeline** as documented in `PYTHON_ANALYSIS_TOOLS.md`
 
 See [PYTHON_ANALYSIS_TOOLS.md](PYTHON_ANALYSIS_TOOLS.md) for detailed information about using ruff and ty for Python analysis.
 
