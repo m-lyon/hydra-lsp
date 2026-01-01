@@ -31,7 +31,7 @@ impl LanguageServer for HydraLspBackend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
         self.client
             .log_message(
-                MessageType::LOG,
+                MessageType::INFO,
                 format!(
                     "Hydra LSP server initializing with options: {:?}",
                     params.initialization_options

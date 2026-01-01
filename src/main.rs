@@ -8,6 +8,7 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
         .with_writer(std::io::stderr)
+        .with_ansi(false)
         .init();
 
     // Create the LSP service
@@ -17,6 +18,5 @@ async fn main() {
     let (service, socket) = LspService::new(HydraLspBackend::new);
 
     // Start the server
-    tracing::info!("Starting Hydra LSP server");
     Server::new(stdin, stdout, socket).serve(service).await;
 }

@@ -47,7 +47,7 @@ salsa = { git = "https://github.com/salsa-rs/salsa.git", rev = "ce80691fa0b87dc2
     "macros",
     "salsa_unstable",
     "inventory",
-] } # Salsa for incremental computation (used by ty)
+] }
 
 # Utilities
 anyhow = "1.0"
