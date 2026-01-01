@@ -4,7 +4,7 @@ use crate::python_analyzer::{FunctionSignature, PythonAnalyzer};
 use crate::yaml_parser::TargetInfo;
 
 /// Validate a Hydra configuration and generate diagnostics
-pub fn validate_target(target_info: &TargetInfo) -> Vec<Diagnostic> {
+fn validate_target(target_info: &TargetInfo) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
 
     // Split target to validate format
@@ -62,10 +62,7 @@ pub fn validate_target(target_info: &TargetInfo) -> Vec<Diagnostic> {
 }
 
 /// Validate parameters against a function signature
-pub fn validate_parameters(
-    target_info: &TargetInfo,
-    signature: &FunctionSignature,
-) -> Vec<Diagnostic> {
+fn validate_parameters(target_info: &TargetInfo, signature: &FunctionSignature) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
 
     // Get parameter names from YAML (excluding _target_)
@@ -210,6 +207,15 @@ pub fn validate_document(
         }
         // If Python analysis fails, we've already added a basic validation diagnostic above
     }
+
+    // Sort all diagnostics by position for consistent ordering
+    diagnostics.sort_by(|a, b| {
+        a.range
+            .start
+            .line
+            .cmp(&b.range.start.line)
+            .then_with(|| a.range.start.character.cmp(&b.range.start.character))
+    });
 
     diagnostics
 }

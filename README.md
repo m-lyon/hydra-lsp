@@ -10,26 +10,31 @@ A Language Server Protocol implementation for [Hydra](https://hydra.cc/) configu
   - Comment markers (`# @hydra` or `# hydra:`)
   - Presence of `_target_` keyword
 - ✅ **YAML Parsing**: Extracts `_target_` references and their parameters
-- ✅ **Basic Hover Support**: Shows module and symbol information when hovering over `_target_` values
-- ✅ **Diagnostics**: Basic validation of `_target_` format
-- ✅ **Completion Placeholders**: Framework for target and parameter autocompletion
+- ✅ **Python Module Resolution**: Resolves Python modules using:
+  - Workspace-relative paths
+  - Python interpreter's `sys.path` (when configured)
+  - Support for virtual environments and custom Python installations
+- ✅ **Function/Class Signature Extraction**: Parses Python files to extract:
+  - Function signatures with parameters, types, and defaults
+  - Class information with `__init__` signatures
+  - Docstrings for hover documentation
+- ✅ **Hover Support**: Shows rich information when hovering over `_target_` values:
+  - Function signatures with parameter details
+  - Class information and docstrings
+  - Type annotations
+- ✅ **Signature Help**: Shows parameter information while typing function arguments
+- ✅ **Go to Definition**: Jump from YAML `_target_` to Python source file
+- ✅ **Diagnostics**: Parameter validation including:
+  - Unknown parameters (unless `**kwargs` present)
+  - Missing required parameters
+  - Basic `_target_` format validation
 
 ### Planned Features
 
-- 🔄 **Full Python Analysis** (requires adding ruff/ty dependencies):
-  - Parse Python files to extract function/class signatures
-  - Resolve Python modules from `_target_` references  
-  - Show actual parameter types and docstrings in hover
-- 🔄 **Advanced Argument Validation**:
-  - Detect unknown parameters (unless `**kwargs` present)
-  - Detect missing required parameters
-  - Type validation for parameter values
-- 🔄 **Smart Autocomplete**:
-  - Suggest Python classes/functions when completing `_target_`
-  - Suggest parameters based on actual function signatures
-  - Filter by current context and partial input
-- 🔄 **Go to Definition**: Jump from YAML config to Python source
-- 🔄 **Configuration**: Custom Python path, virtual environment support
+- 🔄 **Type Validation**: Validate YAML values against Python type annotations
+- 🔄 **Smart Autocomplete**: Suggest Python classes/functions and parameters
+- 🔄 **Semantic Tokens**: Syntax highlighting for Python references
+- 🔄 **Configuration UI**: Better integration for Python interpreter selection
 
 ## Architecture
 
@@ -59,6 +64,44 @@ The LSP server communicates over stdin/stdout:
 
 ```bash
 cargo run
+```
+
+### Configuring Python Interpreter
+
+The LSP can use a Python interpreter to resolve modules from virtual environments or custom Python installations. The interpreter path is stored in the `HydraLspBackend.python_interpreter` field.
+
+**Default Behavior**: When no interpreter is specified, the LSP will:
+
+1. Search for Python modules in workspace-relative paths
+2. Look in standard Python paths (if Python is in PATH)
+
+**Virtual Environment Support**: To enable module discovery from a virtual environment, the LSP client (e.g., VS Code extension) should:
+
+1. Detect or prompt for the Python interpreter path
+2. Update the `python_interpreter` configuration (via LSP initialization params or workspace/didChangeConfiguration)
+
+The interpreter is used to query `sys.path` by running:
+
+```python
+python -c "import sys; print('\\n'.join(sys.path))"
+```
+
+This allows the LSP to discover:
+
+- Packages installed in virtual environments
+- Site-packages from custom Python installations  
+- User-installed packages
+- Development packages (editable installs)
+
+**Example VS Code Extension Integration**:
+```typescript
+// Detect Python interpreter (use VS Code Python extension API or prompt user)
+const pythonPath = await detectPythonInterpreter();
+
+// Pass to LSP server (implementation depends on your extension design)
+// Option 1: Via initialization params
+// Option 2: Via workspace configuration
+// Option 3: Via custom notification to update the RwLock
 ```
 
 ## Testing
@@ -97,33 +140,26 @@ const client = new LanguageClient(
 client.start();
 ```
 
-## Adding Full Python Analysis
+## Python Analysis
 
-Currently, Python analysis is disabled because the `ruff` and `ty` crates are not published to crates.io. To enable full Python analysis:
-
-**Add git dependencies to `Cargo.toml`**:
+The LSP uses [ruff](https://github.com/astral-sh/ruff) for Python parsing and AST analysis:
 
 ```toml
 [dependencies]
-# ... existing dependencies ...
-
 # Python parsing and analysis
 ruff_python_parser = { git = "https://github.com/astral-sh/ruff", tag = "v0.9.0" }
 ruff_python_ast = { git = "https://github.com/astral-sh/ruff", tag = "v0.9.0" }
 ruff_text_size = { git = "https://github.com/astral-sh/ruff", tag = "v0.9.0" }
-
-# Python semantic analysis
-ty_module_resolver = { git = "https://github.com/astral-sh/ty" }
-ty_python_semantic = { git = "https://github.com/astral-sh/ty" }
-ty_project = { git = "https://github.com/astral-sh/ty" }
-ty = { git = "https://github.com/astral-sh/ty" }
 ```
 
-**Uncomment Python analysis code in `src/python_analyzer.rs`**
+The Python analyzer (`src/python_analyzer.rs`) provides:
 
-**Implement the full analysis pipeline** as documented in `PYTHON_ANALYSIS_TOOLS.md`
+- **Module Resolution**: Finds Python files from module paths using workspace and `sys.path`
+- **AST Parsing**: Parses Python files into abstract syntax trees
+- **Signature Extraction**: Extracts function/class signatures using AST visitor pattern
+- **Type Information**: Captures type annotations and default values
 
-See [PYTHON_ANALYSIS_TOOLS.md](PYTHON_ANALYSIS_TOOLS.md) for detailed information about using ruff and ty for Python analysis.
+See [PYTHON_ANALYSIS_TOOLS.md](PYTHON_ANALYSIS_TOOLS.md) for detailed information about the Python analysis implementation.
 
 ## Development Plan
 

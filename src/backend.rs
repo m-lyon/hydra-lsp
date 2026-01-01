@@ -28,7 +28,16 @@ impl HydraLspBackend {
 
 #[tower_lsp::async_trait]
 impl LanguageServer for HydraLspBackend {
-    async fn initialize(&self, _params: InitializeParams) -> Result<InitializeResult> {
+    async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
+        self.client
+            .log_message(
+                MessageType::LOG,
+                format!(
+                    "Hydra LSP server initializing with options: {:?}",
+                    params.initialization_options
+                ),
+            )
+            .await;
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
