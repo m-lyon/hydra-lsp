@@ -1,0 +1,6 @@
+---
+source: tests/diagnostics.rs
+expression: "format!(\"Message: {}\\nCode: '{}'\", diag.message, extract_code(diag))"
+---
+Message: Invalid _target_ format: InvalidTarget
+Code: 'invalid-target'

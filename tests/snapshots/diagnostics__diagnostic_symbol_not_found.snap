@@ -1,0 +1,6 @@
+---
+source: tests/diagnostics.rs
+expression: "format!(\"Message: {}\\nCode: '{}'\", diag.message, extract_code(diag))"
+---
+Message: Symbol 'NonExistentClass' not found in module 'my_module'
+Code: 'symbol-not-found'

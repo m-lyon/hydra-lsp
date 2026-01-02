@@ -1,0 +1,16 @@
+---
+source: tests/diagnostics.rs
+expression: summary
+---
+- code: missing-parameter
+  line: 4
+  message: "Missing required parameter 'batch_size' for __init__"
+  severity: Error
+- code: missing-parameter
+  line: 9
+  message: "Missing required parameter 'output_dim' for create_model"
+  severity: Error
+- code: unknown-parameter
+  line: 16
+  message: "Unknown parameter 'unknown_param' for __init__"
+  severity: Error

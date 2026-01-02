@@ -231,14 +231,11 @@ impl LanguageServer for HydraLspBackend {
                 let range = Range {
                     start: Position {
                         line: target_info.line,
-                        character: target_info.col + TARGET_KEY_C.len() as u32 + 1,
+                        character: target_info.value_start,
                     },
                     end: Position {
                         line: target_info.line,
-                        character: target_info.col
-                            + TARGET_KEY_C.len() as u32
-                            + target_info.value.len() as u32
-                            + 1,
+                        character: target_info.value_start as u32 + target_info.value.len() as u32,
                     },
                 };
 

@@ -1,0 +1,6 @@
+---
+source: tests/diagnostics.rs
+expression: "format!(\"Message: {}\\nCode: '{}'\", diag.message, extract_code(diag))"
+---
+Message: Cannot resolve module 'nonexistent.module': Could not resolve module: nonexistent.module (tried 2 search paths)
+Code: 'module-not-found'

@@ -1,0 +1,19 @@
+# @hydra
+# Test diagnostics - missing required parameters
+
+model:
+  _target_: my_module.DataLoader
+  # Missing required 'batch_size' parameter
+  shuffle: true
+
+optimizer:
+  _target_: my_module.create_model
+  input_dim: 10
+  # Missing required 'output_dim' parameter
+  hidden_dim: 256
+
+config:
+  _target_: my_module.Config
+  name: "test"
+  value: 1.0
+  unknown_param: "should error"

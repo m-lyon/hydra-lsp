@@ -10,7 +10,8 @@ pub struct TargetInfo {
     pub value: String,
     pub parameters: HashMap<String, Value>,
     pub line: u32,
-    pub col: u32,
+    pub key_start: u32,
+    pub value_start: u32,
 }
 
 impl TargetInfo {
@@ -19,7 +20,8 @@ impl TargetInfo {
             value,
             parameters,
             line: 0,
-            col: 0,
+            key_start: 0,
+            value_start: 0,
         }
     }
 }
@@ -87,9 +89,8 @@ impl YamlParser {
         match target_map.remove(&position.line) {
             Some(target) => {
                 // Check if the column is within the function definition
-                if position.character > target.col + TARGET_KEY.len() as u32 + 1
-                    && position.character
-                        <= target.col + TARGET_KEY.len() as u32 + target.value.len() as u32
+                if position.character > target.value_start
+                    && position.character < target.value_start + target.value.len() as u32
                 {
                     Ok(Some(target))
                 } else {
@@ -147,7 +148,16 @@ impl YamlParser {
             if let Some(col) = line.find(TARGET_KEY_C) {
                 // Found a _target_, assign position to the next unassigned target
                 targets[target_idx].line = line_num as u32;
-                targets[target_idx].col = col as u32;
+                targets[target_idx].key_start = col as u32;
+
+                // find the value start position
+                if let Some(value_start) =
+                    line[col + TARGET_KEY_C.len()..].find(|c: char| !c.is_whitespace())
+                {
+                    targets[target_idx].value_start =
+                        (col + TARGET_KEY_C.len() + value_start) as u32;
+                }
+
                 target_idx += 1;
             }
         }
@@ -291,7 +301,7 @@ model:
         assert_eq!(target.value, "myproject.Model");
         assert_eq!(target.parameters.len(), 2);
         assert_eq!(target.line, 2);
-        assert_eq!(target.col, 2);
+        assert_eq!(target.key_start, 2);
     }
 
     #[test]
@@ -313,19 +323,19 @@ model:
         assert_eq!(target1.value, "myproject.Model");
         assert_eq!(target1.parameters.len(), 2);
         assert_eq!(target1.line, 2);
-        assert_eq!(target1.col, 2);
+        assert_eq!(target1.key_start, 2);
 
         let target2 = target_map.get(&4).unwrap();
         assert_eq!(target2.value, "myproject.Encoder");
         assert_eq!(target2.parameters.len(), 1);
         assert_eq!(target2.line, 4);
-        assert_eq!(target2.col, 4);
+        assert_eq!(target2.key_start, 4);
 
         let target3 = target_map.get(&7).unwrap();
         assert_eq!(target3.value, "myproject.Decoder");
         assert_eq!(target3.parameters.len(), 1);
         assert_eq!(target3.line, 7);
-        assert_eq!(target3.col, 4);
+        assert_eq!(target3.key_start, 4);
     }
 
     #[test]
@@ -342,7 +352,7 @@ model:
             .unwrap();
         assert_eq!(target_info.value, "myproject.Model");
         assert_eq!(target_info.line, 2);
-        assert_eq!(target_info.col, 2);
+        assert_eq!(target_info.key_start, 2);
     }
 
     #[test]

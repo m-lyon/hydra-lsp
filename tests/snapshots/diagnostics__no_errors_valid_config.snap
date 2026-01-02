@@ -1,0 +1,6 @@
+---
+source: tests/diagnostics.rs
+expression: summary
+---
+error_count: 0
+total_diagnostics: 0
