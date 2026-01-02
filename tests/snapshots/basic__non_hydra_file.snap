@@ -1,0 +1,5 @@
+---
+source: tests/basic.rs
+expression: "\"Non-Hydra YAML file opened\""
+---
+Non-Hydra YAML file opened

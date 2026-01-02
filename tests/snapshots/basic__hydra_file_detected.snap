@@ -1,0 +1,5 @@
+---
+source: tests/basic.rs
+expression: "\"Hydra file opened and processed\""
+---
+Hydra file opened and processed

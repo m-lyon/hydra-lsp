@@ -6,8 +6,8 @@ use tower_lsp::{Client, LanguageServer};
 
 use crate::diagnostics;
 use crate::document::DocumentStore;
-use crate::python_analyzer::PythonAnalyzer;
-use crate::yaml_parser::{CompletionContext, YamlParser};
+use crate::python_analyzer::{DefinitionInfo, PythonAnalyzer};
+use crate::yaml_parser::{CompletionContext, YamlParser, TARGET_KEY_C};
 
 #[derive(Debug)]
 pub struct HydraLspBackend {
@@ -190,6 +190,13 @@ impl LanguageServer for HydraLspBackend {
             }
         };
 
+        self.client
+            .log_message(
+                MessageType::LOG,
+                format!("Found target at position: {:?}", target_info),
+            )
+            .await;
+
         // Split target into module and symbol
         let (module_path, symbol_name) = match PythonAnalyzer::split_target(&target_info.value) {
             Ok(parts) => parts,
@@ -218,12 +225,21 @@ impl LanguageServer for HydraLspBackend {
         ) {
             Ok(definition_info) => {
                 let hover_content = match definition_info {
-                    crate::python_analyzer::DefinitionInfo::Function(sig) => {
-                        PythonAnalyzer::format_signature(&sig)
-                    }
-                    crate::python_analyzer::DefinitionInfo::Class(class_info) => {
-                        PythonAnalyzer::format_class(&class_info)
-                    }
+                    DefinitionInfo::Function(sig) => PythonAnalyzer::format_signature(&sig),
+                    DefinitionInfo::Class(class_info) => PythonAnalyzer::format_class(&class_info),
+                };
+                let range = Range {
+                    start: Position {
+                        line: target_info.line,
+                        character: target_info.col + TARGET_KEY_C.len() as u32 + 1,
+                    },
+                    end: Position {
+                        line: target_info.line,
+                        character: target_info.col
+                            + TARGET_KEY_C.len() as u32
+                            + target_info.value.len() as u32
+                            + 1,
+                    },
                 };
 
                 Ok(Some(Hover {
@@ -231,7 +247,7 @@ impl LanguageServer for HydraLspBackend {
                         kind: MarkupKind::Markdown,
                         value: hover_content,
                     }),
-                    range: None,
+                    range: Some(range),
                 }))
             }
             Err(e) => {
@@ -247,7 +263,6 @@ impl LanguageServer for HydraLspBackend {
                     "**Hydra Target**\n\nModule: `{}`\n\nSymbol: `{}`\n\n---\n\n*Could not analyze Python definition: {}*",
                     module_path, symbol_name, e
                 );
-
                 Ok(Some(Hover {
                     contents: HoverContents::Markup(MarkupContent {
                         kind: MarkupKind::Markdown,

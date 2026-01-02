@@ -2,6 +2,10 @@ use serde_yaml::Value;
 use std::collections::HashMap;
 use tower_lsp::lsp_types::Position;
 
+const TARGET_KEY: &str = "_target_";
+pub const TARGET_KEY_C: &str = "_target_:"; // with colon for parsing in text
+
+#[derive(Debug)]
 pub struct TargetInfo {
     pub value: String,
     pub parameters: HashMap<String, Value>,
@@ -68,7 +72,7 @@ impl YamlParser {
 
     /// Check if content contains `_target_` keyword
     fn has_target_keyword(content: &str) -> bool {
-        content.contains("_target_")
+        content.contains(TARGET_KEY_C)
     }
 
     /// Find the target info at a specific position
@@ -78,14 +82,16 @@ impl YamlParser {
     ) -> Result<Option<TargetInfo>, serde_yaml::Error> {
         let mut target_map = Self::parse(content)?;
 
-        // Direct HashMap lookup by line number
+        // Direct HashMap lookup by line number. uses remove to gain ownership w/o
+        // cloning.
         match target_map.remove(&position.line) {
-            Some(target_info) => {
-                // Check if the column is within the _target_ key
-                if position.character >= target_info.col
-                    && position.character <= target_info.col + "_target_:".len() as u32
+            Some(target) => {
+                // Check if the column is within the function definition
+                if position.character > target.col + TARGET_KEY.len() as u32 + 1
+                    && position.character
+                        <= target.col + TARGET_KEY.len() as u32 + target.value.len() as u32
                 {
-                    Ok(Some(target_info))
+                    Ok(Some(target))
                 } else {
                     Ok(None)
                 }
@@ -99,12 +105,12 @@ impl YamlParser {
         match value {
             Value::Mapping(map) => {
                 // Check if this mapping has a _target_ key
-                if let Some(Value::String(target_str)) = map.get("_target_") {
+                if let Some(Value::String(target_str)) = map.get(TARGET_KEY) {
                     // Extract parameters (all keys except _target_)
                     let mut parameters = HashMap::new();
                     for (key, val) in map {
                         if let Value::String(key_str) = key {
-                            if key_str != "_target_" {
+                            if key_str != TARGET_KEY {
                                 parameters.insert(key_str.clone(), val.clone());
                             }
                         }
@@ -138,7 +144,7 @@ impl YamlParser {
             }
 
             // Look for _target_: in this line
-            if let Some(col) = line.find("_target_:") {
+            if let Some(col) = line.find(TARGET_KEY_C) {
                 // Found a _target_, assign position to the next unassigned target
                 targets[target_idx].line = line_num as u32;
                 targets[target_idx].col = col as u32;
@@ -158,11 +164,12 @@ impl YamlParser {
         }
 
         let line = lines[position.line as usize];
-        let prefix = &line[..position.character.min(line.len() as u32) as usize];
+        let char_pos = (position.character as usize).min(line.len());
+        let prefix = &line[..char_pos];
 
         // Check if we're completing a _target_ value
-        if let Some(target_pos) = prefix.find("_target_:") {
-            let value_start = target_pos + "_target_:".len();
+        if let Some(target_pos) = prefix.find(TARGET_KEY_C) {
+            let value_start = target_pos + TARGET_KEY_C.len();
             let partial = prefix[value_start..].trim();
             return Ok(CompletionContext::TargetValue {
                 partial: partial.to_string(),
@@ -223,9 +230,9 @@ impl YamlParser {
             }
 
             // Check if this line has _target_
-            if let Some(value_start) = line.find("_target_:") {
+            if let Some(value_start) = line.find(TARGET_KEY_C) {
                 if line_indent == current_indent {
-                    let value = line[value_start + "_target_:".len()..].trim();
+                    let value = line[value_start + TARGET_KEY_C.len()..].trim();
                     return Ok(Some(value.trim_matches('"').trim_matches('\'')));
                 }
             }
@@ -329,7 +336,7 @@ model:
   hidden_size: 256
   num_layers: 12
 "#;
-        let position = Position::new(2, 5);
+        let position = Position::new(2, 15);
         let target_info = YamlParser::find_target_at_position(content, position)
             .unwrap()
             .unwrap();
@@ -359,7 +366,7 @@ model:
   hidden_size: 256
   num_layers: 12
 "#;
-        let position = Position::new(2, 1); // Column before _target_
+        let position = Position::new(2, 11); // Column before _target_ value
         let target_info = YamlParser::find_target_at_position(content, position).unwrap();
         assert!(target_info.is_none());
     }
@@ -372,7 +379,7 @@ model:
   hidden_size: 256
   num_layers: 12
 "#;
-        let position = Position::new(2, 12); // Column after _target_
+        let position = Position::new(2, 27); // Column after _target_
         let target_info = YamlParser::find_target_at_position(content, position).unwrap();
         assert!(target_info.is_none());
     }
