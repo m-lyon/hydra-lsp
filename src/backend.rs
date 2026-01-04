@@ -7,7 +7,7 @@ use tower_lsp::{Client, LanguageServer};
 use crate::diagnostics;
 use crate::document::DocumentStore;
 use crate::python_analyzer::{DefinitionInfo, PythonAnalyzer};
-use crate::yaml_parser::{CompletionContext, YamlParser, TARGET_KEY_C};
+use crate::yaml_parser::{CompletionContext, YamlParser};
 
 #[derive(Debug)]
 pub struct HydraLspBackend {
@@ -235,7 +235,7 @@ impl LanguageServer for HydraLspBackend {
                     },
                     end: Position {
                         line: target_info.line,
-                        character: target_info.value_start as u32 + target_info.value.len() as u32,
+                        character: target_info.value_end(),
                     },
                 };
 

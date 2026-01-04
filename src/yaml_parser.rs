@@ -2,20 +2,44 @@ use serde_yaml::Value;
 use std::collections::HashMap;
 use tower_lsp::lsp_types::Position;
 
-const TARGET_KEY: &str = "_target_";
+pub const TARGET_KEY: &str = "_target_";
 pub const TARGET_KEY_C: &str = "_target_:"; // with colon for parsing in text
+
+/// Represents a parameter in a YAML configuration with position information
+#[derive(Debug, Clone)]
+pub struct ParameterValue {
+    pub value: Value,
+    pub line: u32,
+    pub key_start: u32,
+    pub key_end: u32,
+    pub value_start: u32,
+    pub value_end: u32,
+}
+
+impl ParameterValue {
+    fn new(value: Value) -> Self {
+        Self {
+            value,
+            line: 0,
+            key_start: 0,
+            key_end: 0,
+            value_start: 0,
+            value_end: 0,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct TargetInfo {
     pub value: String,
-    pub parameters: HashMap<String, Value>,
+    pub parameters: HashMap<String, ParameterValue>,
     pub line: u32,
     pub key_start: u32,
     pub value_start: u32,
 }
 
 impl TargetInfo {
-    fn new(value: String, parameters: HashMap<String, Value>) -> Self {
+    fn new(value: String, parameters: HashMap<String, ParameterValue>) -> Self {
         Self {
             value,
             parameters,
@@ -23,6 +47,11 @@ impl TargetInfo {
             key_start: 0,
             value_start: 0,
         }
+    }
+
+    /// Get the end position of the target value
+    pub fn value_end(&self) -> u32 {
+        self.value_start + self.value.len() as u32
     }
 }
 
@@ -90,7 +119,7 @@ impl YamlParser {
             Some(target) => {
                 // Check if the column is within the function definition
                 if position.character > target.value_start
-                    && position.character < target.value_start + target.value.len() as u32
+                    && position.character < target.value_end()
                 {
                     Ok(Some(target))
                 } else {
@@ -107,12 +136,13 @@ impl YamlParser {
             Value::Mapping(map) => {
                 // Check if this mapping has a _target_ key
                 if let Some(Value::String(target_str)) = map.get(TARGET_KEY) {
-                    // Extract parameters (all keys except _target_)
+                    // Extract parameters (all keys including nested _target_)
                     let mut parameters = HashMap::new();
                     for (key, val) in map {
                         if let Value::String(key_str) = key {
                             if key_str != TARGET_KEY {
-                                parameters.insert(key_str.clone(), val.clone());
+                                parameters
+                                    .insert(key_str.clone(), ParameterValue::new(val.clone()));
                             }
                         }
                     }
@@ -158,7 +188,70 @@ impl YamlParser {
                         (col + TARGET_KEY_C.len() + value_start) as u32;
                 }
 
+                // Find parameter positions in subsequent lines
+                Self::find_parameter_positions(content, line_num + 1, &mut targets[target_idx]);
+
                 target_idx += 1;
+            }
+        }
+    }
+
+    /// Find positions for parameters associated with a target
+    fn find_parameter_positions(content: &str, start_line: usize, target_info: &mut TargetInfo) {
+        let lines: Vec<&str> = content.lines().collect();
+        if start_line >= lines.len() {
+            return;
+        }
+
+        // Get the indentation level of the _target_ line
+        let target_indent = lines
+            .get(target_info.line as usize)
+            .and_then(|line| line.find(|c: char| !c.is_whitespace()))
+            .unwrap_or(0);
+
+        // Look through subsequent lines for parameters at the same or deeper indentation
+        for (idx, line) in lines.iter().enumerate().skip(start_line) {
+            let line_indent = line.find(|c: char| !c.is_whitespace()).unwrap_or(0);
+
+            // If we've returned to same or less indentation (and line is not empty), we're done with this target's parameters
+            if !line.trim().is_empty() && line_indent <= target_indent {
+                break;
+            }
+
+            // Look for parameter keys (key: value pattern)
+            if let Some(colon_pos) = line.find(':') {
+                let key_part = &line[..colon_pos];
+                if key_part
+                    .rfind(|c: char| !c.is_whitespace() && c != ':')
+                    .is_some()
+                {
+                    // Extract the key text
+                    let key_text = key_part.trim();
+
+                    // Check if this parameter exists in our target
+                    if let Some(param) = target_info.parameters.get_mut(key_text) {
+                        param.line = idx as u32;
+                        param.key_start = line_indent as u32;
+                        param.key_end = (line_indent + key_text.len()) as u32;
+
+                        // Find value start position (after the colon and whitespace)
+                        if let Some(value_start) =
+                            line[colon_pos + 1..].find(|c: char| !c.is_whitespace())
+                        {
+                            param.value_start = (colon_pos + 1 + value_start) as u32;
+
+                            // Find value end position (end of non-whitespace or comment)
+                            let value_part = &line[param.value_start as usize..];
+                            let value_len = value_part.find('#').unwrap_or(value_part.len());
+                            let value_end_offset = value_part[..value_len].trim_end().len();
+                            param.value_end = param.value_start + value_end_offset as u32;
+                        } else {
+                            // Value might be on next line or empty
+                            param.value_start = (colon_pos + 1) as u32;
+                            param.value_end = param.value_start;
+                        }
+                    }
+                }
             }
         }
     }

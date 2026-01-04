@@ -340,3 +340,257 @@ model:
         "Should not have unknown parameter errors when **kwargs is present"
     );
 }
+
+// ==================== Nested Target Tests ====================
+
+#[tokio::test]
+async fn test_nested_diagnostics_all_valid() {
+    let mut ctx = TestContext::new(TestWorkspace::Nested);
+    ctx.initialize().await;
+
+    let content = std::fs::read_to_string(ctx.workspace.path().join("config.yaml")).unwrap();
+    ctx.open_document("config.yaml", content).await;
+
+    let dp = ctx.recv::<PublishDiagnosticsParams>().await;
+    let diagnostics = dp.diagnostics;
+
+    // Filter diagnostics for model_one (should have no errors)
+    // model_one is on lines 5-15 approximately
+    let model_one_errors: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| {
+            d.range.start.line >= 5
+                && d.range.start.line <= 15
+                && d.severity == Some(DiagnosticSeverity::ERROR)
+        })
+        .collect();
+
+    assert!(
+        model_one_errors.is_empty(),
+        "model_one should have no errors. Found: {:?}",
+        model_one_errors
+    );
+}
+
+#[tokio::test]
+async fn test_nested_diagnostics_missing_d_value() {
+    let mut ctx = TestContext::new(TestWorkspace::Nested);
+    ctx.initialize().await;
+
+    let content = std::fs::read_to_string(ctx.workspace.path().join("config.yaml")).unwrap();
+    ctx.open_document("config.yaml", content).await;
+
+    let dp = ctx.recv::<PublishDiagnosticsParams>().await;
+    let diagnostics = dp.diagnostics;
+
+    // model_two should have error for missing d_value in ClassD
+    let missing_d_value: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| {
+            d.range.start.line >= 17
+                && d.range.start.line <= 26
+                && d.message.contains("Missing required parameter")
+                && d.message.contains("d_value")
+        })
+        .collect();
+
+    assert!(
+        !missing_d_value.is_empty(),
+        "model_two should have missing d_value error"
+    );
+
+    // Verify it's an ERROR severity
+    for diag in &missing_d_value {
+        assert_eq!(diag.severity, Some(DiagnosticSeverity::ERROR));
+    }
+
+    insta::assert_snapshot!(
+        "nested_missing_d_value",
+        format!(
+            "Message: {}\nLine: {}\nCode: '{}'",
+            missing_d_value[0].message,
+            missing_d_value[0].range.start.line,
+            extract_code(missing_d_value[0])
+        )
+    );
+}
+
+#[tokio::test]
+async fn test_nested_diagnostics_multiple_missing_params() {
+    let mut ctx = TestContext::new(TestWorkspace::Nested);
+    ctx.initialize().await;
+
+    let content = std::fs::read_to_string(ctx.workspace.path().join("config.yaml")).unwrap();
+    ctx.open_document("config.yaml", content).await;
+
+    let dp = ctx.recv::<PublishDiagnosticsParams>().await;
+    let diagnostics = dp.diagnostics;
+
+    // model_three (first one) should have errors for missing d_value and b_value
+    let model_three_errors: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| {
+            d.range.start.line >= 28
+                && d.range.start.line <= 37
+                && d.message.contains("Missing required parameter")
+                && d.severity == Some(DiagnosticSeverity::ERROR)
+        })
+        .collect();
+
+    assert!(
+        model_three_errors.len() >= 2,
+        "model_three should have at least 2 missing parameter errors"
+    );
+
+    // Check for both missing parameters
+    let has_d_value_error = model_three_errors
+        .iter()
+        .any(|d| d.message.contains("d_value"));
+    let has_b_value_error = model_three_errors
+        .iter()
+        .any(|d| d.message.contains("b_value"));
+
+    assert!(has_d_value_error, "Should have error for missing d_value");
+    assert!(has_b_value_error, "Should have error for missing b_value");
+
+    let summary: Vec<_> = model_three_errors
+        .iter()
+        .map(|d| {
+            serde_json::json!({
+                "line": d.range.start.line,
+                "message": d.message,
+                "code": extract_code(d)
+            })
+        })
+        .collect();
+
+    insta::assert_yaml_snapshot!("nested_multiple_missing_params", summary);
+}
+
+#[tokio::test]
+async fn test_nested_diagnostics_unknown_param() {
+    let mut ctx = TestContext::new(TestWorkspace::Nested);
+    ctx.initialize().await;
+
+    let content = std::fs::read_to_string(ctx.workspace.path().join("config.yaml")).unwrap();
+    ctx.open_document("config.yaml", content).await;
+
+    let dp = ctx.recv::<PublishDiagnosticsParams>().await;
+    let diagnostics = dp.diagnostics;
+
+    // Last model_four should have error for unknown parameter x_value
+    // Note: The diagnostic may have line 0 if parameter position tracking needs improvement
+    let unknown_x_value: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| {
+            d.message.contains("x_value")
+                && (d.message.contains("Unknown parameter") || d.message.contains("unknown"))
+                && d.severity == Some(DiagnosticSeverity::ERROR)
+        })
+        .collect();
+
+    assert!(
+        !unknown_x_value.is_empty(),
+        "Should have error for unknown parameter x_value. Got diagnostics: {:?}",
+        diagnostics
+    );
+
+    insta::assert_snapshot!(
+        "nested_unknown_param",
+        format!(
+            "Message: {}\nLine: {}\nCol: {}-{}\nCode: '{}'",
+            unknown_x_value[0].message,
+            unknown_x_value[0].range.start.line,
+            unknown_x_value[0].range.start.character,
+            unknown_x_value[0].range.end.character,
+            extract_code(unknown_x_value[0])
+        )
+    );
+}
+
+#[tokio::test]
+async fn test_nested_diagnostics_all_errors() {
+    let mut ctx = TestContext::new(TestWorkspace::Nested);
+    ctx.initialize().await;
+
+    let content = std::fs::read_to_string(ctx.workspace.path().join("config.yaml")).unwrap();
+    ctx.open_document("config.yaml", content).await;
+
+    let dp = ctx.recv::<PublishDiagnosticsParams>().await;
+    let diagnostics = dp.diagnostics;
+
+    // Get all errors
+    let errors: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+        .collect();
+
+    // Should have multiple errors across the nested configs
+    assert!(
+        errors.len() >= 4,
+        "Should have at least 4 errors (missing d_value, missing d_value + b_value twice, unknown x_value). Found: {}",
+        errors.len()
+    );
+
+    // Create comprehensive summary
+    let summary: Vec<_> = errors
+        .iter()
+        .map(|d| {
+            serde_json::json!({
+                "line": d.range.start.line,
+                "start_char": d.range.start.character,
+                "end_char": d.range.end.character,
+                "message": d.message,
+                "severity": format!("{:?}", d.severity.unwrap()),
+                "code": extract_code(d)
+            })
+        })
+        .collect();
+
+    insta::assert_yaml_snapshot!("nested_all_errors", summary);
+}
+
+#[tokio::test]
+async fn test_nested_target_validation_depth() {
+    let mut ctx = TestContext::new(TestWorkspace::Nested);
+    ctx.initialize().await;
+
+    let content = std::fs::read_to_string(ctx.workspace.path().join("config.yaml")).unwrap();
+    ctx.open_document("config.yaml", content).await;
+
+    let dp = ctx.recv::<PublishDiagnosticsParams>().await;
+    let diagnostics = dp.diagnostics;
+
+    // Verify that deeply nested targets (ClassA -> ClassB -> ClassC -> ClassD) are validated
+    // Check that we have diagnostics related to parameters at different nesting levels
+
+    // d_value is a parameter of the deepest level (ClassD)
+    let classd_diagnostics: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.message.contains("d_value"))
+        .collect();
+
+    // b_value is a parameter of ClassB (intermediate level)
+    let classb_diagnostics: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.message.contains("b_value"))
+        .collect();
+
+    assert!(
+        !classd_diagnostics.is_empty(),
+        "Should have diagnostics for deeply nested ClassD (d_value)"
+    );
+
+    assert!(
+        !classb_diagnostics.is_empty(),
+        "Should have diagnostics for intermediate ClassB (b_value)"
+    );
+
+    // Verify we're validating parameters at multiple depths
+    assert!(
+        classd_diagnostics.len() >= 2 && classb_diagnostics.len() >= 2,
+        "Should validate parameters at multiple nesting levels across different models. d_value: {}, b_value: {}",
+        classd_diagnostics.len(),
+        classb_diagnostics.len()
+    );
+}

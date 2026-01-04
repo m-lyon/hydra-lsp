@@ -1,7 +1,7 @@
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 
 use crate::python_analyzer::{DefinitionInfo, FunctionSignature, PythonAnalyzer};
-use crate::yaml_parser::TargetInfo;
+use crate::yaml_parser::{ParameterValue, TargetInfo};
 
 /// Validate a Hydra configuration and generate diagnostics
 fn validate_target(
@@ -24,7 +24,7 @@ fn validate_target(
                     },
                     end: Position {
                         line: target_info.line,
-                        character: target_info.value_start + target_info.value.len() as u32,
+                        character: target_info.value_end(),
                     },
                 },
                 severity: Some(DiagnosticSeverity::ERROR),
@@ -62,7 +62,7 @@ fn validate_target(
                         },
                         end: Position {
                             line: target_info.line,
-                            character: target_info.value_start + target_info.value.len() as u32,
+                            character: target_info.value_end(),
                         },
                     },
                     severity: Some(DiagnosticSeverity::ERROR),
@@ -88,7 +88,7 @@ fn validate_target(
                     },
                     end: Position {
                         line: target_info.line,
-                        character: target_info.key_start + target_info.value.len() as u32,
+                        character: target_info.value_end(),
                     },
                 },
                 severity: Some(DiagnosticSeverity::ERROR),
@@ -125,17 +125,17 @@ fn validate_parameters(target_info: &TargetInfo, signature: &FunctionSignature) 
     let has_kwargs = signature.parameters.iter().any(|p| p.is_variadic_keyword);
 
     // Check for unknown parameters
-    for yaml_param in &yaml_params {
-        if !expected_params.contains(yaml_param) && !has_kwargs {
+    for (param_name, param_value) in &target_info.parameters {
+        if !expected_params.contains(param_name) && !has_kwargs {
             diagnostics.push(Diagnostic {
                 range: Range {
                     start: Position {
-                        line: target_info.line + 1, // Approximate line
-                        character: 0,
+                        line: param_value.line,
+                        character: param_value.key_start,
                     },
                     end: Position {
-                        line: target_info.line + 1,
-                        character: yaml_param.len() as u32,
+                        line: param_value.line,
+                        character: param_value.key_end,
                     },
                 },
                 severity: Some(DiagnosticSeverity::ERROR),
@@ -143,7 +143,7 @@ fn validate_parameters(target_info: &TargetInfo, signature: &FunctionSignature) 
                     "unknown-parameter".to_string(),
                 )),
                 source: Some("hydra-lsp".to_string()),
-                message: format!("Unknown parameter '{}' for {}", yaml_param, signature.name),
+                message: format!("Unknown parameter '{}' for {}", param_name, signature.name),
                 ..Default::default()
             });
         }
@@ -161,11 +161,11 @@ fn validate_parameters(target_info: &TargetInfo, signature: &FunctionSignature) 
                 range: Range {
                     start: Position {
                         line: target_info.line,
-                        character: 0,
+                        character: target_info.value_start,
                     },
                     end: Position {
                         line: target_info.line,
-                        character: 10, // Length of "_target_:"
+                        character: target_info.value_end(),
                     },
                 },
                 severity: Some(DiagnosticSeverity::ERROR),
@@ -190,24 +190,26 @@ fn validate_parameters(target_info: &TargetInfo, signature: &FunctionSignature) 
                 !matches!(&d.code, Some(tower_lsp::lsp_types::NumberOrString::String(code)) if code == "unknown-parameter")
             });
 
-            for param in unknown {
-                diagnostics.push(Diagnostic {
-                    range: Range {
-                        start: Position {
-                            line: target_info.line + 1,
-                            character: 0,
+            for param_name in unknown {
+                if let Some(param_value) = target_info.parameters.get(param_name) {
+                    diagnostics.push(Diagnostic {
+                        range: Range {
+                            start: Position {
+                                line: param_value.line,
+                                character: param_value.key_start,
+                            },
+                            end: Position {
+                                line: param_value.line,
+                                character: param_value.key_end,
+                            },
                         },
-                        end: Position {
-                            line: target_info.line + 1,
-                            character: param.len() as u32,
-                        },
-                    },
-                    severity: Some(DiagnosticSeverity::HINT),
-                    code: None,
-                    source: Some("hydra-lsp".to_string()),
-                    message: format!("Parameter '{}' will be passed via **kwargs", param),
-                    ..Default::default()
-                });
+                        severity: Some(DiagnosticSeverity::HINT),
+                        code: None,
+                        source: Some("hydra-lsp".to_string()),
+                        message: format!("Parameter '{}' will be passed via **kwargs", param_name),
+                        ..Default::default()
+                    });
+                }
             }
         }
     }
@@ -328,7 +330,17 @@ mod tests {
     #[test]
     fn test_validate_unknown_param_without_kwargs() {
         let mut params = std::collections::HashMap::new();
-        params.insert("unknown_param".to_string(), serde_yaml::Value::Null);
+        params.insert(
+            "unknown_param".to_string(),
+            ParameterValue {
+                value: serde_yaml::Value::Null,
+                line: 1,
+                key_start: 2,
+                key_end: 15,
+                value_start: 17,
+                value_end: 21,
+            },
+        );
 
         let target_info = TargetInfo {
             value: "my.Class".to_string(),
@@ -367,7 +379,17 @@ mod tests {
     #[test]
     fn test_validate_unknown_param_with_kwargs() {
         let mut params = std::collections::HashMap::new();
-        params.insert("any_param".to_string(), serde_yaml::Value::Null);
+        params.insert(
+            "any_param".to_string(),
+            ParameterValue {
+                value: serde_yaml::Value::Null,
+                line: 1,
+                key_start: 2,
+                key_end: 11,
+                value_start: 13,
+                value_end: 17,
+            },
+        );
 
         let target_info = TargetInfo {
             value: "my.Class".to_string(),
@@ -604,7 +626,14 @@ mod tests {
         let mut params = std::collections::HashMap::new();
         params.insert(
             "value".to_string(),
-            serde_yaml::Value::Number(serde_yaml::Number::from(42)),
+            ParameterValue {
+                value: serde_yaml::Value::Number(serde_yaml::Number::from(42)),
+                line: 1,
+                key_start: 2,
+                key_end: 7,
+                value_start: 9,
+                value_end: 11,
+            },
         );
         // Missing required 'name' parameter (it has no default)
 
@@ -629,6 +658,111 @@ mod tests {
         assert!(
             missing_param_diag.is_some(),
             "Should have missing parameter diagnostic for 'name'. Got diagnostics: {:?}",
+            diagnostics
+        );
+    }
+
+    #[test]
+    fn test_validate_nested_target_valid() {
+        let mut targets = std::collections::HashMap::new();
+
+        // Create a nested target parameter
+        let mut nested_map = serde_yaml::Mapping::new();
+        nested_map.insert(
+            serde_yaml::Value::String("_target_".to_string()),
+            serde_yaml::Value::String("test_module.SimpleClass".to_string()),
+        );
+
+        let mut params = std::collections::HashMap::new();
+        params.insert(
+            "arg1".to_string(),
+            ParameterValue {
+                value: serde_yaml::Value::Mapping(nested_map),
+                line: 1,
+                key_start: 2,
+                key_end: 6,
+                value_start: 10,
+                value_end: 40,
+            },
+        );
+
+        targets.insert(
+            0,
+            TargetInfo {
+                value: "test_module.function_with_params".to_string(),
+                parameters: params,
+                line: 0,
+                key_start: 10,
+                value_start: 10 + TARGET_KEY_C.len() as u32 + 1,
+            },
+        );
+
+        let resources_dir = get_test_resources_dir();
+        let diagnostics = validate_document(targets, Some(&resources_dir), None);
+
+        // Should not have errors for the nested target (it's a valid SimpleClass)
+        let nested_errors = diagnostics
+            .iter()
+            .filter(|d| {
+                d.severity == Some(DiagnosticSeverity::ERROR)
+                    && (d.message.contains("nested") || d.message.contains("SimpleClass"))
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            nested_errors.is_empty(),
+            "Should not have errors for valid nested target. Got: {:?}",
+            nested_errors
+        );
+    }
+
+    #[test]
+    fn test_validate_nested_target_invalid() {
+        let mut targets = std::collections::HashMap::new();
+
+        // Create an invalid nested target parameter
+        let mut nested_map = serde_yaml::Mapping::new();
+        nested_map.insert(
+            serde_yaml::Value::String("_target_".to_string()),
+            serde_yaml::Value::String("nonexistent.Module".to_string()),
+        );
+
+        let mut params = std::collections::HashMap::new();
+        params.insert(
+            "arg1".to_string(),
+            ParameterValue {
+                value: serde_yaml::Value::Mapping(nested_map),
+                line: 1,
+                key_start: 2,
+                key_end: 6,
+                value_start: 10,
+                value_end: 40,
+            },
+        );
+
+        targets.insert(
+            0,
+            TargetInfo {
+                value: "test_module.function_with_params".to_string(),
+                parameters: params,
+                line: 0,
+                key_start: 10,
+                value_start: 10 + TARGET_KEY_C.len() as u32 + 1,
+            },
+        );
+
+        let resources_dir = get_test_resources_dir();
+        let diagnostics = validate_document(targets, Some(&resources_dir), None);
+
+        // Should have error for the invalid nested target
+        let nested_error = diagnostics.iter().find(|d| {
+            d.severity == Some(DiagnosticSeverity::ERROR)
+                && d.message.contains("Cannot resolve module")
+        });
+
+        assert!(
+            nested_error.is_some(),
+            "Should have error for invalid nested target. Got: {:?}",
             diagnostics
         );
     }
