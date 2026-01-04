@@ -29,6 +29,7 @@ fn encode_message(content_type: Option<&str>, message: &str) -> String {
 pub enum TestWorkspace {
     Simple,
     Diagnostics,
+    Nested,
 }
 
 impl AsRef<str> for TestWorkspace {
@@ -36,6 +37,7 @@ impl AsRef<str> for TestWorkspace {
         match self {
             TestWorkspace::Simple => "simple",
             TestWorkspace::Diagnostics => "diagnostics",
+            TestWorkspace::Nested => "nested",
         }
     }
 }

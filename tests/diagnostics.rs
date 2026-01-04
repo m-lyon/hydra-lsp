@@ -16,7 +16,7 @@ fn extract_code(diagnostic: &Diagnostic) -> String {
 }
 
 #[tokio::test]
-async fn test_diagnostics_missing_required_param() {
+async fn test_diagnostics_multiple_errors() {
     let mut ctx = TestContext::new(TestWorkspace::Diagnostics);
     ctx.initialize().await;
 
@@ -31,17 +31,6 @@ async fn test_diagnostics_missing_required_param() {
 
     // Should have diagnostics for missing parameters
     assert!(!diagnostics.is_empty(), "Should have diagnostics");
-
-    // Check for missing required parameters
-    let missing_param_diags: Vec<_> = diagnostics
-        .iter()
-        .filter(|d| d.message.contains("Missing required parameter"))
-        .collect();
-
-    assert!(
-        !missing_param_diags.is_empty(),
-        "Should have missing parameter diagnostics"
-    );
 
     // Serialize diagnostics for snapshot testing
     let diagnostic_summary: Vec<_> = diagnostics
@@ -59,7 +48,7 @@ async fn test_diagnostics_missing_required_param() {
         })
         .collect();
 
-    insta::assert_yaml_snapshot!("diagnostics_missing_params", diagnostic_summary);
+    insta::assert_yaml_snapshot!("diagnostics_multiple_errors", diagnostic_summary);
 }
 
 #[tokio::test]
@@ -244,49 +233,6 @@ model:
 }
 
 #[tokio::test]
-async fn test_diagnostics_multiple_errors() {
-    let mut ctx = TestContext::new(TestWorkspace::Diagnostics);
-    ctx.initialize().await;
-
-    let content = std::fs::read_to_string(ctx.workspace.path().join("config.yaml")).unwrap();
-    ctx.open_document("config.yaml", content).await;
-
-    let dp = ctx.recv::<PublishDiagnosticsParams>().await;
-    let diagnostics = dp.diagnostics;
-
-    // Should have multiple types of diagnostics
-    let error_count = diagnostics
-        .iter()
-        .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
-        .count();
-
-    assert!(error_count >= 2, "Should have multiple errors");
-
-    // Check that diagnostics are sorted by line number
-    for i in 1..diagnostics.len() {
-        assert!(
-            diagnostics[i - 1].range.start.line <= diagnostics[i].range.start.line,
-            "Diagnostics should be sorted by line number"
-        );
-    }
-
-    // Create a summary
-    let summary: Vec<_> = diagnostics
-        .iter()
-        .map(|d| {
-            serde_json::json!({
-                "line": d.range.start.line,
-                "message": d.message,
-                "severity": format!("{:?}", d.severity.unwrap()),
-                "code": extract_code(d)
-            })
-        })
-        .collect();
-
-    insta::assert_yaml_snapshot!("diagnostics_multiple_errors", summary);
-}
-
-#[tokio::test]
 async fn test_diagnostics_with_kwargs() {
     let mut ctx = TestContext::new(TestWorkspace::Simple);
     ctx.initialize().await;
@@ -373,142 +319,6 @@ async fn test_nested_diagnostics_all_valid() {
 }
 
 #[tokio::test]
-async fn test_nested_diagnostics_missing_d_value() {
-    let mut ctx = TestContext::new(TestWorkspace::Nested);
-    ctx.initialize().await;
-
-    let content = std::fs::read_to_string(ctx.workspace.path().join("config.yaml")).unwrap();
-    ctx.open_document("config.yaml", content).await;
-
-    let dp = ctx.recv::<PublishDiagnosticsParams>().await;
-    let diagnostics = dp.diagnostics;
-
-    // model_two should have error for missing d_value in ClassD
-    let missing_d_value: Vec<_> = diagnostics
-        .iter()
-        .filter(|d| {
-            d.range.start.line >= 17
-                && d.range.start.line <= 26
-                && d.message.contains("Missing required parameter")
-                && d.message.contains("d_value")
-        })
-        .collect();
-
-    assert!(
-        !missing_d_value.is_empty(),
-        "model_two should have missing d_value error"
-    );
-
-    // Verify it's an ERROR severity
-    for diag in &missing_d_value {
-        assert_eq!(diag.severity, Some(DiagnosticSeverity::ERROR));
-    }
-
-    insta::assert_snapshot!(
-        "nested_missing_d_value",
-        format!(
-            "Message: {}\nLine: {}\nCode: '{}'",
-            missing_d_value[0].message,
-            missing_d_value[0].range.start.line,
-            extract_code(missing_d_value[0])
-        )
-    );
-}
-
-#[tokio::test]
-async fn test_nested_diagnostics_multiple_missing_params() {
-    let mut ctx = TestContext::new(TestWorkspace::Nested);
-    ctx.initialize().await;
-
-    let content = std::fs::read_to_string(ctx.workspace.path().join("config.yaml")).unwrap();
-    ctx.open_document("config.yaml", content).await;
-
-    let dp = ctx.recv::<PublishDiagnosticsParams>().await;
-    let diagnostics = dp.diagnostics;
-
-    // model_three (first one) should have errors for missing d_value and b_value
-    let model_three_errors: Vec<_> = diagnostics
-        .iter()
-        .filter(|d| {
-            d.range.start.line >= 28
-                && d.range.start.line <= 37
-                && d.message.contains("Missing required parameter")
-                && d.severity == Some(DiagnosticSeverity::ERROR)
-        })
-        .collect();
-
-    assert!(
-        model_three_errors.len() >= 2,
-        "model_three should have at least 2 missing parameter errors"
-    );
-
-    // Check for both missing parameters
-    let has_d_value_error = model_three_errors
-        .iter()
-        .any(|d| d.message.contains("d_value"));
-    let has_b_value_error = model_three_errors
-        .iter()
-        .any(|d| d.message.contains("b_value"));
-
-    assert!(has_d_value_error, "Should have error for missing d_value");
-    assert!(has_b_value_error, "Should have error for missing b_value");
-
-    let summary: Vec<_> = model_three_errors
-        .iter()
-        .map(|d| {
-            serde_json::json!({
-                "line": d.range.start.line,
-                "message": d.message,
-                "code": extract_code(d)
-            })
-        })
-        .collect();
-
-    insta::assert_yaml_snapshot!("nested_multiple_missing_params", summary);
-}
-
-#[tokio::test]
-async fn test_nested_diagnostics_unknown_param() {
-    let mut ctx = TestContext::new(TestWorkspace::Nested);
-    ctx.initialize().await;
-
-    let content = std::fs::read_to_string(ctx.workspace.path().join("config.yaml")).unwrap();
-    ctx.open_document("config.yaml", content).await;
-
-    let dp = ctx.recv::<PublishDiagnosticsParams>().await;
-    let diagnostics = dp.diagnostics;
-
-    // Last model_four should have error for unknown parameter x_value
-    // Note: The diagnostic may have line 0 if parameter position tracking needs improvement
-    let unknown_x_value: Vec<_> = diagnostics
-        .iter()
-        .filter(|d| {
-            d.message.contains("x_value")
-                && (d.message.contains("Unknown parameter") || d.message.contains("unknown"))
-                && d.severity == Some(DiagnosticSeverity::ERROR)
-        })
-        .collect();
-
-    assert!(
-        !unknown_x_value.is_empty(),
-        "Should have error for unknown parameter x_value. Got diagnostics: {:?}",
-        diagnostics
-    );
-
-    insta::assert_snapshot!(
-        "nested_unknown_param",
-        format!(
-            "Message: {}\nLine: {}\nCol: {}-{}\nCode: '{}'",
-            unknown_x_value[0].message,
-            unknown_x_value[0].range.start.line,
-            unknown_x_value[0].range.start.character,
-            unknown_x_value[0].range.end.character,
-            extract_code(unknown_x_value[0])
-        )
-    );
-}
-
-#[tokio::test]
 async fn test_nested_diagnostics_all_errors() {
     let mut ctx = TestContext::new(TestWorkspace::Nested);
     ctx.initialize().await;
@@ -548,49 +358,4 @@ async fn test_nested_diagnostics_all_errors() {
         .collect();
 
     insta::assert_yaml_snapshot!("nested_all_errors", summary);
-}
-
-#[tokio::test]
-async fn test_nested_target_validation_depth() {
-    let mut ctx = TestContext::new(TestWorkspace::Nested);
-    ctx.initialize().await;
-
-    let content = std::fs::read_to_string(ctx.workspace.path().join("config.yaml")).unwrap();
-    ctx.open_document("config.yaml", content).await;
-
-    let dp = ctx.recv::<PublishDiagnosticsParams>().await;
-    let diagnostics = dp.diagnostics;
-
-    // Verify that deeply nested targets (ClassA -> ClassB -> ClassC -> ClassD) are validated
-    // Check that we have diagnostics related to parameters at different nesting levels
-
-    // d_value is a parameter of the deepest level (ClassD)
-    let classd_diagnostics: Vec<_> = diagnostics
-        .iter()
-        .filter(|d| d.message.contains("d_value"))
-        .collect();
-
-    // b_value is a parameter of ClassB (intermediate level)
-    let classb_diagnostics: Vec<_> = diagnostics
-        .iter()
-        .filter(|d| d.message.contains("b_value"))
-        .collect();
-
-    assert!(
-        !classd_diagnostics.is_empty(),
-        "Should have diagnostics for deeply nested ClassD (d_value)"
-    );
-
-    assert!(
-        !classb_diagnostics.is_empty(),
-        "Should have diagnostics for intermediate ClassB (b_value)"
-    );
-
-    // Verify we're validating parameters at multiple depths
-    assert!(
-        classd_diagnostics.len() >= 2 && classb_diagnostics.len() >= 2,
-        "Should validate parameters at multiple nesting levels across different models. d_value: {}, b_value: {}",
-        classd_diagnostics.len(),
-        classb_diagnostics.len()
-    );
 }

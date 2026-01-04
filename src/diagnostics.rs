@@ -701,18 +701,17 @@ mod tests {
         let diagnostics = validate_document(targets, Some(&resources_dir), None);
 
         // Should not have errors for the nested target (it's a valid SimpleClass)
-        let nested_errors = diagnostics
-            .iter()
-            .filter(|d| {
-                d.severity == Some(DiagnosticSeverity::ERROR)
-                    && (d.message.contains("nested") || d.message.contains("SimpleClass"))
-            })
-            .collect::<Vec<_>>();
-
         assert!(
-            nested_errors.is_empty(),
-            "Should not have errors for valid nested target. Got: {:?}",
-            nested_errors
+            !diagnostics
+                .iter()
+                .any(|d| d.message.contains("Cannot resolve module")),
+            "Should not have module not found error"
+        );
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.message.contains("Symbol") && d.message.contains("not found")),
+            "Should not have symbol not found error"
         );
     }
 

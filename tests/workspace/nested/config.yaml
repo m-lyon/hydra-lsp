@@ -1,0 +1,52 @@
+# @hydra
+# Test diagnostics
+
+# Should not produce errors
+model_one:
+  _target_: my_module.ClassA
+  a_value: 10
+  b: 
+    _target_: my_module.ClassB
+    b_value: 20
+    c:
+      _target_: my_module.ClassC
+      d:
+        _target_: my_module.ClassD
+        d_value: 40
+
+# Should produce an error for missing param in d
+model_two:
+  _target_: my_module.ClassA
+  a_value: 10
+  b: 
+    _target_: my_module.ClassB
+    b_value: 20
+    c:
+      _target_: my_module.ClassC
+      d:
+        _target_: my_module.ClassD
+
+# Should produce an error for missing param in d and b_value
+model_three:
+  _target_: my_module.ClassA
+  a_value: 10
+  b: 
+    _target_: my_module.ClassB
+    c:
+      _target_: my_module.ClassC
+      d:
+        _target_: my_module.ClassD
+
+
+# Should produce an error for unknown param in d and missing param b_value
+model_four:
+  _target_: my_module.ClassA
+  a_value: 10
+  b: 
+    _target_: my_module.ClassB
+    c:
+      _target_: my_module.ClassC
+      d:
+        _target_: my_module.ClassD
+        d_value: 50
+        x_value: 100  # Unknown parameter
