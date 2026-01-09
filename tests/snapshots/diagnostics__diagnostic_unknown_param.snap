@@ -2,6 +2,6 @@
 source: tests/diagnostics.rs
 expression: "format!(\"Message: {}\\nSeverity: {:?}\\nCode: '{}'\", diag.message,\ndiag.severity.unwrap(), extract_code(diag))"
 ---
-Message: Unknown parameter 'unknown_param' for __init__
+Message: Unknown parameter 'unknown_param' for '__init__'
 Severity: Error
 Code: 'unknown-parameter'

@@ -2,5 +2,5 @@
 source: tests/diagnostics.rs
 expression: "format!(\"Message: {}\\nCode: '{}'\", diag.message, extract_code(diag))"
 ---
-Message: Invalid _target_ format: InvalidTarget
+Message: Invalid _target_ format: 'InvalidTarget'. Expected format: 'module.path.SymbolName'
 Code: 'invalid-target'

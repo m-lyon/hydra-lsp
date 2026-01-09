@@ -1,7 +1,34 @@
+use crate::python_analyzer::{DefinitionInfo, FunctionSignature, PythonAnalyzer};
+use crate::yaml_parser::TargetInfo;
+use std::collections::HashSet;
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 
-use crate::python_analyzer::{DefinitionInfo, FunctionSignature, PythonAnalyzer};
-use crate::yaml_parser::{ParameterValue, TargetInfo};
+fn create_diagnostic(
+    line: u32,
+    start_char: u32,
+    end_char: u32,
+    severity: DiagnosticSeverity,
+    code: Option<&str>,
+    message: String,
+) -> Diagnostic {
+    Diagnostic {
+        range: Range {
+            start: Position {
+                line,
+                character: start_char,
+            },
+            end: Position {
+                line,
+                character: end_char,
+            },
+        },
+        severity: Some(severity),
+        code: code.map(|c| tower_lsp::lsp_types::NumberOrString::String(c.to_string())),
+        source: Some("hydra-lsp".to_string()),
+        message,
+        ..Default::default()
+    }
+}
 
 /// Validate a Hydra configuration and generate diagnostics
 fn validate_target(
@@ -16,25 +43,17 @@ fn validate_target(
         Ok(parts) => parts,
         Err(_) => {
             // Invalid target format
-            diagnostics.push(Diagnostic {
-                range: Range {
-                    start: Position {
-                        line: target_info.line,
-                        character: target_info.value_start,
-                    },
-                    end: Position {
-                        line: target_info.line,
-                        character: target_info.value_end(),
-                    },
-                },
-                severity: Some(DiagnosticSeverity::ERROR),
-                code: Some(tower_lsp::lsp_types::NumberOrString::String(
-                    "invalid-target".to_string(),
-                )),
-                source: Some("hydra-lsp".to_string()),
-                message: format!("Invalid _target_ format: {}", target_info.value),
-                ..Default::default()
-            });
+            diagnostics.push(create_diagnostic(
+                target_info.line,
+                target_info.value_start,
+                target_info.value_end(),
+                DiagnosticSeverity::ERROR,
+                Some("invalid-target"),
+                format!(
+                    "Invalid _target_ format: '{}'. Expected format: 'module.path.SymbolName'",
+                    target_info.value
+                ),
+            ));
             return diagnostics;
         }
     };
@@ -54,51 +73,29 @@ fn validate_target(
 
             if !symbol_found {
                 // Module exists but symbol not found
-                diagnostics.push(Diagnostic {
-                    range: Range {
-                        start: Position {
-                            line: target_info.line,
-                            character: target_info.value_start,
-                        },
-                        end: Position {
-                            line: target_info.line,
-                            character: target_info.value_end(),
-                        },
-                    },
-                    severity: Some(DiagnosticSeverity::ERROR),
-                    code: Some(tower_lsp::lsp_types::NumberOrString::String(
-                        "symbol-not-found".to_string(),
-                    )),
-                    source: Some("hydra-lsp".to_string()),
-                    message: format!(
+                diagnostics.push(create_diagnostic(
+                    target_info.line,
+                    target_info.value_start,
+                    target_info.value_end(),
+                    DiagnosticSeverity::ERROR,
+                    Some("symbol-not-found"),
+                    format!(
                         "Symbol '{}' not found in module '{}'",
                         symbol_name, module_path
                     ),
-                    ..Default::default()
-                });
+                ));
             }
         }
         Err(err) => {
             // Module could not be resolved
-            diagnostics.push(Diagnostic {
-                range: Range {
-                    start: Position {
-                        line: target_info.line,
-                        character: target_info.key_start,
-                    },
-                    end: Position {
-                        line: target_info.line,
-                        character: target_info.value_end(),
-                    },
-                },
-                severity: Some(DiagnosticSeverity::ERROR),
-                code: Some(tower_lsp::lsp_types::NumberOrString::String(
-                    "module-not-found".to_string(),
-                )),
-                source: Some("hydra-lsp".to_string()),
-                message: format!("Cannot resolve module '{}': {}", module_path, err),
-                ..Default::default()
-            });
+            diagnostics.push(create_diagnostic(
+                target_info.line,
+                target_info.key_start,
+                target_info.value_end(),
+                DiagnosticSeverity::ERROR,
+                Some("module-not-found"),
+                format!("Cannot resolve module '{}': {}", module_path, err),
+            ));
         }
     }
 
@@ -110,11 +107,14 @@ fn validate_parameters(target_info: &TargetInfo, signature: &FunctionSignature) 
     let mut diagnostics = Vec::new();
 
     // Get parameter names from YAML (excluding _target_)
-    let yaml_params: std::collections::HashSet<String> =
-        target_info.parameters.keys().cloned().collect();
+    let param_names: HashSet<String> = target_info
+        .parameters
+        .iter()
+        .map(|param| param.key.clone())
+        .collect();
 
     // Get expected parameter names from signature (excluding self)
-    let expected_params: std::collections::HashSet<String> = signature
+    let expected_params: HashSet<String> = signature
         .parameters
         .iter()
         .filter(|p| p.name != "self" && !p.is_variadic && !p.is_variadic_keyword)
@@ -125,90 +125,56 @@ fn validate_parameters(target_info: &TargetInfo, signature: &FunctionSignature) 
     let has_kwargs = signature.parameters.iter().any(|p| p.is_variadic_keyword);
 
     // Check for unknown parameters
-    for (param_name, param_value) in &target_info.parameters {
-        if !expected_params.contains(param_name) && !has_kwargs {
-            diagnostics.push(Diagnostic {
-                range: Range {
-                    start: Position {
-                        line: param_value.line,
-                        character: param_value.key_start,
-                    },
-                    end: Position {
-                        line: param_value.line,
-                        character: param_value.key_end,
-                    },
-                },
-                severity: Some(DiagnosticSeverity::ERROR),
-                code: Some(tower_lsp::lsp_types::NumberOrString::String(
-                    "unknown-parameter".to_string(),
-                )),
-                source: Some("hydra-lsp".to_string()),
-                message: format!("Unknown parameter '{}' for {}", param_name, signature.name),
-                ..Default::default()
-            });
+    for param in &target_info.parameters {
+        if !expected_params.contains(&param.key) && !has_kwargs {
+            diagnostics.push(create_diagnostic(
+                param.line,
+                target_info.key_start,
+                param.key.len() as u32 + target_info.key_start,
+                DiagnosticSeverity::ERROR,
+                Some("unknown-parameter"),
+                format!("Unknown parameter '{}' for '{}'", param.key, signature.name),
+            ));
         }
     }
 
     // Check for missing required parameters
     for param in &signature.parameters {
-        if !param.has_default
-            && !param.is_variadic
-            && !param.is_variadic_keyword
-            && param.name != "self"
-            && !yaml_params.contains(&param.name)
-        {
-            diagnostics.push(Diagnostic {
-                range: Range {
-                    start: Position {
-                        line: target_info.line,
-                        character: target_info.value_start,
-                    },
-                    end: Position {
-                        line: target_info.line,
-                        character: target_info.value_end(),
-                    },
-                },
-                severity: Some(DiagnosticSeverity::ERROR),
-                code: Some(tower_lsp::lsp_types::NumberOrString::String(
-                    "missing-parameter".to_string(),
-                )),
-                source: Some("hydra-lsp".to_string()),
-                message: format!(
-                    "Missing required parameter '{}' for {}",
+        if param.is_required() && !param_names.contains(&param.name) {
+            diagnostics.push(create_diagnostic(
+                target_info.line,
+                target_info.value_start,
+                target_info.value_end(),
+                DiagnosticSeverity::ERROR,
+                Some("missing-parameter"),
+                format!(
+                    "Missing required parameter '{}' for '{}'",
                     param.name, signature.name
                 ),
-                ..Default::default()
-            });
+            ));
         }
     }
 
     // If **kwargs present, give a warning instead of error for unknown params
-    if has_kwargs && !yaml_params.is_subset(&expected_params) {
-        let unknown: Vec<_> = yaml_params.difference(&expected_params).collect();
+    if has_kwargs && !param_names.is_subset(&expected_params) {
+        let unknown: Vec<_> = param_names.difference(&expected_params).collect();
         if !unknown.is_empty() {
             diagnostics.retain(|d| {
                 !matches!(&d.code, Some(tower_lsp::lsp_types::NumberOrString::String(code)) if code == "unknown-parameter")
             });
 
             for param_name in unknown {
-                if let Some(param_value) = target_info.parameters.get(param_name) {
-                    diagnostics.push(Diagnostic {
-                        range: Range {
-                            start: Position {
-                                line: param_value.line,
-                                character: param_value.key_start,
-                            },
-                            end: Position {
-                                line: param_value.line,
-                                character: param_value.key_end,
-                            },
-                        },
-                        severity: Some(DiagnosticSeverity::HINT),
-                        code: None,
-                        source: Some("hydra-lsp".to_string()),
-                        message: format!("Parameter '{}' will be passed via **kwargs", param_name),
-                        ..Default::default()
-                    });
+                if let Some(param_value) =
+                    target_info.parameters.iter().find(|p| p.key == *param_name)
+                {
+                    diagnostics.push(create_diagnostic(
+                        param_value.line,
+                        target_info.key_start,
+                        target_info.key_start + param_value.key.len() as u32,
+                        DiagnosticSeverity::HINT,
+                        None,
+                        format!("Parameter '{}' will be passed via **kwargs", param_name),
+                    ));
                 }
             }
         }
@@ -219,13 +185,13 @@ fn validate_parameters(target_info: &TargetInfo, signature: &FunctionSignature) 
 
 /// Validate all targets in a document
 pub fn validate_document(
-    targets: std::collections::HashMap<u32, TargetInfo>,
+    targets: Vec<TargetInfo>,
     workspace_root: Option<&std::path::Path>,
     python_interpreter: Option<&str>,
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
 
-    for target in targets.values() {
+    for target in &targets {
         let target_diagnostics = validate_target(target, workspace_root, python_interpreter);
         diagnostics.extend(target_diagnostics);
 
@@ -269,7 +235,8 @@ pub fn validate_document(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{python_analyzer::ParameterInfo, yaml_parser::TARGET_KEY_C};
+    use crate::python_analyzer::ParameterInfo;
+    use crate::yaml_parser::{ParameterKind, ParameterValue};
     use std::path::PathBuf;
 
     fn get_test_resources_dir() -> PathBuf {
@@ -282,7 +249,7 @@ mod tests {
     fn test_validate_missing_required_param() {
         let target_info = TargetInfo {
             value: "my.Class".to_string(),
-            parameters: std::collections::HashMap::new(),
+            parameters: Vec::new(),
             line: 0,
             key_start: 0,
             value_start: 0,
@@ -329,18 +296,11 @@ mod tests {
 
     #[test]
     fn test_validate_unknown_param_without_kwargs() {
-        let mut params = std::collections::HashMap::new();
-        params.insert(
-            "unknown_param".to_string(),
-            ParameterValue {
-                value: serde_yaml::Value::Null,
-                line: 1,
-                key_start: 2,
-                key_end: 15,
-                value_start: 17,
-                value_end: 21,
-            },
-        );
+        let params = vec![ParameterValue {
+            kind: ParameterKind::Value(serde_yaml::Value::Null),
+            line: 1,
+            key: "unknown_param".to_string(),
+        }];
 
         let target_info = TargetInfo {
             value: "my.Class".to_string(),
@@ -378,18 +338,11 @@ mod tests {
 
     #[test]
     fn test_validate_unknown_param_with_kwargs() {
-        let mut params = std::collections::HashMap::new();
-        params.insert(
-            "any_param".to_string(),
-            ParameterValue {
-                value: serde_yaml::Value::Null,
-                line: 1,
-                key_start: 2,
-                key_end: 11,
-                value_start: 13,
-                value_end: 17,
-            },
-        );
+        let params = vec![ParameterValue {
+            kind: ParameterKind::Value(serde_yaml::Value::Null),
+            line: 1,
+            key: "any_param".to_string(),
+        }];
 
         let target_info = TargetInfo {
             value: "my.Class".to_string(),
@@ -439,10 +392,10 @@ mod tests {
     fn test_validate_target_invalid_format() {
         let target_info = TargetInfo {
             value: "InvalidTarget".to_string(), // No module path
-            parameters: std::collections::HashMap::new(),
+            parameters: Vec::new(),
             line: 0,
             key_start: 10,
-            value_start: 10 + TARGET_KEY_C.len() as u32 + 1,
+            value_start: 10 + "_target_:".len() as u32 + 1,
         };
 
         let diagnostics = validate_target(&target_info, None, None);
@@ -461,10 +414,10 @@ mod tests {
     fn test_validate_target_module_not_found() {
         let target_info = TargetInfo {
             value: "nonexistent.module.Class".to_string(),
-            parameters: std::collections::HashMap::new(),
+            parameters: Vec::new(),
             line: 0,
             key_start: 10,
-            value_start: 10 + TARGET_KEY_C.len() as u32 + 1,
+            value_start: 10 + "_target_:".len() as u32 + 1,
         };
 
         let diagnostics = validate_target(&target_info, Some(&get_test_resources_dir()), None);
@@ -483,10 +436,10 @@ mod tests {
     fn test_validate_target_symbol_not_found() {
         let target_info = TargetInfo {
             value: "test_module.NonExistentClass".to_string(),
-            parameters: std::collections::HashMap::new(),
+            parameters: Vec::new(),
             line: 0,
             key_start: 10,
-            value_start: 10 + TARGET_KEY_C.len() as u32 + 1,
+            value_start: 10 + "_target_:".len() as u32 + 1,
         };
 
         let resources_dir = get_test_resources_dir();
@@ -507,10 +460,10 @@ mod tests {
     fn test_validate_target_valid_class() {
         let target_info = TargetInfo {
             value: "test_module.ClassWithInit".to_string(),
-            parameters: std::collections::HashMap::new(),
+            parameters: Vec::new(),
             line: 0,
             key_start: 10,
-            value_start: 10 + TARGET_KEY_C.len() as u32 + 1,
+            value_start: 10 + "_target_:".len() as u32 + 1,
         };
 
         let resources_dir = get_test_resources_dir();
@@ -535,10 +488,10 @@ mod tests {
     fn test_validate_target_valid_function() {
         let target_info = TargetInfo {
             value: "test_module.simple_function".to_string(),
-            parameters: std::collections::HashMap::new(),
+            parameters: Vec::new(),
             line: 0,
             key_start: 10,
-            value_start: 10 + TARGET_KEY_C.len() as u32 + 1,
+            value_start: 10 + "_target_:".len() as u32 + 1,
         };
 
         let resources_dir = get_test_resources_dir();
@@ -563,43 +516,29 @@ mod tests {
 
     #[test]
     fn test_validate_document_multiple_targets() {
-        let mut targets = std::collections::HashMap::new();
-
-        // Valid target
-        targets.insert(
-            0,
+        let targets = vec![
             TargetInfo {
                 value: "test_module.simple_function".to_string(),
-                parameters: std::collections::HashMap::new(),
+                parameters: Vec::new(),
                 line: 0,
                 key_start: 10,
-                value_start: 10 + TARGET_KEY_C.len() as u32 + 1,
+                value_start: 10 + "_target_:".len() as u32 + 1,
             },
-        );
-
-        // Invalid target format
-        targets.insert(
-            2,
             TargetInfo {
                 value: "InvalidTarget".to_string(),
-                parameters: std::collections::HashMap::new(),
+                parameters: Vec::new(),
                 line: 2,
                 key_start: 10,
-                value_start: 10 + TARGET_KEY_C.len() as u32 + 1,
+                value_start: 10 + "_target_:".len() as u32 + 1,
             },
-        );
-
-        // Module not found
-        targets.insert(
-            4,
             TargetInfo {
                 value: "nonexistent.Module".to_string(),
-                parameters: std::collections::HashMap::new(),
+                parameters: Vec::new(),
                 line: 4,
                 key_start: 10,
-                value_start: 10 + TARGET_KEY_C.len() as u32 + 1,
+                value_start: 10 + "_target_:".len() as u32 + 1,
             },
-        );
+        ];
 
         let resources_dir = get_test_resources_dir();
         let diagnostics = validate_document(targets, Some(&resources_dir), None);
@@ -622,31 +561,19 @@ mod tests {
 
     #[test]
     fn test_validate_document_with_parameter_validation() {
-        let mut targets = std::collections::HashMap::new();
-        let mut params = std::collections::HashMap::new();
-        params.insert(
-            "value".to_string(),
-            ParameterValue {
-                value: serde_yaml::Value::Number(serde_yaml::Number::from(42)),
-                line: 1,
-                key_start: 2,
-                key_end: 7,
-                value_start: 9,
-                value_end: 11,
-            },
-        );
+        let params = vec![ParameterValue {
+            kind: ParameterKind::Value(serde_yaml::Value::Number(serde_yaml::Number::from(42))),
+            line: 1,
+            key: "value".to_string(),
+        }];
         // Missing required 'name' parameter (it has no default)
-
-        targets.insert(
-            0,
-            TargetInfo {
-                value: "test_module.ClassWithInit".to_string(),
-                parameters: params,
-                line: 0,
-                key_start: 10,
-                value_start: 10 + TARGET_KEY_C.len() as u32 + 1,
-            },
-        );
+        let targets = vec![TargetInfo {
+            value: "test_module.ClassWithInit".to_string(),
+            parameters: params,
+            line: 0,
+            key_start: 10,
+            value_start: 10 + "_target_:".len() as u32 + 1,
+        }];
 
         let resources_dir = get_test_resources_dir();
         let diagnostics = validate_document(targets, Some(&resources_dir), None);
@@ -664,8 +591,6 @@ mod tests {
 
     #[test]
     fn test_validate_nested_target_valid() {
-        let mut targets = std::collections::HashMap::new();
-
         // Create a nested target parameter
         let mut nested_map = serde_yaml::Mapping::new();
         nested_map.insert(
@@ -673,29 +598,19 @@ mod tests {
             serde_yaml::Value::String("test_module.SimpleClass".to_string()),
         );
 
-        let mut params = std::collections::HashMap::new();
-        params.insert(
-            "arg1".to_string(),
-            ParameterValue {
-                value: serde_yaml::Value::Mapping(nested_map),
-                line: 1,
-                key_start: 2,
-                key_end: 6,
-                value_start: 10,
-                value_end: 40,
-            },
-        );
+        let params = vec![ParameterValue {
+            kind: ParameterKind::Value(serde_yaml::Value::Mapping(nested_map)),
+            line: 1,
+            key: "value".to_string(),
+        }];
 
-        targets.insert(
-            0,
-            TargetInfo {
-                value: "test_module.function_with_params".to_string(),
-                parameters: params,
-                line: 0,
-                key_start: 10,
-                value_start: 10 + TARGET_KEY_C.len() as u32 + 1,
-            },
-        );
+        let targets = vec![TargetInfo {
+            value: "test_module.function_with_params".to_string(),
+            parameters: params,
+            line: 0,
+            key_start: 10,
+            value_start: 10 + "_target_:".len() as u32 + 1,
+        }];
 
         let resources_dir = get_test_resources_dir();
         let diagnostics = validate_document(targets, Some(&resources_dir), None);
@@ -712,57 +627,6 @@ mod tests {
                 .iter()
                 .any(|d| d.message.contains("Symbol") && d.message.contains("not found")),
             "Should not have symbol not found error"
-        );
-    }
-
-    #[test]
-    fn test_validate_nested_target_invalid() {
-        let mut targets = std::collections::HashMap::new();
-
-        // Create an invalid nested target parameter
-        let mut nested_map = serde_yaml::Mapping::new();
-        nested_map.insert(
-            serde_yaml::Value::String("_target_".to_string()),
-            serde_yaml::Value::String("nonexistent.Module".to_string()),
-        );
-
-        let mut params = std::collections::HashMap::new();
-        params.insert(
-            "arg1".to_string(),
-            ParameterValue {
-                value: serde_yaml::Value::Mapping(nested_map),
-                line: 1,
-                key_start: 2,
-                key_end: 6,
-                value_start: 10,
-                value_end: 40,
-            },
-        );
-
-        targets.insert(
-            0,
-            TargetInfo {
-                value: "test_module.function_with_params".to_string(),
-                parameters: params,
-                line: 0,
-                key_start: 10,
-                value_start: 10 + TARGET_KEY_C.len() as u32 + 1,
-            },
-        );
-
-        let resources_dir = get_test_resources_dir();
-        let diagnostics = validate_document(targets, Some(&resources_dir), None);
-
-        // Should have error for the invalid nested target
-        let nested_error = diagnostics.iter().find(|d| {
-            d.severity == Some(DiagnosticSeverity::ERROR)
-                && d.message.contains("Cannot resolve module")
-        });
-
-        assert!(
-            nested_error.is_some(),
-            "Should have error for invalid nested target. Got: {:?}",
-            diagnostics
         );
     }
 }

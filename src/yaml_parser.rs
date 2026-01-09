@@ -1,45 +1,54 @@
 use serde_yaml::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use tower_lsp::lsp_types::Position;
 
 pub const TARGET_KEY: &str = "_target_";
-pub const TARGET_KEY_C: &str = "_target_:"; // with colon for parsing in text
 
 /// Represents a parameter in a YAML configuration with position information
+/// Can either be a simple value or a nested target
 #[derive(Debug, Clone)]
 pub struct ParameterValue {
-    pub value: Value,
+    pub kind: ParameterKind,
     pub line: u32,
-    pub key_start: u32,
-    pub key_end: u32,
-    pub value_start: u32,
-    pub value_end: u32,
+    pub key: String,
+}
+
+/// The kind of parameter value - either a simple value or a nested target
+#[derive(Debug, Clone)]
+pub enum ParameterKind {
+    Value(Value),
+    NestedTargetIndex(usize),
 }
 
 impl ParameterValue {
-    fn new(value: Value) -> Self {
+    fn new_value(key: String, value: Value) -> Self {
         Self {
-            value,
+            kind: ParameterKind::Value(value),
             line: 0,
-            key_start: 0,
-            key_end: 0,
-            value_start: 0,
-            value_end: 0,
+            key,
+        }
+    }
+
+    fn new_nested(key: String, index: usize) -> Self {
+        Self {
+            kind: ParameterKind::NestedTargetIndex(index),
+            line: 0,
+            key,
         }
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TargetInfo {
     pub value: String,
-    pub parameters: HashMap<String, ParameterValue>,
+    pub parameters: Vec<ParameterValue>,
     pub line: u32,
     pub key_start: u32,
     pub value_start: u32,
 }
 
 impl TargetInfo {
-    fn new(value: String, parameters: HashMap<String, ParameterValue>) -> Self {
+    fn new(value: String, parameters: Vec<ParameterValue>) -> Self {
         Self {
             value,
             parameters,
@@ -60,19 +69,25 @@ pub struct YamlParser;
 
 impl YamlParser {
     /// Parse YAML content and extract all _target_ references with their parameters
-    pub fn parse(content: &str) -> Result<HashMap<u32, TargetInfo>, serde_yaml::Error> {
+    /// Returns a vector of TargetInfo and a line-to-index lookup map
+    pub fn parse(
+        content: &str,
+    ) -> Result<(Vec<TargetInfo>, HashMap<u32, usize>), serde_yaml::Error> {
+        // Changed return type
         let value: Value = serde_yaml::from_str(content)?;
-        let mut targets: Vec<TargetInfo> = Vec::new();
+        let mut targets: VecDeque<TargetInfo> = VecDeque::new();
         Self::extract_targets(&value, &mut targets);
-        Self::find_positions(content, &mut targets);
 
-        // Convert Vec to HashMap keyed by line number
-        let mut target_map = HashMap::new();
-        for target in targets {
-            target_map.insert(target.line, target);
+        // Find positions for all targets
+        let targets = Self::find_positions(content, targets);
+
+        // Build line-to-index lookup map
+        let mut line_map = HashMap::new();
+        for (idx, target) in targets.iter().enumerate() {
+            line_map.insert(target.line, idx);
         }
 
-        Ok(target_map)
+        Ok((targets, line_map))
     }
 
     /// Check if a YAML file is a Hydra configuration file
@@ -103,7 +118,68 @@ impl YamlParser {
 
     /// Check if content contains `_target_` keyword
     fn has_target_keyword(content: &str) -> bool {
-        content.contains(TARGET_KEY_C)
+        Self::find_target_with_colon(content).is_some()
+    }
+
+    /// Find "_target_" (optionally surrounded by quotes) followed by optional whitespace and ":"
+    /// Returns the position of the opening quote or "_target_" if found, and the offset to _target_
+    fn find_target_with_colon(text: &str) -> Option<(usize, usize)> {
+        let mut pos = 0;
+        while let Some(target_pos) = text[pos..].find(TARGET_KEY) {
+            let absolute_pos = pos + target_pos;
+            let after_target = absolute_pos + TARGET_KEY.len();
+
+            if after_target >= text.len() {
+                return None;
+            }
+
+            // Check if there's a quote before _target_
+            let mut quote_offset = 0;
+            let mut key_start = absolute_pos;
+            if absolute_pos > 0 {
+                let before_char = text.chars().nth(absolute_pos - 1);
+                if before_char == Some('"') || before_char == Some('\'') {
+                    quote_offset = 1;
+                    key_start = absolute_pos - 1;
+                }
+            }
+
+            // Check for optional whitespace followed by colon
+            let remaining = &text[after_target..];
+            let mut chars = remaining.chars().peekable();
+            let mut found_colon = false;
+            let mut found_closing_quote = false;
+
+            // If we found an opening quote, look for closing quote first
+            if quote_offset > 0 {
+                let opening_quote = text.chars().nth(absolute_pos - 1).unwrap();
+                if let Some(&ch) = chars.peek() {
+                    if ch == opening_quote {
+                        found_closing_quote = true;
+                        chars.next(); // consume the quote
+                    }
+                }
+            }
+
+            // Now look for optional whitespace and colon
+            for ch in chars.by_ref() {
+                if ch == ':' {
+                    found_colon = true;
+                    break;
+                } else if !ch.is_whitespace() {
+                    break;
+                }
+            }
+
+            // Valid if we found a colon AND (no opening quote OR found matching closing quote)
+            let is_valid = found_colon && (quote_offset == 0 || found_closing_quote);
+            if is_valid {
+                return Some((key_start, quote_offset));
+            }
+
+            pos = after_target;
+        }
+        None
     }
 
     /// Find the target info at a specific position
@@ -111,48 +187,37 @@ impl YamlParser {
         content: &str,
         position: Position,
     ) -> Result<Option<TargetInfo>, serde_yaml::Error> {
-        let mut target_map = Self::parse(content)?;
-
-        // Direct HashMap lookup by line number. uses remove to gain ownership w/o
-        // cloning.
-        match target_map.remove(&position.line) {
-            Some(target) => {
-                // Check if the column is within the function definition
-                if position.character > target.value_start
-                    && position.character < target.value_end()
-                {
-                    Ok(Some(target))
-                } else {
-                    Ok(None)
-                }
+        let (targets, line_map) = Self::parse(content)?;
+        if let Some(line_index) = line_map.get(&position.line) {
+            let target = &targets[*line_index];
+            // Check if the column is within the function definition
+            if position.character > target.value_start && position.character < target.value_end() {
+                return Ok(Some(target.clone()));
             }
-            None => Ok(None),
         }
+        Ok(None)
     }
 
-    /// Recursively extract all `_target_` references from YAML value
-    fn extract_targets(value: &Value, targets: &mut Vec<TargetInfo>) {
+    /// Recursively extract all `_target_` references from YAML value and build tree structure
+    fn extract_targets(value: &Value, targets: &mut VecDeque<TargetInfo>) {
         match value {
             Value::Mapping(map) => {
                 // Check if this mapping has a _target_ key
                 if let Some(Value::String(target_str)) = map.get(TARGET_KEY) {
-                    // Extract parameters (all keys including nested _target_)
-                    let mut parameters = HashMap::new();
-                    for (key, val) in map {
-                        if let Value::String(key_str) = key {
-                            if key_str != TARGET_KEY {
-                                parameters
-                                    .insert(key_str.clone(), ParameterValue::new(val.clone()));
-                            }
-                        }
+                    // Create and push the target immediately to preserve order
+                    let target_index = targets.len();
+                    targets.push_back(TargetInfo::new(target_str.clone(), Vec::new()));
+
+                    // Extract parameters, checking for nested targets
+                    let parameters = Self::extract_parameters(map, targets);
+
+                    // Update the target with the collected parameters
+                    targets[target_index].parameters = parameters;
+                } else {
+                    // If no _target_ found, recursively process nested mappings
+                    for (_key, val) in map {
+                        Self::extract_targets(val, targets);
                     }
-
-                    targets.push(TargetInfo::new(target_str.clone(), parameters));
-                }
-
-                // Recursively process nested mappings
-                for (_key, val) in map {
-                    Self::extract_targets(val, targets);
                 }
             }
             Value::Sequence(seq) => {
@@ -165,93 +230,100 @@ impl YamlParser {
         }
     }
 
-    /// Find the actual line and column positions of `_target_` occurrences in the text
-    fn find_positions(content: &str, targets: &mut [TargetInfo]) {
-        let mut target_idx = 0;
+    /// Extract parameters from a mapping that contains a `_target_` key
+    fn extract_parameters(
+        map: &serde_yaml::Mapping,
+        targets: &mut VecDeque<TargetInfo>,
+    ) -> Vec<ParameterValue> {
+        let mut parameters = Vec::new();
 
-        for (line_num, line) in content.lines().enumerate() {
-            if target_idx >= targets.len() {
-                break;
+        for (key, val) in map {
+            if let Value::String(key_str) = key {
+                // The _target_ key itself is not a parameter, but is the target identifier
+                if key_str != TARGET_KEY {
+                    // Check if this parameter value is a nested target
+                    if let Value::Mapping(nested_map) = val {
+                        if nested_map.get(TARGET_KEY).is_some() {
+                            // This is a nested target - extract it recursively
+                            let nested_index = targets.len();
+                            Self::extract_targets(val, targets);
+                            parameters
+                                .push(ParameterValue::new_nested(key_str.clone(), nested_index));
+                            continue; // Skip the regular value insertion below
+                        }
+                    }
+                    // Simple value (string, number, mapping without _target_, etc.)
+                    parameters.push(ParameterValue::new_value(key_str.clone(), val.clone()));
+                }
             }
+        }
 
-            // Look for _target_: in this line
-            if let Some(col) = line.find(TARGET_KEY_C) {
-                // Found a _target_, assign position to the next unassigned target
-                targets[target_idx].line = line_num as u32;
-                targets[target_idx].key_start = col as u32;
+        parameters
+    }
 
-                // find the value start position
-                if let Some(value_start) =
-                    line[col + TARGET_KEY_C.len()..].find(|c: char| !c.is_whitespace())
-                {
-                    targets[target_idx].value_start =
-                        (col + TARGET_KEY_C.len() + value_start) as u32;
+    /// Find the actual line and column positions of `_target_` occurrences in the text
+    fn find_positions(content: &str, targets: VecDeque<TargetInfo>) -> Vec<TargetInfo> {
+        let mut targets = targets;
+        let mut positioned_targets = Vec::new();
+        for (line_num, line) in content.lines().enumerate() {
+            // Look for _target_ followed by optional whitespace and colon
+            if let Some((col, quote_offset)) = Self::find_target_with_colon(line) {
+                // remove the first entry from targets
+                let mut target = targets.pop_front().unwrap();
+                target.line = line_num as u32;
+                target.key_start = col as u32;
+
+                // Find the colon position after potential whitespace (and closing quote if present)
+                let after_target = col + quote_offset + TARGET_KEY.len();
+                if let Some(colon_offset) = line[after_target..].find(':') {
+                    let after_colon = after_target + colon_offset + 1;
+                    // find the value start position (first non-whitespace after colon)
+                    if let Some(value_offset) =
+                        line[after_colon..].find(|c: char| !c.is_whitespace())
+                    {
+                        let potential_value_start = after_colon + value_offset;
+                        // Check if the value starts with a quote
+                        let value_char = line.chars().nth(potential_value_start);
+                        if value_char == Some('"') || value_char == Some('\'') {
+                            // Skip the opening quote
+                            target.value_start = (potential_value_start + 1) as u32;
+                        } else {
+                            target.value_start = potential_value_start as u32;
+                        }
+                    }
                 }
 
                 // Find parameter positions in subsequent lines
-                Self::find_parameter_positions(content, line_num + 1, &mut targets[target_idx]);
-
-                target_idx += 1;
+                Self::find_parameter_positions(content, line_num + 1, &mut target);
+                positioned_targets.push(target);
             }
         }
+
+        positioned_targets
     }
 
-    /// Find positions for parameters associated with a target
+    /// Find positions for parameters associated with a `_target_`
     fn find_parameter_positions(content: &str, start_line: usize, target_info: &mut TargetInfo) {
         let lines: Vec<&str> = content.lines().collect();
         if start_line >= lines.len() {
             return;
         }
 
-        // Get the indentation level of the _target_ line
-        let target_indent = lines
-            .get(target_info.line as usize)
-            .and_then(|line| line.find(|c: char| !c.is_whitespace()))
-            .unwrap_or(0);
+        let mut remaining_params = std::mem::take(&mut target_info.parameters);
 
         // Look through subsequent lines for parameters at the same or deeper indentation
         for (idx, line) in lines.iter().enumerate().skip(start_line) {
-            let line_indent = line.find(|c: char| !c.is_whitespace()).unwrap_or(0);
-
-            // If we've returned to same or less indentation (and line is not empty), we're done with this target's parameters
-            if !line.trim().is_empty() && line_indent <= target_indent {
-                break;
+            if remaining_params.is_empty() {
+                return;
             }
 
-            // Look for parameter keys (key: value pattern)
-            if let Some(colon_pos) = line.find(':') {
-                let key_part = &line[..colon_pos];
-                if key_part
-                    .rfind(|c: char| !c.is_whitespace() && c != ':')
-                    .is_some()
-                {
-                    // Extract the key text
-                    let key_text = key_part.trim();
+            let line_indent = line.find(|c: char| !c.is_whitespace()).unwrap_or(0);
 
-                    // Check if this parameter exists in our target
-                    if let Some(param) = target_info.parameters.get_mut(key_text) {
-                        param.line = idx as u32;
-                        param.key_start = line_indent as u32;
-                        param.key_end = (line_indent + key_text.len()) as u32;
-
-                        // Find value start position (after the colon and whitespace)
-                        if let Some(value_start) =
-                            line[colon_pos + 1..].find(|c: char| !c.is_whitespace())
-                        {
-                            param.value_start = (colon_pos + 1 + value_start) as u32;
-
-                            // Find value end position (end of non-whitespace or comment)
-                            let value_part = &line[param.value_start as usize..];
-                            let value_len = value_part.find('#').unwrap_or(value_part.len());
-                            let value_end_offset = value_part[..value_len].trim_end().len();
-                            param.value_end = param.value_start + value_end_offset as u32;
-                        } else {
-                            // Value might be on next line or empty
-                            param.value_start = (colon_pos + 1) as u32;
-                            param.value_end = param.value_start;
-                        }
-                    }
-                }
+            if line_indent == target_info.key_start as usize {
+                // Same indentation as target so we're looking at a paremeter line
+                let mut param = remaining_params.remove(0);
+                param.line = idx as u32;
+                target_info.parameters.push(param);
             }
         }
     }
@@ -271,12 +343,16 @@ impl YamlParser {
         let prefix = &line[..char_pos];
 
         // Check if we're completing a _target_ value
-        if let Some(target_pos) = prefix.find(TARGET_KEY_C) {
-            let value_start = target_pos + TARGET_KEY_C.len();
-            let partial = prefix[value_start..].trim();
-            return Ok(CompletionContext::TargetValue {
-                partial: partial.to_string(),
-            });
+        if let Some((target_pos, quote_offset)) = Self::find_target_with_colon(prefix) {
+            // Find the colon position after potential whitespace
+            let after_target = target_pos + quote_offset + TARGET_KEY.len();
+            if let Some(colon_offset) = prefix[after_target..].find(':') {
+                let value_start = after_target + colon_offset + 1;
+                let partial = prefix[value_start..].trim();
+                return Ok(CompletionContext::TargetValue {
+                    partial: partial.to_string(),
+                });
+            }
         }
 
         // Check if we're completing a parameter key
@@ -333,10 +409,15 @@ impl YamlParser {
             }
 
             // Check if this line has _target_
-            if let Some(value_start) = line.find(TARGET_KEY_C) {
+            if let Some((target_pos, quote_offset)) = Self::find_target_with_colon(line) {
                 if line_indent == current_indent {
-                    let value = line[value_start + TARGET_KEY_C.len()..].trim();
-                    return Ok(Some(value.trim_matches('"').trim_matches('\'')));
+                    // Find the colon and extract the value
+                    let after_target = target_pos + quote_offset + TARGET_KEY.len();
+                    if let Some(colon_offset) = line[after_target..].find(':') {
+                        let after_colon = after_target + colon_offset + 1;
+                        let value = line[after_colon..].trim();
+                        return Ok(Some(value.trim_matches('"').trim_matches('\'')));
+                    }
                 }
             }
         }
@@ -388,12 +469,14 @@ model:
   hidden_size: 256
   num_layers: 12
 "#;
-        let target_map = YamlParser::parse(content).unwrap();
-        assert_eq!(target_map.len(), 1);
-        let target = target_map.get(&2).unwrap();
+        let (targets, line_map) = YamlParser::parse(content).unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(line_map.len(), 1);
+        let target = targets.first().unwrap();
         assert_eq!(target.value, "myproject.Model");
         assert_eq!(target.parameters.len(), 2);
         assert_eq!(target.line, 2);
+        assert_eq!(*line_map.get(&2).unwrap(), 0);
         assert_eq!(target.key_start, 2);
     }
 
@@ -409,26 +492,24 @@ model:
     _target_: myproject.Decoder
     layers: 6
 "#;
-        let target_map = YamlParser::parse(content).unwrap();
-        assert_eq!(target_map.len(), 3);
+        let (targets, line_map) = YamlParser::parse(content).unwrap();
+        assert_eq!(targets.len(), 3, "Should have 3 targets total");
+        assert_eq!(line_map.len(), 3, "Line map should have 3 entries");
 
-        let target1 = target_map.get(&2).unwrap();
-        assert_eq!(target1.value, "myproject.Model");
-        assert_eq!(target1.parameters.len(), 2);
-        assert_eq!(target1.line, 2);
-        assert_eq!(target1.key_start, 2);
+        let model = targets.first().unwrap();
+        assert_eq!(model.parameters.len(), 2);
+        assert_eq!(model.line, 2);
+        assert_eq!(*line_map.get(&2).unwrap(), 0);
 
-        let target2 = target_map.get(&4).unwrap();
-        assert_eq!(target2.value, "myproject.Encoder");
-        assert_eq!(target2.parameters.len(), 1);
-        assert_eq!(target2.line, 4);
-        assert_eq!(target2.key_start, 4);
+        let encoder = targets.get(1).unwrap();
+        assert_eq!(encoder.parameters.len(), 1);
+        assert_eq!(encoder.line, 4);
+        assert_eq!(*line_map.get(&4).unwrap(), 1);
 
-        let target3 = target_map.get(&7).unwrap();
-        assert_eq!(target3.value, "myproject.Decoder");
-        assert_eq!(target3.parameters.len(), 1);
-        assert_eq!(target3.line, 7);
-        assert_eq!(target3.key_start, 4);
+        let decoder = targets.get(2).unwrap();
+        assert_eq!(decoder.parameters.len(), 1);
+        assert_eq!(decoder.line, 7);
+        assert_eq!(*line_map.get(&7).unwrap(), 2);
     }
 
     #[test]
@@ -542,5 +623,383 @@ model:
             }
             _ => panic!("Expected ParameterValue context"),
         }
+    }
+
+    #[test]
+    fn test_duplicate_target_values_same_order() {
+        // When parameter keys are alphabetically ordered the same as text order
+        let content = r#"
+config:
+  a_model:
+    _target_: myproject.Model
+    size: 128
+  b_model:
+    _target_: myproject.Model
+    size: 256
+"#;
+        let (targets, line_map) = YamlParser::parse(content).unwrap();
+        assert_eq!(targets.len(), 2, "Should have 2 targets");
+        assert_eq!(line_map.len(), 2, "Line map should have 2 entries");
+
+        // First occurrence (line 3)
+        let first_model = targets.first().unwrap();
+        assert_eq!(first_model.value, "myproject.Model");
+        assert_eq!(first_model.line, 3);
+        assert_eq!(*line_map.get(&3).unwrap(), 0);
+        assert_eq!(first_model.key_start, 4);
+        assert_eq!(first_model.parameters.len(), 1);
+
+        // Check the size value
+        if let ParameterKind::Value(val) = &first_model.parameters.first().unwrap().kind {
+            if let Value::Number(num) = val {
+                assert_eq!(num.as_i64(), Some(128));
+            } else {
+                panic!("Expected Number value");
+            }
+        } else {
+            panic!("Expected Value parameter");
+        }
+
+        // Second occurrence (line 6)
+        let second_model = targets.get(1).unwrap();
+        assert_eq!(second_model.value, "myproject.Model");
+        assert_eq!(second_model.line, 6);
+        assert_eq!(*line_map.get(&6).unwrap(), 1);
+        assert_eq!(second_model.key_start, 4);
+        assert_eq!(second_model.parameters.len(), 1);
+
+        // Check the size value
+        if let ParameterKind::Value(val) = &second_model.parameters.first().unwrap().kind {
+            if let Value::Number(num) = val {
+                assert_eq!(num.as_i64(), Some(256));
+            } else {
+                panic!("Expected Number value");
+            }
+        } else {
+            panic!("Expected Value parameter");
+        }
+    }
+
+    #[test]
+    fn test_duplicate_target_values_reverse_order() {
+        // When parameter keys are alphabetically opposite to text order
+        let content = r#"
+config:
+  z_model:
+    _target_: myproject.Model
+    size: 128
+  a_model:
+    _target_: myproject.Model
+    size: 256
+"#;
+        let (targets, line_map) = YamlParser::parse(content).unwrap();
+        assert_eq!(targets.len(), 2, "Should have 2 targets");
+        assert_eq!(line_map.len(), 2, "Line map should have 2 entries");
+        assert_eq!(*line_map.get(&3).unwrap(), 0);
+        assert_eq!(*line_map.get(&6).unwrap(), 1);
+
+        let target_at_line_3 = targets.first().unwrap();
+        let target_at_line_6 = targets.get(1).unwrap();
+
+        // Verify both targets are correct
+        if let ParameterKind::Value(Value::Number(num)) =
+            &target_at_line_3.parameters.first().unwrap().kind
+        {
+            assert_eq!(
+                num.as_i64(),
+                Some(128),
+                "Line 3's target should have size: 128"
+            );
+        }
+
+        if let ParameterKind::Value(Value::Number(num)) =
+            &target_at_line_6.parameters.first().unwrap().kind
+        {
+            assert_eq!(
+                num.as_i64(),
+                Some(256),
+                "Line 6's target should have size: 256"
+            );
+        }
+    }
+
+    #[test]
+    fn test_target_with_whitespace_before_colon() {
+        // Test that we can handle whitespace between _target_ and :
+        let content = r#"
+model:
+  _target_   : myproject.Model
+  hidden_size: 256
+another:
+  _target_	: another.Model
+  param: value
+"#;
+        let (targets, line_map) = YamlParser::parse(content).unwrap();
+        assert_eq!(targets.len(), 2, "Should have 2 targets");
+        assert_eq!(line_map.len(), 2, "Line map should have 2 entries");
+
+        // First target with spaces before colon
+        let first = targets.first().unwrap();
+        assert_eq!(first.value, "myproject.Model");
+        assert_eq!(first.line, 2);
+        assert_eq!(first.key_start, 2);
+        assert_eq!(first.parameters.len(), 1);
+
+        // Second target with tab before colon
+        let second = targets.get(1).unwrap();
+        assert_eq!(second.value, "another.Model");
+        assert_eq!(second.line, 5);
+        assert_eq!(second.key_start, 2);
+        assert_eq!(second.parameters.len(), 1);
+    }
+
+    #[test]
+    fn test_target_with_double_quotes() {
+        // Test that we can handle "_target_": syntax
+        let content = r#"
+model:
+  "_target_": myproject.Model
+  hidden_size: 256
+"#;
+        let (targets, line_map) = YamlParser::parse(content).unwrap();
+        assert_eq!(targets.len(), 1, "Should have 1 target");
+        assert_eq!(line_map.len(), 1, "Line map should have 1 entry");
+
+        let target = targets.first().unwrap();
+        assert_eq!(target.value, "myproject.Model");
+        assert_eq!(target.line, 2);
+        assert_eq!(target.key_start, 2); // Position of opening quote
+        assert_eq!(target.parameters.len(), 1);
+    }
+
+    #[test]
+    fn test_target_with_single_quotes() {
+        // Test that we can handle '_target_': syntax
+        let content = r#"
+model:
+  '_target_': myproject.Model
+  hidden_size: 256
+"#;
+        let (targets, line_map) = YamlParser::parse(content).unwrap();
+        assert_eq!(targets.len(), 1, "Should have 1 target");
+        assert_eq!(line_map.len(), 1, "Line map should have 1 entry");
+
+        let target = targets.first().unwrap();
+        assert_eq!(target.value, "myproject.Model");
+        assert_eq!(target.line, 2);
+        assert_eq!(target.key_start, 2); // Position of opening quote
+        assert_eq!(target.parameters.len(), 1);
+    }
+
+    #[test]
+    fn test_target_with_quotes_and_whitespace() {
+        // Test that we can handle "_target_" : syntax (quotes + whitespace)
+        let content = r#"
+model:
+  "_target_"  : myproject.Model
+  hidden_size: 256
+another:
+  '_target_'	: another.Model
+  param: value
+"#;
+        let (targets, line_map) = YamlParser::parse(content).unwrap();
+        assert_eq!(targets.len(), 2, "Should have 2 targets");
+        assert_eq!(line_map.len(), 2, "Line map should have 2 entries");
+
+        let first = targets.first().unwrap();
+        assert_eq!(first.value, "myproject.Model");
+        assert_eq!(first.line, 2);
+        assert_eq!(first.key_start, 2);
+
+        let second = targets.get(1).unwrap();
+        assert_eq!(second.value, "another.Model");
+        assert_eq!(second.line, 5);
+        assert_eq!(second.key_start, 2);
+    }
+
+    #[test]
+    fn test_is_hydra_file_with_quoted_target() {
+        let content = "model:\n  \"_target_\": my.Model\n  param: 123";
+        assert!(YamlParser::is_hydra_file(content));
+
+        let content2 = "model:\n  '_target_': my.Model\n  param: 123";
+        assert!(YamlParser::is_hydra_file(content2));
+    }
+
+    #[test]
+    fn test_find_target_at_position_with_quotes() {
+        let content = r#"
+model:
+  "_target_": myproject.Model
+  hidden_size: 256
+"#;
+        let position = Position::new(2, 20); // In the value part
+        let target_info = YamlParser::find_target_at_position(content, position)
+            .unwrap()
+            .unwrap();
+        assert_eq!(target_info.value, "myproject.Model");
+        assert_eq!(target_info.line, 2);
+        assert_eq!(target_info.key_start, 2); // Position of opening quote
+    }
+
+    #[test]
+    fn test_is_hydra_file_with_whitespace_in_target() {
+        let content = "model:\n  _target_  : my.Model\n  param: 123";
+        assert!(YamlParser::is_hydra_file(content));
+    }
+
+    #[test]
+    fn test_find_target_at_position_with_whitespace() {
+        let content = r#"
+model:
+  _target_   : myproject.Model
+  hidden_size: 256
+"#;
+        let position = Position::new(2, 20); // In the value part
+        let target_info = YamlParser::find_target_at_position(content, position)
+            .unwrap()
+            .unwrap();
+        assert_eq!(target_info.value, "myproject.Model");
+        assert_eq!(target_info.line, 2);
+        assert_eq!(target_info.key_start, 2);
+    }
+
+    #[test]
+    fn test_invalid_quote_opening_only() {
+        // Test that YAML parser rejects "_target_: (opening quote but no closing quote)
+        let content = r#"
+model:
+  "_target_: myproject.Model
+  hidden_size: 256
+"#;
+        // serde_yaml should fail to parse this as it's invalid YAML
+        let result = YamlParser::parse(content);
+        assert!(
+            result.is_err(),
+            "Should fail to parse YAML with unclosed quote"
+        );
+    }
+
+    #[test]
+    fn test_invalid_quote_closing_only() {
+        // Test that we reject _target_": (closing quote but no opening quote)
+        let content = r#"
+model:
+  _target_": myproject.Model
+  hidden_size: 256
+"#;
+        let (targets, _) = YamlParser::parse(content).unwrap();
+        // Should not find the target because there's an unexpected quote
+        assert_eq!(
+            targets.len(),
+            0,
+            "Should not find target with invalid closing quote"
+        );
+    }
+
+    #[test]
+    fn test_mismatched_quotes() {
+        // Test that YAML parser rejects "_target_': (mismatched quotes)
+        let content = r#"
+model:
+  "_target_': myproject.Model
+  hidden_size: 256
+"#;
+        // serde_yaml should fail to parse this as it's invalid YAML
+        let result = YamlParser::parse(content);
+        assert!(
+            result.is_err(),
+            "Should fail to parse YAML with mismatched quotes"
+        );
+    }
+
+    #[test]
+    fn test_is_hydra_file_with_invalid_quotes() {
+        // Opening quote only - this is invalid YAML but we should still not detect it as valid _target_
+        let content1 = "model:\n  \"_target_: my.Model\n  param: 123";
+        assert!(
+            !YamlParser::is_hydra_file(content1),
+            "Should not detect opening quote only"
+        );
+
+        // Closing quote only - this should not match our pattern
+        let content2 = "model:\n  _target_\": my.Model\n  param: 123";
+        assert!(
+            !YamlParser::is_hydra_file(content2),
+            "Should not detect closing quote only"
+        );
+    }
+
+    #[test]
+    fn test_target_value_with_double_quotes() {
+        // Test that we handle quoted values: _target_: "myproject.Model"
+        let content = r#"
+model:
+  _target_: "myproject.Model"
+  hidden_size: 256
+"#;
+        let (targets, _) = YamlParser::parse(content).unwrap();
+        assert_eq!(targets.len(), 1);
+
+        let target = targets.first().unwrap();
+        // serde_yaml strips the quotes from the value
+        assert_eq!(target.value, "myproject.Model");
+        assert_eq!(target.line, 2);
+        // value_start should point to the first character of the actual value (after the quote)
+        assert_eq!(target.value_start, 13); // Position after opening quote
+    }
+
+    #[test]
+    fn test_target_value_with_single_quotes() {
+        // Test that we handle quoted values: _target_: 'myproject.Model'
+        let content = r#"
+model:
+  _target_: 'myproject.Model'
+  hidden_size: 256
+"#;
+        let (targets, _) = YamlParser::parse(content).unwrap();
+        assert_eq!(targets.len(), 1);
+
+        let target = targets.first().unwrap();
+        // serde_yaml strips the quotes from the value
+        assert_eq!(target.value, "myproject.Model");
+        assert_eq!(target.line, 2);
+        // value_start should point to the first character of the actual value (after the quote)
+        assert_eq!(target.value_start, 13); // Position after opening quote
+    }
+
+    #[test]
+    fn test_quoted_key_and_quoted_value() {
+        // Test both key and value quoted: "_target_": "myproject.Model"
+        let content = r#"
+model:
+  "_target_": "myproject.Model"
+  hidden_size: 256
+"#;
+        let (targets, _) = YamlParser::parse(content).unwrap();
+        assert_eq!(targets.len(), 1);
+
+        let target = targets.first().unwrap();
+        assert_eq!(target.value, "myproject.Model");
+        assert_eq!(target.line, 2);
+        assert_eq!(target.key_start, 2); // Position of opening quote of key
+                                         // value_start should point to after the opening quote of the value
+        assert_eq!(target.value_start, 15); // Position after opening quote of value
+    }
+
+    #[test]
+    fn test_find_target_at_position_with_quoted_value() {
+        let content = r#"
+model:
+  _target_: "myproject.Model"
+  hidden_size: 256
+"#;
+        // Position in the middle of the value (inside quotes)
+        let position = Position::new(2, 20);
+        let target_info = YamlParser::find_target_at_position(content, position)
+            .unwrap()
+            .unwrap();
+        assert_eq!(target_info.value, "myproject.Model");
+        assert_eq!(target_info.line, 2);
     }
 }

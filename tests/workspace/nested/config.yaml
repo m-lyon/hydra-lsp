@@ -16,8 +16,7 @@ model_one:
 
 # Should produce an error for missing param in d
 model_two:
-  _target_: my_module.ClassA
-  a_value: 10
+  _target_ : my_module.ClassA
   b: 
     _target_: my_module.ClassB
     b_value: 20
@@ -25,11 +24,13 @@ model_two:
       _target_: my_module.ClassC
       d:
         _target_: my_module.ClassD
+  a_value: 10
 
 # Should produce an error for missing param in d and b_value
 model_three:
   _target_: my_module.ClassA
   a_value: 10
+
   b: 
     _target_: my_module.ClassB
     c:

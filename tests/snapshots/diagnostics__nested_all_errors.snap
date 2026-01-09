@@ -4,31 +4,31 @@ expression: summary
 ---
 - code: missing-parameter
   end_char: 34
-  line: 26
-  message: "Missing required parameter 'd_value' for __init__"
+  line: 25
+  message: "Missing required parameter 'd_value' for '__init__'"
   severity: Error
   start_char: 18
 - code: missing-parameter
   end_char: 30
-  line: 33
-  message: "Missing required parameter 'b_value' for __init__"
+  line: 34
+  message: "Missing required parameter 'b_value' for '__init__'"
   severity: Error
   start_char: 14
 - code: missing-parameter
   end_char: 34
-  line: 37
-  message: "Missing required parameter 'd_value' for __init__"
+  line: 38
+  message: "Missing required parameter 'd_value' for '__init__'"
   severity: Error
   start_char: 18
 - code: missing-parameter
   end_char: 30
-  line: 45
-  message: "Missing required parameter 'b_value' for __init__"
+  line: 46
+  message: "Missing required parameter 'b_value' for '__init__'"
   severity: Error
   start_char: 14
 - code: unknown-parameter
   end_char: 15
-  line: 51
-  message: "Unknown parameter 'x_value' for __init__"
+  line: 52
+  message: "Unknown parameter 'x_value' for '__init__'"
   severity: Error
   start_char: 8
