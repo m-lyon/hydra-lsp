@@ -1,0 +1,5 @@
+---
+source: tests/signature_help.rs
+expression: "signatures.join(\"\\n\")"
+---
+Signature: DataLoader(batch_size: int, shuffle: bool, num_workers: int)

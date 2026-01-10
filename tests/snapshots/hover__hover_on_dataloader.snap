@@ -1,0 +1,16 @@
+---
+source: tests/hover.rs
+expression: markup.value
+---
+```python
+class DataLoader(batch_size: int, shuffle: bool = false, num_workers: int = 0)
+```
+
+---
+
+A simple data loader for testing.
+
+    Args:
+        batch_size: The size of each batch
+        shuffle: Whether to shuffle the data
+        num_workers: Number of worker processes (default: 0)

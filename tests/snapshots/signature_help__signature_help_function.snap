@@ -1,0 +1,5 @@
+---
+source: tests/signature_help.rs
+expression: "format!(\"Signature: {}\", signature.label,)"
+---
+Signature: create_model(input_dim: int, output_dim: int, hidden_dim: int)

@@ -1,0 +1,19 @@
+---
+source: tests/hover.rs
+expression: markup.value
+---
+```python
+def create_model(input_dim: int, output_dim: int, hidden_dim: int = 128)
+```
+
+---
+
+Create a simple model.
+
+    Args:
+        input_dim: Input dimension
+        output_dim: Output dimension
+        hidden_dim: Hidden layer dimension (default: 128)
+
+    Returns:
+        A model instance

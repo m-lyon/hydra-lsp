@@ -550,7 +550,11 @@ fn expr_to_string(expr: &Expr) -> String {
             format!("[{}]", elements.join(", "))
         }
         Expr::StringLiteral(s) => format!("'{}'", s.value),
-        Expr::NumberLiteral(n) => format!("{:?}", n.value),
+        Expr::NumberLiteral(n) => match &n.value {
+            ast::Number::Int(i) => i.to_string(),
+            ast::Number::Float(f) => f.to_string(),
+            ast::Number::Complex { real, imag } => format!("{}+{}j", real, imag),
+        },
         Expr::BooleanLiteral(b) => format!("{}", b.value),
         Expr::NoneLiteral(_) => "None".to_string(),
         Expr::BinOp(binop) => {
