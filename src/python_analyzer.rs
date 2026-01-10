@@ -25,6 +25,12 @@ pub struct ParameterInfo {
     pub is_keyword_only: bool,
 }
 
+impl ParameterInfo {
+    pub fn is_required(&self) -> bool {
+        !self.has_default && !self.is_variadic && !self.is_variadic_keyword && self.name != "self"
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ClassInfo {
     pub name: String,
@@ -272,7 +278,7 @@ impl PythonAnalyzer {
             return Ok(DefinitionInfo::Class(class_info));
         }
 
-        anyhow::bail!("Could not find definition for '{}'", symbol_name)
+        anyhow::bail!("Symbol '{}' not found in module", symbol_name)
     }
 
     /// Format a function signature for display (e.g., in hover)

@@ -90,7 +90,7 @@ fn validate_target(
             // Module could not be resolved
             diagnostics.push(create_diagnostic(
                 target_info.line,
-                target_info.key_start,
+                target_info.value_start,
                 target_info.value_end(),
                 DiagnosticSeverity::ERROR,
                 Some("module-not-found"),

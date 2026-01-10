@@ -80,14 +80,6 @@ impl LanguageServer for HydraLspBackend {
                         },
                     ),
                 ),
-                diagnostic_provider: Some(DiagnosticServerCapabilities::Options(
-                    DiagnosticOptions {
-                        identifier: Some("hydra-lsp".to_string()),
-                        inter_file_dependencies: false,
-                        workspace_diagnostics: false,
-                        ..Default::default()
-                    },
-                )),
                 ..Default::default()
             },
             server_info: Some(ServerInfo {
@@ -198,7 +190,7 @@ impl LanguageServer for HydraLspBackend {
             .await;
 
         // Split target into module and symbol
-        let (module_path, symbol_name) = match PythonAnalyzer::split_target(&target_info.value) {
+        let (_module_path, _symbol_name) = match PythonAnalyzer::split_target(&target_info.value) {
             Ok(parts) => parts,
             Err(e) => {
                 self.client
@@ -248,25 +240,14 @@ impl LanguageServer for HydraLspBackend {
                 }))
             }
             Err(e) => {
-                // If Python analysis fails, show a basic hover with error info
+                // If Python analysis fails, don't show any hover, but log a warning
                 self.client
                     .log_message(
                         MessageType::WARNING,
                         format!("Python analysis failed: {}", e),
                     )
                     .await;
-
-                let hover_content = format!(
-                    "**Hydra Target**\n\nModule: `{}`\n\nSymbol: `{}`\n\n---\n\n*Could not analyze Python definition: {}*",
-                    module_path, symbol_name, e
-                );
-                Ok(Some(Hover {
-                    contents: HoverContents::Markup(MarkupContent {
-                        kind: MarkupKind::Markdown,
-                        value: hover_content,
-                    }),
-                    range: None,
-                }))
+                Ok(None)
             }
         }
     }
@@ -737,9 +718,9 @@ impl HydraLspBackend {
         let python_interpreter = self.python_interpreter.read().clone();
 
         match YamlParser::parse(content) {
-            Ok(target_map) => {
+            Ok((targets, _line_map)) => {
                 let diagnostics = diagnostics::validate_document(
-                    target_map,
+                    targets,
                     workspace_root.as_deref(),
                     python_interpreter.as_deref(),
                 );
