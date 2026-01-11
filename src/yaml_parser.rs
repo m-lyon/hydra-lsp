@@ -223,11 +223,11 @@ impl YamlParser {
             // If we found an opening quote, look for closing quote first
             if quote_offset > 0 {
                 let opening_quote = text.chars().nth(absolute_pos - 1).unwrap();
-                if let Some(&ch) = chars.peek() {
-                    if ch == opening_quote {
-                        found_closing_quote = true;
-                        chars.next(); // consume the quote
-                    }
+                if let Some(&ch) = chars.peek()
+                    && ch == opening_quote
+                {
+                    found_closing_quote = true;
+                    chars.next(); // consume the quote
                 }
             }
 
@@ -312,15 +312,14 @@ impl YamlParser {
                 // The _target_ key itself is not a parameter, but is the target identifier
                 if key_str != TARGET_KEY {
                     // Check if this parameter value is a nested target
-                    if let Value::Mapping(nested_map) = val {
-                        if nested_map.get(TARGET_KEY).is_some() {
-                            // This is a nested target - extract it recursively
-                            let nested_index = targets.len();
-                            Self::extract_targets(val, targets);
-                            parameters
-                                .push(ParameterValue::new_nested(key_str.clone(), nested_index));
-                            continue; // Skip the regular value insertion below
-                        }
+                    if let Value::Mapping(nested_map) = val
+                        && nested_map.get(TARGET_KEY).is_some()
+                    {
+                        // This is a nested target - extract it recursively
+                        let nested_index = targets.len();
+                        Self::extract_targets(val, targets);
+                        parameters.push(ParameterValue::new_nested(key_str.clone(), nested_index));
+                        continue; // Skip the regular value insertion below
                     }
                     // Simple value (string, number, mapping without _target_, etc.)
                     parameters.push(ParameterValue::new_value(key_str.clone(), val.clone()));
@@ -479,15 +478,15 @@ impl YamlParser {
             }
 
             // Check if this line has _target_
-            if let Some((target_pos, quote_offset)) = Self::find_target_with_colon(line) {
-                if line_indent == current_indent {
-                    // Find the colon and extract the value
-                    let after_target = target_pos + quote_offset + TARGET_KEY.len();
-                    if let Some(colon_offset) = line[after_target..].find(':') {
-                        let after_colon = after_target + colon_offset + 1;
-                        let value = line[after_colon..].trim();
-                        return Ok(Some(value.trim_matches('"').trim_matches('\'')));
-                    }
+            if let Some((target_pos, quote_offset)) = Self::find_target_with_colon(line)
+                && line_indent == current_indent
+            {
+                // Find the colon and extract the value
+                let after_target = target_pos + quote_offset + TARGET_KEY.len();
+                if let Some(colon_offset) = line[after_target..].find(':') {
+                    let after_colon = after_target + colon_offset + 1;
+                    let value = line[after_colon..].trim();
+                    return Ok(Some(value.trim_matches('"').trim_matches('\'')));
                 }
             }
         }
@@ -1254,7 +1253,7 @@ model:
         assert_eq!(target.value, "myproject.Model");
         assert_eq!(target.line, 2);
         assert_eq!(target.key_start, 2); // Position of opening quote of key
-                                         // value_start should point to after the opening quote of the value
+        // value_start should point to after the opening quote of the value
         assert_eq!(target.value_start, 15); // Position after opening quote of value
     }
 

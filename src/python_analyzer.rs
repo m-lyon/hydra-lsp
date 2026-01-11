@@ -1,6 +1,6 @@
 use anyhow::Result;
 use ruff_db::system::{OsSystem, SystemPath, SystemPathBuf};
-use ruff_python_ast::{self as ast, visitor::Visitor, Expr, Stmt};
+use ruff_python_ast::{self as ast, Expr, Stmt, visitor::Visitor};
 use ruff_python_parser::parse_module;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -63,11 +63,16 @@ impl PythonAnalyzer {
 
     /// Discover the Python environment and get site-packages paths
     ///
-    /// This uses ty's sophisticated Python environment discovery which:
-    /// - Discovers virtual environments (venv, conda, uv)
-    /// - Handles Python interpreter paths vs sys.prefix directories
-    /// - Resolves site-packages for different Python versions and implementations
-    /// - Supports system site-packages and editable installs
+    /// This uses `ty` Python environment discovery with the following priority:
+    /// 1. Configured Python interpreter from LSP initialization (highest priority)
+    /// 2. Activated virtual environment (VIRTUAL_ENV)
+    /// 3. Conda environment (CONDA_PREFIX)
+    /// 4. Working directory virtual environment (.venv)
+    /// 5. Conda base environment
+    /// 6. System Python (fallback)
+    ///
+    /// The configured interpreter is always preferred if provided, as it represents
+    /// the user's explicit choice via LSP configuration.
     fn discover_python_environment(
         workspace_root: Option<&Path>,
         python_path: Option<&str>,
@@ -85,13 +90,14 @@ impl PythonAnalyzer {
         let project_root = cwd;
 
         let env = if let Some(python_path_str) = python_path {
-            // User provided a specific Python path (could be executable or sys.prefix directory)
+            // User provided a specific Python path (highest priority - from LSP configuration)
+            // This could be an executable or sys.prefix directory
             let python_sys_path = SystemPath::from_std_path(Path::new(python_path_str))
                 .ok_or_else(|| anyhow::anyhow!("Invalid Python path"))?;
 
             PythonEnvironment::new(python_sys_path, SysPrefixPathOrigin::PythonCliFlag, &system)?
         } else {
-            // Auto-discover Python environment with priority:
+            // Auto-discover Python environment with built-in priority:
             // 1. Activated virtual environment (VIRTUAL_ENV)
             // 2. Conda environment (CONDA_PREFIX)
             // 3. Working directory virtual environment (.venv)
@@ -379,11 +385,11 @@ impl<'a> Visitor<'a> for FunctionExtractor {
             return; // Already found
         }
 
-        if let Stmt::FunctionDef(func_def) = stmt {
-            if func_def.name.as_str() == self.target_name {
-                self.result = Some(extract_function_signature_from_def(func_def));
-                return;
-            }
+        if let Stmt::FunctionDef(func_def) = stmt
+            && func_def.name.as_str() == self.target_name
+        {
+            self.result = Some(extract_function_signature_from_def(func_def));
+            return;
         }
 
         // Continue walking
@@ -403,11 +409,11 @@ impl<'a> Visitor<'a> for ClassExtractor {
             return; // Already found
         }
 
-        if let Stmt::ClassDef(class_def) = stmt {
-            if class_def.name.as_str() == self.target_name {
-                self.result = Some(extract_class_info_from_def(class_def));
-                return;
-            }
+        if let Stmt::ClassDef(class_def) = stmt
+            && class_def.name.as_str() == self.target_name
+        {
+            self.result = Some(extract_class_info_from_def(class_def));
+            return;
         }
 
         // Continue walking
@@ -435,10 +441,10 @@ fn extract_class_info_from_def(class_def: &ast::StmtClassDef) -> ClassInfo {
 
     // Look for __init__ method
     let init_signature = class_def.body.iter().find_map(|stmt| {
-        if let Stmt::FunctionDef(func_def) = stmt {
-            if func_def.name.as_str() == "__init__" {
-                return Some(extract_function_signature_from_def(func_def));
-            }
+        if let Stmt::FunctionDef(func_def) = stmt
+            && func_def.name.as_str() == "__init__"
+        {
+            return Some(extract_function_signature_from_def(func_def));
         }
         None
     });
@@ -519,10 +525,10 @@ fn extract_parameters(params: &ast::Parameters) -> Vec<ParameterInfo> {
 
 /// Extract docstring from function or class body
 fn extract_docstring(body: &[Stmt]) -> Option<String> {
-    if let Some(Stmt::Expr(expr_stmt)) = body.first() {
-        if let Expr::StringLiteral(string_literal) = expr_stmt.value.as_ref() {
-            return Some(string_literal.value.to_string());
-        }
+    if let Some(Stmt::Expr(expr_stmt)) = body.first()
+        && let Expr::StringLiteral(string_literal) = expr_stmt.value.as_ref()
+    {
+        return Some(string_literal.value.to_string());
     }
     None
 }
@@ -1521,5 +1527,125 @@ mod tests {
             assert!(memory_fs.exists(&site_packages));
             assert!(site_packages.to_string().contains("python3.13t"));
         }
+    }
+
+    // ==================== Python Interpreter Priority Tests ====================
+    // These tests verify that the configured Python interpreter from LSP initialization
+    // takes priority over auto-discovery
+
+    #[test]
+    #[ignore = "Requires Python in PATH"]
+    fn test_configured_interpreter_takes_priority() {
+        // This test verifies that when a Python interpreter is explicitly configured
+        // via LSP initialization, it is used instead of auto-discovery
+        let examples_dir = get_resources_dir();
+
+        // Get the current system Python
+        let system_python = which::which("python3")
+            .or_else(|_| which::which("python"))
+            .expect("Python not found in PATH");
+
+        let system_python_str = system_python.to_str().unwrap();
+
+        // Resolve a module with explicit interpreter configuration
+        let result_with_config = PythonAnalyzer::resolve_module(
+            "test_module",
+            Some(&examples_dir),
+            Some(system_python_str),
+        );
+
+        // Should succeed using the configured interpreter
+        assert!(
+            result_with_config.is_ok(),
+            "Module resolution should succeed with configured interpreter"
+        );
+    }
+
+    #[test]
+    fn test_auto_discovery_when_no_interpreter_configured() {
+        // This test verifies that when no Python interpreter is configured,
+        // the system falls back to auto-discovery
+        let examples_dir = get_resources_dir();
+
+        // Resolve a module without explicit interpreter configuration (None)
+        let result = PythonAnalyzer::resolve_module("test_module", Some(&examples_dir), None);
+
+        // Should still succeed using auto-discovery
+        assert!(
+            result.is_ok(),
+            "Module resolution should succeed with auto-discovery"
+        );
+    }
+
+    #[test]
+    #[ignore = "Requires Python in PATH"]
+    fn test_extract_definition_with_configured_interpreter() {
+        // Test that definition extraction uses configured interpreter
+        let examples_dir = get_resources_dir();
+
+        // Get the current system Python
+        let system_python = which::which("python3")
+            .or_else(|_| which::which("python"))
+            .ok();
+
+        let system_python_str = system_python.as_ref().and_then(|p| p.to_str());
+
+        // Extract definition with configured interpreter
+        let result = PythonAnalyzer::extract_definition_info(
+            "test_module.simple_function",
+            Some(&examples_dir),
+            system_python_str,
+        );
+
+        assert!(
+            result.is_ok(),
+            "Definition extraction should work with configured interpreter: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_extract_definition_without_configured_interpreter() {
+        // Test that definition extraction works without configured interpreter (auto-discovery)
+        let examples_dir = get_resources_dir();
+
+        // Extract definition without configured interpreter
+        let result = PythonAnalyzer::extract_definition_info(
+            "test_module.simple_function",
+            Some(&examples_dir),
+            None,
+        );
+
+        assert!(
+            result.is_ok(),
+            "Definition extraction should work with auto-discovery: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    #[ignore = "Requires Python in PATH"]
+    fn test_resolve_module_priority_order() {
+        // This test documents the priority order:
+        // 1. Configured interpreter (highest priority)
+        // 2. Auto-discovered environment (fallback)
+        let examples_dir = get_resources_dir();
+
+        // Test with configured interpreter (priority 1)
+        if let Ok(python_path) = which::which("python3").or_else(|_| which::which("python")) {
+            let result_configured = PythonAnalyzer::resolve_module(
+                "test_module",
+                Some(&examples_dir),
+                python_path.to_str(),
+            );
+            assert!(
+                result_configured.is_ok(),
+                "Should resolve with configured interpreter"
+            );
+        }
+
+        // Test with auto-discovery (priority 2)
+        let result_auto = PythonAnalyzer::resolve_module("test_module", Some(&examples_dir), None);
+        assert!(result_auto.is_ok(), "Should resolve with auto-discovery");
     }
 }

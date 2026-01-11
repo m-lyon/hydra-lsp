@@ -38,6 +38,21 @@ impl LanguageServer for HydraLspBackend {
                 ),
             )
             .await;
+
+        // Parse initialization options to extract Python interpreter
+        if let Some(init_options) = params.initialization_options
+            && let Some(settings) = init_options.get("settings")
+            && let Some(python_interpreter) = settings.get("pythonInterpreter")
+            && let Some(interpreter_path) = python_interpreter.as_str()
+        {
+            *self.python_interpreter.write() = Some(interpreter_path.to_string());
+            self.client
+                .log_message(
+                    MessageType::INFO,
+                    format!("Python interpreter configured: {}", interpreter_path),
+                )
+                .await;
+        }
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
