@@ -2,6 +2,76 @@ use serde_yaml::Value;
 use std::collections::{HashMap, VecDeque};
 use tower_lsp::lsp_types::Position;
 
+/// Represents a semantic token in the document (internal representation)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HydraSemanticToken {
+    pub line: u32,
+    pub start_char: u32,
+    pub length: u32,
+    pub token_type: SemanticTokenType,
+}
+
+/// Token types for semantic highlighting
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SemanticTokenType {
+    Namespace, // Module path parts (e.g., "myproject" in "myproject.models")
+    Class,     // Class name in _target_
+    Function,  // Function name in _target_
+    Parameter, // Parameter key names
+    Property,  // YAML property keys
+    String,    // String values
+    Number,    // Numeric values
+}
+
+impl SemanticTokenType {
+    /// Convert to LSP token type index (based on order in legend)
+    pub fn to_index(self) -> u32 {
+        match self {
+            SemanticTokenType::Namespace => 0,
+            SemanticTokenType::Class => 1,
+            SemanticTokenType::Function => 2,
+            SemanticTokenType::Parameter => 3,
+            SemanticTokenType::Property => 4,
+            SemanticTokenType::String => 6,
+            SemanticTokenType::Number => 7,
+        }
+    }
+}
+
+impl HydraSemanticToken {
+    /// Convert a list of semantic tokens to LSP SemanticToken format (delta-encoded)
+    /// LSP uses relative positioning: [deltaLine, deltaStartChar, length, tokenType, tokenModifiers]
+    pub fn to_lsp_tokens(
+        tokens: &[HydraSemanticToken],
+    ) -> Vec<tower_lsp::lsp_types::SemanticToken> {
+        let mut lsp_tokens = Vec::new();
+        let mut prev_line = 0;
+        let mut prev_start = 0;
+
+        for token in tokens {
+            let delta_line = token.line - prev_line;
+            let delta_start = if delta_line == 0 {
+                token.start_char - prev_start
+            } else {
+                token.start_char
+            };
+
+            lsp_tokens.push(tower_lsp::lsp_types::SemanticToken {
+                delta_line,
+                delta_start,
+                length: token.length,
+                token_type: token.token_type.to_index(),
+                token_modifiers_bitset: 0, // No modifiers for now
+            });
+
+            prev_line = token.line;
+            prev_start = token.start_char;
+        }
+
+        lsp_tokens
+    }
+}
+
 pub const TARGET_KEY: &str = "_target_";
 
 /// Represents a parameter in a YAML configuration with position information
@@ -423,6 +493,207 @@ impl YamlParser {
         }
 
         Ok(None)
+    }
+
+    /// Extract semantic tokens from the document for syntax highlighting
+    /// Returns tokens sorted by position (line, then character)
+    pub fn extract_semantic_tokens(content: &str) -> Vec<HydraSemanticToken> {
+        let mut tokens = Vec::new();
+
+        // Parse the YAML to get targets and their parameters
+        let Ok((targets, _)) = Self::parse(content) else {
+            return tokens;
+        };
+
+        // Generate tokens for each target
+        for target in targets {
+            // Tokenize the _target_ value
+            Self::tokenize_target_value(&target, &mut tokens);
+
+            // Tokenize parameter keys
+            Self::tokenize_parameters(&target, content, &mut tokens);
+        }
+
+        // Sort tokens by position (line, then start character)
+        tokens.sort_by_key(|t| (t.line, t.start_char));
+
+        tokens
+    }
+
+    /// Tokenize a _target_ value, splitting it into namespace and class/function parts
+    fn tokenize_target_value(target: &TargetInfo, tokens: &mut Vec<HydraSemanticToken>) {
+        let value = &target.value;
+        let line = target.line;
+        let start = target.value_start;
+
+        // Split by dots to identify module path vs class/function name
+        if let Some(last_dot) = value.rfind('.') {
+            // Everything before the last dot is the module path
+            let module_path = &value[..last_dot];
+            let symbol_name = &value[last_dot + 1..];
+
+            // Tokenize module path (could have multiple dots)
+            let mut current_pos = start;
+            for (idx, part) in module_path.split('.').enumerate() {
+                if !part.is_empty() {
+                    tokens.push(HydraSemanticToken {
+                        line,
+                        start_char: current_pos,
+                        length: part.len() as u32,
+                        token_type: SemanticTokenType::Namespace,
+                    });
+                    current_pos += part.len() as u32;
+                }
+                // Skip the dot (unless it's the last segment)
+                if idx < module_path.split('.').count() - 1 {
+                    current_pos += 1;
+                }
+            }
+            // Skip the last dot
+            current_pos += 1;
+
+            // Tokenize the class/function name
+            // Heuristic: CamelCase = Class, snake_case = Function
+            let token_type = if symbol_name
+                .chars()
+                .next()
+                .map(|c| c.is_uppercase())
+                .unwrap_or(false)
+            {
+                SemanticTokenType::Class
+            } else {
+                SemanticTokenType::Function
+            };
+
+            tokens.push(HydraSemanticToken {
+                line,
+                start_char: current_pos,
+                length: symbol_name.len() as u32,
+                token_type,
+            });
+        } else {
+            // No dots, treat the whole thing as a class/function name
+            let token_type = if value
+                .chars()
+                .next()
+                .map(|c| c.is_uppercase())
+                .unwrap_or(false)
+            {
+                SemanticTokenType::Class
+            } else {
+                SemanticTokenType::Function
+            };
+
+            tokens.push(HydraSemanticToken {
+                line,
+                start_char: start,
+                length: value.len() as u32,
+                token_type,
+            });
+        }
+    }
+
+    /// Tokenize parameter keys and values
+    fn tokenize_parameters(
+        target: &TargetInfo,
+        content: &str,
+        tokens: &mut Vec<HydraSemanticToken>,
+    ) {
+        let lines: Vec<&str> = content.lines().collect();
+
+        for param in &target.parameters {
+            let param_line = param.line as usize;
+            if param_line >= lines.len() {
+                continue;
+            }
+
+            let line = lines[param_line];
+            let param_key = &param.key;
+
+            // Find the parameter key in the line
+            if let Some(key_pos) = line.find(param_key) {
+                // Token for parameter key
+                tokens.push(HydraSemanticToken {
+                    line: param_line as u32,
+                    start_char: key_pos as u32,
+                    length: param_key.len() as u32,
+                    token_type: SemanticTokenType::Parameter,
+                });
+
+                // Try to tokenize the value after the colon
+                if let Some(colon_pos) = line[key_pos + param_key.len()..].find(':') {
+                    let value_start = key_pos + param_key.len() + colon_pos + 1;
+                    let value_part = &line[value_start..];
+
+                    // Skip whitespace to find the actual value
+                    if let Some(val_offset) = value_part.find(|c: char| !c.is_whitespace()) {
+                        let val_start = value_start + val_offset;
+                        let remaining = &line[val_start..];
+
+                        // Determine token type based on value
+                        if let ParameterKind::Value(ref yaml_val) = param.kind {
+                            match yaml_val {
+                                Value::Number(_) => {
+                                    // Find the length of the number
+                                    let num_len = remaining
+                                        .find(|c: char| !c.is_numeric() && c != '.' && c != '-')
+                                        .unwrap_or(remaining.len());
+                                    if num_len > 0 {
+                                        tokens.push(HydraSemanticToken {
+                                            line: param_line as u32,
+                                            start_char: val_start as u32,
+                                            length: num_len as u32,
+                                            token_type: SemanticTokenType::Number,
+                                        });
+                                    }
+                                }
+                                Value::String(_) => {
+                                    // Find the length of the string value
+                                    let str_len = if remaining.starts_with('"')
+                                        || remaining.starts_with('\'')
+                                    {
+                                        // Quoted string - find closing quote
+                                        let quote = remaining.chars().next().unwrap();
+                                        remaining[1..]
+                                            .find(quote)
+                                            .map(|pos| pos + 2) // Include both quotes
+                                            .unwrap_or_else(|| remaining.len())
+                                    } else {
+                                        // Unquoted - until end of line or comment
+                                        remaining
+                                            .find('#')
+                                            .unwrap_or(remaining.len())
+                                            .min(remaining.trim_end().len())
+                                    };
+                                    if str_len > 0 {
+                                        tokens.push(HydraSemanticToken {
+                                            line: param_line as u32,
+                                            start_char: val_start as u32,
+                                            length: str_len as u32,
+                                            token_type: SemanticTokenType::String,
+                                        });
+                                    }
+                                }
+                                _ => {
+                                    // Other value types (bool, null, etc.) - treat as property
+                                    let val_len = remaining
+                                        .find(|c: char| c.is_whitespace() || c == '#')
+                                        .unwrap_or(remaining.len());
+                                    if val_len > 0 {
+                                        tokens.push(HydraSemanticToken {
+                                            line: param_line as u32,
+                                            start_char: val_start as u32,
+                                            length: val_len as u32,
+                                            token_type: SemanticTokenType::Property,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1001,5 +1272,146 @@ model:
             .unwrap();
         assert_eq!(target_info.value, "myproject.Model");
         assert_eq!(target_info.line, 2);
+    }
+
+    #[test]
+    fn test_semantic_tokens_simple_target() {
+        let content = r#"
+model:
+  _target_: myproject.Model
+  hidden_size: 256
+"#;
+        let tokens = YamlParser::extract_semantic_tokens(content);
+
+        // Should have tokens for: "myproject" (namespace), "Model" (class),
+        // "hidden_size" (parameter), "256" (number)
+        assert!(tokens.len() >= 4, "Should have at least 4 tokens");
+
+        // Check module namespace token
+        let namespace_token = tokens
+            .iter()
+            .find(|t| t.line == 2 && t.token_type == SemanticTokenType::Namespace)
+            .expect("Should have namespace token");
+        assert_eq!(namespace_token.length, "myproject".len() as u32);
+
+        // Check class name token
+        let class_token = tokens
+            .iter()
+            .find(|t| t.line == 2 && t.token_type == SemanticTokenType::Class)
+            .expect("Should have class token");
+        assert_eq!(class_token.length, "Model".len() as u32);
+
+        // Check parameter key token
+        let param_token = tokens
+            .iter()
+            .find(|t| t.line == 3 && t.token_type == SemanticTokenType::Parameter)
+            .expect("Should have parameter token");
+        assert_eq!(param_token.length, "hidden_size".len() as u32);
+
+        // Check number value token
+        let number_token = tokens
+            .iter()
+            .find(|t| t.line == 3 && t.token_type == SemanticTokenType::Number)
+            .expect("Should have number token");
+        assert_eq!(number_token.length, "256".len() as u32);
+    }
+
+    #[test]
+    fn test_semantic_tokens_nested_module() {
+        let content = r#"
+model:
+  _target_: my.project.models.Transformer
+  layers: 12
+"#;
+        let tokens = YamlParser::extract_semantic_tokens(content);
+
+        // Should have 3 namespace tokens (my, project, models) and 1 class token (Transformer)
+        let namespace_tokens: Vec<_> = tokens
+            .iter()
+            .filter(|t| t.line == 2 && t.token_type == SemanticTokenType::Namespace)
+            .collect();
+        assert_eq!(namespace_tokens.len(), 3, "Should have 3 namespace tokens");
+
+        let class_tokens: Vec<_> = tokens
+            .iter()
+            .filter(|t| t.line == 2 && t.token_type == SemanticTokenType::Class)
+            .collect();
+        assert_eq!(class_tokens.len(), 1, "Should have 1 class token");
+    }
+
+    #[test]
+    fn test_semantic_tokens_function_target() {
+        let content = r#"
+func:
+  _target_: my.module.create_model
+  config: test
+"#;
+        let tokens = YamlParser::extract_semantic_tokens(content);
+
+        // Function name (lowercase) should be tokenized as Function
+        let function_tokens: Vec<_> = tokens
+            .iter()
+            .filter(|t| t.line == 2 && t.token_type == SemanticTokenType::Function)
+            .collect();
+        assert_eq!(function_tokens.len(), 1, "Should have 1 function token");
+        assert_eq!(function_tokens[0].length, "create_model".len() as u32);
+    }
+
+    #[test]
+    fn test_semantic_tokens_lsp_encoding() {
+        let content = r#"
+model:
+  _target_: myproject.Model
+  size: 100
+"#;
+        let tokens = YamlParser::extract_semantic_tokens(content);
+        let lsp_tokens = HydraSemanticToken::to_lsp_tokens(&tokens);
+
+        // Should have tokens in LSP format
+        assert!(!lsp_tokens.is_empty(), "Should have LSP tokens");
+
+        // First token should have delta_line relative to start (0)
+        assert_eq!(
+            lsp_tokens[0].delta_line, 2,
+            "First token should be on line 2"
+        );
+
+        // Tokens on same line should have delta_line = 0
+        if lsp_tokens.len() > 1 {
+            // Find two consecutive tokens on the same line
+            for i in 1..lsp_tokens.len() {
+                let prev_line = lsp_tokens[..i].iter().fold(0, |acc, t| acc + t.delta_line);
+                let curr_line = lsp_tokens[..=i].iter().fold(0, |acc, t| acc + t.delta_line);
+
+                if prev_line == curr_line {
+                    assert_eq!(
+                        lsp_tokens[i].delta_line, 0,
+                        "Token on same line should have delta_line = 0"
+                    );
+                    break;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_semantic_tokens_string_values() {
+        let content = r#"
+model:
+  _target_: myproject.Model
+  name: "test_model"
+  path: '/tmp/model'
+"#;
+        let tokens = YamlParser::extract_semantic_tokens(content);
+
+        // Should have string tokens for both quoted strings
+        let string_tokens: Vec<_> = tokens
+            .iter()
+            .filter(|t| t.token_type == SemanticTokenType::String)
+            .collect();
+        assert!(
+            string_tokens.len() >= 2,
+            "Should have at least 2 string tokens"
+        );
     }
 }

@@ -7,7 +7,7 @@ use tower_lsp::{Client, LanguageServer};
 use crate::diagnostics;
 use crate::document::DocumentStore;
 use crate::python_analyzer::{DefinitionInfo, PythonAnalyzer};
-use crate::yaml_parser::{CompletionContext, YamlParser};
+use crate::yaml_parser::{CompletionContext, HydraSemanticToken, YamlParser};
 
 #[derive(Debug)]
 pub struct HydraLspBackend {
@@ -680,28 +680,26 @@ impl LanguageServer for HydraLspBackend {
             return Ok(None);
         }
 
-        // TODO: Implement semantic token generation
-        // This would involve:
-        // 1. Parse YAML to find all _target_ values
-        // 2. Identify parameter keys associated with targets
-        // 3. Generate semantic tokens for:
-        //    - Module paths (NAMESPACE)
-        //    - Class/function names (CLASS/FUNCTION)
-        //    - Parameter names (PARAMETER/PROPERTY)
-        //    - Values (STRING/NUMBER/etc)
-        // 4. Return tokens in the LSP delta format
+        self.client
+            .log_message(MessageType::INFO, "Generating semantic tokens".to_string())
+            .await;
+
+        // Extract semantic tokens from the YAML content
+        let tokens = YamlParser::extract_semantic_tokens(&document.content);
+
+        // Convert to LSP format
+        let data = HydraSemanticToken::to_lsp_tokens(&tokens);
 
         self.client
             .log_message(
                 MessageType::INFO,
-                "Semantic tokens requested (not yet fully implemented)".to_string(),
+                format!("Generated {} semantic tokens", tokens.len()),
             )
             .await;
 
-        // Placeholder: return empty token list
         Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
             result_id: None,
-            data: vec![],
+            data,
         })))
     }
 }
