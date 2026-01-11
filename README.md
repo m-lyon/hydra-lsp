@@ -4,7 +4,7 @@ A Language Server Protocol implementation for [Hydra](https://hydra.cc/) configu
 
 ## Features
 
-### Currently Implemented (v0.1.0)
+### Currently Implemented (v0.4.0)
 
 - ✅ **Hydra File Detection**: Automatically detects Hydra YAML files using:
   - Comment markers (`# @hydra` or `# hydra:`)
@@ -28,12 +28,16 @@ A Language Server Protocol implementation for [Hydra](https://hydra.cc/) configu
   - Unknown parameters (unless `**kwargs` present)
   - Missing required parameters
   - Basic `_target_` format validation
+- ✅ **Semantic Tokens**: Rich syntax highlighting for Hydra configurations:
+  - Module path components (namespace tokens)
+  - Class and function names (with automatic detection)
+  - Parameter keys (parameter tokens)
+  - Values (string, number, and property tokens)
 
 ### Planned Features
 
 - 🔄 **Type Validation**: Validate YAML values against Python type annotations
 - 🔄 **Smart Autocomplete**: Suggest Python classes/functions and parameters
-- 🔄 **Semantic Tokens**: Syntax highlighting for Python references
 - 🔄 **Configuration UI**: Better integration for Python interpreter selection
 
 ## Architecture
