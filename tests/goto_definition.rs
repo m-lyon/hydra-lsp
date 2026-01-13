@@ -46,8 +46,12 @@ async fn test_goto_definition_class() {
             insta::assert_snapshot!(
                 "goto_definition_class",
                 format!(
-                    "File: {}\nLine: {}\nCharacter: {}",
-                    file_name, location.range.start.line, location.range.start.character
+                    "File: {}\nStart Line: {}\nStart Character: {}\nEnd Line: {}\nEnd Character: {}",
+                    file_name,
+                    location.range.start.line,
+                    location.range.start.character,
+                    location.range.end.line,
+                    location.range.end.character
                 )
             );
         }
@@ -94,8 +98,12 @@ test:
             insta::assert_snapshot!(
                 "goto_definition_function",
                 format!(
-                    "File: {}\nLine: {}\nCharacter: {}",
-                    file_name, location.range.start.line, location.range.start.character
+                    "File: {}\nStart Line: {}\nStart Character: {}\nEnd Line: {}\nEnd Character: {}",
+                    file_name,
+                    location.range.start.line,
+                    location.range.start.character,
+                    location.range.end.line,
+                    location.range.end.character
                 )
             );
         }

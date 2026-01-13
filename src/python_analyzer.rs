@@ -2,6 +2,8 @@ use anyhow::Result;
 use ruff_db::system::{OsSystem, SystemPath, SystemPathBuf};
 use ruff_python_ast::{self as ast, Expr, Stmt, visitor::Visitor};
 use ruff_python_parser::parse_module;
+use ruff_source_file::{LineIndex, PositionEncoding};
+use ruff_text_size::TextRange;
 use std::fs;
 use std::path::{Path, PathBuf};
 use ty_python_semantic::{PythonEnvironment, SysPrefixPathOrigin};
@@ -12,6 +14,10 @@ pub struct FunctionSignature {
     pub parameters: Vec<ParameterInfo>,
     pub return_type: Option<String>,
     pub docstring: Option<String>,
+    pub start_line: u32,
+    pub start_column: u32,
+    pub end_line: u32,
+    pub end_column: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -36,6 +42,10 @@ pub struct ClassInfo {
     pub name: String,
     pub docstring: Option<String>,
     pub init_signature: Option<FunctionSignature>,
+    pub start_line: u32,
+    pub start_column: u32,
+    pub end_line: u32,
+    pub end_column: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -231,6 +241,7 @@ impl PythonAnalyzer {
         let mut visitor = FunctionExtractor {
             target_name: function_name.to_string(),
             result: None,
+            source,
         };
 
         visitor.visit_body(parsed.suite());
@@ -252,6 +263,7 @@ impl PythonAnalyzer {
         let mut visitor = ClassExtractor {
             target_name: class_name.to_string(),
             result: None,
+            source: source.clone(),
         };
 
         visitor.visit_body(parsed.suite());
@@ -377,6 +389,7 @@ impl PythonAnalyzer {
 struct FunctionExtractor {
     target_name: String,
     result: Option<FunctionSignature>,
+    source: String,
 }
 
 impl<'a> Visitor<'a> for FunctionExtractor {
@@ -388,7 +401,7 @@ impl<'a> Visitor<'a> for FunctionExtractor {
         if let Stmt::FunctionDef(func_def) = stmt
             && func_def.name.as_str() == self.target_name
         {
-            self.result = Some(extract_function_signature_from_def(func_def));
+            self.result = Some(extract_function_signature_from_def(func_def, &self.source));
             return;
         }
 
@@ -401,6 +414,7 @@ impl<'a> Visitor<'a> for FunctionExtractor {
 struct ClassExtractor {
     target_name: String,
     result: Option<ClassInfo>,
+    source: String,
 }
 
 impl<'a> Visitor<'a> for ClassExtractor {
@@ -412,7 +426,7 @@ impl<'a> Visitor<'a> for ClassExtractor {
         if let Stmt::ClassDef(class_def) = stmt
             && class_def.name.as_str() == self.target_name
         {
-            self.result = Some(extract_class_info_from_def(class_def));
+            self.result = Some(extract_class_info_from_def(class_def, &self.source));
             return;
         }
 
@@ -421,30 +435,57 @@ impl<'a> Visitor<'a> for ClassExtractor {
     }
 }
 
+/// Convert a TextRange to line/column position
+/// Returns (start_line, start_column, end_line, end_column)
+fn get_position_info(range: TextRange, source: &str) -> (u32, u32, u32, u32) {
+    let line_index = LineIndex::from_source_text(source);
+
+    let start = line_index.source_location(range.start(), source, PositionEncoding::Utf32);
+    let end = line_index.source_location(range.end(), source, PositionEncoding::Utf32);
+
+    (
+        start.line.to_zero_indexed() as u32,
+        start.character_offset.to_zero_indexed() as u32,
+        end.line.to_zero_indexed() as u32,
+        end.character_offset.to_zero_indexed() as u32,
+    )
+}
+
 /// Extract function signature from a function definition node
-fn extract_function_signature_from_def(func_def: &ast::StmtFunctionDef) -> FunctionSignature {
+fn extract_function_signature_from_def(
+    func_def: &ast::StmtFunctionDef,
+    source: &str,
+) -> FunctionSignature {
     let parameters = extract_parameters(&func_def.parameters);
     let return_type = func_def.returns.as_ref().map(|e| expr_to_string(e));
     let docstring = extract_docstring(&func_def.body);
+    let (start_line, start_column, end_line, end_column) =
+        get_position_info(func_def.range, source);
 
     FunctionSignature {
         name: func_def.name.to_string(),
         parameters,
         return_type,
         docstring,
+        start_line,
+        start_column,
+        end_line,
+        end_column,
     }
 }
 
 /// Extract class info from a class definition node
-fn extract_class_info_from_def(class_def: &ast::StmtClassDef) -> ClassInfo {
+fn extract_class_info_from_def(class_def: &ast::StmtClassDef, source: &str) -> ClassInfo {
     let docstring = extract_docstring(&class_def.body);
+    let (start_line, start_column, end_line, end_column) =
+        get_position_info(class_def.range, source);
 
     // Look for __init__ method
     let init_signature = class_def.body.iter().find_map(|stmt| {
         if let Stmt::FunctionDef(func_def) = stmt
             && func_def.name.as_str() == "__init__"
         {
-            return Some(extract_function_signature_from_def(func_def));
+            return Some(extract_function_signature_from_def(func_def, source));
         }
         None
     });
@@ -453,6 +494,10 @@ fn extract_class_info_from_def(class_def: &ast::StmtClassDef) -> ClassInfo {
         name: class_def.name.to_string(),
         docstring,
         init_signature,
+        start_line,
+        start_column,
+        end_line,
+        end_column,
     }
 }
 
@@ -909,6 +954,10 @@ mod tests {
             parameters: vec![],
             return_type: None,
             docstring: None,
+            start_line: 0,
+            start_column: 0,
+            end_line: 5,
+            end_column: 5,
         };
 
         let formatted = PythonAnalyzer::format_signature(&sig);
@@ -943,6 +992,10 @@ mod tests {
             ],
             return_type: Some("bool".to_string()),
             docstring: Some("Test docstring".to_string()),
+            start_line: 0,
+            start_column: 0,
+            end_line: 5,
+            end_column: 5,
         };
 
         let formatted = PythonAnalyzer::format_signature(&sig);
@@ -976,6 +1029,10 @@ mod tests {
             ],
             return_type: None,
             docstring: None,
+            start_line: 0,
+            start_column: 0,
+            end_line: 5,
+            end_column: 5,
         };
 
         let formatted = PythonAnalyzer::format_signature(&sig);
@@ -991,6 +1048,10 @@ mod tests {
             name: "TestClass".to_string(),
             docstring: Some("A test class".to_string()),
             init_signature: None,
+            start_line: 0,
+            start_column: 0,
+            end_line: 5,
+            end_column: 5,
         };
 
         let formatted = PythonAnalyzer::format_class(&class_info);
@@ -1004,6 +1065,10 @@ mod tests {
         let class_info = ClassInfo {
             name: "TestClass".to_string(),
             docstring: Some("A test class".to_string()),
+            start_line: 0,
+            start_column: 0,
+            end_line: 5,
+            end_column: 5,
             init_signature: Some(FunctionSignature {
                 name: "__init__".to_string(),
                 parameters: vec![
@@ -1028,6 +1093,10 @@ mod tests {
                 ],
                 return_type: None,
                 docstring: None,
+                start_line: 0,
+                start_column: 0,
+                end_line: 5,
+                end_column: 5,
             }),
         };
 
@@ -1042,6 +1111,10 @@ mod tests {
         let class_info = ClassInfo {
             name: "TestClass".to_string(),
             docstring: None,
+            start_line: 0,
+            start_column: 0,
+            end_line: 5,
+            end_column: 5,
             init_signature: Some(FunctionSignature {
                 name: "__init__".to_string(),
                 parameters: vec![
@@ -1066,6 +1139,10 @@ mod tests {
                 ],
                 return_type: None,
                 docstring: None,
+                start_line: 0,
+                start_column: 0,
+                end_line: 5,
+                end_column: 5,
             }),
         };
 

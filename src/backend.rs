@@ -609,17 +609,6 @@ impl LanguageServer for HydraLspBackend {
             }
         };
 
-        // Split target into module and symbol
-        let (module_path, _symbol_name) = match PythonAnalyzer::split_target(&target_info.value) {
-            Ok(parts) => parts,
-            Err(e) => {
-                self.client
-                    .log_message(MessageType::ERROR, format!("Invalid target: {}", e))
-                    .await;
-                return Ok(None);
-            }
-        };
-
         // Try to get the workspace root from the URI
         let workspace_root = uri
             .to_file_path()
@@ -629,7 +618,18 @@ impl LanguageServer for HydraLspBackend {
         // Get the python interpreter path
         let python_interpreter = self.python_interpreter.read().clone();
 
-        // Try to resolve the module to a file
+        // Split target to get module path
+        let (module_path, _) = match PythonAnalyzer::split_target(&target_info.value) {
+            Ok(parts) => parts,
+            Err(e) => {
+                self.client
+                    .log_message(MessageType::ERROR, format!("Invalid target: {}", e))
+                    .await;
+                return Ok(None);
+            }
+        };
+
+        // Resolve module to file path
         let file_path = match PythonAnalyzer::resolve_module(
             &module_path,
             workspace_root.as_deref(),
@@ -639,13 +639,45 @@ impl LanguageServer for HydraLspBackend {
             Err(e) => {
                 self.client
                     .log_message(
-                        MessageType::WARNING,
-                        format!("Could not resolve module {}: {}", module_path, e),
+                        MessageType::ERROR,
+                        format!("Could not resolve module: {}", e),
                     )
                     .await;
                 return Ok(None);
             }
         };
+
+        // Extract definition info to get the line number
+        let (start_line, start_col, end_line, end_col) =
+            match PythonAnalyzer::extract_definition_info(
+                &target_info.value,
+                workspace_root.as_deref(),
+                python_interpreter.as_deref(),
+            ) {
+                Ok(definition_info) => match definition_info {
+                    DefinitionInfo::Function(sig) => (
+                        sig.start_line,
+                        sig.start_column,
+                        sig.end_line,
+                        sig.end_column,
+                    ),
+                    DefinitionInfo::Class(class_info) => (
+                        class_info.start_line,
+                        class_info.start_column,
+                        class_info.end_line,
+                        class_info.end_column,
+                    ),
+                },
+                Err(e) => {
+                    self.client
+                        .log_message(
+                            MessageType::WARNING,
+                            format!("Could not extract definition info: {}", e),
+                        )
+                        .await;
+                    return Ok(None);
+                }
+            };
 
         // Convert file path to URI
         let target_uri = match Url::from_file_path(&file_path) {
@@ -661,18 +693,16 @@ impl LanguageServer for HydraLspBackend {
             }
         };
 
-        // For now, just navigate to the file (line 0)
-        // TODO: Find the exact line number of the definition
         Ok(Some(GotoDefinitionResponse::Scalar(Location {
             uri: target_uri,
             range: Range {
                 start: Position {
-                    line: 0,
-                    character: 0,
+                    line: start_line,
+                    character: start_col,
                 },
                 end: Position {
-                    line: 0,
-                    character: 0,
+                    line: end_line,
+                    character: end_col,
                 },
             },
         })))

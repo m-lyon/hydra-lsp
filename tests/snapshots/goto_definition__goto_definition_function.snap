@@ -1,0 +1,9 @@
+---
+source: tests/goto_definition.rs
+expression: "format!(\"File: {}\\nStart Line: {}\\nStart Character: {}\\nEnd Line: {}\\nEnd Character: {}\",\nfile_name, location.range.start.line, location.range.start.character,\nlocation.range.end.line, location.range.end.character)"
+---
+File: my_module.py
+Start Line: 18
+Start Character: 0
+End Line: 29
+End Character: 15

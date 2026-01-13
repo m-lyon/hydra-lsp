@@ -279,13 +279,19 @@ mod tests {
             ],
             return_type: None,
             docstring: None,
+            start_line: 1,
+            start_column: 1,
+            end_line: 1,
+            end_column: 1,
         };
 
         let diagnostics = validate_parameters(&target_info, &signature);
         assert_eq!(diagnostics.len(), 1);
-        assert!(diagnostics[0]
-            .message
-            .contains("Missing required parameter"));
+        assert!(
+            diagnostics[0]
+                .message
+                .contains("Missing required parameter")
+        );
         assert_eq!(
             diagnostics[0].code,
             Some(tower_lsp::lsp_types::NumberOrString::String(
@@ -323,6 +329,10 @@ mod tests {
             }],
             return_type: None,
             docstring: None,
+            start_line: 1,
+            start_column: 1,
+            end_line: 1,
+            end_column: 1,
         };
 
         let diagnostics = validate_parameters(&target_info, &signature);
@@ -376,13 +386,19 @@ mod tests {
             ],
             return_type: None,
             docstring: None,
+            start_line: 1,
+            start_column: 1,
+            end_line: 1,
+            end_column: 1,
         };
 
         let diagnostics = validate_parameters(&target_info, &signature);
         // Should be a HINT, not ERROR
-        assert!(diagnostics
-            .iter()
-            .any(|d| d.severity == Some(DiagnosticSeverity::HINT)));
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.severity == Some(DiagnosticSeverity::HINT))
+        );
         assert!(diagnostics.iter().any(|d| d.message.contains("**kwargs")));
     }
 
