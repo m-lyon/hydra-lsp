@@ -110,10 +110,15 @@ impl ParameterValue {
 
 #[derive(Debug, Clone)]
 pub struct TargetInfo {
+    /// The target value (class/function path)
     pub value: String,
+    /// Parameters for the target
     pub parameters: Vec<ParameterValue>,
+    /// The line number where the `_target_` key is located
     pub line: u32,
+    /// The start position of the `_target_` key in the line
     pub key_start: u32,
+    /// The start position of the target value in the line
     pub value_start: u32,
 }
 
@@ -138,7 +143,7 @@ impl TargetInfo {
 pub struct YamlParser;
 
 impl YamlParser {
-    /// Parse YAML content and extract all _target_ references with their parameters
+    /// Parse YAML content and extract all `_target_` references with their parameters
     /// Returns a vector of TargetInfo and a line-to-index lookup map
     pub fn parse(
         content: &str,
@@ -175,32 +180,38 @@ impl YamlParser {
         false
     }
 
-    /// Check for Hydra comment markers (# @hydra or # hydra:)
+    /// Check for Hydra comment markers (# @hydra, # @package, # hydra:)
     fn has_hydra_comment(content: &str) -> bool {
         content
             .lines()
             .take(10) // Check first 10 lines
             .any(|line| {
                 let trimmed = line.trim();
-                trimmed.starts_with("# @hydra") || trimmed.starts_with("# hydra:")
+                trimmed.starts_with("# @hydra")
+                    || trimmed.starts_with("# @package")
+                    || trimmed.starts_with("# hydra:")
             })
     }
 
     /// Check if content contains `_target_` keyword
     fn has_target_keyword(content: &str) -> bool {
-        Self::find_target_with_colon(content).is_some()
+        Self::find_valid_target_key(content).is_some()
     }
 
     /// Find "_target_" (optionally surrounded by quotes) followed by optional whitespace and ":"
     /// Returns the position of the opening quote or "_target_" if found, and the offset to _target_
-    fn find_target_with_colon(text: &str) -> Option<(usize, usize)> {
+    fn find_valid_target_key(text: &str) -> Option<(usize, usize)> {
         let mut pos = 0;
         while let Some(target_pos) = text[pos..].find(TARGET_KEY) {
             let absolute_pos = pos + target_pos;
             let after_target = absolute_pos + TARGET_KEY.len();
 
-            if after_target >= text.len() {
-                return None;
+            // Check if there's a comment marker before _target_ (ignoring whitespace)
+            let before_text = &text[..absolute_pos];
+            if before_text.rfind('#').is_some() {
+                // This _target_ is commented out, skip it
+                pos = after_target;
+                continue;
             }
 
             // Check if there's a quote before _target_
@@ -335,31 +346,48 @@ impl YamlParser {
         let mut targets = targets;
         let mut positioned_targets = Vec::new();
         for (line_num, line) in content.lines().enumerate() {
+            if targets.is_empty() {
+                return positioned_targets;
+            }
             // Look for _target_ followed by optional whitespace and colon
-            if let Some((col, quote_offset)) = Self::find_target_with_colon(line) {
-                // remove the first entry from targets
+            if let Some((col, quote_offset)) = Self::find_valid_target_key(line) {
+                // Find the colon position after potential whitespace (and closing quote if present)
+                let after_target = col + quote_offset + TARGET_KEY.len();
+                let colon_offset = match line[after_target..].find(':') {
+                    Some(offset) => offset,
+                    None => continue, // No colon found, skip this line
+                };
+
+                let after_colon = after_target + colon_offset + 1;
+                // find the value start position (first non-whitespace after colon)
+                let value_info = line[after_colon..].find(|c: char| !c.is_whitespace());
+
+                // Check if there's a value and it's not a comment
+                if value_info.is_none() {
+                    // Empty value, skip this line
+                    continue;
+                }
+
+                let value_offset = value_info.unwrap();
+                let potential_value_start = after_colon + value_offset;
+                let value_char = line.chars().nth(potential_value_start);
+
+                // If the value is a comment, skip this line
+                if value_char == Some('#') {
+                    continue;
+                }
+
+                // Now we know this is a valid _target_ with a value, consume a target from the queue
                 let mut target = targets.pop_front().unwrap();
                 target.line = line_num as u32;
                 target.key_start = col as u32;
 
-                // Find the colon position after potential whitespace (and closing quote if present)
-                let after_target = col + quote_offset + TARGET_KEY.len();
-                if let Some(colon_offset) = line[after_target..].find(':') {
-                    let after_colon = after_target + colon_offset + 1;
-                    // find the value start position (first non-whitespace after colon)
-                    if let Some(value_offset) =
-                        line[after_colon..].find(|c: char| !c.is_whitespace())
-                    {
-                        let potential_value_start = after_colon + value_offset;
-                        // Check if the value starts with a quote
-                        let value_char = line.chars().nth(potential_value_start);
-                        if value_char == Some('"') || value_char == Some('\'') {
-                            // Skip the opening quote
-                            target.value_start = (potential_value_start + 1) as u32;
-                        } else {
-                            target.value_start = potential_value_start as u32;
-                        }
-                    }
+                // Set the value start position
+                if value_char == Some('"') || value_char == Some('\'') {
+                    // Skip the opening quote
+                    target.value_start = (potential_value_start + 1) as u32;
+                } else {
+                    target.value_start = potential_value_start as u32;
                 }
 
                 // Find parameter positions in subsequent lines
@@ -412,7 +440,7 @@ impl YamlParser {
         let prefix = &line[..char_pos];
 
         // Check if we're completing a _target_ value
-        if let Some((target_pos, quote_offset)) = Self::find_target_with_colon(prefix) {
+        if let Some((target_pos, quote_offset)) = Self::find_valid_target_key(prefix) {
             // Find the colon position after potential whitespace
             let after_target = target_pos + quote_offset + TARGET_KEY.len();
             if let Some(colon_offset) = prefix[after_target..].find(':') {
@@ -478,7 +506,7 @@ impl YamlParser {
             }
 
             // Check if this line has _target_
-            if let Some((target_pos, quote_offset)) = Self::find_target_with_colon(line)
+            if let Some((target_pos, quote_offset)) = Self::find_valid_target_key(line)
                 && line_indent == current_indent
             {
                 // Find the colon and extract the value
@@ -1085,6 +1113,89 @@ another:
         assert_eq!(second.value, "another.Model");
         assert_eq!(second.line, 5);
         assert_eq!(second.key_start, 2);
+    }
+
+    #[test]
+    fn test_target_with_comments() {
+        // Test that we can handle a commented out _target_
+        let content = r#"
+training:
+  trainer:
+    logger:
+      # - _target_: package.loggers.Logger
+      - _target_: package.debug.Logger
+        project_name: my_project
+"#;
+        let (targets, line_map) = YamlParser::parse(content).unwrap();
+        assert_eq!(targets.len(), 1, "Should have 1 target");
+        assert_eq!(line_map.len(), 1, "Line map should have 1 entry");
+
+        let target = targets.first().unwrap();
+        assert_eq!(target.value, "package.debug.Logger");
+        assert_eq!(target.line, 5);
+        assert_eq!(target.key_start, 8);
+    }
+
+    #[test]
+    fn test_empty_target_value() {
+        // Test that we can handle _target_: with empty value
+        let content = r#"
+model:
+  _target_: 
+  hidden_size: 256
+"#;
+        let (targets, _) = YamlParser::parse(content).unwrap();
+        assert_eq!(targets.len(), 0, "Should have 0 targets");
+    }
+
+    #[test]
+    fn test_empty_target_value_with_one_valid() {
+        // Test that we can handle _target_: with empty value among valid targets
+        let content = r#"
+model:
+  _target_: 
+  hidden_size: 256
+another:
+  _target_: myproject.Model
+  param: value
+"#;
+        let (targets, _) = YamlParser::parse(content).unwrap();
+        assert_eq!(targets.len(), 1, "Should have 1 target");
+        let target = targets.first().unwrap();
+        assert_eq!(target.value, "myproject.Model");
+        assert_eq!(target.line, 5);
+        assert_eq!(target.key_start, 2);
+    }
+
+    #[test]
+    fn test_commented_out_target_value() {
+        // Test that we can handle _target_: with empty value
+        let content = r#"
+model:
+  _target_: # comment
+  hidden_size: 256
+"#;
+        let (targets, _) = YamlParser::parse(content).unwrap();
+        assert_eq!(targets.len(), 0, "Should have 0 targets");
+    }
+
+    #[test]
+    fn test_commented_out_target_value_with_one_valid() {
+        // Test that we can handle _target_: with empty value among valid targets
+        let content = r#"
+model:
+  _target_: # comment
+  hidden_size: 256
+another:
+  _target_: myproject.Model
+  param: value
+"#;
+        let (targets, _) = YamlParser::parse(content).unwrap();
+        assert_eq!(targets.len(), 1, "Should have 1 target");
+        let target = targets.first().unwrap();
+        assert_eq!(target.value, "myproject.Model");
+        assert_eq!(target.line, 5);
+        assert_eq!(target.key_start, 2);
     }
 
     #[test]

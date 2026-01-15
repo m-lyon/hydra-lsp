@@ -14,9 +14,6 @@ cargo test --test hover
 # Run with output visible
 cargo test -- --nocapture
 
-# Update all snapshots (first run)
-INSTA_UPDATE=always cargo test
-
 # Review snapshots interactively (requires cargo-insta)
 cargo install cargo-insta
 cargo test
