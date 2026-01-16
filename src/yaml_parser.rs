@@ -195,72 +195,85 @@ impl YamlParser {
 
     /// Check if content contains `_target_` keyword
     fn has_target_keyword(content: &str) -> bool {
-        Self::find_valid_target_key(content).is_some()
+        content
+            .lines()
+            .any(|line| Self::find_valid_target_key(line).is_some())
     }
 
-    /// Find "_target_" (optionally surrounded by quotes) followed by optional whitespace and ":"
-    /// Returns the position of the opening quote or "_target_" if found, and the offset to _target_
-    fn find_valid_target_key(text: &str) -> Option<(usize, usize)> {
-        let mut pos = 0;
-        while let Some(target_pos) = text[pos..].find(TARGET_KEY) {
-            let absolute_pos = pos + target_pos;
-            let after_target = absolute_pos + TARGET_KEY.len();
+    /// Find `_target_` (optionally surrounded by quotes) followed by optional whitespace and ":"
+    /// in a single line. Returns the position of the opening quote or `_target_` if found,
+    /// and the offset to `_target_`. Valid only if preceded by whitespace or "- " (single dash
+    /// with space for YAML lists)
+    fn find_valid_target_key(line: &str) -> Option<(usize, usize)> {
+        // Find _target_ in the line
+        let target_pos = line.find(TARGET_KEY)?;
 
-            // Check if there's a comment marker before _target_ (ignoring whitespace)
-            let before_text = &text[..absolute_pos];
-            if before_text.rfind('#').is_some() {
-                // This _target_ is commented out, skip it
-                pos = after_target;
-                continue;
+        // Check if there's a quote immediately before _target_
+        let (key_start, quote_offset) = if target_pos > 0 {
+            let prev_char = line.chars().nth(target_pos - 1)?;
+            if prev_char == '"' || prev_char == '\'' {
+                (target_pos - 1, 1)
+            } else {
+                (target_pos, 0)
             }
+        } else {
+            (target_pos, 0)
+        };
 
-            // Check if there's a quote before _target_
-            let mut quote_offset = 0;
-            let mut key_start = absolute_pos;
-            if absolute_pos > 0 {
-                let before_char = text.chars().nth(absolute_pos - 1);
-                if before_char == Some('"') || before_char == Some('\'') {
-                    quote_offset = 1;
-                    key_start = absolute_pos - 1;
-                }
-            }
+        // Validate prefix (everything before the quote or _target_)
+        let prefix = &line[..key_start];
 
-            // Check for optional whitespace followed by colon
-            let remaining = &text[after_target..];
-            let mut chars = remaining.chars().peekable();
-            let mut found_colon = false;
-            let mut found_closing_quote = false;
+        // Check if prefix matches: optional whitespace, optionally "- " followed by whitespace
+        let is_valid_prefix = if let Some(dash_pos) = prefix.rfind('-') {
+            // Has a dash - validate: whitespace + "-" + " " + whitespace
+            let before_dash = &prefix[..dash_pos];
+            let after_dash = &prefix[dash_pos + 1..];
 
-            // If we found an opening quote, look for closing quote first
-            if quote_offset > 0 {
-                let opening_quote = text.chars().nth(absolute_pos - 1).unwrap();
-                if let Some(&ch) = chars.peek()
-                    && ch == opening_quote
-                {
-                    found_closing_quote = true;
-                    chars.next(); // consume the quote
-                }
-            }
+            before_dash.chars().all(|c| c.is_whitespace())
+                && after_dash.starts_with(' ')
+                && after_dash[1..].chars().all(|c| c.is_whitespace())
+        } else {
+            // No dash - just whitespace
+            prefix.chars().all(|c| c.is_whitespace())
+        };
 
-            // Now look for optional whitespace and colon
-            for ch in chars.by_ref() {
-                if ch == ':' {
-                    found_colon = true;
-                    break;
-                } else if !ch.is_whitespace() {
-                    break;
-                }
-            }
-
-            // Valid if we found a colon AND (no opening quote OR found matching closing quote)
-            let is_valid = found_colon && (quote_offset == 0 || found_closing_quote);
-            if is_valid {
-                return Some((key_start, quote_offset));
-            }
-
-            pos = after_target;
+        if !is_valid_prefix {
+            return None;
         }
-        None
+
+        // Check what comes after _target_
+        let after_target = &line[target_pos + TARGET_KEY.len()..];
+
+        // If we have a quote, we need the matching closing quote
+        if quote_offset > 0 {
+            let quote_char = line.chars().nth(target_pos - 1)?;
+            let mut chars = after_target.chars();
+
+            // First char must be the closing quote
+            if chars.next() != Some(quote_char) {
+                return None;
+            }
+
+            // Then optional whitespace followed by colon
+            for ch in chars {
+                if ch == ':' {
+                    return Some((key_start, quote_offset));
+                } else if !ch.is_whitespace() {
+                    return None;
+                }
+            }
+            None
+        } else {
+            // No quotes - just optional whitespace then colon
+            for ch in after_target.chars() {
+                if ch == ':' {
+                    return Some((key_start, quote_offset));
+                } else if !ch.is_whitespace() {
+                    return None;
+                }
+            }
+            None
+        }
     }
 
     /// Find the target info at a specific position
@@ -1523,5 +1536,182 @@ model:
             string_tokens.len() >= 2,
             "Should have at least 2 string tokens"
         );
+    }
+
+    #[test]
+    fn test_find_valid_target_with_whitespace_prefix() {
+        // Valid: whitespace before _target_
+        let yaml = "  _target_: some.module.Class";
+        assert!(YamlParser::is_hydra_file(yaml));
+
+        let yaml = "    _target_: another.Class";
+        assert!(YamlParser::is_hydra_file(yaml));
+
+        let yaml = "\t_target_: tab.Class";
+        assert!(YamlParser::is_hydra_file(yaml));
+    }
+
+    #[test]
+    fn test_find_valid_target_with_list_item() {
+        // Valid: dash with space before _target_
+        let yaml = "- _target_: some.module.Class";
+        assert!(YamlParser::is_hydra_file(yaml));
+
+        let yaml = "  - _target_: another.Class";
+        assert!(YamlParser::is_hydra_file(yaml));
+
+        let yaml = "    - _target_: nested.Class";
+        assert!(YamlParser::is_hydra_file(yaml));
+    }
+
+    #[test]
+    fn test_find_valid_target_with_quotes() {
+        // Valid: quoted _target_ with whitespace prefix
+        let yaml = "  \"_target_\": some.module.Class";
+        assert!(YamlParser::is_hydra_file(yaml));
+
+        let yaml = "  '_target_': another.Class";
+        assert!(YamlParser::is_hydra_file(yaml));
+
+        // Valid: quoted _target_ with list item
+        let yaml = "- \"_target_\": some.module.Class";
+        assert!(YamlParser::is_hydra_file(yaml));
+
+        let yaml = "  - '_target_': another.Class";
+        assert!(YamlParser::is_hydra_file(yaml));
+    }
+
+    #[test]
+    fn test_invalid_target_with_invalid_prefix() {
+        // Invalid: non-whitespace before _target_
+        let yaml = "key_target_: some.module.Class";
+        assert!(!YamlParser::is_hydra_file(yaml));
+
+        let yaml = "my_target_: another.Class";
+        assert!(!YamlParser::is_hydra_file(yaml));
+
+        let yaml = "some_prefix_target_: test.Class";
+        assert!(!YamlParser::is_hydra_file(yaml));
+    }
+
+    #[test]
+    fn test_invalid_target_with_double_dash() {
+        // Invalid: double dash (not valid YAML list marker)
+        let yaml = "-- _target_: some.module.Class";
+        assert!(!YamlParser::is_hydra_file(yaml));
+
+        let yaml = "  -- _target_: another.Class";
+        assert!(!YamlParser::is_hydra_file(yaml));
+    }
+
+    #[test]
+    fn test_invalid_target_with_dash_no_space() {
+        // Invalid: dash without space after it
+        let yaml = "-_target_: some.module.Class";
+        assert!(!YamlParser::is_hydra_file(yaml));
+
+        let yaml = "  -_target_: another.Class";
+        assert!(!YamlParser::is_hydra_file(yaml));
+    }
+
+    #[test]
+    fn test_invalid_target_with_dash_multiple_spaces() {
+        // Note: multiple spaces after dash should still be valid (just whitespace)
+        let yaml = "-  _target_: some.module.Class";
+        assert!(YamlParser::is_hydra_file(yaml));
+
+        let yaml = "  -   _target_: another.Class";
+        assert!(YamlParser::is_hydra_file(yaml));
+    }
+
+    #[test]
+    fn test_valid_target_commented_out() {
+        // Invalid: commented out _target_
+        let yaml = "  # _target_: some.module.Class";
+        assert!(!YamlParser::is_hydra_file(yaml));
+
+        let yaml = "# - _target_: another.Class";
+        assert!(!YamlParser::is_hydra_file(yaml));
+    }
+
+    #[test]
+    fn test_multiline_yaml_with_valid_targets() {
+        let yaml = r#"
+config:
+  _target_: some.module.Class
+  param1: value1
+
+items:
+  - _target_: first.Item
+    value: 1
+  - _target_: second.Item
+    value: 2
+"#;
+        assert!(YamlParser::is_hydra_file(yaml));
+
+        // Parse and verify all targets are found
+        let result = YamlParser::parse(yaml);
+        assert!(result.is_ok());
+        let (targets, _) = result.unwrap();
+        assert_eq!(targets.len(), 3); // config._target_, items[0]._target_, items[1]._target_
+    }
+
+    #[test]
+    fn test_multiline_yaml_with_invalid_targets() {
+        let yaml = r#"
+config:
+  prefix_target_: some.module.Class
+  param1: value1
+
+items:
+  key_target_: not.a.valid.Target
+"#;
+        assert!(!YamlParser::is_hydra_file(yaml));
+    }
+
+    #[test]
+    fn test_mixed_valid_and_invalid_targets() {
+        // This has one valid target and one invalid (as part of a key name)
+        let yaml = r#"
+valid:
+  _target_: some.module.Class
+  
+invalid_target_key: this is not a target
+"#;
+        // Should detect as hydra file because of the valid _target_
+        assert!(YamlParser::is_hydra_file(yaml));
+
+        let result = YamlParser::parse(yaml);
+        assert!(result.is_ok());
+        let (targets, _) = result.unwrap();
+        // Should only find the one valid target
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].value, "some.module.Class");
+    }
+
+    #[test]
+    fn test_edge_case_target_at_start_of_file() {
+        // Valid: _target_ at very start of file (no indentation)
+        let yaml = "_target_: some.module.Class";
+        assert!(YamlParser::is_hydra_file(yaml));
+
+        let result = YamlParser::parse(yaml);
+        assert!(result.is_ok());
+        let (targets, _) = result.unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].value, "some.module.Class");
+    }
+
+    #[test]
+    fn test_edge_case_list_at_start_of_file() {
+        // Valid: list item with _target_ at start of file
+        let yaml = "- _target_: some.module.Class";
+        assert!(YamlParser::is_hydra_file(yaml));
+
+        let result = YamlParser::parse(yaml);
+        assert!(result.is_ok());
+        let (targets, _) = result.unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].value, "some.module.Class");
     }
 }
