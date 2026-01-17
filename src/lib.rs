@@ -1,5 +1,5 @@
 pub mod backend;
-mod diagnostics;
+pub mod diagnostics;
 mod document;
 pub mod python_analyzer;
-mod yaml_parser;
+pub mod yaml_parser;

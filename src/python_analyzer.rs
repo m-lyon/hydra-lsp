@@ -123,7 +123,7 @@ impl PythonAnalyzer {
         Ok(site_packages_paths.into_vec())
     }
 
-    /// Resolve a Python module path to a file path using ty's sophisticated module resolution
+    /// Resolve a Python module path to a file path using ty's module resolution
     ///
     /// This implementation:
     /// - Discovers Python environment (venv, conda, system)

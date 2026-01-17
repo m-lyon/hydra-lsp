@@ -28,6 +28,52 @@ A Language Server Protocol implementation for [Hydra](https://hydra.cc/) configu
 - 🔄 **Type Validation**: Validate YAML values against Python type annotations
 - 🔄 **Smart Autocomplete**: Suggest Python classes/functions and parameters
 
+## CLI Tool: hydra-check
+
+In addition to the language server, this project provides a standalone CLI tool for diagnosing Hydra YAML configuration files. This is useful for:
+
+- Debugging why a `_target_` is not being resolved
+- CI/CD pipeline validation
+- Quick command-line checks without an IDE
+
+### Usage
+
+```bash
+# Basic usage
+hydra-check config.yaml
+
+# Specify workspace root for local module resolution
+hydra-check config.yaml -w /path/to/project
+
+# Specify Python interpreter for site-packages resolution
+hydra-check config.yaml -p /path/to/venv/bin/python
+
+# Enable detailed resolution tracing for debugging
+hydra-check config.yaml --trace-resolution
+
+# Change verbosity level (error, warn, info, debug, trace)
+hydra-check config.yaml -v debug
+
+# Output in different formats (pretty, json, compact)
+hydra-check config.yaml -f json
+```
+
+### Options
+
+| Option | Description |
+|--------|-------------|
+| `-w, --workspace <PATH>` | Working directory for resolving Python modules |
+| `-p, --python <PATH>` | Path to Python interpreter for module resolution |
+| `-v, --verbosity <LEVEL>` | Logging verbosity: error, warn, info, debug, trace |
+| `-f, --format <FORMAT>` | Output format: pretty (default), json, compact |
+| `--trace-resolution` | Show detailed resolution steps for each target |
+
+### Exit Codes
+
+- `0`: No errors found
+- `1`: One or more errors found
+- `2`: Fatal error (file not found, parse error, etc.)
+
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.

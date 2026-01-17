@@ -15,6 +15,10 @@ path = "src/lib.rs"
 name = "hydra-lsp"
 path = "src/main.rs"
 
+[[bin]]
+name = "hydra-check"
+path = "src/cli.rs"
+
 [dependencies]
 # LSP framework
 tower-lsp = "0.20"
@@ -56,6 +60,8 @@ thiserror = "2.0"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 tempfile = "3.24.0"
+clap = { version = "4.5", features = ["derive"] }
+colored = "2.1"
 
 [dev-dependencies]
 tokio-test = "0.4"
