@@ -1,6 +1,6 @@
 [package]
 name = "hydra-lsp"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 authors = ["hydra-lsp contributors"]
 description = "Language Server Protocol implementation for Hydra configuration files"
@@ -53,6 +53,7 @@ salsa = { git = "https://github.com/salsa-rs/salsa.git", rev = "ce80691fa0b87dc2
     "salsa_unstable",
     "inventory",
 ] }
+rustc-hash = "2.1"
 
 # Utilities
 anyhow = "1.0"

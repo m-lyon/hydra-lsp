@@ -134,7 +134,7 @@ model:
     // Should have module not found error
     let module_not_found = diagnostics
         .iter()
-        .find(|d| d.message.contains("Cannot resolve module"));
+        .find(|d| d.message.contains("Could not resolve module"));
 
     assert!(
         module_not_found.is_some(),

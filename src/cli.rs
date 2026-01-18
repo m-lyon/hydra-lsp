@@ -219,61 +219,46 @@ fn trace_target_resolution(
         target.line + 1
     );
 
-    // Split target
-    match PythonAnalyzer::split_target(&target.value) {
-        Ok((module_path, symbol_name)) => {
+    // Try to extract definition info
+    match PythonAnalyzer::extract_definition_info(&target.value, workspace_root, python_interpreter)
+    {
+        Ok((def_info, file_path, module_path, symbol_name)) => {
             println!("  {} {}", "Module:".dimmed(), module_path);
             println!("  {} {}", "Symbol:".dimmed(), symbol_name);
+            println!("  {} {}", "Definition found:".green(), file_path.display());
 
-            // Try to resolve module
-            match PythonAnalyzer::resolve_module(&module_path, workspace_root, python_interpreter) {
-                Ok(file_path) => {
-                    println!("  {} {}", "Resolved to:".green(), file_path.display());
-
-                    // Try to extract definition info
-                    match PythonAnalyzer::extract_definition_info(
-                        &target.value,
-                        workspace_root,
-                        python_interpreter,
-                    ) {
-                        Ok(def_info) => match def_info {
-                            hydra_lsp::python_analyzer::DefinitionInfo::Function(sig) => {
-                                println!("  {} Function", "Type:".dimmed());
-                                println!(
-                                    "  {} {}",
-                                    "Signature:".dimmed(),
-                                    format_signature_brief(&sig)
-                                );
-                            }
-                            hydra_lsp::python_analyzer::DefinitionInfo::Class(class_info) => {
-                                println!("  {} Class", "Type:".dimmed());
-                                if let Some(ref init_sig) = class_info.init_signature {
-                                    println!(
-                                        "  {} {}",
-                                        "__init__:".dimmed(),
-                                        format_signature_brief(init_sig)
-                                    );
-                                } else {
-                                    println!("  {} (no __init__ found)", "__init__:".dimmed());
-                                }
-                            }
-                        },
-                        Err(e) => {
-                            println!(
-                                "  {} Could not extract definition: {}",
-                                "Warning:".yellow(),
-                                e
-                            );
-                        }
-                    }
+            match def_info {
+                hydra_lsp::python_analyzer::DefinitionInfo::Function(sig) => {
+                    println!("  {} Function", "Type:".dimmed());
+                    println!(
+                        "  {} {}",
+                        "Signature:".dimmed(),
+                        format_signature_brief(&sig)
+                    );
                 }
-                Err(e) => {
-                    println!("  {} {}", "Resolution failed:".red(), e);
+                hydra_lsp::python_analyzer::DefinitionInfo::Class(class_info) => {
+                    println!("  {} Class", "Type:".dimmed());
+                    if let Some(ref init_sig) = class_info.init_signature {
+                        println!(
+                            "  {} {}",
+                            "__init__:".dimmed(),
+                            format_signature_brief(init_sig)
+                        );
+                    } else {
+                        println!("  {} (no __init__ found)", "__init__:".dimmed());
+                    }
                 }
             }
         }
         Err(e) => {
-            println!("  {} Invalid target format: {}", "Error:".red(), e);
+            let error_msg = e.to_string();
+            if error_msg.starts_with("Invalid _target_ format:")
+                || error_msg.starts_with("Could not resolve module:")
+            {
+                println!("  {} {}", "Error:".red(), error_msg)
+            } else {
+                println!("  {} {}", "Warning:".yellow(), error_msg);
+            }
         }
     }
 

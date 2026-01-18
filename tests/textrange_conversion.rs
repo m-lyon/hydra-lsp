@@ -213,12 +213,13 @@ def test_function(x: int) -> int:
     let test_file = workspace_dir.join("test_module.py");
     fs::write(&test_file, source).unwrap();
 
-    let def_info = PythonAnalyzer::extract_definition_info(
-        "workspace.test_module.test_function",
-        Some(workspace_root),
-        None,
-    )
-    .unwrap();
+    let (def_info, _file_path, _module_path, _symbol_name) =
+        PythonAnalyzer::extract_definition_info(
+            "workspace.test_module.test_function",
+            Some(workspace_root),
+            None,
+        )
+        .unwrap();
 
     match def_info {
         DefinitionInfo::Function(sig) => {
@@ -252,12 +253,13 @@ class TestClass:
     let test_file = workspace_dir.join("test_class_module.py");
     fs::write(&test_file, source).unwrap();
 
-    let def_info = PythonAnalyzer::extract_definition_info(
-        "workspace.test_class_module.TestClass",
-        Some(workspace_root),
-        None,
-    )
-    .unwrap();
+    let (def_info, _file_path, _module_path, _symbol_name) =
+        PythonAnalyzer::extract_definition_info(
+            "workspace.test_class_module.TestClass",
+            Some(workspace_root),
+            None,
+        )
+        .unwrap();
 
     match def_info {
         DefinitionInfo::Class(class_info) => {

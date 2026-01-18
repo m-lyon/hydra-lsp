@@ -1,0 +1,20 @@
+# Test configuration for re-export resolution
+model:
+    _target_: mylib.Linear
+    in_features: 128
+    out_features: 64
+
+# Test with direct import
+optimizer:
+    _target_: mylib.modules.linear.DirectClass
+    value: 10
+
+# Test with aliased import
+trainer:
+    _target_: mylib.AliasedClass
+    param: 'test'
+
+# Test with star import chain
+data:
+    _target_: mylib.StarExportedClass
+    size: 100

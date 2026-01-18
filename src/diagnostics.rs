@@ -30,76 +30,46 @@ fn create_diagnostic(
     }
 }
 
-/// Validate a Hydra configuration and generate diagnostics
+/// Validate a Hydra _target_ entry. Returns diagnostics and optionally the resolved
+/// DefinitionInfo.
 fn validate_target(
     target_info: &TargetInfo,
     workspace_root: Option<&std::path::Path>,
     python_interpreter: Option<&str>,
-) -> Vec<Diagnostic> {
+) -> (Vec<Diagnostic>, Option<DefinitionInfo>) {
     let mut diagnostics = Vec::new();
 
-    // Split target to validate format
-    let (module_path, symbol_name) = match PythonAnalyzer::split_target(&target_info.value) {
-        Ok(parts) => parts,
-        Err(_) => {
-            // Invalid target format
-            diagnostics.push(create_diagnostic(
-                target_info.line,
-                target_info.value_start,
-                target_info.value_end(),
-                DiagnosticSeverity::ERROR,
-                Some("invalid-target"),
-                format!(
-                    "Invalid _target_ format: '{}'. Expected format: 'module.path.SymbolName'",
-                    target_info.value
-                ),
-            ));
-            return diagnostics;
-        }
-    };
-
-    // Try to resolve the module to check if it exists
-    match PythonAnalyzer::resolve_module(&module_path, workspace_root, python_interpreter) {
-        Ok(file_path) => {
-            // Module resolved successfully, now try to find the symbol
-            let symbol_found =
-                match PythonAnalyzer::extract_function_signature(&file_path, &symbol_name) {
-                    Ok(_) => true,
-                    Err(_) => {
-                        // Not a function, try as a class
-                        PythonAnalyzer::extract_class_info(&file_path, &symbol_name).is_ok()
-                    }
-                };
-
-            if !symbol_found {
-                // Module exists but symbol not found
-                diagnostics.push(create_diagnostic(
-                    target_info.line,
-                    target_info.value_start,
-                    target_info.value_end(),
-                    DiagnosticSeverity::ERROR,
-                    Some("symbol-not-found"),
-                    format!(
-                        "Symbol '{}' not found in module '{}'",
-                        symbol_name, module_path
-                    ),
-                ));
-            }
+    match PythonAnalyzer::extract_definition_info(
+        &target_info.value,
+        workspace_root,
+        python_interpreter,
+    ) {
+        Ok((definition_info, _file_path, _module_path, _symbol_name)) => {
+            return (diagnostics, Some(definition_info));
         }
         Err(err) => {
-            // Module could not be resolved
+            let error_msg = err.to_string();
+            let (code, msg) = if error_msg.starts_with("Could not resolve module:") {
+                ("module-not-found", error_msg)
+            } else if error_msg.starts_with("Invalid _target_ format:") {
+                (
+                    "invalid-target",
+                    format!("{}. Expected format: 'module.path.SymbolName'", error_msg),
+                )
+            } else {
+                ("symbol-not-found", error_msg)
+            };
             diagnostics.push(create_diagnostic(
                 target_info.line,
                 target_info.value_start,
                 target_info.value_end(),
                 DiagnosticSeverity::ERROR,
-                Some("module-not-found"),
-                format!("Cannot resolve module '{}': {}", module_path, err),
+                Some(code),
+                msg,
             ));
+            return (diagnostics, None);
         }
     }
-
-    diagnostics
 }
 
 /// Validate parameters against a function signature
@@ -192,15 +162,12 @@ pub fn validate_document(
     let mut diagnostics = Vec::new();
 
     for target in &targets {
-        let target_diagnostics = validate_target(target, workspace_root, python_interpreter);
+        let (target_diagnostics, definition_info) =
+            validate_target(target, workspace_root, python_interpreter);
         diagnostics.extend(target_diagnostics);
 
         // Try to resolve the target and validate parameters
-        if let Ok(definition_info) = PythonAnalyzer::extract_definition_info(
-            &target.value,
-            workspace_root,
-            python_interpreter,
-        ) {
+        if let Some(definition_info) = definition_info {
             let signature = match definition_info {
                 DefinitionInfo::Function(sig) => sig,
                 DefinitionInfo::Class(class_info) => {
@@ -414,7 +381,7 @@ mod tests {
             value_start: 10 + "_target_:".len() as u32 + 1,
         };
 
-        let diagnostics = validate_target(&target_info, None, None);
+        let (diagnostics, _definition_info) = validate_target(&target_info, None, None);
         assert_eq!(diagnostics.len(), 1);
         assert!(diagnostics[0].message.contains("Invalid _target_ format"));
         assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
@@ -436,9 +403,14 @@ mod tests {
             value_start: 10 + "_target_:".len() as u32 + 1,
         };
 
-        let diagnostics = validate_target(&target_info, Some(&get_test_resources_dir()), None);
+        let (diagnostics, _definition_info) =
+            validate_target(&target_info, Some(&get_test_resources_dir()), None);
         assert_eq!(diagnostics.len(), 1);
-        assert!(diagnostics[0].message.contains("Cannot resolve module"));
+        assert!(
+            diagnostics[0].message.contains("Could not resolve module"),
+            "Got message: {}",
+            diagnostics[0].message
+        );
         assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
         assert_eq!(
             diagnostics[0].code,
@@ -459,7 +431,8 @@ mod tests {
         };
 
         let resources_dir = get_test_resources_dir();
-        let diagnostics = validate_target(&target_info, Some(&resources_dir), None);
+        let (diagnostics, _definition_info) =
+            validate_target(&target_info, Some(&resources_dir), None);
         assert_eq!(diagnostics.len(), 1);
         assert!(diagnostics[0].message.contains("Symbol"));
         assert!(diagnostics[0].message.contains("not found"));
@@ -483,7 +456,8 @@ mod tests {
         };
 
         let resources_dir = get_test_resources_dir();
-        let diagnostics = validate_target(&target_info, Some(&resources_dir), None);
+        let (diagnostics, _definition_info) =
+            validate_target(&target_info, Some(&resources_dir), None);
 
         // Should not have module/symbol not found errors
         assert!(
@@ -511,7 +485,8 @@ mod tests {
         };
 
         let resources_dir = get_test_resources_dir();
-        let diagnostics = validate_target(&target_info, Some(&resources_dir), None);
+        let (diagnostics, _definition_info) =
+            validate_target(&target_info, Some(&resources_dir), None);
 
         // Should not have module/symbol not found errors
         assert!(

@@ -1,3 +1,4 @@
+use crate::import_resolver::ImportResolver;
 use anyhow::Result;
 use ruff_db::system::{OsSystem, SystemPath, SystemPathBuf};
 use ruff_python_ast::{self as ast, Expr, Stmt, visitor::Visitor};
@@ -62,7 +63,7 @@ impl PythonAnalyzer {
     pub fn split_target(target: &str) -> Result<(String, String)> {
         let parts: Vec<&str> = target.split('.').collect();
         if parts.len() < 2 {
-            anyhow::bail!("Invalid target format: {}", target);
+            anyhow::bail!("Invalid _target_ format: '{}'", target);
         }
 
         let symbol_name = parts.last().unwrap().to_string();
@@ -105,7 +106,7 @@ impl PythonAnalyzer {
             let python_sys_path = SystemPath::from_std_path(Path::new(python_path_str))
                 .ok_or_else(|| anyhow::anyhow!("Invalid Python path"))?;
 
-            PythonEnvironment::new(python_sys_path, SysPrefixPathOrigin::PythonCliFlag, &system)?
+            PythonEnvironment::new(python_sys_path, SysPrefixPathOrigin::Editor, &system)?
         } else {
             // Auto-discover Python environment with built-in priority:
             // 1. Activated virtual environment (VIRTUAL_ENV)
@@ -130,40 +131,28 @@ impl PythonAnalyzer {
     /// - Uses proper site-packages resolution
     /// - Handles package hierarchies correctly
     /// - Supports .pyi stub files
+    /// Resolve a Python module path to a file path using ty's module resolution
+    ///
+    /// Returns the resolved file path and the search paths used
     pub fn resolve_module(
         module_path: &str,
         workspace_root: Option<&Path>,
         python_interpreter: Option<&str>,
+    ) -> Result<(PathBuf, Vec<PathBuf>)> {
+        let site_packages_paths =
+            Self::discover_python_environment(workspace_root, python_interpreter)
+                .unwrap_or_default();
+        let search_paths = Self::build_search_paths(workspace_root, site_packages_paths.to_vec());
+        let file_path = Self::resolve_module_with_search_paths(module_path, &search_paths)?;
+        Ok((file_path, search_paths))
+    }
+
+    /// Resolve a Python module path to a file path using pre-built search paths
+    pub fn resolve_module_with_search_paths(
+        module_path: &str,
+        search_paths: &[PathBuf],
     ) -> Result<PathBuf> {
         let module_parts: Vec<&str> = module_path.split('.').collect();
-
-        // Build search paths: workspace root + site-packages from ty
-        let mut search_paths = Vec::new();
-
-        // Add workspace root first (highest priority for first-party code)
-        if let Some(root) = workspace_root {
-            search_paths.push(PathBuf::from(root));
-        }
-
-        // Add current directory
-        search_paths.push(PathBuf::from("."));
-
-        // Use ty's environment discovery to get site-packages paths
-        match Self::discover_python_environment(workspace_root, python_interpreter) {
-            Ok(site_packages_paths) => {
-                // Convert SystemPathBuf to PathBuf for searching
-                for sys_path in site_packages_paths {
-                    // SystemPath provides as_std_path() to convert to std::path::Path
-                    search_paths.push(sys_path.as_std_path().to_path_buf());
-                }
-            }
-            Err(e) => {
-                // Log error but continue with basic search paths
-                eprintln!("Warning: Could not discover Python environment: {}", e);
-            }
-        }
-
-        // Store the count before iterating
         let search_path_count = search_paths.len();
 
         // Try to find the module as a package or file
@@ -179,26 +168,8 @@ impl PythonAnalyzer {
                 package_path.push(part);
             }
 
-            // Check for package __init__.py (prioritize .pyi over .py)
-            let init_pyi_path = package_path.join("__init__.pyi");
-            if init_pyi_path.exists() {
-                return Ok(init_pyi_path);
-            }
-
-            let init_path = package_path.join("__init__.py");
-            if init_path.exists() {
-                return Ok(init_path);
-            }
-
-            // Check for regular module file (prioritize .pyi over .py)
-            let file_pyi_path = package_path.with_extension("pyi");
-            if file_pyi_path.exists() {
-                return Ok(file_pyi_path);
-            }
-
-            let file_path = package_path.with_extension("py");
-            if file_path.exists() {
-                return Ok(file_path);
+            if let Some(found_path) = ImportResolver::find_module_file(&package_path) {
+                return Ok(found_path);
             }
 
             // Try parent as package and last part as module
@@ -223,7 +194,7 @@ impl PythonAnalyzer {
         }
 
         anyhow::bail!(
-            "Could not resolve module: {} (tried {} search paths)",
+            "Could not resolve module: '{}' (tried {} search paths)",
             module_path,
             search_path_count
         )
@@ -277,26 +248,137 @@ impl PythonAnalyzer {
         })
     }
 
-    /// Extract definition info (function or class) from a target string
+    /// Build search paths from discovered site-packages
+    fn build_search_paths(
+        workspace_root: Option<&Path>,
+        site_packages_paths: Vec<SystemPathBuf>,
+    ) -> Vec<PathBuf> {
+        let mut search_paths = Vec::new();
+
+        // Add workspace root first (highest priority for first-party code)
+        if let Some(root) = workspace_root {
+            search_paths.push(PathBuf::from(root));
+        }
+
+        // Add current directory
+        search_paths.push(PathBuf::from("."));
+
+        // Add site-packages paths
+        for sys_path in site_packages_paths {
+            search_paths.push(sys_path.as_std_path().to_path_buf());
+        }
+
+        search_paths
+    }
+
+    /// Extract class information, following re-exports if necessary
+    pub fn extract_class_info_with_imports(
+        file_path: &Path,
+        class_name: &str,
+        search_paths: Vec<PathBuf>,
+    ) -> Result<ClassInfo> {
+        // First try direct lookup
+        if let Ok(class_info) = Self::extract_class_info(file_path, class_name) {
+            return Ok(class_info);
+        }
+
+        // Try to resolve through imports
+        let mut resolver = ImportResolver::new(search_paths);
+        if let Some((resolved_file, resolved_name)) = resolver.resolve_symbol(file_path, class_name)
+        {
+            let actual_name = if resolved_name.is_empty() {
+                class_name.to_string()
+            } else {
+                resolved_name
+            };
+            return Self::extract_class_info(&resolved_file, &actual_name);
+        }
+
+        anyhow::bail!(
+            "Class '{}' not found in {} (also checked re-exports)",
+            class_name,
+            file_path.display()
+        )
+    }
+
+    /// Extract function signature, following re-exports if necessary
+    pub fn extract_function_signature_with_imports(
+        file_path: &Path,
+        function_name: &str,
+        search_paths: Vec<PathBuf>,
+    ) -> Result<FunctionSignature> {
+        // First try direct lookup
+        if let Ok(func_sig) = Self::extract_function_signature(file_path, function_name) {
+            return Ok(func_sig);
+        }
+
+        // Try to resolve through imports
+        let mut resolver = ImportResolver::new(search_paths);
+        if let Some((resolved_file, resolved_name)) =
+            resolver.resolve_symbol(file_path, function_name)
+        {
+            let actual_name = if resolved_name.is_empty() {
+                function_name.to_string()
+            } else {
+                resolved_name
+            };
+            return Self::extract_function_signature(&resolved_file, &actual_name);
+        }
+
+        anyhow::bail!(
+            "Function '{}' not found in {} (also checked re-exports)",
+            function_name,
+            file_path.display()
+        )
+    }
+
+    /// Extract definition info (function or class) from a target string.
+    /// Returns:
+    /// - DefinitionInfo (Function or Class)
+    /// - File path where the definition was found
+    /// - Module path
+    /// - Symbol name
     pub fn extract_definition_info(
         target: &str,
         workspace_root: Option<&Path>,
         python_interpreter: Option<&str>,
-    ) -> Result<DefinitionInfo> {
+    ) -> Result<(DefinitionInfo, PathBuf, String, String)> {
         let (module_path, symbol_name) = Self::split_target(target)?;
-        let file_path = Self::resolve_module(&module_path, workspace_root, python_interpreter)?;
 
-        // Try to extract as function first
-        if let Ok(func_sig) = Self::extract_function_signature(&file_path, &symbol_name) {
-            return Ok(DefinitionInfo::Function(func_sig));
+        let (file_path, search_paths) =
+            Self::resolve_module(&module_path, workspace_root, python_interpreter)?;
+
+        // Try to extract as function first (with import resolution)
+        if let Ok(func_sig) = Self::extract_function_signature_with_imports(
+            &file_path,
+            &symbol_name,
+            search_paths.clone(),
+        ) {
+            return Ok((
+                DefinitionInfo::Function(func_sig),
+                file_path,
+                module_path,
+                symbol_name,
+            ));
         }
 
-        // Try to extract as class
-        if let Ok(class_info) = Self::extract_class_info(&file_path, &symbol_name) {
-            return Ok(DefinitionInfo::Class(class_info));
+        // Try to extract as class (with import resolution)
+        if let Ok(class_info) =
+            Self::extract_class_info_with_imports(&file_path, &symbol_name, search_paths)
+        {
+            return Ok((
+                DefinitionInfo::Class(class_info),
+                file_path,
+                module_path,
+                symbol_name,
+            ));
         }
 
-        anyhow::bail!("Symbol '{}' not found in module", symbol_name)
+        anyhow::bail!(
+            "Symbol '{}' not found in module '{}'",
+            symbol_name,
+            module_path
+        )
     }
 
     /// Format a function signature for display (e.g., in hover)
@@ -386,10 +468,24 @@ impl PythonAnalyzer {
 }
 
 /// Visitor to extract function signatures from AST
-struct FunctionExtractor {
+pub struct FunctionExtractor {
     target_name: String,
     result: Option<FunctionSignature>,
     source: String,
+}
+
+impl FunctionExtractor {
+    pub fn new(target_name: String, source: String) -> Self {
+        Self {
+            target_name,
+            result: None,
+            source,
+        }
+    }
+
+    pub fn get_result(self) -> Option<FunctionSignature> {
+        self.result
+    }
 }
 
 impl<'a> Visitor<'a> for FunctionExtractor {
@@ -411,10 +507,24 @@ impl<'a> Visitor<'a> for FunctionExtractor {
 }
 
 /// Visitor to extract class information from AST
-struct ClassExtractor {
+pub struct ClassExtractor {
     target_name: String,
-    result: Option<ClassInfo>,
     source: String,
+    result: Option<ClassInfo>,
+}
+
+impl ClassExtractor {
+    pub fn new(target_name: String, source: String) -> Self {
+        Self {
+            target_name,
+            source,
+            result: None,
+        }
+    }
+
+    pub fn get_result(self) -> Option<ClassInfo> {
+        self.result
+    }
 }
 
 impl<'a> Visitor<'a> for ClassExtractor {
@@ -663,7 +773,7 @@ mod tests {
         let examples_dir = get_resources_dir();
         let result = PythonAnalyzer::resolve_module("test_module", Some(&examples_dir), None);
         assert!(result.is_ok());
-        let path = result.unwrap();
+        let (path, _) = result.unwrap();
         assert!(path.ends_with("test_module.py"));
     }
 
@@ -672,7 +782,7 @@ mod tests {
         let examples_dir = get_resources_dir();
         let result = PythonAnalyzer::resolve_module("test_package", Some(&examples_dir), None);
         assert!(result.is_ok());
-        let path = result.unwrap();
+        let (path, _) = result.unwrap();
         assert!(path.ends_with("__init__.py"));
     }
 
@@ -682,7 +792,7 @@ mod tests {
         let result =
             PythonAnalyzer::resolve_module("test_package.submodule", Some(&examples_dir), None);
         assert!(result.is_ok());
-        let path = result.unwrap();
+        let (path, _) = result.unwrap();
         assert!(path.ends_with("submodule.py"));
     }
 
@@ -886,8 +996,9 @@ mod tests {
             None,
         );
         assert!(result.is_ok());
+        let (definition_info, _file_path, _module_path, _symbol_name) = result.unwrap();
 
-        match result.unwrap() {
+        match definition_info {
             DefinitionInfo::Function(sig) => {
                 assert_eq!(sig.name, "simple_function");
             }
@@ -905,8 +1016,9 @@ mod tests {
             None,
         );
         assert!(result.is_ok());
+        let (definition_info, _file_path, _module_path, _symbol_name) = result.unwrap();
 
-        match result.unwrap() {
+        match definition_info {
             DefinitionInfo::Class(class_info) => {
                 assert_eq!(class_info.name, "SimpleClass");
             }
@@ -924,8 +1036,9 @@ mod tests {
             None,
         );
         assert!(result.is_ok());
+        let (definition_info, _file_path, _module_path, _symbol_name) = result.unwrap();
 
-        match result.unwrap() {
+        match definition_info {
             DefinitionInfo::Class(class_info) => {
                 assert_eq!(class_info.name, "SubmoduleClass");
             }
@@ -1724,5 +1837,147 @@ mod tests {
         // Test with auto-discovery (priority 2)
         let result_auto = PythonAnalyzer::resolve_module("test_module", Some(&examples_dir), None);
         assert!(result_auto.is_ok(), "Should resolve with auto-discovery");
+    }
+
+    // ==================== Re-export resolution tests ====================
+
+    fn get_reexport_test_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("workspace")
+            .join("reexport")
+    }
+
+    #[test]
+    fn test_reexport_via_subpackage() {
+        // Test: mylib.Linear should resolve to mylib/modules/linear.py::Linear
+        // Path: mylib/__init__.py imports from mylib.modules
+        //       mylib/modules/__init__.py imports from mylib.modules.linear
+        //       mylib/modules/linear.py defines Linear
+        let workspace_dir = get_reexport_test_dir();
+
+        let result =
+            PythonAnalyzer::extract_definition_info("mylib.Linear", Some(&workspace_dir), None);
+
+        assert!(
+            result.is_ok(),
+            "Should resolve Linear through re-export chain: {:?}",
+            result.err()
+        );
+        let (definition_info, _file_path, _module_path, _symbol_name) = result.unwrap();
+
+        match definition_info {
+            DefinitionInfo::Class(class_info) => {
+                assert_eq!(class_info.name, "Linear");
+                assert!(class_info.init_signature.is_some());
+                let init = class_info.init_signature.as_ref().unwrap();
+                // Check that it has the expected parameters: self, in_features, out_features, bias
+                assert_eq!(init.parameters.len(), 4);
+                assert_eq!(init.parameters[1].name, "in_features");
+                assert_eq!(init.parameters[2].name, "out_features");
+                assert_eq!(init.parameters[3].name, "bias");
+            }
+            _ => panic!("Expected Class definition"),
+        }
+    }
+
+    #[test]
+    fn test_reexport_with_alias() {
+        // Test: mylib.AliasedClass should resolve to mylib/modules/linear.py::OriginalClass
+        // Path: mylib/__init__.py imports OriginalClass as AliasedClass
+        let workspace_dir = get_reexport_test_dir();
+
+        let result = PythonAnalyzer::extract_definition_info(
+            "mylib.AliasedClass",
+            Some(&workspace_dir),
+            None,
+        );
+
+        assert!(
+            result.is_ok(),
+            "Should resolve AliasedClass through aliased re-export: {:?}",
+            result.err()
+        );
+        let (definition_info, _file_path, _module_path, _symbol_name) = result.unwrap();
+
+        match definition_info {
+            DefinitionInfo::Class(class_info) => {
+                // The actual class is OriginalClass, but we look it up via the alias
+                assert_eq!(class_info.name, "OriginalClass");
+            }
+            _ => panic!("Expected Class definition"),
+        }
+    }
+
+    #[test]
+    fn test_reexport_via_star_import() {
+        // Test: mylib.StarExportedClass should resolve through star import
+        // Path: mylib/__init__.py has `from mylib.star_module import *`
+        //       mylib/star_module.py defines StarExportedClass and has __all__
+        let workspace_dir = get_reexport_test_dir();
+
+        let result = PythonAnalyzer::extract_definition_info(
+            "mylib.StarExportedClass",
+            Some(&workspace_dir),
+            None,
+        );
+
+        assert!(
+            result.is_ok(),
+            "Should resolve StarExportedClass through star import: {:?}",
+            result.err()
+        );
+        let (definition_info, _file_path, _module_path, _symbol_name) = result.unwrap();
+
+        match definition_info {
+            DefinitionInfo::Class(class_info) => {
+                assert_eq!(class_info.name, "StarExportedClass");
+            }
+            _ => panic!("Expected Class definition"),
+        }
+    }
+
+    #[test]
+    fn test_direct_module_access() {
+        // Test: mylib.modules.linear.DirectClass should resolve directly
+        let workspace_dir = get_reexport_test_dir();
+
+        let result = PythonAnalyzer::extract_definition_info(
+            "mylib.modules.linear.DirectClass",
+            Some(&workspace_dir),
+            None,
+        );
+
+        assert!(
+            result.is_ok(),
+            "Should resolve DirectClass directly: {:?}",
+            result.err()
+        );
+        let (definition_info, _file_path, _module_path, _symbol_name) = result.unwrap();
+
+        match definition_info {
+            DefinitionInfo::Class(class_info) => {
+                assert_eq!(class_info.name, "DirectClass");
+            }
+            _ => panic!("Expected Class definition"),
+        }
+    }
+
+    #[test]
+    fn test_private_class_not_star_exported() {
+        // Test: _PrivateClass should NOT be accessible via star import
+        // because it starts with _ and is not in __all__
+        let workspace_dir = get_reexport_test_dir();
+
+        let result = PythonAnalyzer::extract_definition_info(
+            "mylib._PrivateClass",
+            Some(&workspace_dir),
+            None,
+        );
+
+        assert!(
+            result.is_err(),
+            "Private class should not be accessible via star import"
+        );
     }
 }

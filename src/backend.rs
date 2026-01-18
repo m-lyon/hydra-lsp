@@ -204,17 +204,6 @@ impl LanguageServer for HydraLspBackend {
             )
             .await;
 
-        // Split target into module and symbol
-        let (_module_path, _symbol_name) = match PythonAnalyzer::split_target(&target_info.value) {
-            Ok(parts) => parts,
-            Err(e) => {
-                self.client
-                    .log_message(MessageType::ERROR, format!("Invalid target: {}", e))
-                    .await;
-                return Ok(None);
-            }
-        };
-
         // Try to get the workspace root from the URI
         let workspace_root = uri
             .to_file_path()
@@ -230,7 +219,7 @@ impl LanguageServer for HydraLspBackend {
             workspace_root.as_deref(),
             python_interpreter.as_deref(),
         ) {
-            Ok(definition_info) => {
+            Ok((definition_info, _file_path, _module_path, _symbol_name)) => {
                 let hover_content = match definition_info {
                     DefinitionInfo::Function(sig) => PythonAnalyzer::format_signature(&sig),
                     DefinitionInfo::Class(class_info) => PythonAnalyzer::format_class(&class_info),
@@ -256,12 +245,12 @@ impl LanguageServer for HydraLspBackend {
             }
             Err(e) => {
                 // If Python analysis fails, don't show any hover, but log a warning
-                self.client
-                    .log_message(
-                        MessageType::WARNING,
-                        format!("Python analysis failed: {}", e),
-                    )
-                    .await;
+                let err_msg = e.to_string();
+                if err_msg.starts_with("Invalid _target_ format:") {
+                    self.client.log_message(MessageType::ERROR, err_msg).await;
+                } else {
+                    self.client.log_message(MessageType::WARNING, err_msg).await;
+                }
                 Ok(None)
             }
         }
@@ -416,17 +405,6 @@ impl LanguageServer for HydraLspBackend {
             }
         };
 
-        // Split target into module and symbol
-        let (_module_path, _symbol_name) = match PythonAnalyzer::split_target(&target_info.value) {
-            Ok(parts) => parts,
-            Err(e) => {
-                self.client
-                    .log_message(MessageType::ERROR, format!("Invalid target: {}", e))
-                    .await;
-                return Ok(None);
-            }
-        };
-
         // Try to get the workspace root from the URI
         let workspace_root = uri
             .to_file_path()
@@ -442,9 +420,9 @@ impl LanguageServer for HydraLspBackend {
             workspace_root.as_deref(),
             python_interpreter.as_deref(),
         ) {
-            Ok(definition_info) => {
+            Ok((definition_info, _file_path, _module_path, _symbol_name)) => {
                 let (signature_label, parameters, doc_string) = match definition_info {
-                    crate::python_analyzer::DefinitionInfo::Function(sig) => {
+                    DefinitionInfo::Function(sig) => {
                         let param_strs: Vec<String> = sig
                             .parameters
                             .iter()
@@ -491,7 +469,7 @@ impl LanguageServer for HydraLspBackend {
 
                         (label, params, sig.docstring.clone())
                     }
-                    crate::python_analyzer::DefinitionInfo::Class(class_info) => {
+                    DefinitionInfo::Class(class_info) => {
                         if let Some(init_sig) = &class_info.init_signature {
                             let param_strs: Vec<String> = init_sig
                                 .parameters
@@ -568,12 +546,17 @@ impl LanguageServer for HydraLspBackend {
                 }))
             }
             Err(e) => {
-                self.client
-                    .log_message(
-                        MessageType::WARNING,
-                        format!("Python analysis failed for signature help: {}", e),
-                    )
-                    .await;
+                let err_msg = e.to_string();
+                if err_msg.starts_with("Invalid _target_ format:") {
+                    self.client.log_message(MessageType::ERROR, err_msg).await;
+                } else {
+                    self.client
+                        .log_message(
+                            MessageType::WARNING,
+                            format!("Python analysis failed for signature help: {}", e),
+                        )
+                        .await;
+                }
                 Ok(None)
             }
         }
@@ -618,63 +601,39 @@ impl LanguageServer for HydraLspBackend {
         // Get the python interpreter path
         let python_interpreter = self.python_interpreter.read().clone();
 
-        // Split target to get module path
-        let (module_path, _) = match PythonAnalyzer::split_target(&target_info.value) {
-            Ok(parts) => parts,
-            Err(e) => {
-                self.client
-                    .log_message(MessageType::ERROR, format!("Invalid target: {}", e))
-                    .await;
-                return Ok(None);
-            }
-        };
-
-        // Resolve module to file path
-        let file_path = match PythonAnalyzer::resolve_module(
-            &module_path,
-            workspace_root.as_deref(),
-            python_interpreter.as_deref(),
-        ) {
-            Ok(path) => path,
-            Err(e) => {
-                self.client
-                    .log_message(
-                        MessageType::ERROR,
-                        format!("Could not resolve module: {}", e),
-                    )
-                    .await;
-                return Ok(None);
-            }
-        };
-
         // Extract definition info to get the line number
-        let (start_line, start_col, end_line, end_col) =
+        let (file_path, start_line, start_col, end_line, end_col) =
             match PythonAnalyzer::extract_definition_info(
                 &target_info.value,
                 workspace_root.as_deref(),
                 python_interpreter.as_deref(),
             ) {
-                Ok(definition_info) => match definition_info {
-                    DefinitionInfo::Function(sig) => (
-                        sig.start_line,
-                        sig.start_column,
-                        sig.end_line,
-                        sig.end_column,
-                    ),
-                    DefinitionInfo::Class(class_info) => (
-                        class_info.start_line,
-                        class_info.start_column,
-                        class_info.end_line,
-                        class_info.end_column,
-                    ),
-                },
+                Ok((definition_info, file_path, _module_path, _symbol_name)) => {
+                    let (start_line, start_col, end_line, end_col) = match definition_info {
+                        DefinitionInfo::Function(sig) => (
+                            sig.start_line,
+                            sig.start_column,
+                            sig.end_line,
+                            sig.end_column,
+                        ),
+                        DefinitionInfo::Class(class_info) => (
+                            class_info.start_line,
+                            class_info.start_column,
+                            class_info.end_line,
+                            class_info.end_column,
+                        ),
+                    };
+                    (file_path, start_line, start_col, end_line, end_col)
+                }
                 Err(e) => {
-                    self.client
-                        .log_message(
-                            MessageType::WARNING,
-                            format!("Could not extract definition info: {}", e),
-                        )
-                        .await;
+                    let error_msg = e.to_string();
+                    if error_msg.starts_with("Invalid _target_ format:") {
+                        self.client.log_message(MessageType::ERROR, error_msg).await;
+                    } else {
+                        self.client
+                            .log_message(MessageType::WARNING, error_msg)
+                            .await;
+                    }
                     return Ok(None);
                 }
             };
