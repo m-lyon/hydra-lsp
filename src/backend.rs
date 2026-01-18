@@ -288,7 +288,6 @@ impl LanguageServer for HydraLspBackend {
         match context {
             CompletionContext::TargetValue { partial } => {
                 // TODO: Implement module/class completion
-                // For now, return placeholder completions
                 self.client
                     .log_message(
                         MessageType::INFO,
@@ -296,20 +295,21 @@ impl LanguageServer for HydraLspBackend {
                     )
                     .await;
 
-                Ok(Some(CompletionResponse::Array(vec![
-                    CompletionItem {
-                        label: "example.module.Class".to_string(),
-                        kind: Some(CompletionItemKind::CLASS),
-                        detail: Some("Example class (placeholder)".to_string()),
-                        ..Default::default()
-                    },
-                    CompletionItem {
-                        label: "example.module.function".to_string(),
-                        kind: Some(CompletionItemKind::FUNCTION),
-                        detail: Some("Example function (placeholder)".to_string()),
-                        ..Default::default()
-                    },
-                ])))
+                // Ok(Some(CompletionResponse::Array(vec![
+                //     CompletionItem {
+                //         label: "example.module.Class".to_string(),
+                //         kind: Some(CompletionItemKind::CLASS),
+                //         detail: Some("Example class (placeholder)".to_string()),
+                //         ..Default::default()
+                //     },
+                //     CompletionItem {
+                //         label: "example.module.function".to_string(),
+                //         kind: Some(CompletionItemKind::FUNCTION),
+                //         detail: Some("Example function (placeholder)".to_string()),
+                //         ..Default::default()
+                //     },
+                // ])))
+                Ok(None) // Placeholder: no completions yet
             }
             CompletionContext::ParameterKey { target, partial } => {
                 // TODO: Resolve target and get parameter completions
@@ -324,23 +324,24 @@ impl LanguageServer for HydraLspBackend {
                     .await;
 
                 // For demonstration, return some placeholder parameters
-                Ok(Some(CompletionResponse::Array(vec![
-                    CompletionItem {
-                        label: "param1".to_string(),
-                        kind: Some(CompletionItemKind::PROPERTY),
-                        detail: Some("int - Example parameter".to_string()),
-                        documentation: Some(Documentation::String(
-                            "A placeholder parameter".to_string(),
-                        )),
-                        ..Default::default()
-                    },
-                    CompletionItem {
-                        label: "param2".to_string(),
-                        kind: Some(CompletionItemKind::PROPERTY),
-                        detail: Some("str - Example parameter".to_string()),
-                        ..Default::default()
-                    },
-                ])))
+                // Ok(Some(CompletionResponse::Array(vec![
+                //     CompletionItem {
+                //         label: "param1".to_string(),
+                //         kind: Some(CompletionItemKind::PROPERTY),
+                //         detail: Some("int - Example parameter".to_string()),
+                //         documentation: Some(Documentation::String(
+                //             "A placeholder parameter".to_string(),
+                //         )),
+                //         ..Default::default()
+                //     },
+                //     CompletionItem {
+                //         label: "param2".to_string(),
+                //         kind: Some(CompletionItemKind::PROPERTY),
+                //         detail: Some("str - Example parameter".to_string()),
+                //         ..Default::default()
+                //     },
+                // ])))
+                Ok(None) // Placeholder: no completions yet
             }
             CompletionContext::ParameterValue {
                 target,
@@ -359,20 +360,21 @@ impl LanguageServer for HydraLspBackend {
                     .await;
 
                 // For demonstration, return some placeholder value completions
-                Ok(Some(CompletionResponse::Array(vec![
-                    CompletionItem {
-                        label: "true".to_string(),
-                        kind: Some(CompletionItemKind::VALUE),
-                        detail: Some("Boolean value".to_string()),
-                        ..Default::default()
-                    },
-                    CompletionItem {
-                        label: "false".to_string(),
-                        kind: Some(CompletionItemKind::VALUE),
-                        detail: Some("Boolean value".to_string()),
-                        ..Default::default()
-                    },
-                ])))
+                // Ok(Some(CompletionResponse::Array(vec![
+                //     CompletionItem {
+                //         label: "true".to_string(),
+                //         kind: Some(CompletionItemKind::VALUE),
+                //         detail: Some("Boolean value".to_string()),
+                //         ..Default::default()
+                //     },
+                //     CompletionItem {
+                //         label: "false".to_string(),
+                //         kind: Some(CompletionItemKind::VALUE),
+                //         detail: Some("Boolean value".to_string()),
+                //         ..Default::default()
+                //     },
+                // ])))
+                Ok(None) // Placeholder: no completions yet
             }
             crate::yaml_parser::CompletionContext::Unknown => Ok(None),
         }

@@ -3,6 +3,7 @@
 //! This tool parses Hydra YAML files and outputs diagnostics to help debug
 //! issues with `_target_` resolution and parameter validation.
 
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -16,7 +17,7 @@ use hydra_lsp::python_analyzer::PythonAnalyzer;
 use hydra_lsp::yaml_parser::YamlParser;
 
 /// CLI tool for diagnosing Hydra YAML configuration files
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(name = "hydra-check")]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -43,6 +44,30 @@ struct Args {
     /// Show detailed resolution steps for each target
     #[arg(long)]
     trace_resolution: bool,
+}
+
+struct OptionalPath<'a>(Option<&'a PathBuf>);
+
+impl fmt::Debug for OptionalPath<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Some(p) => write!(f, "\"{}\"", p.display()),
+            None => write!(f, "None"),
+        }
+    }
+}
+
+impl fmt::Debug for Args {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Args")
+            .field("file", &self.file.display().to_string())
+            .field("workspace", &OptionalPath(self.workspace.as_ref()))
+            .field("python", &OptionalPath(self.python.as_ref()))
+            .field("verbosity", &self.verbosity)
+            .field("format", &self.format)
+            .field("trace_resolution", &self.trace_resolution)
+            .finish()
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
