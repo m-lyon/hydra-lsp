@@ -203,7 +203,7 @@ pub fn validate_document(
 mod tests {
     use super::*;
     use crate::python_analyzer::ParameterInfo;
-    use crate::yaml_parser::{ParameterKind, ParameterValue};
+    use crate::yaml_parser::Parameter;
     use std::path::PathBuf;
 
     fn get_test_resources_dir() -> PathBuf {
@@ -269,8 +269,8 @@ mod tests {
 
     #[test]
     fn test_validate_unknown_param_without_kwargs() {
-        let params = vec![ParameterValue {
-            kind: ParameterKind::Value(serde_yaml::Value::Null),
+        let params = vec![Parameter {
+            value: serde_yaml::Value::Null,
             line: 1,
             key: "unknown_param".to_string(),
         }];
@@ -315,8 +315,8 @@ mod tests {
 
     #[test]
     fn test_validate_unknown_param_with_kwargs() {
-        let params = vec![ParameterValue {
-            kind: ParameterKind::Value(serde_yaml::Value::Null),
+        let params = vec![Parameter {
+            value: serde_yaml::Value::Null,
             line: 1,
             key: "any_param".to_string(),
         }];
@@ -552,8 +552,8 @@ mod tests {
 
     #[test]
     fn test_validate_document_with_parameter_validation() {
-        let params = vec![ParameterValue {
-            kind: ParameterKind::Value(serde_yaml::Value::Number(serde_yaml::Number::from(42))),
+        let params = vec![Parameter {
+            value: serde_yaml::Value::Number(serde_yaml::Number::from(42)),
             line: 1,
             key: "value".to_string(),
         }];
@@ -589,8 +589,8 @@ mod tests {
             serde_yaml::Value::String("test_module.SimpleClass".to_string()),
         );
 
-        let params = vec![ParameterValue {
-            kind: ParameterKind::Value(serde_yaml::Value::Mapping(nested_map)),
+        let params = vec![Parameter {
+            value: serde_yaml::Value::Mapping(nested_map),
             line: 1,
             key: "value".to_string(),
         }];

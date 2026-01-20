@@ -359,3 +359,49 @@ async fn test_nested_diagnostics_all_errors() {
 
     insta::assert_yaml_snapshot!("nested_all_errors", summary);
 }
+#[tokio::test]
+async fn test_two_missing_targets() {
+    let mut ctx = TestContext::new(TestWorkspace::Diagnostics);
+    ctx.initialize().await;
+
+    let content = r#"
+training:
+  lightning_module:
+    _target_: made.up.Module
+
+    metrics:
+      accuracy:
+        _target_: my_module.DataLoader
+        batch_size: 2
+
+    partial_optimizer:
+      _target_: made.up.mod
+"#;
+    ctx.open_document("two_missing.yaml", content.to_string())
+        .await;
+    let dp = ctx.recv::<PublishDiagnosticsParams>().await;
+    let diagnostics = dp.diagnostics;
+
+    let diagnostics: Vec<_> = diagnostics.iter().collect();
+
+    assert_eq!(
+        diagnostics.len(),
+        2,
+        "Should have two missing module errors"
+    );
+
+    let summary: Vec<_> = diagnostics
+        .iter()
+        .map(|d| {
+            serde_json::json!({
+                "line": d.range.start.line,
+                "start_char": d.range.start.character,
+                "end_char": d.range.end.character,
+                "message": d.message,
+                "severity": format!("{:?}", d.severity.unwrap()),
+                "code": extract_code(d)
+            })
+        })
+        .collect();
+    insta::assert_yaml_snapshot!("two_missing_targets", summary);
+}

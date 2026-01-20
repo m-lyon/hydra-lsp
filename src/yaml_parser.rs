@@ -77,33 +77,18 @@ pub const TARGET_KEY: &str = "_target_";
 /// Represents a parameter in a YAML configuration with position information
 /// Can either be a simple value or a nested target
 #[derive(Debug, Clone)]
-pub struct ParameterValue {
-    pub kind: ParameterKind,
+pub struct Parameter {
+    pub value: Value,
     pub line: u32,
     pub key: String,
 }
 
-/// The kind of parameter value - either a simple value or a nested target
-#[derive(Debug, Clone)]
-pub enum ParameterKind {
-    Value(Value),
-    NestedTargetIndex(usize),
-}
-
-impl ParameterValue {
+impl Parameter {
     fn new_value(key: String, value: Value) -> Self {
         Self {
-            kind: ParameterKind::Value(value),
             line: 0,
             key,
-        }
-    }
-
-    fn new_nested(key: String, index: usize) -> Self {
-        Self {
-            kind: ParameterKind::NestedTargetIndex(index),
-            line: 0,
-            key,
+            value,
         }
     }
 }
@@ -113,7 +98,7 @@ pub struct TargetInfo {
     /// The target value (class/function path)
     pub value: String,
     /// Parameters for the target
-    pub parameters: Vec<ParameterValue>,
+    pub parameters: Vec<Parameter>,
     /// The line number where the `_target_` key is located
     pub line: u32,
     /// The start position of the `_target_` key in the line
@@ -123,7 +108,7 @@ pub struct TargetInfo {
 }
 
 impl TargetInfo {
-    fn new(value: String, parameters: Vec<ParameterValue>) -> Self {
+    fn new(value: String, parameters: Vec<Parameter>) -> Self {
         Self {
             value,
             parameters,
@@ -328,25 +313,18 @@ impl YamlParser {
     fn extract_parameters(
         map: &serde_yaml::Mapping,
         targets: &mut VecDeque<TargetInfo>,
-    ) -> Vec<ParameterValue> {
+    ) -> Vec<Parameter> {
         let mut parameters = Vec::new();
 
         for (key, val) in map {
             if let Value::String(key_str) = key {
                 // The _target_ key itself is not a parameter, but is the target identifier
                 if key_str != TARGET_KEY {
-                    // Check if this parameter value is a nested target
-                    if let Value::Mapping(nested_map) = val
-                        && nested_map.get(TARGET_KEY).is_some()
-                    {
-                        // This is a nested target - extract it recursively
-                        let nested_index = targets.len();
-                        Self::extract_targets(val, targets);
-                        parameters.push(ParameterValue::new_nested(key_str.clone(), nested_index));
-                        continue; // Skip the regular value insertion below
-                    }
+                    // Recursively check for nested targets in parameter values
+                    Self::extract_targets(val, targets);
+
                     // Simple value (string, number, mapping without _target_, etc.)
-                    parameters.push(ParameterValue::new_value(key_str.clone(), val.clone()));
+                    parameters.push(Parameter::new_value(key_str.clone(), val.clone()));
                 }
             }
         }
@@ -670,28 +648,25 @@ impl YamlParser {
                         let val_start = value_start + val_offset;
                         let remaining = &line[val_start..];
 
-                        // Determine token type based on value
-                        if let ParameterKind::Value(ref yaml_val) = param.kind {
-                            match yaml_val {
-                                Value::Number(_) => {
-                                    // Find the length of the number
-                                    let num_len = remaining
-                                        .find(|c: char| !c.is_numeric() && c != '.' && c != '-')
-                                        .unwrap_or(remaining.len());
-                                    if num_len > 0 {
-                                        tokens.push(HydraSemanticToken {
-                                            line: param_line as u32,
-                                            start_char: val_start as u32,
-                                            length: num_len as u32,
-                                            token_type: SemanticTokenType::Number,
-                                        });
-                                    }
+                        match param.value {
+                            Value::Number(_) => {
+                                // Find the length of the number
+                                let num_len = remaining
+                                    .find(|c: char| !c.is_numeric() && c != '.' && c != '-')
+                                    .unwrap_or(remaining.len());
+                                if num_len > 0 {
+                                    tokens.push(HydraSemanticToken {
+                                        line: param_line as u32,
+                                        start_char: val_start as u32,
+                                        length: num_len as u32,
+                                        token_type: SemanticTokenType::Number,
+                                    });
                                 }
-                                Value::String(_) => {
-                                    // Find the length of the string value
-                                    let str_len = if remaining.starts_with('"')
-                                        || remaining.starts_with('\'')
-                                    {
+                            }
+                            Value::String(_) => {
+                                // Find the length of the string value
+                                let str_len =
+                                    if remaining.starts_with('"') || remaining.starts_with('\'') {
                                         // Quoted string - find closing quote
                                         let quote = remaining.chars().next().unwrap();
                                         remaining[1..]
@@ -705,28 +680,27 @@ impl YamlParser {
                                             .unwrap_or(remaining.len())
                                             .min(remaining.trim_end().len())
                                     };
-                                    if str_len > 0 {
-                                        tokens.push(HydraSemanticToken {
-                                            line: param_line as u32,
-                                            start_char: val_start as u32,
-                                            length: str_len as u32,
-                                            token_type: SemanticTokenType::String,
-                                        });
-                                    }
+                                if str_len > 0 {
+                                    tokens.push(HydraSemanticToken {
+                                        line: param_line as u32,
+                                        start_char: val_start as u32,
+                                        length: str_len as u32,
+                                        token_type: SemanticTokenType::String,
+                                    });
                                 }
-                                _ => {
-                                    // Other value types (bool, null, etc.) - treat as property
-                                    let val_len = remaining
-                                        .find(|c: char| c.is_whitespace() || c == '#')
-                                        .unwrap_or(remaining.len());
-                                    if val_len > 0 {
-                                        tokens.push(HydraSemanticToken {
-                                            line: param_line as u32,
-                                            start_char: val_start as u32,
-                                            length: val_len as u32,
-                                            token_type: SemanticTokenType::Property,
-                                        });
-                                    }
+                            }
+                            _ => {
+                                // Other value types (bool, null, etc.) - treat as property
+                                let val_len = remaining
+                                    .find(|c: char| c.is_whitespace() || c == '#')
+                                    .unwrap_or(remaining.len());
+                                if val_len > 0 {
+                                    tokens.push(HydraSemanticToken {
+                                        line: param_line as u32,
+                                        start_char: val_start as u32,
+                                        length: val_len as u32,
+                                        token_type: SemanticTokenType::Property,
+                                    });
                                 }
                             }
                         }
@@ -961,14 +935,11 @@ config:
         assert_eq!(first_model.parameters.len(), 1);
 
         // Check the size value
-        if let ParameterKind::Value(val) = &first_model.parameters.first().unwrap().kind {
-            if let Value::Number(num) = val {
-                assert_eq!(num.as_i64(), Some(128));
-            } else {
-                panic!("Expected Number value");
-            }
+
+        if let Value::Number(num) = &first_model.parameters.first().unwrap().value {
+            assert_eq!(num.as_i64(), Some(128));
         } else {
-            panic!("Expected Value parameter");
+            panic!("Expected Number value");
         }
 
         // Second occurrence (line 6)
@@ -980,14 +951,10 @@ config:
         assert_eq!(second_model.parameters.len(), 1);
 
         // Check the size value
-        if let ParameterKind::Value(val) = &second_model.parameters.first().unwrap().kind {
-            if let Value::Number(num) = val {
-                assert_eq!(num.as_i64(), Some(256));
-            } else {
-                panic!("Expected Number value");
-            }
+        if let Value::Number(num) = &second_model.parameters.first().unwrap().value {
+            assert_eq!(num.as_i64(), Some(256));
         } else {
-            panic!("Expected Value parameter");
+            panic!("Expected Number value");
         }
     }
 
@@ -1013,9 +980,7 @@ config:
         let target_at_line_6 = targets.get(1).unwrap();
 
         // Verify both targets are correct
-        if let ParameterKind::Value(Value::Number(num)) =
-            &target_at_line_3.parameters.first().unwrap().kind
-        {
+        if let Value::Number(num) = &target_at_line_3.parameters.first().unwrap().value {
             assert_eq!(
                 num.as_i64(),
                 Some(128),
@@ -1023,9 +988,7 @@ config:
             );
         }
 
-        if let ParameterKind::Value(Value::Number(num)) =
-            &target_at_line_6.parameters.first().unwrap().kind
-        {
+        if let Value::Number(num) = &target_at_line_6.parameters.first().unwrap().value {
             assert_eq!(
                 num.as_i64(),
                 Some(256),
@@ -1713,5 +1676,44 @@ invalid_target_key: this is not a target
         let (targets, _) = result.unwrap();
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].value, "some.module.Class");
+    }
+
+    #[test]
+    fn test_parse_nested_sibling_targets() {
+        let content = r#"
+training:
+  lightning_module:
+    _target_: made.up.Module
+
+    metrics:
+      accuracy:
+        _target_: DataLoader
+        batch_size: 2
+
+    partial_optimizer:
+      _target_: made.up.mod
+"#;
+        let (targets, _line_map) = YamlParser::parse(content).unwrap();
+
+        assert_eq!(targets.len(), 3, "Should have 3 targets total");
+
+        // Expected order based on document line order
+        assert_eq!(
+            targets[0].value, "made.up.Module",
+            "First target should be made.up.Module"
+        );
+        assert_eq!(targets[0].line, 3, "First target should be on line 3");
+
+        assert_eq!(
+            targets[1].value, "DataLoader",
+            "Second target should be DataLoader"
+        );
+        assert_eq!(targets[1].line, 7, "Second target should be on line 7");
+
+        assert_eq!(
+            targets[2].value, "made.up.mod",
+            "Third target should be made.up.mod"
+        );
+        assert_eq!(targets[2].line, 11, "Third target should be on line 11");
     }
 }
