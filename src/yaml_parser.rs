@@ -36,6 +36,20 @@ impl SemanticTokenType {
             SemanticTokenType::Number => 7,
         }
     }
+
+    /// Convert from LSP token type index to SemanticTokenType
+    pub fn from_index(index: u32) -> Option<Self> {
+        match index {
+            0 => Some(SemanticTokenType::Namespace),
+            1 => Some(SemanticTokenType::Class),
+            2 => Some(SemanticTokenType::Function),
+            3 => Some(SemanticTokenType::Parameter),
+            4 => Some(SemanticTokenType::Property),
+            6 => Some(SemanticTokenType::String),
+            7 => Some(SemanticTokenType::Number),
+            _ => None,
+        }
+    }
 }
 
 impl HydraSemanticToken {
@@ -646,67 +660,173 @@ impl YamlParser {
                     // Skip whitespace to find the actual value
                     if let Some(val_offset) = value_part.find(|c: char| !c.is_whitespace()) {
                         let val_start = value_start + val_offset;
-                        let remaining = &line[val_start..];
-
-                        match param.value {
-                            Value::Number(_) => {
-                                // Find the length of the number
-                                let num_len = remaining
-                                    .find(|c: char| !c.is_numeric() && c != '.' && c != '-')
-                                    .unwrap_or(remaining.len());
-                                if num_len > 0 {
-                                    tokens.push(HydraSemanticToken {
-                                        line: param_line as u32,
-                                        start_char: val_start as u32,
-                                        length: num_len as u32,
-                                        token_type: SemanticTokenType::Number,
-                                    });
-                                }
-                            }
-                            Value::String(_) => {
-                                // Find the length of the string value
-                                let str_len =
-                                    if remaining.starts_with('"') || remaining.starts_with('\'') {
-                                        // Quoted string - find closing quote
-                                        let quote = remaining.chars().next().unwrap();
-                                        remaining[1..]
-                                            .find(quote)
-                                            .map(|pos| pos + 2) // Include both quotes
-                                            .unwrap_or_else(|| remaining.len())
-                                    } else {
-                                        // Unquoted - until end of line or comment
-                                        remaining
-                                            .find('#')
-                                            .unwrap_or(remaining.len())
-                                            .min(remaining.trim_end().len())
-                                    };
-                                if str_len > 0 {
-                                    tokens.push(HydraSemanticToken {
-                                        line: param_line as u32,
-                                        start_char: val_start as u32,
-                                        length: str_len as u32,
-                                        token_type: SemanticTokenType::String,
-                                    });
-                                }
-                            }
-                            _ => {
-                                // Other value types (bool, null, etc.) - treat as property
-                                let val_len = remaining
-                                    .find(|c: char| c.is_whitespace() || c == '#')
-                                    .unwrap_or(remaining.len());
-                                if val_len > 0 {
-                                    tokens.push(HydraSemanticToken {
-                                        line: param_line as u32,
-                                        start_char: val_start as u32,
-                                        length: val_len as u32,
-                                        token_type: SemanticTokenType::Property,
-                                    });
-                                }
-                            }
-                        }
+                        Self::tokenize_value(
+                            &param.value,
+                            line,
+                            val_start,
+                            param_line as u32,
+                            false,
+                            tokens,
+                        );
                     }
                 }
             }
+        }
+    }
+
+    /// Tokenize a single YAML value at the given position.
+    /// Returns the length of the tokenized value (for position tracking in sequences).
+    /// `in_array` controls delimiter detection: arrays use `,`/`]`, top-level uses `#`/whitespace.
+    fn tokenize_value(
+        value: &Value,
+        line: &str,
+        pos: usize,
+        line_num: u32,
+        in_array: bool,
+        tokens: &mut Vec<HydraSemanticToken>,
+    ) -> usize {
+        if pos >= line.len() {
+            return 0;
+        }
+
+        let remaining = &line[pos..];
+
+        match value {
+            Value::Number(_) => {
+                let num_len = remaining
+                    .find(|c: char| {
+                        !c.is_numeric() && c != '.' && c != '-' && c != 'e' && c != 'E' && c != '+'
+                    })
+                    .unwrap_or(remaining.len());
+                if num_len > 0 {
+                    tokens.push(HydraSemanticToken {
+                        line: line_num,
+                        start_char: pos as u32,
+                        length: num_len as u32,
+                        token_type: SemanticTokenType::Number,
+                    });
+                }
+                num_len
+            }
+            Value::String(_) => {
+                if remaining.starts_with('"') || remaining.starts_with('\'') {
+                    // Quoted string - find closing quote
+                    let quote = remaining.chars().next().unwrap();
+                    if let Some(end_pos) = remaining[1..].find(quote) {
+                        let str_len = end_pos + 2; // Include both quotes
+                        tokens.push(HydraSemanticToken {
+                            line: line_num,
+                            start_char: pos as u32,
+                            length: str_len as u32,
+                            token_type: SemanticTokenType::String,
+                        });
+                        str_len
+                    } else {
+                        remaining.len()
+                    }
+                } else {
+                    // Unquoted string - delimiter depends on context
+                    let str_len = if in_array {
+                        let len = remaining
+                            .find(|c: char| c == ',' || c == ']')
+                            .unwrap_or(remaining.len());
+                        remaining[..len].trim_end().len()
+                    } else {
+                        remaining
+                            .find('#')
+                            .unwrap_or(remaining.len())
+                            .min(remaining.trim_end().len())
+                    };
+                    if str_len > 0 {
+                        tokens.push(HydraSemanticToken {
+                            line: line_num,
+                            start_char: pos as u32,
+                            length: str_len as u32,
+                            token_type: SemanticTokenType::String,
+                        });
+                    }
+                    str_len
+                }
+            }
+            Value::Bool(_) => {
+                let bool_len = remaining
+                    .find(|c: char| c.is_whitespace() || c == '#' || c == ',' || c == ']')
+                    .unwrap_or(remaining.len());
+                if bool_len > 0 {
+                    tokens.push(HydraSemanticToken {
+                        line: line_num,
+                        start_char: pos as u32,
+                        length: bool_len as u32,
+                        token_type: SemanticTokenType::Property,
+                    });
+                }
+                bool_len
+            }
+            Value::Sequence(seq) => {
+                // Tokenize array elements individually
+                Self::tokenize_sequence_values(seq, line, pos, line_num, tokens)
+            }
+            _ => {
+                // Other value types (null, etc.) - treat as property
+                let val_len = remaining
+                    .find(|c: char| c.is_whitespace() || c == '#' || c == ',' || c == ']')
+                    .unwrap_or(remaining.len());
+                if val_len > 0 {
+                    tokens.push(HydraSemanticToken {
+                        line: line_num,
+                        start_char: pos as u32,
+                        length: val_len as u32,
+                        token_type: SemanticTokenType::Property,
+                    });
+                }
+                val_len
+            }
+        }
+    }
+
+    /// Tokenize values inside a YAML sequence (array) on a single line.
+    /// Handles inline arrays like [0.9, 0.999] or ["hello", "world"].
+    /// Returns the total length consumed including brackets.
+    fn tokenize_sequence_values(
+        seq: &[Value],
+        line: &str,
+        start_pos: usize,
+        line_num: u32,
+        tokens: &mut Vec<HydraSemanticToken>,
+    ) -> usize {
+        // Only handle inline arrays (single line)
+        let remaining = &line[start_pos..];
+        if !remaining.starts_with('[') {
+            return 0;
+        }
+
+        let mut pos = start_pos + 1; // Skip opening bracket
+
+        for value in seq {
+            // Skip whitespace and commas
+            while pos < line.len() {
+                let c = line[pos..].chars().next().unwrap_or(' ');
+                if c.is_whitespace() || c == ',' {
+                    pos += 1;
+                } else {
+                    break;
+                }
+            }
+
+            if pos >= line.len() {
+                break;
+            }
+
+            // Tokenize the value and advance position
+            let consumed = Self::tokenize_value(value, line, pos, line_num, true, tokens);
+            pos += consumed;
+        }
+
+        // Find closing bracket to return total length
+        if let Some(close_pos) = line[start_pos..].find(']') {
+            close_pos + 1
+        } else {
+            pos - start_pos
         }
     }
 }

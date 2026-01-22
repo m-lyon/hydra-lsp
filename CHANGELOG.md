@@ -6,6 +6,7 @@
 - Created `hydra-check` CLI tool
 - Removed dummy `CompletionResponse`s
 - Fixed issue in `YamlParser` whereby parameters weren't being fully recursively searched
+- Fixed issue with incorrect semantic token handling for sequences
 
 ## [0.1.2]
 

@@ -1,0 +1,11 @@
+---
+source: tests/semantic_tokens.rs
+expression: token_summary
+---
+- "delta_line=2, delta_start=12, length=2, type=Namespace, modifiers=0"
+- "delta_line=0, delta_start=3, length=4, type=Namespace, modifiers=0"
+- "delta_line=0, delta_start=5, length=6, type=Namespace, modifiers=0"
+- "delta_line=0, delta_start=7, length=6, type=Namespace, modifiers=0"
+- "delta_line=0, delta_start=7, length=10, type=Class, modifiers=0"
+- "delta_line=1, delta_start=2, length=11, type=Parameter, modifiers=0"
+- "delta_line=0, delta_start=13, length=3, type=Number, modifiers=0"
