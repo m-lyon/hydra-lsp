@@ -1,0 +1,10 @@
+---
+source: tests/goto_definition.rs
+assertion_line: 258
+expression: "format!(\"File: {}\\nStart Line: {}\\nStart Character: {}\\nEnd Line: {}\\nEnd Character: {}\",\nfile_name, location.range.start.line, location.range.start.character,\nlocation.range.end.line, location.range.end.character)"
+---
+File: mylib/modules/linear.py
+Start Line: 27
+Start Character: 0
+End Line: 32
+End Character: 26

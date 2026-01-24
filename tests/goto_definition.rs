@@ -1,8 +1,21 @@
 mod common;
-
+use std::path::Path;
 use tower_lsp::lsp_types::*;
 
 use crate::common::*;
+
+fn get_filepath_with_parent(uri: &Url) -> String {
+    let path = Path::new(uri.path());
+    path.iter()
+        .rev()
+        .take(2)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|s| s.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
 
 #[tokio::test]
 async fn test_goto_definition_class() {
@@ -148,4 +161,165 @@ test:
         res.is_none(),
         "Should not get definition on non-target line"
     );
+}
+
+#[tokio::test]
+async fn test_goto_definition_reexport_simple() {
+    let mut ctx = TestContext::new(TestWorkspace::Reexport);
+    ctx.initialize().await;
+
+    let content = std::fs::read_to_string(ctx.workspace.path().join("config.yaml")).unwrap();
+    ctx.open_document("config.yaml", content.clone()).await;
+
+    let target_line = content
+        .lines()
+        .enumerate()
+        .find(|(_, line)| line.contains("_target_: mylib.Linear"))
+        .map(|(idx, _)| idx)
+        .unwrap();
+
+    let res = ctx
+        .request::<request::GotoDefinition>(GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                position: Position {
+                    line: target_line as u32,
+                    character: 19,
+                },
+                text_document: TextDocumentIdentifier {
+                    uri: ctx.doc_uri("config.yaml"),
+                },
+            },
+            work_done_progress_params: WorkDoneProgressParams {
+                work_done_token: None,
+            },
+            partial_result_params: PartialResultParams {
+                partial_result_token: None,
+            },
+        })
+        .await;
+
+    match res {
+        Some(GotoDefinitionResponse::Scalar(location)) => {
+            let file_name = get_filepath_with_parent(&location.uri);
+            insta::assert_snapshot!(
+                "goto_definition_reexport_simple",
+                format!(
+                    "File: {}\nStart Line: {}\nStart Character: {}\nEnd Line: {}\nEnd Character: {}",
+                    file_name,
+                    location.range.start.line,
+                    location.range.start.character,
+                    location.range.end.line,
+                    location.range.end.character
+                )
+            );
+        }
+        _ => panic!("Expected scalar location response"),
+    }
+}
+
+#[tokio::test]
+async fn test_goto_definition_reexport_alias() {
+    let mut ctx = TestContext::new(TestWorkspace::Reexport);
+    ctx.initialize().await;
+
+    let content = std::fs::read_to_string(ctx.workspace.path().join("config.yaml")).unwrap();
+    ctx.open_document("config.yaml", content.clone()).await;
+
+    let target_line = content
+        .lines()
+        .enumerate()
+        .find(|(_, line)| line.contains("_target_: mylib.AliasedClass"))
+        .map(|(idx, _)| idx)
+        .unwrap();
+
+    let res = ctx
+        .request::<request::GotoDefinition>(GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                position: Position {
+                    line: target_line as u32,
+                    character: 19,
+                },
+                text_document: TextDocumentIdentifier {
+                    uri: ctx.doc_uri("config.yaml"),
+                },
+            },
+            work_done_progress_params: WorkDoneProgressParams {
+                work_done_token: None,
+            },
+            partial_result_params: PartialResultParams {
+                partial_result_token: None,
+            },
+        })
+        .await;
+
+    match res {
+        Some(GotoDefinitionResponse::Scalar(location)) => {
+            let file_name = get_filepath_with_parent(&location.uri);
+            insta::assert_snapshot!(
+                "goto_definition_reexport_alias",
+                format!(
+                    "File: {}\nStart Line: {}\nStart Character: {}\nEnd Line: {}\nEnd Character: {}",
+                    file_name,
+                    location.range.start.line,
+                    location.range.start.character,
+                    location.range.end.line,
+                    location.range.end.character
+                )
+            );
+        }
+        _ => panic!("Expected scalar location response"),
+    }
+}
+
+#[tokio::test]
+async fn test_goto_definition_reexport_star() {
+    let mut ctx = TestContext::new(TestWorkspace::Reexport);
+    ctx.initialize().await;
+
+    let content = std::fs::read_to_string(ctx.workspace.path().join("config.yaml")).unwrap();
+    ctx.open_document("config.yaml", content.clone()).await;
+
+    let target_line = content
+        .lines()
+        .enumerate()
+        .find(|(_, line)| line.contains("_target_: mylib.StarExportedClass"))
+        .map(|(idx, _)| idx)
+        .unwrap();
+    let res = ctx
+        .request::<request::GotoDefinition>(GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                position: Position {
+                    line: target_line as u32,
+                    character: 19,
+                },
+                text_document: TextDocumentIdentifier {
+                    uri: ctx.doc_uri("config.yaml"),
+                },
+            },
+            work_done_progress_params: WorkDoneProgressParams {
+                work_done_token: None,
+            },
+            partial_result_params: PartialResultParams {
+                partial_result_token: None,
+            },
+        })
+        .await;
+
+    match res {
+        Some(GotoDefinitionResponse::Scalar(location)) => {
+            let file_name = get_filepath_with_parent(&location.uri);
+            insta::assert_snapshot!(
+                "goto_definition_reexport_star",
+                format!(
+                    "File: {}\nStart Line: {}\nStart Character: {}\nEnd Line: {}\nEnd Character: {}",
+                    file_name,
+                    location.range.start.line,
+                    location.range.start.character,
+                    location.range.end.line,
+                    location.range.end.character
+                )
+            );
+        }
+        _ => panic!("Expected scalar location response"),
+    }
 }

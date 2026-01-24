@@ -25,8 +25,7 @@ A Language Server Protocol implementation for [Hydra](https://hydra.cc/) configu
 
 ### Planned Features
 
-- 🔄 **Type Validation**: Validate YAML values against Python type annotations
-- 🔄 **Smart Autocomplete**: Suggest Python classes/functions and parameters
+For a list of planned features and enhancements, see the [issues](https://github.com/m-lyon/hydra-lsp/issues) page.
 
 ## CLI Tool: hydra-check
 

@@ -31,6 +31,7 @@ pub enum TestWorkspace {
     Diagnostics,
     Nested,
     Editable,
+    Reexport,
 }
 
 impl AsRef<str> for TestWorkspace {
@@ -40,6 +41,7 @@ impl AsRef<str> for TestWorkspace {
             TestWorkspace::Diagnostics => "diagnostics",
             TestWorkspace::Nested => "nested",
             TestWorkspace::Editable => "editable",
+            TestWorkspace::Reexport => "reexport",
         }
     }
 }

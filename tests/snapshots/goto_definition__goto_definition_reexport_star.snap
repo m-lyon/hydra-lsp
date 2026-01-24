@@ -1,0 +1,10 @@
+---
+source: tests/goto_definition.rs
+assertion_line: 311
+expression: "format!(\"File: {}\\nStart Line: {}\\nStart Character: {}\\nEnd Line: {}\\nEnd Character: {}\",\nfile_name, location.range.start.line, location.range.start.character,\nlocation.range.end.line, location.range.end.character)"
+---
+File: mylib/star_module.py
+Start Line: 5
+Start Character: 0
+End Line: 10
+End Character: 24
