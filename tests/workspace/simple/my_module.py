@@ -2,15 +2,16 @@
 
 
 class DataLoader:
-    """A simple data loader for testing.
-
-    Args:
-        batch_size: The size of each batch
-        shuffle: Whether to shuffle the data
-        num_workers: Number of worker processes (default: 0)
-    """
+    """A simple data loader for testing."""
 
     def __init__(self, batch_size: int, shuffle: bool = False, num_workers: int = 0):
+        """Initialize the data loader.
+
+        Args:
+            batch_size: Size of each batch
+            shuffle: Whether to shuffle the data (default: False)
+            num_workers: Number of worker threads (default: 0)
+        """
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.num_workers = num_workers
@@ -106,3 +107,41 @@ class ComplexClass:
     def method(self):
         """A method."""
         pass
+
+
+def my_long_func(
+    param1: int, param2: str = "default", param3: float = 3.14, param4=True
+) -> None:
+    """A function with a really long signature to test line wrapping in documentation.
+
+    Args:
+        param1: An integer parameter
+        param2: A string parameter with default
+        param3: A float parameter with default
+        param4: A boolean parameter with default
+    """
+    pass
+
+
+class MyReallyLongClassNameToTestLineWrappingInDocumentation:
+    pass
+
+
+class MyReallyReallyLongClassNameToTestLine(
+    MyReallyLongClassNameToTestLineWrappingInDocumentation
+):
+    """A class with a really long name to test line wrapping in documentation."""
+
+    def __init__(
+        self, some_parameter: str, another_parameter: int = 42, flag: bool = True
+    ) -> None:
+        """Initialize the class.
+
+        Args:
+            some_parameter: A parameter for initialization
+            another_parameter: Another parameter with default
+            flag: A boolean flag with default
+        """
+        self.some_parameter = some_parameter
+        self.another_parameter = another_parameter
+        self.flag = flag

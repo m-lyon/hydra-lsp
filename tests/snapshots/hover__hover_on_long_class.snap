@@ -1,0 +1,25 @@
+---
+source: tests/hover.rs
+assertion_line: 205
+expression: markup.value
+---
+```python
+class MyReallyReallyLongClassNameToTestLine(
+    MyReallyLongClassNameToTestLineWrappingInDocumentation
+):
+    """A class with a really long name to test line wrapping in documentation."""
+
+    def __init__(
+        self,
+        some_parameter: str,
+        another_parameter: int = 42,
+        flag: bool = True
+    ) -> None:
+        """Initialize the class.
+
+        Args:
+            some_parameter: A parameter for initialization
+            another_parameter: Another parameter with default
+            flag: A boolean flag with default
+        """
+```

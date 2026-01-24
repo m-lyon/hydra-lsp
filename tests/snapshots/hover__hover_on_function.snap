@@ -3,12 +3,8 @@ source: tests/hover.rs
 expression: markup.value
 ---
 ```python
-def create_model(input_dim: int, output_dim: int, hidden_dim: int = 128)
-```
-
----
-
-Create a simple model.
+def create_model(input_dim: int, output_dim: int, hidden_dim: int = 128):
+    """Create a simple model.
 
     Args:
         input_dim: Input dimension
@@ -17,3 +13,6 @@ Create a simple model.
 
     Returns:
         A model instance
+    
+    """
+```

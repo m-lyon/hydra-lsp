@@ -5,7 +5,7 @@ use tower_lsp::lsp_types::*;
 use crate::common::*;
 
 #[tokio::test]
-async fn test_hover_on_target() {
+async fn test_hover_on_class_target() {
     let mut ctx = TestContext::new(TestWorkspace::Simple);
     ctx.initialize().await;
 
@@ -40,7 +40,7 @@ async fn test_hover_on_target() {
     if let Some(hover) = res {
         match hover.contents {
             HoverContents::Markup(markup) => {
-                insta::assert_snapshot!("hover_on_dataloader", markup.value);
+                insta::assert_snapshot!("hover_on_class", markup.value);
             }
             _ => {
                 panic!("Expected Markup hover content but got something else");
@@ -127,4 +127,88 @@ test:
         .await;
 
     assert!(res.is_none(), "Should not get hover on non-target line");
+}
+
+#[tokio::test]
+async fn test_hover_long_function_signature() {
+    let mut ctx = TestContext::new(TestWorkspace::Simple);
+    ctx.initialize().await;
+
+    let content = r#"# @hydra
+test:
+  _target_: my_module.my_long_func
+  param1: value1
+"#;
+    ctx.open_document("test.yaml", content.to_string()).await;
+
+    let res = ctx
+        .request::<request::HoverRequest>(HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                position: Position {
+                    line: 2,
+                    character: 16,
+                },
+                text_document: TextDocumentIdentifier {
+                    uri: ctx.doc_uri("test.yaml"),
+                },
+            },
+            work_done_progress_params: WorkDoneProgressParams {
+                work_done_token: None,
+            },
+        })
+        .await;
+    if let Some(hover) = res {
+        match hover.contents {
+            HoverContents::Markup(markup) => {
+                insta::assert_snapshot!("hover_on_long_function", markup.value);
+            }
+            _ => {
+                panic!("Expected Markup hover content but got something else");
+            }
+        }
+    } else {
+        panic!("Expected hover response but got None");
+    }
+}
+
+#[tokio::test]
+async fn test_hover_long_class_signature() {
+    let mut ctx = TestContext::new(TestWorkspace::Simple);
+    ctx.initialize().await;
+
+    let content = r#"# @hydra
+test:
+  _target_: my_module.MyReallyReallyLongClassNameToTestLine
+  some_parameter: value1
+"#;
+    ctx.open_document("test.yaml", content.to_string()).await;
+
+    let res = ctx
+        .request::<request::HoverRequest>(HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                position: Position {
+                    line: 2,
+                    character: 16,
+                },
+                text_document: TextDocumentIdentifier {
+                    uri: ctx.doc_uri("test.yaml"),
+                },
+            },
+            work_done_progress_params: WorkDoneProgressParams {
+                work_done_token: None,
+            },
+        })
+        .await;
+    if let Some(hover) = res {
+        match hover.contents {
+            HoverContents::Markup(markup) => {
+                insta::assert_snapshot!("hover_on_long_class", markup.value);
+            }
+            _ => {
+                panic!("Expected Markup hover content but got something else");
+            }
+        }
+    } else {
+        panic!("Expected hover response but got None");
+    }
 }
