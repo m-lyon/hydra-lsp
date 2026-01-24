@@ -45,7 +45,7 @@ fn validate_target(
         python_interpreter,
     ) {
         Ok((definition_info, _file_path, _module_path, _symbol_name)) => {
-            return (diagnostics, Some(definition_info));
+            (diagnostics, Some(definition_info))
         }
         Err(err) => {
             let error_msg = err.to_string();
@@ -67,7 +67,7 @@ fn validate_target(
                 Some(code),
                 msg,
             ));
-            return (diagnostics, None);
+            (diagnostics, None)
         }
     }
 }
@@ -407,7 +407,7 @@ mod tests {
         };
 
         let (diagnostics, _definition_info) =
-            validate_target(&target_info, Some(&&get_simple_test_dir()), None);
+            validate_target(&target_info, Some(&get_simple_test_dir()), None);
         assert_eq!(diagnostics.len(), 1);
         assert!(
             diagnostics[0].message.contains("Could not resolve module"),

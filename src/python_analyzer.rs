@@ -131,6 +131,7 @@ impl PythonAnalyzer {
     /// - Uses proper site-packages resolution
     /// - Handles package hierarchies correctly
     /// - Supports .pyi stub files
+    ///
     /// Resolve a Python module path to a file path using ty's module resolution
     ///
     /// Returns the resolved file path and the search paths used
@@ -484,12 +485,11 @@ impl PythonAnalyzer {
             result.push_str(&format!(" -> {}", ret_type));
         }
 
-        result.push_str("\n```");
-
         if let Some(docstring) = &sig.docstring {
-            result.push_str("\n\n---\n\n");
-            result.push_str(docstring);
+            result.push_str(&format!(":\n    \"\"\"{}\n    \"\"\"", docstring));
         }
+
+        result.push_str("\n```");
 
         result
     }
@@ -521,12 +521,11 @@ impl PythonAnalyzer {
             result.push(')');
         }
 
-        result.push_str("\n```");
-
         if let Some(docstring) = &class.docstring {
-            result.push_str("\n\n---\n\n");
-            result.push_str(docstring);
+            result.push_str(&format!(":\n    \"\"\"{}\n    \"\"\"", docstring));
         }
+
+        result.push_str("\n```");
 
         result
     }

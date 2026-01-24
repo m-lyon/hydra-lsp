@@ -727,9 +727,7 @@ impl YamlParser {
                 } else {
                     // Unquoted string - delimiter depends on context
                     let str_len = if in_array {
-                        let len = remaining
-                            .find(|c: char| c == ',' || c == ']')
-                            .unwrap_or(remaining.len());
+                        let len = remaining.find([',', ']']).unwrap_or(remaining.len());
                         remaining[..len].trim_end().len()
                     } else {
                         remaining

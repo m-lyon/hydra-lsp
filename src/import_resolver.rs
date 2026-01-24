@@ -115,7 +115,7 @@ impl ImportResolver {
         // Sort search paths by length descending to match more specific paths first
         // (e.g., site-packages should match before workspace root)
         let mut sorted_paths = self.search_paths.clone();
-        sorted_paths.sort_by(|a, b| b.as_os_str().len().cmp(&a.as_os_str().len()));
+        sorted_paths.sort_by_key(|a| a.as_os_str().len());
 
         let mut package_path: Option<String> = None;
         for search_path in &sorted_paths {
@@ -253,25 +253,25 @@ impl ImportResolver {
                     Some(module.clone())
                 };
 
-                if let Some(module_path) = resolved_module {
-                    if let Some(module_file) = self.resolve_module_path(&module_path) {
-                        // Check if this symbol is exported from the star-imported module
-                        let star_dunder_all = self.extract_dunder_all(&module_file);
+                if let Some(module_path) = resolved_module
+                    && let Some(module_file) = self.resolve_module_path(&module_path)
+                {
+                    // Check if this symbol is exported from the star-imported module
+                    let star_dunder_all = self.extract_dunder_all(&module_file);
 
-                        // If __all__ is defined, check if symbol is in it
-                        // If not defined, check if symbol doesn't start with _
-                        let is_exported = if let Some(ref all_names) = star_dunder_all {
-                            all_names.contains(&symbol_name.to_string())
-                        } else {
-                            !symbol_name.starts_with('_')
-                        };
+                    // If __all__ is defined, check if symbol is in it
+                    // If not defined, check if symbol doesn't start with _
+                    let is_exported = if let Some(ref all_names) = star_dunder_all {
+                        all_names.contains(&symbol_name.to_string())
+                    } else {
+                        !symbol_name.starts_with('_')
+                    };
 
-                        if is_exported {
-                            if let Some(result) = self.resolve_symbol(&module_file, symbol_name) {
-                                self.depth -= 1;
-                                return Some(result);
-                            }
-                        }
+                    if is_exported
+                        && let Some(result) = self.resolve_symbol(&module_file, symbol_name)
+                    {
+                        self.depth -= 1;
+                        return Some(result);
                     }
                 }
             }
@@ -340,13 +340,12 @@ impl<'a> Visitor<'a> for DunderAllFinder {
 
         if let Stmt::Assign(assign) = stmt {
             for target in &assign.targets {
-                if let Expr::Name(name) = target {
-                    if name.id.as_str() == "__all__" {
-                        if let Some(names) = extract_list_of_strings(&assign.value) {
-                            self.names = Some(names);
-                            return;
-                        }
-                    }
+                if let Expr::Name(name) = target
+                    && name.id.as_str() == "__all__"
+                    && let Some(names) = extract_list_of_strings(&assign.value)
+                {
+                    self.names = Some(names);
+                    return;
                 }
             }
         }
