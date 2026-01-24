@@ -7,6 +7,7 @@
 - Removed dummy `CompletionResponse`s
 - Fixed issue in `YamlParser` whereby parameters weren't being fully recursively searched
 - Fixed issue with incorrect semantic token handling for sequences
+- Fixed issue of `.pth` files not being used for python import resolution
 
 ## [0.1.2]
 

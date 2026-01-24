@@ -1,0 +1,10 @@
+# @hydra
+# Test configuration for editable installs via .pth files
+
+# This simulates a pixi-style editable install where the package
+# is only accessible via a .pth file in site-packages
+
+model:
+  _target_: editable_package.lib.EditableModel
+  input_size: 128
+  output_size: 64

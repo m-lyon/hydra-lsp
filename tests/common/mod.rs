@@ -7,10 +7,10 @@ use std::path::Path;
 
 use fs_extra::dir::CopyOptions;
 use temp_dir::TempDir;
-use tokio::io::{duplex, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, DuplexStream};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, DuplexStream, duplex};
 use tower_lsp::lsp_types::notification::Notification;
 use tower_lsp::lsp_types::{InitializedParams, Url, WorkspaceFolder};
-use tower_lsp::{jsonrpc, lsp_types, lsp_types::request::Request, LspService, Server};
+use tower_lsp::{LspService, Server, jsonrpc, lsp_types, lsp_types::request::Request};
 
 use hydra_lsp::backend::HydraLspBackend;
 
@@ -30,6 +30,7 @@ pub enum TestWorkspace {
     Simple,
     Diagnostics,
     Nested,
+    Editable,
 }
 
 impl AsRef<str> for TestWorkspace {
@@ -38,6 +39,7 @@ impl AsRef<str> for TestWorkspace {
             TestWorkspace::Simple => "simple",
             TestWorkspace::Diagnostics => "diagnostics",
             TestWorkspace::Nested => "nested",
+            TestWorkspace::Editable => "editable",
         }
     }
 }

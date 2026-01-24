@@ -11,6 +11,9 @@ cargo test
 # Run a specific test file
 cargo test --test hover
 
+# Run ignored tests
+cargo test -- --ignored
+
 # Run with output visible
 cargo test -- --nocapture
 

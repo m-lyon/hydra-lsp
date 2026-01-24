@@ -206,8 +206,11 @@ mod tests {
     use crate::yaml_parser::Parameter;
     use std::path::PathBuf;
 
-    fn get_test_resources_dir() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources")
+    fn get_simple_test_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("workspace")
+            .join("simple")
     }
 
     // ==================== validate_parameters tests ====================
@@ -404,7 +407,7 @@ mod tests {
         };
 
         let (diagnostics, _definition_info) =
-            validate_target(&target_info, Some(&get_test_resources_dir()), None);
+            validate_target(&target_info, Some(&&get_simple_test_dir()), None);
         assert_eq!(diagnostics.len(), 1);
         assert!(
             diagnostics[0].message.contains("Could not resolve module"),
@@ -423,14 +426,14 @@ mod tests {
     #[test]
     fn test_validate_target_symbol_not_found() {
         let target_info = TargetInfo {
-            value: "test_module.NonExistentClass".to_string(),
+            value: "my_module.NonExistentClass".to_string(),
             parameters: Vec::new(),
             line: 0,
             key_start: 10,
             value_start: 10 + "_target_:".len() as u32 + 1,
         };
 
-        let resources_dir = get_test_resources_dir();
+        let resources_dir = get_simple_test_dir();
         let (diagnostics, _definition_info) =
             validate_target(&target_info, Some(&resources_dir), None);
         assert_eq!(diagnostics.len(), 1);
@@ -448,14 +451,14 @@ mod tests {
     #[test]
     fn test_validate_target_valid_class() {
         let target_info = TargetInfo {
-            value: "test_module.ClassWithInit".to_string(),
+            value: "my_module.ClassWithInit".to_string(),
             parameters: Vec::new(),
             line: 0,
             key_start: 10,
             value_start: 10 + "_target_:".len() as u32 + 1,
         };
 
-        let resources_dir = get_test_resources_dir();
+        let resources_dir = get_simple_test_dir();
         let (diagnostics, _definition_info) =
             validate_target(&target_info, Some(&resources_dir), None);
 
@@ -477,14 +480,14 @@ mod tests {
     #[test]
     fn test_validate_target_valid_function() {
         let target_info = TargetInfo {
-            value: "test_module.simple_function".to_string(),
+            value: "my_module.simple_function".to_string(),
             parameters: Vec::new(),
             line: 0,
             key_start: 10,
             value_start: 10 + "_target_:".len() as u32 + 1,
         };
 
-        let resources_dir = get_test_resources_dir();
+        let resources_dir = get_simple_test_dir();
         let (diagnostics, _definition_info) =
             validate_target(&target_info, Some(&resources_dir), None);
 
@@ -509,7 +512,7 @@ mod tests {
     fn test_validate_document_multiple_targets() {
         let targets = vec![
             TargetInfo {
-                value: "test_module.simple_function".to_string(),
+                value: "my_module.simple_function".to_string(),
                 parameters: Vec::new(),
                 line: 0,
                 key_start: 10,
@@ -531,7 +534,7 @@ mod tests {
             },
         ];
 
-        let resources_dir = get_test_resources_dir();
+        let resources_dir = get_simple_test_dir();
         let diagnostics = validate_document(targets, Some(&resources_dir), None);
 
         // Should have at least 2 errors (invalid format and module not found)
@@ -559,14 +562,14 @@ mod tests {
         }];
         // Missing required 'name' parameter (it has no default)
         let targets = vec![TargetInfo {
-            value: "test_module.ClassWithInit".to_string(),
+            value: "my_module.ClassWithInit".to_string(),
             parameters: params,
             line: 0,
             key_start: 10,
             value_start: 10 + "_target_:".len() as u32 + 1,
         }];
 
-        let resources_dir = get_test_resources_dir();
+        let resources_dir = get_simple_test_dir();
         let diagnostics = validate_document(targets, Some(&resources_dir), None);
 
         // Should have diagnostic for missing required parameter 'name'
@@ -596,14 +599,14 @@ mod tests {
         }];
 
         let targets = vec![TargetInfo {
-            value: "test_module.function_with_params".to_string(),
+            value: "my_module.function_with_params".to_string(),
             parameters: params,
             line: 0,
             key_start: 10,
             value_start: 10 + "_target_:".len() as u32 + 1,
         }];
 
-        let resources_dir = get_test_resources_dir();
+        let resources_dir = get_simple_test_dir();
         let diagnostics = validate_document(targets, Some(&resources_dir), None);
 
         // Should not have errors for the nested target (it's a valid SimpleClass)

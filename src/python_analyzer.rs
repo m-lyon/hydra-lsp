@@ -263,12 +263,73 @@ impl PythonAnalyzer {
         // Add current directory
         search_paths.push(PathBuf::from("."));
 
-        // Add site-packages paths
+        // Add site-packages paths AND process .pth files for editable installs
         for sys_path in site_packages_paths {
-            search_paths.push(sys_path.as_std_path().to_path_buf());
+            let site_packages = sys_path.as_std_path().to_path_buf();
+
+            // Process .pth files in this site-packages directory
+            let editable_paths = Self::parse_pth_files(&site_packages);
+
+            search_paths.push(site_packages);
+            search_paths.extend(editable_paths);
         }
 
         search_paths
+    }
+
+    /// Parse all .pth files in a site-packages directory and extract editable install paths.
+    ///
+    /// This follows the Python site module specification:
+    /// - Empty lines and lines beginning with `#` are skipped
+    /// - Lines starting with `import ` or `import\t` are executed, not treated as paths
+    /// - All other lines are treated as directories to add to `sys.path`
+    ///
+    /// See: https://docs.python.org/3/library/site.html
+    fn parse_pth_files(site_packages: &Path) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+
+        let Ok(entries) = fs::read_dir(site_packages) else {
+            return paths;
+        };
+
+        // Collect and sort .pth files alphabetically (per Python spec)
+        let mut pth_files: Vec<PathBuf> = entries
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "pth"))
+            .map(|e| e.path())
+            .collect();
+        pth_files.sort();
+
+        for pth_file in pth_files {
+            if let Ok(contents) = fs::read_to_string(&pth_file) {
+                for line in contents.lines() {
+                    let line = line.trim_end();
+
+                    // Skip empty lines, comments, and import statements
+                    if line.is_empty()
+                        || line.starts_with('#')
+                        || line.starts_with("import ")
+                        || line.starts_with("import\t")
+                    {
+                        continue;
+                    }
+
+                    // Resolve relative paths relative to site-packages
+                    let path = if Path::new(line).is_absolute() {
+                        PathBuf::from(line)
+                    } else {
+                        site_packages.join(line)
+                    };
+
+                    // Only add if the directory exists
+                    if path.is_dir() {
+                        paths.push(path);
+                    }
+                }
+            }
+        }
+
+        paths
     }
 
     /// Extract class information, following re-exports if necessary
@@ -734,8 +795,11 @@ mod tests {
     use super::*;
     use std::env;
 
-    fn get_resources_dir() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources")
+    fn get_simple_test_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("workspace")
+            .join("simple")
     }
 
     // ==================== split_target tests ====================
@@ -770,16 +834,16 @@ mod tests {
 
     #[test]
     fn test_resolve_module_simple() {
-        let examples_dir = get_resources_dir();
-        let result = PythonAnalyzer::resolve_module("test_module", Some(&examples_dir), None);
+        let examples_dir = get_simple_test_dir();
+        let result = PythonAnalyzer::resolve_module("my_module", Some(&examples_dir), None);
         assert!(result.is_ok());
         let (path, _) = result.unwrap();
-        assert!(path.ends_with("test_module.py"));
+        assert!(path.ends_with("my_module.py"));
     }
 
     #[test]
     fn test_resolve_module_package() {
-        let examples_dir = get_resources_dir();
+        let examples_dir = get_simple_test_dir();
         let result = PythonAnalyzer::resolve_module("test_package", Some(&examples_dir), None);
         assert!(result.is_ok());
         let (path, _) = result.unwrap();
@@ -788,7 +852,7 @@ mod tests {
 
     #[test]
     fn test_resolve_module_submodule() {
-        let examples_dir = get_resources_dir();
+        let examples_dir = get_simple_test_dir();
         let result =
             PythonAnalyzer::resolve_module("test_package.submodule", Some(&examples_dir), None);
         assert!(result.is_ok());
@@ -798,7 +862,7 @@ mod tests {
 
     #[test]
     fn test_resolve_module_nonexistent() {
-        let examples_dir = get_resources_dir();
+        let examples_dir = get_simple_test_dir();
         let result =
             PythonAnalyzer::resolve_module("nonexistent_module", Some(&examples_dir), None);
         assert!(result.is_err());
@@ -808,8 +872,8 @@ mod tests {
 
     #[test]
     fn test_extract_simple_function() {
-        let examples_dir = get_resources_dir();
-        let test_file = examples_dir.join("test_module.py");
+        let examples_dir = get_simple_test_dir();
+        let test_file = examples_dir.join("my_module.py");
 
         let sig =
             PythonAnalyzer::extract_function_signature(&test_file, "simple_function").unwrap();
@@ -821,8 +885,8 @@ mod tests {
 
     #[test]
     fn test_extract_function_with_params() {
-        let examples_dir = get_resources_dir();
-        let test_file = examples_dir.join("test_module.py");
+        let examples_dir = get_simple_test_dir();
+        let test_file = examples_dir.join("my_module.py");
 
         let sig =
             PythonAnalyzer::extract_function_signature(&test_file, "function_with_params").unwrap();
@@ -851,8 +915,8 @@ mod tests {
 
     #[test]
     fn test_extract_function_with_return() {
-        let examples_dir = get_resources_dir();
-        let test_file = examples_dir.join("test_module.py");
+        let examples_dir = get_simple_test_dir();
+        let test_file = examples_dir.join("my_module.py");
 
         let sig =
             PythonAnalyzer::extract_function_signature(&test_file, "function_with_return").unwrap();
@@ -863,8 +927,8 @@ mod tests {
 
     #[test]
     fn test_extract_variadic_function() {
-        let examples_dir = get_resources_dir();
-        let test_file = examples_dir.join("test_module.py");
+        let examples_dir = get_simple_test_dir();
+        let test_file = examples_dir.join("my_module.py");
 
         let sig =
             PythonAnalyzer::extract_function_signature(&test_file, "variadic_function").unwrap();
@@ -884,8 +948,8 @@ mod tests {
 
     #[test]
     fn test_extract_complex_function() {
-        let examples_dir = get_resources_dir();
-        let test_file = examples_dir.join("test_module.py");
+        let examples_dir = get_simple_test_dir();
+        let test_file = examples_dir.join("my_module.py");
 
         let sig =
             PythonAnalyzer::extract_function_signature(&test_file, "complex_function").unwrap();
@@ -908,8 +972,8 @@ mod tests {
 
     #[test]
     fn test_extract_nonexistent_function() {
-        let examples_dir = get_resources_dir();
-        let test_file = examples_dir.join("test_module.py");
+        let examples_dir = get_simple_test_dir();
+        let test_file = examples_dir.join("my_module.py");
 
         let result = PythonAnalyzer::extract_function_signature(&test_file, "nonexistent");
         assert!(result.is_err());
@@ -919,8 +983,8 @@ mod tests {
 
     #[test]
     fn test_extract_simple_class() {
-        let examples_dir = get_resources_dir();
-        let test_file = examples_dir.join("test_module.py");
+        let examples_dir = get_simple_test_dir();
+        let test_file = examples_dir.join("my_module.py");
 
         let class_info = PythonAnalyzer::extract_class_info(&test_file, "SimpleClass").unwrap();
         assert_eq!(class_info.name, "SimpleClass");
@@ -930,8 +994,8 @@ mod tests {
 
     #[test]
     fn test_extract_class_with_init() {
-        let examples_dir = get_resources_dir();
-        let test_file = examples_dir.join("test_module.py");
+        let examples_dir = get_simple_test_dir();
+        let test_file = examples_dir.join("my_module.py");
 
         let class_info = PythonAnalyzer::extract_class_info(&test_file, "ClassWithInit").unwrap();
         assert_eq!(class_info.name, "ClassWithInit");
@@ -963,8 +1027,8 @@ mod tests {
 
     #[test]
     fn test_extract_complex_class() {
-        let examples_dir = get_resources_dir();
-        let test_file = examples_dir.join("test_module.py");
+        let examples_dir = get_simple_test_dir();
+        let test_file = examples_dir.join("my_module.py");
 
         let class_info = PythonAnalyzer::extract_class_info(&test_file, "ComplexClass").unwrap();
         assert_eq!(class_info.name, "ComplexClass");
@@ -977,8 +1041,8 @@ mod tests {
 
     #[test]
     fn test_extract_nonexistent_class() {
-        let examples_dir = get_resources_dir();
-        let test_file = examples_dir.join("test_module.py");
+        let examples_dir = get_simple_test_dir();
+        let test_file = examples_dir.join("my_module.py");
 
         let result = PythonAnalyzer::extract_class_info(&test_file, "NonexistentClass");
         assert!(result.is_err());
@@ -988,10 +1052,10 @@ mod tests {
 
     #[test]
     fn test_extract_definition_function() {
-        let examples_dir = get_resources_dir();
+        let examples_dir = get_simple_test_dir();
 
         let result = PythonAnalyzer::extract_definition_info(
-            "test_module.simple_function",
+            "my_module.simple_function",
             Some(&examples_dir),
             None,
         );
@@ -1008,10 +1072,10 @@ mod tests {
 
     #[test]
     fn test_extract_definition_class() {
-        let examples_dir = get_resources_dir();
+        let examples_dir = get_simple_test_dir();
 
         let result = PythonAnalyzer::extract_definition_info(
-            "test_module.SimpleClass",
+            "my_module.SimpleClass",
             Some(&examples_dir),
             None,
         );
@@ -1028,7 +1092,7 @@ mod tests {
 
     #[test]
     fn test_extract_definition_from_package() {
-        let examples_dir = get_resources_dir();
+        let examples_dir = get_simple_test_dir();
 
         let result = PythonAnalyzer::extract_definition_info(
             "test_package.submodule.SubmoduleClass",
@@ -1048,10 +1112,10 @@ mod tests {
 
     #[test]
     fn test_extract_definition_nonexistent() {
-        let examples_dir = get_resources_dir();
+        let examples_dir = get_simple_test_dir();
 
         let result = PythonAnalyzer::extract_definition_info(
-            "test_module.NonexistentSymbol",
+            "my_module.NonexistentSymbol",
             Some(&examples_dir),
             None,
         );
@@ -1728,7 +1792,7 @@ mod tests {
     fn test_configured_interpreter_takes_priority() {
         // This test verifies that when a Python interpreter is explicitly configured
         // via LSP initialization, it is used instead of auto-discovery
-        let examples_dir = get_resources_dir();
+        let examples_dir = get_simple_test_dir();
 
         // Get the current system Python
         let system_python = which::which("python3")
@@ -1739,7 +1803,7 @@ mod tests {
 
         // Resolve a module with explicit interpreter configuration
         let result_with_config = PythonAnalyzer::resolve_module(
-            "test_module",
+            "my_module",
             Some(&examples_dir),
             Some(system_python_str),
         );
@@ -1755,10 +1819,10 @@ mod tests {
     fn test_auto_discovery_when_no_interpreter_configured() {
         // This test verifies that when no Python interpreter is configured,
         // the system falls back to auto-discovery
-        let examples_dir = get_resources_dir();
+        let examples_dir = get_simple_test_dir();
 
         // Resolve a module without explicit interpreter configuration (None)
-        let result = PythonAnalyzer::resolve_module("test_module", Some(&examples_dir), None);
+        let result = PythonAnalyzer::resolve_module("my_module", Some(&examples_dir), None);
 
         // Should still succeed using auto-discovery
         assert!(
@@ -1771,7 +1835,7 @@ mod tests {
     #[ignore = "Requires Python in PATH"]
     fn test_extract_definition_with_configured_interpreter() {
         // Test that definition extraction uses configured interpreter
-        let examples_dir = get_resources_dir();
+        let examples_dir = get_simple_test_dir();
 
         // Get the current system Python
         let system_python = which::which("python3")
@@ -1782,7 +1846,7 @@ mod tests {
 
         // Extract definition with configured interpreter
         let result = PythonAnalyzer::extract_definition_info(
-            "test_module.simple_function",
+            "my_module.simple_function",
             Some(&examples_dir),
             system_python_str,
         );
@@ -1797,11 +1861,11 @@ mod tests {
     #[test]
     fn test_extract_definition_without_configured_interpreter() {
         // Test that definition extraction works without configured interpreter (auto-discovery)
-        let examples_dir = get_resources_dir();
+        let examples_dir = get_simple_test_dir();
 
         // Extract definition without configured interpreter
         let result = PythonAnalyzer::extract_definition_info(
-            "test_module.simple_function",
+            "my_module.simple_function",
             Some(&examples_dir),
             None,
         );
@@ -1819,12 +1883,12 @@ mod tests {
         // This test documents the priority order:
         // 1. Configured interpreter (highest priority)
         // 2. Auto-discovered environment (fallback)
-        let examples_dir = get_resources_dir();
+        let examples_dir = get_simple_test_dir();
 
         // Test with configured interpreter (priority 1)
         if let Ok(python_path) = which::which("python3").or_else(|_| which::which("python")) {
             let result_configured = PythonAnalyzer::resolve_module(
-                "test_module",
+                "my_module",
                 Some(&examples_dir),
                 python_path.to_str(),
             );
@@ -1835,7 +1899,7 @@ mod tests {
         }
 
         // Test with auto-discovery (priority 2)
-        let result_auto = PythonAnalyzer::resolve_module("test_module", Some(&examples_dir), None);
+        let result_auto = PythonAnalyzer::resolve_module("my_module", Some(&examples_dir), None);
         assert!(result_auto.is_ok(), "Should resolve with auto-discovery");
     }
 
@@ -1979,5 +2043,97 @@ mod tests {
             result.is_err(),
             "Private class should not be accessible via star import"
         );
+    }
+
+    // ==================== .pth file parsing tests ====================
+
+    fn get_editable_test_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("workspace")
+            .join("editable")
+    }
+
+    #[test]
+    fn test_parse_pth_files_basic() {
+        // Test parsing .pth files from the editable test workspace
+        let workspace_dir = get_editable_test_dir();
+        let site_packages = workspace_dir.join("site-packages");
+
+        let paths = PythonAnalyzer::parse_pth_files(&site_packages);
+
+        // Should find the path from _editable_package.pth
+        assert!(!paths.is_empty(), "Should find paths from .pth files");
+
+        // The path should point to the src directory
+        let has_src_path = paths.iter().any(|p| p.ends_with("src"));
+        assert!(has_src_path, "Should find src path from .pth file");
+    }
+
+    #[test]
+    fn test_parse_pth_files_nonexistent_dir() {
+        // Test that parsing .pth files from nonexistent directory returns empty
+        let nonexistent = PathBuf::from("/nonexistent/path/site-packages");
+        let paths = PythonAnalyzer::parse_pth_files(&nonexistent);
+        assert!(paths.is_empty(), "Should return empty for nonexistent dir");
+    }
+
+    #[test]
+    fn test_resolve_editable_module() {
+        // Test resolving a module from an editable install via .pth file
+        let workspace_dir = get_editable_test_dir();
+        let site_packages = workspace_dir.join("site-packages");
+
+        // Build search paths manually with site-packages that has .pth files
+        let mut search_paths = vec![workspace_dir.clone()];
+        search_paths.push(site_packages.clone());
+        search_paths.extend(PythonAnalyzer::parse_pth_files(&site_packages));
+
+        // The editable_package should now be resolvable
+        let result =
+            PythonAnalyzer::resolve_module_with_search_paths("editable_package.lib", &search_paths);
+
+        assert!(
+            result.is_ok(),
+            "Should resolve editable_package.lib: {:?}",
+            result.err()
+        );
+        let path = result.unwrap();
+        assert!(
+            path.ends_with("lib.py"),
+            "Should resolve to lib.py: {:?}",
+            path
+        );
+    }
+
+    #[test]
+    fn test_extract_definition_from_editable_package() {
+        // Test extracting class definition from an editable package via .pth resolution
+        let workspace_dir = get_editable_test_dir();
+        let site_packages = workspace_dir.join("site-packages");
+
+        // Build search paths manually with site-packages that has .pth files
+        let mut search_paths = vec![workspace_dir.clone()];
+        search_paths.push(site_packages.clone());
+        search_paths.extend(PythonAnalyzer::parse_pth_files(&site_packages));
+
+        // Resolve the module first
+        let module_path =
+            PythonAnalyzer::resolve_module_with_search_paths("editable_package.lib", &search_paths)
+                .expect("Should resolve module");
+
+        // Extract the class info
+        let class_info = PythonAnalyzer::extract_class_info(&module_path, "EditableModel")
+            .expect("Should extract class info");
+
+        assert_eq!(class_info.name, "EditableModel");
+        assert!(class_info.docstring.is_some());
+        assert!(class_info.init_signature.is_some());
+
+        let init_sig = class_info.init_signature.as_ref().unwrap();
+        // Should have self, input_size, output_size
+        assert_eq!(init_sig.parameters.len(), 3);
+        assert_eq!(init_sig.parameters[1].name, "input_size");
+        assert_eq!(init_sig.parameters[2].name, "output_size");
     }
 }
