@@ -4,11 +4,11 @@ use tower_lsp::lsp_types::*;
 
 use crate::common::*;
 
-fn get_filepath_with_parent(uri: &Url) -> String {
+fn get_filepath_components(uri: &Url, n: usize) -> String {
     let path = Path::new(uri.path());
     path.iter()
         .rev()
-        .take(2)
+        .take(n)
         .collect::<Vec<_>>()
         .into_iter()
         .rev()
@@ -55,7 +55,7 @@ async fn test_goto_definition_class() {
 
     match res {
         Some(GotoDefinitionResponse::Scalar(location)) => {
-            let file_name = location.uri.path().split('/').next_back().unwrap_or("");
+            let file_name = get_filepath_components(&location.uri, 1);
             insta::assert_snapshot!(
                 "goto_definition_class",
                 format!(
@@ -107,7 +107,7 @@ test:
 
     match res {
         Some(GotoDefinitionResponse::Scalar(location)) => {
-            let file_name = location.uri.path().split('/').next_back().unwrap_or("");
+            let file_name = get_filepath_components(&location.uri, 1);
             insta::assert_snapshot!(
                 "goto_definition_function",
                 format!(
@@ -200,7 +200,7 @@ async fn test_goto_definition_reexport_simple() {
 
     match res {
         Some(GotoDefinitionResponse::Scalar(location)) => {
-            let file_name = get_filepath_with_parent(&location.uri);
+            let file_name = get_filepath_components(&location.uri, 3);
             insta::assert_snapshot!(
                 "goto_definition_reexport_simple",
                 format!(
@@ -254,7 +254,7 @@ async fn test_goto_definition_reexport_alias() {
 
     match res {
         Some(GotoDefinitionResponse::Scalar(location)) => {
-            let file_name = get_filepath_with_parent(&location.uri);
+            let file_name = get_filepath_components(&location.uri, 3);
             insta::assert_snapshot!(
                 "goto_definition_reexport_alias",
                 format!(
@@ -307,7 +307,7 @@ async fn test_goto_definition_reexport_star() {
 
     match res {
         Some(GotoDefinitionResponse::Scalar(location)) => {
-            let file_name = get_filepath_with_parent(&location.uri);
+            let file_name = get_filepath_components(&location.uri, 2);
             insta::assert_snapshot!(
                 "goto_definition_reexport_star",
                 format!(

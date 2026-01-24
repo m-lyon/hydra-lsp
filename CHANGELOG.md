@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.1.4]
+
+- Fixed issue with `goto_definition` filepath for reexported modules
+
 ## [0.1.3]
 
 - Fixed issue with `python` reimports not being found by `PythonAnalyzer`

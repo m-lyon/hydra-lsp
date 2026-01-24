@@ -332,15 +332,16 @@ impl PythonAnalyzer {
         paths
     }
 
-    /// Extract class information, following re-exports if necessary
+    /// Extract class information, following re-exports if necessary.
+    /// Returns the ClassInfo and the file path where it was found.
     pub fn extract_class_info_with_imports(
         file_path: &Path,
         class_name: &str,
         search_paths: Vec<PathBuf>,
-    ) -> Result<ClassInfo> {
+    ) -> Result<(ClassInfo, PathBuf)> {
         // First try direct lookup
         if let Ok(class_info) = Self::extract_class_info(file_path, class_name) {
-            return Ok(class_info);
+            return Ok((class_info, file_path.to_path_buf()));
         }
 
         // Try to resolve through imports
@@ -352,7 +353,8 @@ impl PythonAnalyzer {
             } else {
                 resolved_name
             };
-            return Self::extract_class_info(&resolved_file, &actual_name);
+            let class_info = Self::extract_class_info(&resolved_file, &actual_name)?;
+            return Ok((class_info, resolved_file));
         }
 
         anyhow::bail!(
@@ -362,15 +364,16 @@ impl PythonAnalyzer {
         )
     }
 
-    /// Extract function signature, following re-exports if necessary
+    /// Extract function signature, following re-exports if necessary.
+    /// Returns the FunctionSignature and the file path where it was found.
     pub fn extract_function_signature_with_imports(
         file_path: &Path,
         function_name: &str,
         search_paths: Vec<PathBuf>,
-    ) -> Result<FunctionSignature> {
+    ) -> Result<(FunctionSignature, PathBuf)> {
         // First try direct lookup
         if let Ok(func_sig) = Self::extract_function_signature(file_path, function_name) {
-            return Ok(func_sig);
+            return Ok((func_sig, file_path.to_path_buf()));
         }
 
         // Try to resolve through imports
@@ -383,7 +386,8 @@ impl PythonAnalyzer {
             } else {
                 resolved_name
             };
-            return Self::extract_function_signature(&resolved_file, &actual_name);
+            let func_sig = Self::extract_function_signature(&resolved_file, &actual_name)?;
+            return Ok((func_sig, resolved_file));
         }
 
         anyhow::bail!(
@@ -410,26 +414,26 @@ impl PythonAnalyzer {
             Self::resolve_module(&module_path, workspace_root, python_interpreter)?;
 
         // Try to extract as function first (with import resolution)
-        if let Ok(func_sig) = Self::extract_function_signature_with_imports(
+        if let Ok((func_sig, resolved_file)) = Self::extract_function_signature_with_imports(
             &file_path,
             &symbol_name,
             search_paths.clone(),
         ) {
             return Ok((
                 DefinitionInfo::Function(func_sig),
-                file_path,
+                resolved_file,
                 module_path,
                 symbol_name,
             ));
         }
 
         // Try to extract as class (with import resolution)
-        if let Ok(class_info) =
+        if let Ok((class_info, resolved_file)) =
             Self::extract_class_info_with_imports(&file_path, &symbol_name, search_paths)
         {
             return Ok((
                 DefinitionInfo::Class(class_info),
-                file_path,
+                resolved_file,
                 module_path,
                 symbol_name,
             ));
