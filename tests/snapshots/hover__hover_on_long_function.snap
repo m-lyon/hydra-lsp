@@ -1,6 +1,5 @@
 ---
 source: tests/hover.rs
-assertion_line: 163
 expression: markup.value
 ---
 ```python
@@ -8,7 +7,7 @@ def my_long_func(
     param1: int,
     param2: str = 'default',
     param3: float = 3.14,
-    param4 = true
+    param4 = True
 ) -> None:
     """A function with a really long signature to test line wrapping in documentation.
 
@@ -17,6 +16,5 @@ def my_long_func(
         param2: A string parameter with default
         param3: A float parameter with default
         param4: A boolean parameter with default
-    
     """
 ```

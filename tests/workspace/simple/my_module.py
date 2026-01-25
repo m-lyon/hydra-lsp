@@ -123,7 +123,11 @@ def my_long_func(
     pass
 
 
-class MyReallyLongClassNameToTestLineWrappingInDocumentation:
+class MyBaseClass:
+    pass
+
+
+class MyReallyLongClassNameToTestLineWrappingInDocumentation(MyBaseClass):
     pass
 
 

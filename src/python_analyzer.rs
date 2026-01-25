@@ -41,6 +41,7 @@ impl ParameterInfo {
 #[derive(Debug, Clone)]
 pub struct ClassInfo {
     pub name: String,
+    pub base_classes: Vec<String>,
     pub docstring: Option<String>,
     pub init_signature: Option<FunctionSignature>,
     pub start_line: u32,
@@ -447,47 +448,44 @@ impl PythonAnalyzer {
         )
     }
 
+    /// Format a single parameter for display
+    fn format_parameter(p: &ParameterInfo) -> String {
+        let mut s = String::new();
+
+        // Add * or ** prefix for variadic parameters
+        if p.is_variadic {
+            s.push('*');
+        } else if p.is_variadic_keyword {
+            s.push_str("**");
+        }
+
+        s.push_str(&p.name);
+
+        if let Some(type_ann) = &p.type_annotation {
+            s.push_str(&format!(": {}", type_ann));
+        }
+        if let Some(default) = &p.default_value {
+            s.push_str(&format!(" = {}", default));
+        }
+        s
+    }
+
     /// Format a function signature for display (e.g., in hover)
-    pub fn format_signature(sig: &FunctionSignature) -> String {
+    pub fn format_function(sig: &FunctionSignature) -> String {
         let mut result = String::new();
         result.push_str("```python\n");
-        result.push_str(&format!("def {}(", sig.name));
 
-        let param_strs: Vec<String> = sig
-            .parameters
-            .iter()
-            .map(|p| {
-                let mut s = String::new();
+        let param_strs: Vec<String> = sig.parameters.iter().map(Self::format_parameter).collect();
 
-                // Add * or ** prefix for variadic parameters
-                if p.is_variadic {
-                    s.push('*');
-                } else if p.is_variadic_keyword {
-                    s.push_str("**");
-                }
-
-                s.push_str(&p.name);
-
-                if let Some(type_ann) = &p.type_annotation {
-                    s.push_str(&format!(": {}", type_ann));
-                }
-                if let Some(default) = &p.default_value {
-                    s.push_str(&format!(" = {}", default));
-                }
-                s
-            })
-            .collect();
-
-        result.push_str(&param_strs.join(", "));
-        result.push(')');
-
-        if let Some(ret_type) = &sig.return_type {
-            result.push_str(&format!(" -> {}", ret_type));
-        }
-
-        if let Some(docstring) = &sig.docstring {
-            result.push_str(&format!(":\n    \"\"\"{}\n    \"\"\"", docstring));
-        }
+        result.push_str(&Self::format_definition(
+            "def",
+            &sig.name,
+            &param_strs,
+            true,
+            sig.return_type.as_ref(),
+            sig.docstring.as_ref(),
+            None,
+        ));
 
         result.push_str("\n```");
 
@@ -495,38 +493,100 @@ impl PythonAnalyzer {
     }
 
     /// Format a class for display (e.g., in hover)
+    /// Shows class definition with base classes, class docstring,
+    /// then __init__ method definition with its docstring
     pub fn format_class(class: &ClassInfo) -> String {
         let mut result = String::new();
         result.push_str("```python\n");
-        result.push_str(&format!("class {}", class.name));
 
+        result.push_str(&Self::format_definition(
+            "class",
+            &class.name,
+            &class.base_classes,
+            false,
+            None,
+            class.docstring.as_ref(),
+            None,
+        ));
+
+        // Add __init__ method if present
         if let Some(init_sig) = &class.init_signature {
-            result.push('(');
             let param_strs: Vec<String> = init_sig
                 .parameters
                 .iter()
-                .filter(|p| p.name != "self") // Skip self parameter
-                .map(|p| {
-                    let mut s = p.name.clone();
-                    if let Some(type_ann) = &p.type_annotation {
-                        s.push_str(&format!(": {}", type_ann));
-                    }
-                    if let Some(default) = &p.default_value {
-                        s.push_str(&format!(" = {}", default));
-                    }
-                    s
-                })
+                .map(Self::format_parameter)
                 .collect();
-            result.push_str(&param_strs.join(", "));
-            result.push(')');
-        }
 
-        if let Some(docstring) = &class.docstring {
-            result.push_str(&format!(":\n    \"\"\"{}\n    \"\"\"", docstring));
+            result.push_str("\n\n");
+
+            result.push_str(&Self::format_definition(
+                "def",
+                "__init__",
+                &param_strs,
+                true,
+                init_sig.return_type.as_ref(),
+                init_sig.docstring.as_ref(),
+                Some(4),
+            ));
         }
 
         result.push_str("\n```");
 
+        result
+    }
+
+    /// Format a function definition string (placeholder for future use)
+    fn format_definition(
+        def_str: &str,
+        name: &str,
+        param_strs: &[String],
+        wrap_empty_params: bool,
+        return_type: Option<&String>,
+        docstring: Option<&String>,
+        indent: Option<usize>,
+    ) -> String {
+        // Placeholder for future implementation
+        let mut result = String::new();
+        let indent_str = " ".repeat(indent.unwrap_or(0));
+        let single_line_params = if param_strs.is_empty() && !wrap_empty_params {
+            String::new()
+        } else {
+            format!("({})", param_strs.join(", "))
+        };
+        let single_line = format!(
+            "{}{} {}{}{}:",
+            indent_str,
+            def_str,
+            name,
+            single_line_params,
+            return_type
+                .map(|rt| format!(" -> {}", rt))
+                .unwrap_or_default()
+        );
+        if single_line.len() < 100 || (param_strs.is_empty() && return_type.is_none()) {
+            // Single line format (without colon - added later with docstring)
+            result.push_str(&single_line[..single_line.len() - 1]);
+        } else {
+            // Multi-line format with parameters on separate lines
+            result.push_str(&format!("{}{} {}(", indent_str, def_str, name));
+            for (i, param_str) in param_strs.iter().enumerate() {
+                result.push_str(&format!("\n{}    ", indent_str));
+                result.push_str(param_str);
+                if i < param_strs.len() - 1 {
+                    result.push(',');
+                }
+            }
+            result.push_str(&format!("\n{})", indent_str));
+            if let Some(ret_type) = &return_type {
+                result.push_str(&format!(" -> {}", ret_type));
+            }
+        }
+
+        if let Some(docstring) = docstring {
+            result.push_str(&format!(":\n{}    \"\"\"{}\"\"\"", indent_str, docstring));
+        } else {
+            result.push(':');
+        }
         result
     }
 }
@@ -654,6 +714,9 @@ fn extract_class_info_from_def(class_def: &ast::StmtClassDef, source: &str) -> C
     let (start_line, start_column, end_line, end_column) =
         get_position_info(class_def.range, source);
 
+    // Extract base classes
+    let base_classes: Vec<String> = class_def.bases().iter().map(expr_to_string).collect();
+
     // Look for __init__ method
     let init_signature = class_def.body.iter().find_map(|stmt| {
         if let Stmt::FunctionDef(func_def) = stmt
@@ -666,6 +729,7 @@ fn extract_class_info_from_def(class_def: &ast::StmtClassDef, source: &str) -> C
 
     ClassInfo {
         name: class_def.name.to_string(),
+        base_classes,
         docstring,
         init_signature,
         start_line,
@@ -780,7 +844,13 @@ fn expr_to_string(expr: &Expr) -> String {
             ast::Number::Float(f) => f.to_string(),
             ast::Number::Complex { real, imag } => format!("{}+{}j", real, imag),
         },
-        Expr::BooleanLiteral(b) => format!("{}", b.value),
+        Expr::BooleanLiteral(b) => {
+            if b.value {
+                "True".to_string()
+            } else {
+                "False".to_string()
+            }
+        }
         Expr::NoneLiteral(_) => "None".to_string(),
         Expr::BinOp(binop) => {
             format!(
@@ -1140,7 +1210,7 @@ mod tests {
             end_column: 5,
         };
 
-        let formatted = PythonAnalyzer::format_signature(&sig);
+        let formatted = PythonAnalyzer::format_function(&sig);
         assert!(formatted.contains("def test_func()"));
         assert!(formatted.starts_with("```python"));
         assert!(formatted.contains("```"));
@@ -1178,7 +1248,7 @@ mod tests {
             end_column: 5,
         };
 
-        let formatted = PythonAnalyzer::format_signature(&sig);
+        let formatted = PythonAnalyzer::format_function(&sig);
         assert!(formatted.contains("def test_func(x: int, y: str = 'hello') -> bool"));
         assert!(formatted.contains("Test docstring"));
     }
@@ -1215,7 +1285,7 @@ mod tests {
             end_column: 5,
         };
 
-        let formatted = PythonAnalyzer::format_signature(&sig);
+        let formatted = PythonAnalyzer::format_function(&sig);
         assert!(formatted.contains("*args"));
         assert!(formatted.contains("**kwargs"));
     }
@@ -1226,6 +1296,7 @@ mod tests {
     fn test_format_simple_class() {
         let class_info = ClassInfo {
             name: "TestClass".to_string(),
+            base_classes: vec![],
             docstring: Some("A test class".to_string()),
             init_signature: None,
             start_line: 0,
@@ -1244,6 +1315,7 @@ mod tests {
     fn test_format_class_with_init() {
         let class_info = ClassInfo {
             name: "TestClass".to_string(),
+            base_classes: vec![],
             docstring: Some("A test class".to_string()),
             start_line: 0,
             start_column: 0,
@@ -1281,8 +1353,12 @@ mod tests {
         };
 
         let formatted = PythonAnalyzer::format_class(&class_info);
-        assert!(formatted.contains("class TestClass(value: int)"));
-        assert!(!formatted.contains("self")); // self should be filtered out
+        assert!(formatted.contains("class TestClass:"));
+        assert!(
+            formatted.contains("def __init__(self, value: int):"),
+            "Expected __init__ method in formatted output, got: \"{}\"",
+            formatted
+        );
         assert!(formatted.contains("A test class"));
     }
 
@@ -1290,6 +1366,7 @@ mod tests {
     fn test_format_class_with_defaults() {
         let class_info = ClassInfo {
             name: "TestClass".to_string(),
+            base_classes: vec![],
             docstring: None,
             start_line: 0,
             start_column: 0,

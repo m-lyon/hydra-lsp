@@ -221,7 +221,7 @@ impl LanguageServer for HydraLspBackend {
         ) {
             Ok((definition_info, _file_path, _module_path, _symbol_name)) => {
                 let hover_content = match definition_info {
-                    DefinitionInfo::Function(sig) => PythonAnalyzer::format_signature(&sig),
+                    DefinitionInfo::Function(sig) => PythonAnalyzer::format_function(&sig),
                     DefinitionInfo::Class(class_info) => PythonAnalyzer::format_class(&class_info),
                 };
                 let range = Range {

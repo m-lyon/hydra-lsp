@@ -13,6 +13,5 @@ def create_model(input_dim: int, output_dim: int, hidden_dim: int = 128):
 
     Returns:
         A model instance
-    
     """
 ```
