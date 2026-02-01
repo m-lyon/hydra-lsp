@@ -1,6 +1,6 @@
-# Hydra LSP (Language Server Protocol)
+# Hydrust
 
-A Language Server Protocol implementation for [Hydra](https://hydra.cc/) configuration files, written in Rust.
+A Language Server for [Hydra](https://hydra.cc/) configuration files, written in Rust.
 
 ## Features
 
