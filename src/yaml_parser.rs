@@ -142,8 +142,7 @@ impl TargetInfo {
     pub fn is_partial(&self) -> bool {
         self.parameters
             .iter()
-            .find(|p| p.key == PARTIAL_KEY)
-            .is_some_and(|p| p.value.as_bool() == Some(true))
+            .any(|p| p.key == PARTIAL_KEY && p.value.as_bool() == Some(true))
     }
 }
 
