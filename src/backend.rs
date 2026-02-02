@@ -223,6 +223,9 @@ impl LanguageServer for HydraLspBackend {
                 let hover_content = match definition_info {
                     DefinitionInfo::Function(sig) => PythonAnalyzer::format_function(&sig),
                     DefinitionInfo::Class(class_info) => PythonAnalyzer::format_class(&class_info),
+                    DefinitionInfo::Method(method_info) => {
+                        PythonAnalyzer::format_method(&method_info)
+                    }
                 };
                 let range = Range {
                     start: Position {
@@ -525,6 +528,70 @@ impl LanguageServer for HydraLspBackend {
                             (label, vec![], class_info.docstring.clone())
                         }
                     }
+                    DefinitionInfo::Method(method_info) => {
+                        let sig = &method_info.signature;
+                        // Filter out 'self' and 'cls' for classmethods
+                        let filter_param = if method_info.is_classmethod {
+                            "cls"
+                        } else if method_info.is_staticmethod {
+                            "" // No parameter to filter for staticmethods
+                        } else {
+                            "self"
+                        };
+
+                        let param_strs: Vec<String> = sig
+                            .parameters
+                            .iter()
+                            .filter(|p| p.name != filter_param)
+                            .map(|p| {
+                                let mut s = String::new();
+                                if p.is_variadic {
+                                    s.push('*');
+                                } else if p.is_variadic_keyword {
+                                    s.push_str("**");
+                                }
+                                s.push_str(&p.name);
+                                if let Some(type_ann) = &p.type_annotation {
+                                    s.push_str(&format!(": {}", type_ann));
+                                }
+                                s
+                            })
+                            .collect();
+
+                        let label = format!(
+                            "{}.{}({})",
+                            method_info.class_name,
+                            sig.name,
+                            param_strs.join(", ")
+                        );
+
+                        let params = sig
+                            .parameters
+                            .iter()
+                            .filter(|p| p.name != filter_param)
+                            .map(|p| {
+                                let mut label = String::new();
+                                if p.is_variadic {
+                                    label.push('*');
+                                } else if p.is_variadic_keyword {
+                                    label.push_str("**");
+                                }
+                                label.push_str(&p.name);
+                                if let Some(type_ann) = &p.type_annotation {
+                                    label.push_str(&format!(": {}", type_ann));
+                                }
+
+                                ParameterInformation {
+                                    label: ParameterLabel::Simple(label),
+                                    documentation: p.default_value.as_ref().map(|dv| {
+                                        Documentation::String(format!("Default: {}", dv))
+                                    }),
+                                }
+                            })
+                            .collect();
+
+                        (label, params, sig.docstring.clone())
+                    }
                 };
 
                 Ok(Some(SignatureHelp {
@@ -623,6 +690,12 @@ impl LanguageServer for HydraLspBackend {
                             class_info.start_column,
                             class_info.end_line,
                             class_info.end_column,
+                        ),
+                        DefinitionInfo::Method(method_info) => (
+                            method_info.signature.start_line,
+                            method_info.signature.start_column,
+                            method_info.signature.end_line,
+                            method_info.signature.end_column,
                         ),
                     };
                     (file_path, start_line, start_col, end_line, end_col)

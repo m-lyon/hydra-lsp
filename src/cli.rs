@@ -273,6 +273,26 @@ fn trace_target_resolution(
                         println!("  {} (no __init__ found)", "__init__:".dimmed());
                     }
                 }
+                hydra_lsp::python_analyzer::DefinitionInfo::Method(method_info) => {
+                    let method_type = if method_info.is_classmethod {
+                        "classmethod"
+                    } else if method_info.is_staticmethod {
+                        "staticmethod"
+                    } else {
+                        "method"
+                    };
+                    println!(
+                        "  {} {} ({})",
+                        "Type:".dimmed(),
+                        method_type,
+                        method_info.class_name
+                    );
+                    println!(
+                        "  {} {}",
+                        "Signature:".dimmed(),
+                        format_signature_brief(&method_info.signature)
+                    );
+                }
             }
         }
         Err(e) => {

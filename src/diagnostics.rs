@@ -179,6 +179,7 @@ pub fn validate_document(
                         continue;
                     }
                 }
+                DefinitionInfo::Method(method_info) => method_info.signature,
             };
 
             let parameter_diagnostics = validate_parameters(target, &signature);
@@ -398,8 +399,9 @@ mod tests {
 
     #[test]
     fn test_validate_target_module_not_found() {
+        // Use a clearly nonexistent module path that won't match class.method patterns
         let target_info = TargetInfo {
-            value: "nonexistent.module.Class".to_string(),
+            value: "totally_nonexistent_xyz.SomeClass".to_string(),
             parameters: Vec::new(),
             line: 0,
             key_start: 10,

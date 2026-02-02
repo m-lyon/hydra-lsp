@@ -50,10 +50,21 @@ pub struct ClassInfo {
     pub end_column: u32,
 }
 
+/// Represents a method within a class (including classmethods and staticmethods)
+#[derive(Debug, Clone)]
+pub struct MethodInfo {
+    pub class_name: String,
+    pub method_name: String,
+    pub signature: FunctionSignature,
+    pub is_classmethod: bool,
+    pub is_staticmethod: bool,
+}
+
 #[derive(Debug, Clone)]
 pub enum DefinitionInfo {
     Function(FunctionSignature),
     Class(ClassInfo),
+    Method(MethodInfo),
 }
 
 pub struct PythonAnalyzer;
@@ -250,6 +261,34 @@ impl PythonAnalyzer {
         })
     }
 
+    /// Extract a method (including classmethod/staticmethod) from a class
+    pub fn extract_method_info(
+        file_path: &Path,
+        class_name: &str,
+        method_name: &str,
+    ) -> Result<MethodInfo> {
+        let source = fs::read_to_string(file_path)?;
+        let parsed = parse_module(&source)?;
+
+        let mut visitor = MethodExtractor {
+            class_name: class_name.to_string(),
+            method_name: method_name.to_string(),
+            result: None,
+            source,
+        };
+
+        visitor.visit_body(parsed.suite());
+
+        visitor.result.ok_or_else(|| {
+            anyhow::anyhow!(
+                "Method '{}' not found in class '{}' in {}",
+                method_name,
+                class_name,
+                file_path.display()
+            )
+        })
+    }
+
     /// Build search paths from discovered site-packages
     fn build_search_paths(
         workspace_root: Option<&Path>,
@@ -412,39 +451,153 @@ impl PythonAnalyzer {
     ) -> Result<(DefinitionInfo, PathBuf, String, String)> {
         let (module_path, symbol_name) = Self::split_target(target)?;
 
-        let (file_path, search_paths) =
-            Self::resolve_module(&module_path, workspace_root, python_interpreter)?;
+        // Track whether we found the module but not the symbol
+        let mut module_found = false;
 
-        // Try to extract as function first (with import resolution)
-        if let Ok((func_sig, resolved_file)) = Self::extract_function_signature_with_imports(
-            &file_path,
-            &symbol_name,
-            search_paths.clone(),
-        ) {
-            return Ok((
-                DefinitionInfo::Function(func_sig),
-                resolved_file,
-                module_path,
-                symbol_name,
-            ));
+        // First try standard resolution: module.symbol where symbol is a function or class
+        if let Ok((file_path, search_paths)) =
+            Self::resolve_module(&module_path, workspace_root, python_interpreter)
+        {
+            module_found = true;
+
+            // Try to extract as function first (with import resolution)
+            if let Ok((func_sig, resolved_file)) = Self::extract_function_signature_with_imports(
+                &file_path,
+                &symbol_name,
+                search_paths.clone(),
+            ) {
+                return Ok((
+                    DefinitionInfo::Function(func_sig),
+                    resolved_file,
+                    module_path,
+                    symbol_name,
+                ));
+            }
+
+            // Try to extract as class (with import resolution)
+            if let Ok((class_info, resolved_file)) =
+                Self::extract_class_info_with_imports(&file_path, &symbol_name, search_paths)
+            {
+                return Ok((
+                    DefinitionInfo::Class(class_info),
+                    resolved_file,
+                    module_path,
+                    symbol_name,
+                ));
+            }
         }
 
-        // Try to extract as class (with import resolution)
-        if let Ok((class_info, resolved_file)) =
-            Self::extract_class_info_with_imports(&file_path, &symbol_name, search_paths)
+        // Try to interpret as Class.method pattern (e.g., "my_module.MyClass.from_config")
+        // In this case, the symbol_name might be "MyClass" and we need to look for "from_config"
+        // Or the module_path might end with the class name
+        if let Some((class_module, class_name, method_name)) =
+            Self::try_split_class_method(target, workspace_root, python_interpreter)
         {
-            return Ok((
-                DefinitionInfo::Class(class_info),
-                resolved_file,
-                module_path,
+            let (file_path, search_paths) =
+                Self::resolve_module(&class_module, workspace_root, python_interpreter)?;
+
+            if let Ok((method_info, resolved_file)) = Self::extract_method_info_with_imports(
+                &file_path,
+                &class_name,
+                &method_name,
+                search_paths,
+            ) {
+                return Ok((
+                    DefinitionInfo::Method(method_info),
+                    resolved_file,
+                    class_module,
+                    format!("{}.{}", class_name, method_name),
+                ));
+            }
+        }
+
+        // Return appropriate error based on whether module was found
+        if module_found {
+            anyhow::bail!(
+                "Symbol '{}' not found in module '{}'",
                 symbol_name,
-            ));
+                module_path
+            )
+        } else {
+            anyhow::bail!("Could not resolve module: '{}'", module_path)
+        }
+    }
+
+    /// Try to split a target string as module.Class.method
+    /// Returns (module_path, class_name, method_name) if the pattern matches
+    fn try_split_class_method(
+        target: &str,
+        workspace_root: Option<&Path>,
+        python_interpreter: Option<&str>,
+    ) -> Option<(String, String, String)> {
+        let parts: Vec<&str> = target.split('.').collect();
+        if parts.len() < 3 {
+            return None;
+        }
+
+        // Try different splits: the class could be at various positions
+        // Start from the end and work backwards
+        // For "a.b.c.MyClass.method", try:
+        //   module="a.b.c", class="MyClass", method="method"
+        //   module="a.b", class="c", method="MyClass" (if c is a class)
+        //   etc.
+
+        for class_idx in (1..parts.len() - 1).rev() {
+            let potential_class = parts[class_idx];
+            let method_name = parts[class_idx + 1..].join(".");
+            let module_path = parts[..class_idx].join(".");
+
+            // Skip if this doesn't look like a class name (heuristic: starts with uppercase)
+            // But also try it if we can resolve the module
+            if !potential_class
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_uppercase())
+            {
+                continue;
+            }
+
+            // Try to resolve the module
+            if Self::resolve_module(&module_path, workspace_root, python_interpreter).is_ok() {
+                return Some((module_path, potential_class.to_string(), method_name));
+            }
+        }
+
+        None
+    }
+
+    /// Extract method info, following re-exports if necessary.
+    /// Returns the MethodInfo and the file path where it was found.
+    pub fn extract_method_info_with_imports(
+        file_path: &Path,
+        class_name: &str,
+        method_name: &str,
+        search_paths: Vec<PathBuf>,
+    ) -> Result<(MethodInfo, PathBuf)> {
+        // First try direct lookup
+        if let Ok(method_info) = Self::extract_method_info(file_path, class_name, method_name) {
+            return Ok((method_info, file_path.to_path_buf()));
+        }
+
+        // Try to resolve class through imports, then find the method
+        let mut resolver = ImportResolver::new(search_paths);
+        if let Some((resolved_file, resolved_name)) = resolver.resolve_symbol(file_path, class_name)
+        {
+            let actual_class_name = if resolved_name.is_empty() {
+                class_name.to_string()
+            } else {
+                resolved_name
+            };
+            let method_info =
+                Self::extract_method_info(&resolved_file, &actual_class_name, method_name)?;
+            return Ok((method_info, resolved_file));
         }
 
         anyhow::bail!(
-            "Symbol '{}' not found in module '{}'",
-            symbol_name,
-            module_path
+            "Method '{}' not found in class '{}' in {} (also checked re-exports)",
+            method_name,
+            class_name,
+            file_path.display()
         )
     }
 
@@ -529,6 +682,41 @@ impl PythonAnalyzer {
                 Some(4),
             ));
         }
+
+        result.push_str("\n```");
+
+        result
+    }
+
+    /// Format a method for display (e.g., in hover)
+    /// Shows the method signature with @classmethod or @staticmethod decorator if applicable
+    pub fn format_method(method: &MethodInfo) -> String {
+        let mut result = String::new();
+        result.push_str("```python\n");
+
+        // Show decorator if applicable
+        if method.is_classmethod {
+            result.push_str("@classmethod\n");
+        } else if method.is_staticmethod {
+            result.push_str("@staticmethod\n");
+        }
+
+        let param_strs: Vec<String> = method
+            .signature
+            .parameters
+            .iter()
+            .map(Self::format_parameter)
+            .collect();
+
+        result.push_str(&Self::format_definition(
+            "def",
+            &method.signature.name,
+            &param_strs,
+            true,
+            method.signature.return_type.as_ref(),
+            method.signature.docstring.as_ref(),
+            None,
+        ));
 
         result.push_str("\n```");
 
@@ -667,6 +855,69 @@ impl<'a> Visitor<'a> for ClassExtractor {
         // Continue walking
         ast::visitor::walk_stmt(self, stmt);
     }
+}
+
+/// Visitor to extract a specific method from a class
+struct MethodExtractor {
+    class_name: String,
+    method_name: String,
+    result: Option<MethodInfo>,
+    source: String,
+}
+
+impl<'a> Visitor<'a> for MethodExtractor {
+    fn visit_stmt(&mut self, stmt: &'a Stmt) {
+        if self.result.is_some() {
+            return; // Already found
+        }
+
+        if let Stmt::ClassDef(class_def) = stmt
+            && class_def.name.as_str() == self.class_name
+        {
+            // Look for the method within the class body
+            for class_stmt in &class_def.body {
+                if let Stmt::FunctionDef(func_def) = class_stmt
+                    && func_def.name.as_str() == self.method_name
+                {
+                    let signature = extract_function_signature_from_def(func_def, &self.source);
+
+                    // Check decorators for @classmethod or @staticmethod
+                    let (is_classmethod, is_staticmethod) =
+                        check_method_decorators(&func_def.decorator_list);
+
+                    self.result = Some(MethodInfo {
+                        class_name: self.class_name.clone(),
+                        method_name: self.method_name.clone(),
+                        signature,
+                        is_classmethod,
+                        is_staticmethod,
+                    });
+                    return;
+                }
+            }
+        }
+
+        // Continue walking to find nested classes
+        ast::visitor::walk_stmt(self, stmt);
+    }
+}
+
+/// Check if a function has @classmethod or @staticmethod decorators
+fn check_method_decorators(decorators: &[ast::Decorator]) -> (bool, bool) {
+    let mut is_classmethod = false;
+    let mut is_staticmethod = false;
+
+    for decorator in decorators {
+        if let Expr::Name(name) = &decorator.expression {
+            match name.id.as_str() {
+                "classmethod" => is_classmethod = true,
+                "staticmethod" => is_staticmethod = true,
+                _ => {}
+            }
+        }
+    }
+
+    (is_classmethod, is_staticmethod)
 }
 
 /// Convert a TextRange to line/column position
@@ -2123,6 +2374,216 @@ mod tests {
             result.is_err(),
             "Private class should not be accessible via star import"
         );
+    }
+
+    // ==================== classmethod and staticmethod tests ====================
+
+    #[test]
+    fn test_extract_classmethod() {
+        // Test: class_methods.ModelFactory.from_config should resolve to a classmethod
+        let workspace_dir = get_simple_test_dir();
+
+        let result = PythonAnalyzer::extract_definition_info(
+            "class_methods.ModelFactory.from_config",
+            Some(&workspace_dir),
+            None,
+        );
+
+        assert!(
+            result.is_ok(),
+            "Should resolve classmethod: {:?}",
+            result.err()
+        );
+        let (definition_info, _file_path, _module_path, _symbol_name) = result.unwrap();
+
+        match definition_info {
+            DefinitionInfo::Method(method_info) => {
+                assert_eq!(method_info.class_name, "ModelFactory");
+                assert_eq!(method_info.method_name, "from_config");
+                assert!(method_info.is_classmethod);
+                assert!(!method_info.is_staticmethod);
+                assert_eq!(method_info.signature.name, "from_config");
+                // Check parameters: cls and config
+                assert_eq!(method_info.signature.parameters.len(), 2);
+                assert_eq!(method_info.signature.parameters[0].name, "cls");
+                assert_eq!(method_info.signature.parameters[1].name, "config");
+            }
+            _ => panic!("Expected Method definition, got {:?}", definition_info),
+        }
+    }
+
+    #[test]
+    fn test_extract_staticmethod() {
+        // Test: class_methods.ModelFactory.compute_size should resolve to a staticmethod
+        let workspace_dir = get_simple_test_dir();
+
+        let result = PythonAnalyzer::extract_definition_info(
+            "class_methods.ModelFactory.compute_size",
+            Some(&workspace_dir),
+            None,
+        );
+
+        assert!(
+            result.is_ok(),
+            "Should resolve staticmethod: {:?}",
+            result.err()
+        );
+        let (definition_info, _file_path, _module_path, _symbol_name) = result.unwrap();
+
+        match definition_info {
+            DefinitionInfo::Method(method_info) => {
+                assert_eq!(method_info.class_name, "ModelFactory");
+                assert_eq!(method_info.method_name, "compute_size");
+                assert!(!method_info.is_classmethod);
+                assert!(method_info.is_staticmethod);
+                assert_eq!(method_info.signature.name, "compute_size");
+                // Check parameters: dim1 and dim2
+                assert_eq!(method_info.signature.parameters.len(), 2);
+                assert_eq!(method_info.signature.parameters[0].name, "dim1");
+                assert_eq!(method_info.signature.parameters[1].name, "dim2");
+            }
+            _ => panic!("Expected Method definition, got {:?}", definition_info),
+        }
+    }
+
+    #[test]
+    fn test_extract_classmethod_with_defaults() {
+        // Test: class_methods.ModelFactory.with_defaults has default parameter
+        let workspace_dir = get_simple_test_dir();
+
+        let result = PythonAnalyzer::extract_definition_info(
+            "class_methods.ModelFactory.with_defaults",
+            Some(&workspace_dir),
+            None,
+        );
+
+        assert!(
+            result.is_ok(),
+            "Should resolve classmethod: {:?}",
+            result.err()
+        );
+        let (definition_info, _file_path, _module_path, _symbol_name) = result.unwrap();
+
+        match definition_info {
+            DefinitionInfo::Method(method_info) => {
+                assert_eq!(method_info.class_name, "ModelFactory");
+                assert_eq!(method_info.method_name, "with_defaults");
+                assert!(method_info.is_classmethod);
+                // Check parameters: cls and output_dim (with default)
+                assert_eq!(method_info.signature.parameters.len(), 2);
+                assert_eq!(method_info.signature.parameters[1].name, "output_dim");
+                assert!(method_info.signature.parameters[1].has_default);
+            }
+            _ => panic!("Expected Method definition, got {:?}", definition_info),
+        }
+    }
+
+    #[test]
+    fn test_extract_classmethod_with_kwargs() {
+        // Test: class_methods.DataProcessor.create has **kwargs
+        let workspace_dir = get_simple_test_dir();
+
+        let result = PythonAnalyzer::extract_definition_info(
+            "class_methods.DataProcessor.create",
+            Some(&workspace_dir),
+            None,
+        );
+
+        assert!(
+            result.is_ok(),
+            "Should resolve classmethod: {:?}",
+            result.err()
+        );
+        let (definition_info, _file_path, _module_path, _symbol_name) = result.unwrap();
+
+        match definition_info {
+            DefinitionInfo::Method(method_info) => {
+                assert_eq!(method_info.class_name, "DataProcessor");
+                assert_eq!(method_info.method_name, "create");
+                assert!(method_info.is_classmethod);
+                // Check parameters: cls, name, **kwargs
+                assert_eq!(method_info.signature.parameters.len(), 3);
+                assert_eq!(method_info.signature.parameters[2].name, "kwargs");
+                assert!(method_info.signature.parameters[2].is_variadic_keyword);
+            }
+            _ => panic!("Expected Method definition, got {:?}", definition_info),
+        }
+    }
+
+    #[test]
+    fn test_format_classmethod() {
+        let method_info = MethodInfo {
+            class_name: "MyClass".to_string(),
+            method_name: "from_config".to_string(),
+            signature: FunctionSignature {
+                name: "from_config".to_string(),
+                parameters: vec![
+                    ParameterInfo {
+                        name: "cls".to_string(),
+                        type_annotation: None,
+                        default_value: None,
+                        has_default: false,
+                        is_variadic: false,
+                        is_variadic_keyword: false,
+                        is_keyword_only: false,
+                    },
+                    ParameterInfo {
+                        name: "config".to_string(),
+                        type_annotation: Some("dict".to_string()),
+                        default_value: None,
+                        has_default: false,
+                        is_variadic: false,
+                        is_variadic_keyword: false,
+                        is_keyword_only: false,
+                    },
+                ],
+                return_type: Some("MyClass".to_string()),
+                docstring: Some("Create from config".to_string()),
+                start_line: 0,
+                start_column: 0,
+                end_line: 5,
+                end_column: 5,
+            },
+            is_classmethod: true,
+            is_staticmethod: false,
+        };
+
+        let formatted = PythonAnalyzer::format_method(&method_info);
+        assert!(formatted.contains("@classmethod"));
+        assert!(formatted.contains("def from_config(cls, config: dict) -> MyClass"));
+        assert!(formatted.contains("Create from config"));
+    }
+
+    #[test]
+    fn test_format_staticmethod() {
+        let method_info = MethodInfo {
+            class_name: "MyClass".to_string(),
+            method_name: "helper".to_string(),
+            signature: FunctionSignature {
+                name: "helper".to_string(),
+                parameters: vec![ParameterInfo {
+                    name: "value".to_string(),
+                    type_annotation: Some("int".to_string()),
+                    default_value: None,
+                    has_default: false,
+                    is_variadic: false,
+                    is_variadic_keyword: false,
+                    is_keyword_only: false,
+                }],
+                return_type: Some("int".to_string()),
+                docstring: None,
+                start_line: 0,
+                start_column: 0,
+                end_line: 5,
+                end_column: 5,
+            },
+            is_classmethod: false,
+            is_staticmethod: true,
+        };
+
+        let formatted = PythonAnalyzer::format_method(&method_info);
+        assert!(formatted.contains("@staticmethod"));
+        assert!(formatted.contains("def helper(value: int) -> int"));
     }
 
     // ==================== .pth file parsing tests ====================
