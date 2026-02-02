@@ -1,6 +1,6 @@
 [package]
 name = "hydra-lsp"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 authors = ["Matthew Lyon"]
 description = "Language Server Protocol implementation for Hydra configuration files"

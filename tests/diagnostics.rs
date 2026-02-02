@@ -405,3 +405,108 @@ training:
         .collect();
     insta::assert_yaml_snapshot!("two_missing_targets", summary);
 }
+
+// ==================== _partial_ Integration Tests ====================
+
+#[tokio::test]
+async fn test_partial_true_suppresses_missing_params() {
+    let mut ctx = TestContext::new(TestWorkspace::Simple);
+    ctx.initialize().await;
+
+    // my_module.DataLoader requires batch_size (required) and shuffle (optional)
+    // With _partial_: true, missing batch_size should not be an error
+    let content = r#"
+model:
+  _target_: my_module.DataLoader
+  _partial_: true
+  shuffle: true
+"#;
+    ctx.open_document("partial_config.yaml", content.to_string())
+        .await;
+
+    let dp = ctx.recv::<PublishDiagnosticsParams>().await;
+    let diagnostics = dp.diagnostics;
+
+    // Filter errors
+    let errors: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+        .collect();
+
+    // Should have no errors - missing batch_size is suppressed by _partial_: true
+    assert!(
+        errors.is_empty(),
+        "Should have no errors with _partial_: true, but got: {:?}",
+        errors
+    );
+
+    // _partial_ itself should not be flagged as unknown parameter
+    assert!(
+        !diagnostics.iter().any(|d| d.message.contains("_partial_")),
+        "_partial_ should not be flagged as unknown parameter"
+    );
+}
+
+#[tokio::test]
+async fn test_partial_false_still_reports_missing_params() {
+    let mut ctx = TestContext::new(TestWorkspace::Simple);
+    ctx.initialize().await;
+
+    // With _partial_: false, missing required params should still be reported
+    let content = r#"
+model:
+  _target_: my_module.DataLoader
+  _partial_: false
+  shuffle: true
+"#;
+    ctx.open_document("partial_false_config.yaml", content.to_string())
+        .await;
+
+    let dp = ctx.recv::<PublishDiagnosticsParams>().await;
+    let diagnostics = dp.diagnostics;
+
+    // Should have error for missing batch_size
+    let missing_param_error = diagnostics.iter().find(|d| {
+        d.message.contains("Missing required parameter")
+            && d.message.contains("batch_size")
+            && d.severity == Some(DiagnosticSeverity::ERROR)
+    });
+
+    assert!(
+        missing_param_error.is_some(),
+        "Should have missing parameter error for batch_size when _partial_: false"
+    );
+}
+
+#[tokio::test]
+async fn test_partial_not_reported_as_unknown_param() {
+    let mut ctx = TestContext::new(TestWorkspace::Simple);
+    ctx.initialize().await;
+
+    // Even without other params, _partial_ should not be flagged as unknown
+    let content = r#"
+model:
+  _target_: my_module.DataLoader
+  _partial_: true
+  batch_size: 32
+"#;
+    ctx.open_document("partial_valid.yaml", content.to_string())
+        .await;
+
+    let dp = ctx.recv::<PublishDiagnosticsParams>().await;
+    let diagnostics = dp.diagnostics;
+
+    // Should have no unknown parameter error for _partial_
+    let unknown_param_errors: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| {
+            d.message.contains("Unknown parameter") && d.severity == Some(DiagnosticSeverity::ERROR)
+        })
+        .collect();
+
+    assert!(
+        unknown_param_errors.is_empty(),
+        "Should have no unknown parameter errors, but got: {:?}",
+        unknown_param_errors
+    );
+}
