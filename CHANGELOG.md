@@ -3,6 +3,7 @@
 ## [0.1.5]
 
 - Added support for `_partial_`
+- Fixed module resolution for `classmethod`s and `staticmethod`s
 
 ## [0.1.4]
 
