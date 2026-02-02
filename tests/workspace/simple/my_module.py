@@ -149,3 +149,43 @@ class MyReallyReallyLongClassNameToTestLine(
         self.some_parameter = some_parameter
         self.another_parameter = another_parameter
         self.flag = flag
+
+
+class ParentWithInit:
+    """Parent class with __init__ for testing inheritance."""
+
+    def __init__(self, name: str, value: int = 0):
+        """Initialize parent.
+
+        Args:
+            name: The name parameter
+            value: Optional value (default: 0)
+        """
+        self.name = name
+        self.value = value
+
+
+class ChildWithoutInit(ParentWithInit):
+    """Child class that inherits __init__ from parent."""
+
+    pass
+
+
+class GrandchildWithoutInit(ChildWithoutInit):
+    """Grandchild class that inherits __init__ from grandparent through parent."""
+
+    pass
+
+
+class ChildWithOwnInit(ParentWithInit):
+    """Child class that overrides __init__."""
+
+    def __init__(self, name: str, extra: bool = False):
+        """Initialize child with different signature.
+
+        Args:
+            name: The name parameter
+            extra: An extra boolean flag
+        """
+        super().__init__(name)
+        self.extra = extra

@@ -405,3 +405,143 @@ training:
         .collect();
     insta::assert_yaml_snapshot!("two_missing_targets", summary);
 }
+
+// ==================== Inherited Init Tests ====================
+
+#[tokio::test]
+async fn test_diagnostics_inherited_init_valid() {
+    let mut ctx = TestContext::new(TestWorkspace::Simple);
+    ctx.initialize().await;
+
+    // Valid config using child class with inherited __init__ from parent
+    let content = r#"# @hydra
+test:
+  _target_: my_module.ChildWithoutInit
+  name: "test_name"
+  value: 42
+"#;
+    ctx.open_document("inherited_valid.yaml", content.to_string())
+        .await;
+
+    let dp = ctx.recv::<PublishDiagnosticsParams>().await;
+    let diagnostics = dp.diagnostics;
+
+    // Should have no errors - all params from inherited __init__ are valid
+    let errors: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+        .collect();
+
+    assert!(
+        errors.is_empty(),
+        "Should have no errors for valid inherited __init__ usage. Found: {:?}",
+        errors
+    );
+}
+
+#[tokio::test]
+async fn test_diagnostics_inherited_init_missing_required() {
+    let mut ctx = TestContext::new(TestWorkspace::Simple);
+    ctx.initialize().await;
+
+    // Missing required 'name' parameter from inherited __init__
+    let content = r#"# @hydra
+test:
+  _target_: my_module.ChildWithoutInit
+  value: 42
+"#;
+    ctx.open_document("inherited_missing.yaml", content.to_string())
+        .await;
+
+    let dp = ctx.recv::<PublishDiagnosticsParams>().await;
+    let diagnostics = dp.diagnostics;
+
+    // Should have an error for missing 'name' parameter
+    let missing_param = diagnostics
+        .iter()
+        .find(|d| d.message.contains("name") && d.message.contains("Missing"));
+
+    assert!(
+        missing_param.is_some(),
+        "Should have diagnostic for missing 'name' parameter from inherited __init__. Diagnostics: {:?}",
+        diagnostics
+    );
+
+    if let Some(diag) = missing_param {
+        assert_eq!(diag.severity, Some(DiagnosticSeverity::ERROR));
+        insta::assert_snapshot!(
+            "diagnostic_inherited_init_missing_param",
+            format!(
+                "Message: {}\nSeverity: {:?}\nCode: '{}'",
+                diag.message,
+                diag.severity.unwrap(),
+                extract_code(diag)
+            )
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_diagnostics_inherited_init_unknown_param() {
+    let mut ctx = TestContext::new(TestWorkspace::Simple);
+    ctx.initialize().await;
+
+    // Unknown parameter for inherited __init__ (which doesn't have **kwargs)
+    let content = r#"# @hydra
+test:
+  _target_: my_module.ChildWithoutInit
+  name: "test"
+  unknown_param: 123
+"#;
+    ctx.open_document("inherited_unknown.yaml", content.to_string())
+        .await;
+
+    let dp = ctx.recv::<PublishDiagnosticsParams>().await;
+    let diagnostics = dp.diagnostics;
+
+    // Should have an error for unknown parameter
+    let unknown_param = diagnostics
+        .iter()
+        .find(|d| d.message.contains("unknown_param") || d.message.contains("Unknown parameter"));
+
+    assert!(
+        unknown_param.is_some(),
+        "Should have diagnostic for unknown parameter with inherited __init__. Diagnostics: {:?}",
+        diagnostics
+    );
+
+    if let Some(diag) = unknown_param {
+        assert_eq!(diag.severity, Some(DiagnosticSeverity::ERROR));
+    }
+}
+
+#[tokio::test]
+async fn test_diagnostics_grandchild_inherited_init() {
+    let mut ctx = TestContext::new(TestWorkspace::Simple);
+    ctx.initialize().await;
+
+    // Test grandchild class that inherits __init__ from grandparent
+    let content = r#"# @hydra
+test:
+  _target_: my_module.GrandchildWithoutInit
+  name: "test_name"
+  value: 42
+"#;
+    ctx.open_document("grandchild_valid.yaml", content.to_string())
+        .await;
+
+    let dp = ctx.recv::<PublishDiagnosticsParams>().await;
+    let diagnostics = dp.diagnostics;
+
+    // Should have no errors - params from grandparent's __init__ should be valid
+    let errors: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+        .collect();
+
+    assert!(
+        errors.is_empty(),
+        "Should have no errors for valid grandchild inherited __init__ usage. Found: {:?}",
+        errors
+    );
+}
