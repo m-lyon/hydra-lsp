@@ -3,6 +3,7 @@
 ## [0.1.5]
 
 - Added support for `_partial_`
+- Fixed issue of finding parent class docstring and signature when not overridden by child class
 
 ## [0.1.4]
 
