@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.1.5]
+
+- Added support for `_partial_`
+
 ## [0.1.4]
 
 - Fixed issue with `goto_definition` filepath for re-exported modules
