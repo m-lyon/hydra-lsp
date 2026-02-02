@@ -415,7 +415,7 @@ async fn test_partial_true_suppresses_missing_params() {
 
     // my_module.DataLoader requires batch_size (required) and shuffle (optional)
     // With _partial_: true, missing batch_size should not be an error
-    let content = r#"# @hydra
+    let content = r#"
 model:
   _target_: my_module.DataLoader
   _partial_: true
@@ -442,9 +442,7 @@ model:
 
     // _partial_ itself should not be flagged as unknown parameter
     assert!(
-        !diagnostics
-            .iter()
-            .any(|d| d.message.contains("_partial_")),
+        !diagnostics.iter().any(|d| d.message.contains("_partial_")),
         "_partial_ should not be flagged as unknown parameter"
     );
 }
@@ -455,7 +453,7 @@ async fn test_partial_false_still_reports_missing_params() {
     ctx.initialize().await;
 
     // With _partial_: false, missing required params should still be reported
-    let content = r#"# @hydra
+    let content = r#"
 model:
   _target_: my_module.DataLoader
   _partial_: false
@@ -486,7 +484,7 @@ async fn test_partial_not_reported_as_unknown_param() {
     ctx.initialize().await;
 
     // Even without other params, _partial_ should not be flagged as unknown
-    let content = r#"# @hydra
+    let content = r#"
 model:
   _target_: my_module.DataLoader
   _partial_: true
@@ -502,8 +500,7 @@ model:
     let unknown_param_errors: Vec<_> = diagnostics
         .iter()
         .filter(|d| {
-            d.message.contains("Unknown parameter")
-                && d.severity == Some(DiagnosticSeverity::ERROR)
+            d.message.contains("Unknown parameter") && d.severity == Some(DiagnosticSeverity::ERROR)
         })
         .collect();
 

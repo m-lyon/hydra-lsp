@@ -1,5 +1,5 @@
 use crate::python_analyzer::{DefinitionInfo, FunctionSignature, PythonAnalyzer};
-use crate::yaml_parser::{TargetInfo, PARTIAL_KEY};
+use crate::yaml_parser::{PARTIAL_KEY, TargetInfo};
 use std::collections::HashSet;
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 
@@ -98,7 +98,7 @@ fn validate_parameters(target_info: &TargetInfo, signature: &FunctionSignature) 
     // Check if function accepts **kwargs
     let has_kwargs = signature.parameters.iter().any(|p| p.is_variadic_keyword);
 
-    // Check for unknown parameters (skip _partial_ as it's a Hydra keyword)
+    // Check for unknown parameters (skip _partial_)
     for param in &target_info.parameters {
         if param.key == PARTIAL_KEY {
             continue;
@@ -786,9 +786,7 @@ mod tests {
         let diagnostics = validate_parameters(&target_info, &signature);
         // Should not have "unknown parameter" error for _partial_
         assert!(
-            !diagnostics
-                .iter()
-                .any(|d| d.message.contains("_partial_")),
+            !diagnostics.iter().any(|d| d.message.contains("_partial_")),
             "_partial_ should not be reported as unknown parameter"
         );
     }
