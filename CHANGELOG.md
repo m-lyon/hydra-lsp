@@ -2,7 +2,8 @@
 
 ## [0.1.4]
 
-- Fixed issue with `goto_definition` filepath for reexported modules
+- Fixed issue with `goto_definition` filepath for re-exported modules
+- Improved docstring rendering on hover
 
 ## [0.1.3]
 
