@@ -1,5 +1,5 @@
 use crate::python_analyzer::{DefinitionInfo, FunctionSignature, PythonAnalyzer};
-use crate::yaml_parser::TargetInfo;
+use crate::yaml_parser::{TargetInfo, PARTIAL_KEY};
 use std::collections::HashSet;
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 
@@ -76,10 +76,14 @@ fn validate_target(
 fn validate_parameters(target_info: &TargetInfo, signature: &FunctionSignature) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
 
-    // Get parameter names from YAML (excluding _target_)
+    // Check if _partial_ is set to true - if so, skip missing parameter checks
+    let is_partial = target_info.is_partial();
+
+    // Get parameter names from YAML (excluding _target_ and _partial_)
     let param_names: HashSet<String> = target_info
         .parameters
         .iter()
+        .filter(|p| p.key != PARTIAL_KEY)
         .map(|param| param.key.clone())
         .collect();
 
@@ -94,8 +98,11 @@ fn validate_parameters(target_info: &TargetInfo, signature: &FunctionSignature) 
     // Check if function accepts **kwargs
     let has_kwargs = signature.parameters.iter().any(|p| p.is_variadic_keyword);
 
-    // Check for unknown parameters
+    // Check for unknown parameters (skip _partial_ as it's a Hydra keyword)
     for param in &target_info.parameters {
+        if param.key == PARTIAL_KEY {
+            continue;
+        }
         if !expected_params.contains(&param.key) && !has_kwargs {
             diagnostics.push(create_diagnostic(
                 param.line,
@@ -108,20 +115,22 @@ fn validate_parameters(target_info: &TargetInfo, signature: &FunctionSignature) 
         }
     }
 
-    // Check for missing required parameters
-    for param in &signature.parameters {
-        if param.is_required() && !param_names.contains(&param.name) {
-            diagnostics.push(create_diagnostic(
-                target_info.line,
-                target_info.value_start,
-                target_info.value_end(),
-                DiagnosticSeverity::ERROR,
-                Some("missing-parameter"),
-                format!(
-                    "Missing required parameter '{}' for '{}'",
-                    param.name, signature.name
-                ),
-            ));
+    // Check for missing required parameters (skip if _partial_ is true)
+    if !is_partial {
+        for param in &signature.parameters {
+            if param.is_required() && !param_names.contains(&param.name) {
+                diagnostics.push(create_diagnostic(
+                    target_info.line,
+                    target_info.value_start,
+                    target_info.value_end(),
+                    DiagnosticSeverity::ERROR,
+                    Some("missing-parameter"),
+                    format!(
+                        "Missing required parameter '{}' for '{}'",
+                        param.name, signature.name
+                    ),
+                ));
+            }
         }
     }
 
@@ -622,5 +631,240 @@ mod tests {
                 .any(|d| d.message.contains("Symbol") && d.message.contains("not found")),
             "Should not have symbol not found error"
         );
+    }
+
+    // ==================== _partial_ support tests ====================
+
+    #[test]
+    fn test_partial_true_skips_missing_required_params() {
+        // When _partial_: true, missing required parameters should not be reported
+        let params = vec![Parameter {
+            value: serde_yaml::Value::Bool(true),
+            line: 1,
+            key: "_partial_".to_string(),
+        }];
+
+        let target_info = TargetInfo {
+            value: "my.Class".to_string(),
+            parameters: params,
+            line: 0,
+            key_start: 0,
+            value_start: 0,
+        };
+
+        let signature = FunctionSignature {
+            name: "Class".to_string(),
+            parameters: vec![
+                ParameterInfo {
+                    name: "self".to_string(),
+                    type_annotation: None,
+                    default_value: None,
+                    has_default: false,
+                    is_variadic: false,
+                    is_variadic_keyword: false,
+                    is_keyword_only: false,
+                },
+                ParameterInfo {
+                    name: "required_param".to_string(),
+                    type_annotation: Some("int".to_string()),
+                    default_value: None,
+                    has_default: false,
+                    is_variadic: false,
+                    is_variadic_keyword: false,
+                    is_keyword_only: false,
+                },
+            ],
+            return_type: None,
+            docstring: None,
+            start_line: 1,
+            start_column: 1,
+            end_line: 1,
+            end_column: 1,
+        };
+
+        let diagnostics = validate_parameters(&target_info, &signature);
+        // Should have no diagnostics - _partial_: true suppresses missing param errors
+        assert!(
+            diagnostics.is_empty(),
+            "Should have no diagnostics when _partial_: true, but got: {:?}",
+            diagnostics
+        );
+    }
+
+    #[test]
+    fn test_partial_false_reports_missing_required_params() {
+        // When _partial_: false, missing required parameters should still be reported
+        let params = vec![Parameter {
+            value: serde_yaml::Value::Bool(false),
+            line: 1,
+            key: "_partial_".to_string(),
+        }];
+
+        let target_info = TargetInfo {
+            value: "my.Class".to_string(),
+            parameters: params,
+            line: 0,
+            key_start: 0,
+            value_start: 0,
+        };
+
+        let signature = FunctionSignature {
+            name: "Class".to_string(),
+            parameters: vec![
+                ParameterInfo {
+                    name: "self".to_string(),
+                    type_annotation: None,
+                    default_value: None,
+                    has_default: false,
+                    is_variadic: false,
+                    is_variadic_keyword: false,
+                    is_keyword_only: false,
+                },
+                ParameterInfo {
+                    name: "required_param".to_string(),
+                    type_annotation: Some("int".to_string()),
+                    default_value: None,
+                    has_default: false,
+                    is_variadic: false,
+                    is_variadic_keyword: false,
+                    is_keyword_only: false,
+                },
+            ],
+            return_type: None,
+            docstring: None,
+            start_line: 1,
+            start_column: 1,
+            end_line: 1,
+            end_column: 1,
+        };
+
+        let diagnostics = validate_parameters(&target_info, &signature);
+        assert_eq!(diagnostics.len(), 1);
+        assert!(
+            diagnostics[0]
+                .message
+                .contains("Missing required parameter")
+        );
+    }
+
+    #[test]
+    fn test_partial_key_not_reported_as_unknown_param() {
+        // The _partial_ key itself should not be reported as unknown parameter
+        let params = vec![Parameter {
+            value: serde_yaml::Value::Bool(true),
+            line: 1,
+            key: "_partial_".to_string(),
+        }];
+
+        let target_info = TargetInfo {
+            value: "my.Class".to_string(),
+            parameters: params,
+            line: 0,
+            key_start: 0,
+            value_start: 0,
+        };
+
+        let signature = FunctionSignature {
+            name: "Class".to_string(),
+            parameters: vec![ParameterInfo {
+                name: "self".to_string(),
+                type_annotation: None,
+                default_value: None,
+                has_default: false,
+                is_variadic: false,
+                is_variadic_keyword: false,
+                is_keyword_only: false,
+            }],
+            return_type: None,
+            docstring: None,
+            start_line: 1,
+            start_column: 1,
+            end_line: 1,
+            end_column: 1,
+        };
+
+        let diagnostics = validate_parameters(&target_info, &signature);
+        // Should not have "unknown parameter" error for _partial_
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.message.contains("_partial_")),
+            "_partial_ should not be reported as unknown parameter"
+        );
+    }
+
+    #[test]
+    fn test_partial_with_other_params() {
+        // Test _partial_ with other valid and invalid parameters
+        let params = vec![
+            Parameter {
+                value: serde_yaml::Value::Bool(true),
+                line: 1,
+                key: "_partial_".to_string(),
+            },
+            Parameter {
+                value: serde_yaml::Value::String("value".to_string()),
+                line: 2,
+                key: "valid_param".to_string(),
+            },
+            Parameter {
+                value: serde_yaml::Value::String("value".to_string()),
+                line: 3,
+                key: "unknown_param".to_string(),
+            },
+        ];
+
+        let target_info = TargetInfo {
+            value: "my.Class".to_string(),
+            parameters: params,
+            line: 0,
+            key_start: 0,
+            value_start: 0,
+        };
+
+        let signature = FunctionSignature {
+            name: "Class".to_string(),
+            parameters: vec![
+                ParameterInfo {
+                    name: "self".to_string(),
+                    type_annotation: None,
+                    default_value: None,
+                    has_default: false,
+                    is_variadic: false,
+                    is_variadic_keyword: false,
+                    is_keyword_only: false,
+                },
+                ParameterInfo {
+                    name: "required_param".to_string(),
+                    type_annotation: Some("int".to_string()),
+                    default_value: None,
+                    has_default: false,
+                    is_variadic: false,
+                    is_variadic_keyword: false,
+                    is_keyword_only: false,
+                },
+                ParameterInfo {
+                    name: "valid_param".to_string(),
+                    type_annotation: Some("str".to_string()),
+                    default_value: None,
+                    has_default: true,
+                    is_variadic: false,
+                    is_variadic_keyword: false,
+                    is_keyword_only: false,
+                },
+            ],
+            return_type: None,
+            docstring: None,
+            start_line: 1,
+            start_column: 1,
+            end_line: 1,
+            end_column: 1,
+        };
+
+        let diagnostics = validate_parameters(&target_info, &signature);
+        // Should only have error for unknown_param (not for missing required_param due to _partial_)
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].message.contains("unknown_param"));
+        assert!(diagnostics[0].message.contains("Unknown parameter"));
     }
 }

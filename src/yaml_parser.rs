@@ -87,6 +87,7 @@ impl HydraSemanticToken {
 }
 
 pub const TARGET_KEY: &str = "_target_";
+pub const PARTIAL_KEY: &str = "_partial_";
 
 /// Represents a parameter in a YAML configuration with position information
 /// Can either be a simple value or a nested target
@@ -135,6 +136,14 @@ impl TargetInfo {
     /// Get the end position of the target value
     pub fn value_end(&self) -> u32 {
         self.value_start + self.value.len() as u32
+    }
+
+    /// Check if `_partial_` is set to true for this target
+    pub fn is_partial(&self) -> bool {
+        self.parameters
+            .iter()
+            .find(|p| p.key == PARTIAL_KEY)
+            .is_some_and(|p| p.value.as_bool() == Some(true))
     }
 }
 
