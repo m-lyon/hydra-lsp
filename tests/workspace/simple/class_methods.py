@@ -97,3 +97,15 @@ class DataProcessor:
             Preprocessed data
         """
         return data
+
+
+class NestedExample:
+    """A class with nested classmethods and staticmethods."""
+
+    nested_class = ModelFactory
+
+
+class NestedTwice:
+    """A class with twice nested classmethods and staticmethods."""
+
+    nested = NestedExample

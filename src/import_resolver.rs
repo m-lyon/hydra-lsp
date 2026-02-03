@@ -72,7 +72,7 @@ impl ImportResolver {
     }
 
     /// Resolve a module path to a file path
-    fn resolve_module_path(&self, module_path: &str) -> Option<PathBuf> {
+    pub fn resolve_module_path(&self, module_path: &str) -> Option<PathBuf> {
         let module_parts: Vec<&str> = module_path.split('.').collect();
 
         for search_path in &self.search_paths {
