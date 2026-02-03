@@ -6,8 +6,48 @@ use tower_lsp::{Client, LanguageServer};
 
 use crate::diagnostics;
 use crate::document::DocumentStore;
-use crate::python_analyzer::{DefinitionInfo, PythonAnalyzer};
+use crate::python_analyzer::{DefinitionInfo, ParameterInfo, PythonAnalyzer};
 use crate::yaml_parser::{CompletionContext, HydraSemanticToken, YamlParser};
+
+/// Format a parameter as a string for signature labels (e.g., "*args", "name: str")
+fn format_param_label(p: &ParameterInfo) -> String {
+    let mut s = String::new();
+    if p.is_variadic {
+        s.push('*');
+    } else if p.is_variadic_keyword {
+        s.push_str("**");
+    }
+    s.push_str(&p.name);
+    if let Some(type_ann) = &p.type_annotation {
+        s.push_str(&format!(": {}", type_ann));
+    }
+    s
+}
+
+/// Convert a ParameterInfo to LSP ParameterInformation
+fn to_parameter_information(p: &ParameterInfo) -> ParameterInformation {
+    ParameterInformation {
+        label: ParameterLabel::Simple(format_param_label(p)),
+        documentation: p
+            .default_value
+            .as_ref()
+            .map(|dv| Documentation::String(format!("Default: {}", dv))),
+    }
+}
+
+/// Build signature label and parameter information from a list of parameters
+fn build_signature_params(
+    params: &[ParameterInfo],
+    filter_param: &str,
+) -> (String, Vec<ParameterInformation>) {
+    let filtered: Vec<_> = params.iter().filter(|p| p.name != filter_param).collect();
+    let param_strs: Vec<String> = filtered.iter().map(|p| format_param_label(p)).collect();
+    let param_infos: Vec<ParameterInformation> = filtered
+        .iter()
+        .map(|p| to_parameter_information(p))
+        .collect();
+    (param_strs.join(", "), param_infos)
+}
 
 #[derive(Debug)]
 pub struct HydraLspBackend {
@@ -428,100 +468,15 @@ impl LanguageServer for HydraLspBackend {
             Ok((definition_info, _file_path, _module_path, _symbol_name)) => {
                 let (signature_label, parameters, doc_string) = match definition_info {
                     DefinitionInfo::Function(sig) => {
-                        let param_strs: Vec<String> = sig
-                            .parameters
-                            .iter()
-                            .map(|p| {
-                                let mut s = String::new();
-                                if p.is_variadic {
-                                    s.push('*');
-                                } else if p.is_variadic_keyword {
-                                    s.push_str("**");
-                                }
-                                s.push_str(&p.name);
-                                if let Some(type_ann) = &p.type_annotation {
-                                    s.push_str(&format!(": {}", type_ann));
-                                }
-                                s
-                            })
-                            .collect();
-
-                        let label = format!("{}({})", sig.name, param_strs.join(", "));
-
-                        let params = sig
-                            .parameters
-                            .iter()
-                            .map(|p| {
-                                let mut label = String::new();
-                                if p.is_variadic {
-                                    label.push('*');
-                                } else if p.is_variadic_keyword {
-                                    label.push_str("**");
-                                }
-                                label.push_str(&p.name);
-                                if let Some(type_ann) = &p.type_annotation {
-                                    label.push_str(&format!(": {}", type_ann));
-                                }
-
-                                ParameterInformation {
-                                    label: ParameterLabel::Simple(label),
-                                    documentation: p.default_value.as_ref().map(|dv| {
-                                        Documentation::String(format!("Default: {}", dv))
-                                    }),
-                                }
-                            })
-                            .collect();
-
+                        let (params_str, params) = build_signature_params(&sig.parameters, "");
+                        let label = format!("{}({})", sig.name, params_str);
                         (label, params, sig.docstring.clone())
                     }
                     DefinitionInfo::Class(class_info) => {
                         if let Some(init_sig) = &class_info.init_signature {
-                            let param_strs: Vec<String> = init_sig
-                                .parameters
-                                .iter()
-                                .filter(|p| p.name != "self")
-                                .map(|p| {
-                                    let mut s = String::new();
-                                    if p.is_variadic {
-                                        s.push('*');
-                                    } else if p.is_variadic_keyword {
-                                        s.push_str("**");
-                                    }
-                                    s.push_str(&p.name);
-                                    if let Some(type_ann) = &p.type_annotation {
-                                        s.push_str(&format!(": {}", type_ann));
-                                    }
-                                    s
-                                })
-                                .collect();
-
-                            let label = format!("{}({})", class_info.name, param_strs.join(", "));
-
-                            let params = init_sig
-                                .parameters
-                                .iter()
-                                .filter(|p| p.name != "self")
-                                .map(|p| {
-                                    let mut label = String::new();
-                                    if p.is_variadic {
-                                        label.push('*');
-                                    } else if p.is_variadic_keyword {
-                                        label.push_str("**");
-                                    }
-                                    label.push_str(&p.name);
-                                    if let Some(type_ann) = &p.type_annotation {
-                                        label.push_str(&format!(": {}", type_ann));
-                                    }
-
-                                    ParameterInformation {
-                                        label: ParameterLabel::Simple(label),
-                                        documentation: p.default_value.as_ref().map(|dv| {
-                                            Documentation::String(format!("Default: {}", dv))
-                                        }),
-                                    }
-                                })
-                                .collect();
-
+                            let (params_str, params) =
+                                build_signature_params(&init_sig.parameters, "self");
+                            let label = format!("{}({})", class_info.name, params_str);
                             (label, params, class_info.docstring.clone())
                         } else {
                             let label = format!("{}()", class_info.name);
@@ -539,57 +494,10 @@ impl LanguageServer for HydraLspBackend {
                             "self"
                         };
 
-                        let param_strs: Vec<String> = sig
-                            .parameters
-                            .iter()
-                            .filter(|p| p.name != filter_param)
-                            .map(|p| {
-                                let mut s = String::new();
-                                if p.is_variadic {
-                                    s.push('*');
-                                } else if p.is_variadic_keyword {
-                                    s.push_str("**");
-                                }
-                                s.push_str(&p.name);
-                                if let Some(type_ann) = &p.type_annotation {
-                                    s.push_str(&format!(": {}", type_ann));
-                                }
-                                s
-                            })
-                            .collect();
-
-                        let label = format!(
-                            "{}.{}({})",
-                            method_info.class_name,
-                            sig.name,
-                            param_strs.join(", ")
-                        );
-
-                        let params = sig
-                            .parameters
-                            .iter()
-                            .filter(|p| p.name != filter_param)
-                            .map(|p| {
-                                let mut label = String::new();
-                                if p.is_variadic {
-                                    label.push('*');
-                                } else if p.is_variadic_keyword {
-                                    label.push_str("**");
-                                }
-                                label.push_str(&p.name);
-                                if let Some(type_ann) = &p.type_annotation {
-                                    label.push_str(&format!(": {}", type_ann));
-                                }
-
-                                ParameterInformation {
-                                    label: ParameterLabel::Simple(label),
-                                    documentation: p.default_value.as_ref().map(|dv| {
-                                        Documentation::String(format!("Default: {}", dv))
-                                    }),
-                                }
-                            })
-                            .collect();
-
+                        let (params_str, params) =
+                            build_signature_params(&sig.parameters, filter_param);
+                        let label =
+                            format!("{}.{}({})", method_info.class_name, sig.name, params_str);
                         (label, params, sig.docstring.clone())
                     }
                 };
@@ -678,26 +586,7 @@ impl LanguageServer for HydraLspBackend {
                 python_interpreter.as_deref(),
             ) {
                 Ok((definition_info, file_path, _module_path, _symbol_name)) => {
-                    let (start_line, start_col, end_line, end_col) = match definition_info {
-                        DefinitionInfo::Function(sig) => (
-                            sig.start_line,
-                            sig.start_column,
-                            sig.end_line,
-                            sig.end_column,
-                        ),
-                        DefinitionInfo::Class(class_info) => (
-                            class_info.start_line,
-                            class_info.start_column,
-                            class_info.end_line,
-                            class_info.end_column,
-                        ),
-                        DefinitionInfo::Method(method_info) => (
-                            method_info.signature.start_line,
-                            method_info.signature.start_column,
-                            method_info.signature.end_line,
-                            method_info.signature.end_column,
-                        ),
-                    };
+                    let (start_line, start_col, end_line, end_col) = definition_info.position();
                     (file_path, start_line, start_col, end_line, end_col)
                 }
                 Err(e) => {

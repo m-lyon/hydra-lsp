@@ -5,9 +5,45 @@ use ruff_python_ast::{self as ast, Expr, Stmt, visitor::Visitor};
 use ruff_python_parser::parse_module;
 use ruff_source_file::{LineIndex, PositionEncoding};
 use ruff_text_size::TextRange;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use ty_python_semantic::{PythonEnvironment, SysPrefixPathOrigin};
+
+/// Cache for file contents to minimize disk reads during analysis.
+/// Files are read once and stored in memory for the duration of an analysis operation.
+pub struct FileCache {
+    cache: HashMap<PathBuf, String>,
+}
+
+impl FileCache {
+    pub fn new() -> Self {
+        Self {
+            cache: HashMap::new(),
+        }
+    }
+
+    /// Get file contents, reading from disk if not already cached
+    pub fn get(&mut self, path: &Path) -> Result<&str> {
+        // Use entry API to avoid double lookup
+        if !self.cache.contains_key(path) {
+            let content = fs::read_to_string(path)?;
+            self.cache.insert(path.to_path_buf(), content);
+        }
+        Ok(self.cache.get(path).unwrap())
+    }
+
+    /// Check if a file is already cached
+    pub fn contains(&self, path: &Path) -> bool {
+        self.cache.contains_key(path)
+    }
+}
+
+impl Default for FileCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct FunctionSignature {
@@ -65,6 +101,32 @@ pub enum DefinitionInfo {
     Function(FunctionSignature),
     Class(ClassInfo),
     Method(MethodInfo),
+}
+
+impl DefinitionInfo {
+    /// Get the source location (start_line, start_col, end_line, end_col)
+    pub fn position(&self) -> (u32, u32, u32, u32) {
+        match self {
+            DefinitionInfo::Function(sig) => (
+                sig.start_line,
+                sig.start_column,
+                sig.end_line,
+                sig.end_column,
+            ),
+            DefinitionInfo::Class(info) => (
+                info.start_line,
+                info.start_column,
+                info.end_line,
+                info.end_column,
+            ),
+            DefinitionInfo::Method(info) => (
+                info.signature.start_line,
+                info.signature.start_column,
+                info.signature.end_line,
+                info.signature.end_column,
+            ),
+        }
+    }
 }
 
 pub struct PythonAnalyzer;
@@ -213,90 +275,76 @@ impl PythonAnalyzer {
         )
     }
 
-    /// Extract function signature from a parsed Python AST
-    /// This is a simplified extraction that visits the AST to find function definitions
+    /// Extract function signature from source code
     pub fn extract_function_signature(
-        file_path: &Path,
+        source: &str,
         function_name: &str,
     ) -> Result<FunctionSignature> {
-        let source = fs::read_to_string(file_path)?;
-        let parsed = parse_module(&source)?;
+        let parsed = parse_module(source)?;
 
         let mut visitor = FunctionExtractor {
             target_name: function_name.to_string(),
             result: None,
-            source,
+            source: source.to_string(),
         };
 
         visitor.visit_body(parsed.suite());
 
-        visitor.result.ok_or_else(|| {
-            anyhow::anyhow!(
-                "Function '{}' not found in {}",
-                function_name,
-                file_path.display()
-            )
-        })
+        visitor
+            .result
+            .ok_or_else(|| anyhow::anyhow!("Function '{}' not found", function_name))
     }
 
-    /// Extract class information from a parsed Python AST
-    pub fn extract_class_info(file_path: &Path, class_name: &str) -> Result<ClassInfo> {
-        let source = fs::read_to_string(file_path)?;
-        let parsed = parse_module(&source)?;
+    /// Extract class information from source code
+    pub fn extract_class_info(source: &str, class_name: &str) -> Result<ClassInfo> {
+        let parsed = parse_module(source)?;
 
         let mut visitor = ClassExtractor {
             target_name: class_name.to_string(),
             result: None,
-            source: source.clone(),
+            source: source.to_string(),
         };
 
         visitor.visit_body(parsed.suite());
 
-        visitor.result.ok_or_else(|| {
-            anyhow::anyhow!(
-                "Class '{}' not found in {}",
-                class_name,
-                file_path.display()
-            )
-        })
+        visitor
+            .result
+            .ok_or_else(|| anyhow::anyhow!("Class '{}' not found", class_name))
     }
 
-    /// Extract a method (including classmethod/staticmethod) from a class
+    /// Extract method information from source code
     pub fn extract_method_info(
-        file_path: &Path,
+        source: &str,
         class_name: &str,
         method_name: &str,
     ) -> Result<MethodInfo> {
-        let source = fs::read_to_string(file_path)?;
-        let parsed = parse_module(&source)?;
+        let parsed = parse_module(source)?;
 
         let mut visitor = MethodExtractor {
             class_name: class_name.to_string(),
             method_name: method_name.to_string(),
             result: None,
-            source,
+            source: source.to_string(),
         };
 
         visitor.visit_body(parsed.suite());
 
         visitor.result.ok_or_else(|| {
             anyhow::anyhow!(
-                "Method '{}' not found in class '{}' in {}",
+                "Method '{}' not found in class '{}'",
                 method_name,
-                class_name,
-                file_path.display()
+                class_name
             )
         })
     }
 
-    /// Extract a class attribute value from a class
+    /// Extract class attribute from source code
     pub fn extract_class_attribute(
-        file_path: &Path,
+        source: &str,
         class_name: &str,
         attribute_name: &str,
     ) -> Result<ClassAttributeInfo> {
-        let source = fs::read_to_string(file_path)?;
-        let parsed = parse_module(&source)?;
+        let parsed = parse_module(source)?;
 
         let mut visitor = ClassAttributeExtractor {
             class_name: class_name.to_string(),
@@ -308,10 +356,9 @@ impl PythonAnalyzer {
 
         visitor.result.ok_or_else(|| {
             anyhow::anyhow!(
-                "Attribute '{}' not found in class '{}' in {}",
+                "Attribute '{}' not found in class '{}'",
                 attribute_name,
-                class_name,
-                file_path.display()
+                class_name
             )
         })
     }
@@ -327,6 +374,7 @@ impl PythonAnalyzer {
         starting_class: &str,
         attribute_chain: &[&str],
         search_paths: &[PathBuf],
+        file_cache: &mut FileCache,
     ) -> Result<(PathBuf, String, Option<String>)> {
         if attribute_chain.is_empty() {
             anyhow::bail!("Empty attribute chain");
@@ -340,14 +388,17 @@ impl PythonAnalyzer {
         for (i, attr) in attribute_chain.iter().enumerate() {
             let is_last = i == attribute_chain.len() - 1;
 
+            // Read current file source
+            let source = file_cache.get(&current_file)?;
+
             // First, check if this is a method on the current class
-            if is_last && Self::extract_method_info(&current_file, &current_class, attr).is_ok() {
+            if is_last && Self::extract_method_info(source, &current_class, attr).is_ok() {
                 // It's a method - return the class and method name
                 return Ok((current_file, current_class, Some(attr.to_string())));
             }
 
             // Try to get the attribute as a class attribute
-            match Self::extract_class_attribute(&current_file, &current_class, attr) {
+            match Self::extract_class_attribute(source, &current_class, attr) {
                 Ok(attr_info) => {
                     // The value could be a simple name or a dotted path
                     let value_parts: Vec<&str> = attr_info.value.split('.').collect();
@@ -357,7 +408,7 @@ impl PythonAnalyzer {
                         let new_class_name = value_parts[0];
 
                         // Try direct lookup in current file
-                        if Self::extract_class_info(&current_file, new_class_name).is_ok() {
+                        if Self::extract_class_info(source, new_class_name).is_ok() {
                             current_class = new_class_name.to_string();
                             continue;
                         }
@@ -506,13 +557,16 @@ impl PythonAnalyzer {
         file_path: &Path,
         class_name: &str,
         search_paths: Vec<PathBuf>,
+        file_cache: &mut FileCache,
     ) -> Result<(ClassInfo, PathBuf)> {
-        // First try direct lookup
-        if let Ok(class_info) = Self::extract_class_info(file_path, class_name) {
+        // First try direct lookup using cache
+        if let Ok(source) = file_cache.get(file_path)
+            && let Ok(class_info) = Self::extract_class_info(source, class_name)
+        {
             return Ok((class_info, file_path.to_path_buf()));
         }
 
-        // Try to resolve through imports
+        // Try to resolve through imports (ImportResolver has its own cache that shares with us)
         let mut resolver = ImportResolver::new(search_paths);
         if let Some((resolved_file, resolved_name)) = resolver.resolve_symbol(file_path, class_name)
         {
@@ -521,7 +575,9 @@ impl PythonAnalyzer {
             } else {
                 resolved_name
             };
-            let class_info = Self::extract_class_info(&resolved_file, &actual_name)?;
+            // Use cache for the resolved file
+            let source = file_cache.get(&resolved_file)?;
+            let class_info = Self::extract_class_info(source, &actual_name)?;
             return Ok((class_info, resolved_file));
         }
 
@@ -538,9 +594,12 @@ impl PythonAnalyzer {
         file_path: &Path,
         function_name: &str,
         search_paths: Vec<PathBuf>,
+        file_cache: &mut FileCache,
     ) -> Result<(FunctionSignature, PathBuf)> {
-        // First try direct lookup
-        if let Ok(func_sig) = Self::extract_function_signature(file_path, function_name) {
+        // First try direct lookup using cache
+        if let Ok(source) = file_cache.get(file_path)
+            && let Ok(func_sig) = Self::extract_function_signature(source, function_name)
+        {
             return Ok((func_sig, file_path.to_path_buf()));
         }
 
@@ -554,7 +613,9 @@ impl PythonAnalyzer {
             } else {
                 resolved_name
             };
-            let func_sig = Self::extract_function_signature(&resolved_file, &actual_name)?;
+            // Use cache for the resolved file
+            let source = file_cache.get(&resolved_file)?;
+            let func_sig = Self::extract_function_signature(source, &actual_name)?;
             return Ok((func_sig, resolved_file));
         }
 
@@ -578,6 +639,9 @@ impl PythonAnalyzer {
     ) -> Result<(DefinitionInfo, PathBuf, String, String)> {
         let (module_path, symbol_name) = Self::split_target(target)?;
 
+        // Create a shared file cache for all operations
+        let mut file_cache = FileCache::new();
+
         // Track whether we found the module but not the symbol
         let mut module_found = false;
 
@@ -592,6 +656,7 @@ impl PythonAnalyzer {
                 &file_path,
                 &symbol_name,
                 search_paths.clone(),
+                &mut file_cache,
             ) {
                 return Ok((
                     DefinitionInfo::Function(func_sig),
@@ -602,9 +667,12 @@ impl PythonAnalyzer {
             }
 
             // Try to extract as class (with import resolution)
-            if let Ok((class_info, resolved_file)) =
-                Self::extract_class_info_with_imports(&file_path, &symbol_name, search_paths)
-            {
+            if let Ok((class_info, resolved_file)) = Self::extract_class_info_with_imports(
+                &file_path,
+                &symbol_name,
+                search_paths,
+                &mut file_cache,
+            ) {
                 return Ok((
                     DefinitionInfo::Class(class_info),
                     resolved_file,
@@ -617,12 +685,18 @@ impl PythonAnalyzer {
         // Try to interpret as Class.method pattern (e.g., "my_module.MyClass.from_config")
         // or nested pattern (e.g., "my_module.OuterClass.nested.nested_class.method")
         if let Some((resolved_file, class_name, method_name, search_paths)) =
-            Self::resolve_class_method_chain(target, workspace_root, python_interpreter)
+            Self::resolve_class_method_chain(
+                target,
+                workspace_root,
+                python_interpreter,
+                &mut file_cache,
+            )
             && let Ok((method_info, final_file)) = Self::extract_method_info_with_imports(
                 &resolved_file,
                 &class_name,
                 &method_name,
                 search_paths,
+                &mut file_cache,
             )
         {
             return Ok((
@@ -656,6 +730,7 @@ impl PythonAnalyzer {
         target: &str,
         workspace_root: Option<&Path>,
         python_interpreter: Option<&str>,
+        file_cache: &mut FileCache,
     ) -> Option<(PathBuf, String, String, Vec<PathBuf>)> {
         let parts: Vec<&str> = target.split('.').collect();
         if parts.len() < 3 {
@@ -689,12 +764,14 @@ impl PythonAnalyzer {
                 &file_path,
                 first_symbol,
                 search_paths.clone(),
+                file_cache,
             ) {
                 if remaining_parts.len() == 2 {
                     // Simple case: Class.method
                     let method_name = remaining_parts[1];
-                    if Self::extract_method_info(&resolved_file, &class_info.name, method_name)
-                        .is_ok()
+                    // Read the resolved file source and check if method exists
+                    if let Ok(source) = file_cache.get(&resolved_file)
+                        && Self::extract_method_info(source, &class_info.name, method_name).is_ok()
                     {
                         return Some((
                             resolved_file,
@@ -713,6 +790,7 @@ impl PythonAnalyzer {
                             &class_info.name,
                             attribute_chain,
                             &search_paths,
+                            file_cache,
                         )
                     {
                         return Some((final_file, final_class, method_name, search_paths));
@@ -731,9 +809,12 @@ impl PythonAnalyzer {
         class_name: &str,
         method_name: &str,
         search_paths: Vec<PathBuf>,
+        file_cache: &mut FileCache,
     ) -> Result<(MethodInfo, PathBuf)> {
-        // First try direct lookup
-        if let Ok(method_info) = Self::extract_method_info(file_path, class_name, method_name) {
+        // First try direct lookup using cache
+        if let Ok(source) = file_cache.get(file_path)
+            && let Ok(method_info) = Self::extract_method_info(source, class_name, method_name)
+        {
             return Ok((method_info, file_path.to_path_buf()));
         }
 
@@ -746,8 +827,8 @@ impl PythonAnalyzer {
             } else {
                 resolved_name
             };
-            let method_info =
-                Self::extract_method_info(&resolved_file, &actual_class_name, method_name)?;
+            let source = file_cache.get(&resolved_file)?;
+            let method_info = Self::extract_method_info(source, &actual_class_name, method_name)?;
             return Ok((method_info, resolved_file));
         }
 
@@ -1336,6 +1417,7 @@ fn expr_to_string(expr: &Expr) -> String {
 mod tests {
     use super::*;
     use std::env;
+    use std::fs;
 
     fn get_simple_test_dir() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1416,9 +1498,9 @@ mod tests {
     fn test_extract_simple_function() {
         let examples_dir = get_simple_test_dir();
         let test_file = examples_dir.join("my_module.py");
+        let source = fs::read_to_string(&test_file).unwrap();
 
-        let sig =
-            PythonAnalyzer::extract_function_signature(&test_file, "simple_function").unwrap();
+        let sig = PythonAnalyzer::extract_function_signature(&source, "simple_function").unwrap();
         assert_eq!(sig.name, "simple_function");
         assert_eq!(sig.parameters.len(), 0);
         assert!(sig.docstring.is_some());
@@ -1429,9 +1511,10 @@ mod tests {
     fn test_extract_function_with_params() {
         let examples_dir = get_simple_test_dir();
         let test_file = examples_dir.join("my_module.py");
+        let source = fs::read_to_string(&test_file).unwrap();
 
         let sig =
-            PythonAnalyzer::extract_function_signature(&test_file, "function_with_params").unwrap();
+            PythonAnalyzer::extract_function_signature(&source, "function_with_params").unwrap();
         assert_eq!(sig.name, "function_with_params");
         assert_eq!(sig.parameters.len(), 3);
 
@@ -1459,9 +1542,10 @@ mod tests {
     fn test_extract_function_with_return() {
         let examples_dir = get_simple_test_dir();
         let test_file = examples_dir.join("my_module.py");
+        let source = fs::read_to_string(&test_file).unwrap();
 
         let sig =
-            PythonAnalyzer::extract_function_signature(&test_file, "function_with_return").unwrap();
+            PythonAnalyzer::extract_function_signature(&source, "function_with_return").unwrap();
         assert_eq!(sig.name, "function_with_return");
         assert!(sig.return_type.is_some());
         assert_eq!(sig.return_type.as_ref().unwrap(), "int");
@@ -1471,9 +1555,9 @@ mod tests {
     fn test_extract_variadic_function() {
         let examples_dir = get_simple_test_dir();
         let test_file = examples_dir.join("my_module.py");
+        let source = fs::read_to_string(&test_file).unwrap();
 
-        let sig =
-            PythonAnalyzer::extract_function_signature(&test_file, "variadic_function").unwrap();
+        let sig = PythonAnalyzer::extract_function_signature(&source, "variadic_function").unwrap();
         assert_eq!(sig.name, "variadic_function");
         assert_eq!(sig.parameters.len(), 2);
 
@@ -1492,9 +1576,9 @@ mod tests {
     fn test_extract_complex_function() {
         let examples_dir = get_simple_test_dir();
         let test_file = examples_dir.join("my_module.py");
+        let source = fs::read_to_string(&test_file).unwrap();
 
-        let sig =
-            PythonAnalyzer::extract_function_signature(&test_file, "complex_function").unwrap();
+        let sig = PythonAnalyzer::extract_function_signature(&source, "complex_function").unwrap();
         assert_eq!(sig.name, "complex_function");
 
         // Should have: pos_only, regular, *args, keyword_only, another_kw, **kwargs
@@ -1516,8 +1600,9 @@ mod tests {
     fn test_extract_nonexistent_function() {
         let examples_dir = get_simple_test_dir();
         let test_file = examples_dir.join("my_module.py");
+        let source = fs::read_to_string(&test_file).unwrap();
 
-        let result = PythonAnalyzer::extract_function_signature(&test_file, "nonexistent");
+        let result = PythonAnalyzer::extract_function_signature(&source, "nonexistent");
         assert!(result.is_err());
     }
 
@@ -1527,8 +1612,9 @@ mod tests {
     fn test_extract_simple_class() {
         let examples_dir = get_simple_test_dir();
         let test_file = examples_dir.join("my_module.py");
+        let source = fs::read_to_string(&test_file).unwrap();
 
-        let class_info = PythonAnalyzer::extract_class_info(&test_file, "SimpleClass").unwrap();
+        let class_info = PythonAnalyzer::extract_class_info(&source, "SimpleClass").unwrap();
         assert_eq!(class_info.name, "SimpleClass");
         assert!(class_info.docstring.is_some());
         assert!(class_info.init_signature.is_none());
@@ -1538,8 +1624,9 @@ mod tests {
     fn test_extract_class_with_init() {
         let examples_dir = get_simple_test_dir();
         let test_file = examples_dir.join("my_module.py");
+        let source = fs::read_to_string(&test_file).unwrap();
 
-        let class_info = PythonAnalyzer::extract_class_info(&test_file, "ClassWithInit").unwrap();
+        let class_info = PythonAnalyzer::extract_class_info(&source, "ClassWithInit").unwrap();
         assert_eq!(class_info.name, "ClassWithInit");
         assert!(class_info.docstring.is_some());
         assert!(class_info.init_signature.is_some());
@@ -1571,8 +1658,9 @@ mod tests {
     fn test_extract_complex_class() {
         let examples_dir = get_simple_test_dir();
         let test_file = examples_dir.join("my_module.py");
+        let source = fs::read_to_string(&test_file).unwrap();
 
-        let class_info = PythonAnalyzer::extract_class_info(&test_file, "ComplexClass").unwrap();
+        let class_info = PythonAnalyzer::extract_class_info(&source, "ComplexClass").unwrap();
         assert_eq!(class_info.name, "ComplexClass");
         assert!(class_info.init_signature.is_some());
 
@@ -1585,8 +1673,9 @@ mod tests {
     fn test_extract_nonexistent_class() {
         let examples_dir = get_simple_test_dir();
         let test_file = examples_dir.join("my_module.py");
+        let source = fs::read_to_string(&test_file).unwrap();
 
-        let result = PythonAnalyzer::extract_class_info(&test_file, "NonexistentClass");
+        let result = PythonAnalyzer::extract_class_info(&source, "NonexistentClass");
         assert!(result.is_err());
     }
 
@@ -2952,7 +3041,8 @@ mod tests {
                 .expect("Should resolve module");
 
         // Extract the class info
-        let class_info = PythonAnalyzer::extract_class_info(&module_path, "EditableModel")
+        let source = fs::read_to_string(&module_path).expect("Should read module file");
+        let class_info = PythonAnalyzer::extract_class_info(&source, "EditableModel")
             .expect("Should extract class info");
 
         assert_eq!(class_info.name, "EditableModel");
