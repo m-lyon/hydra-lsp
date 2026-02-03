@@ -5,9 +5,45 @@ use ruff_python_ast::{self as ast, Expr, Stmt, visitor::Visitor};
 use ruff_python_parser::parse_module;
 use ruff_source_file::{LineIndex, PositionEncoding};
 use ruff_text_size::TextRange;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use ty_python_semantic::{PythonEnvironment, SysPrefixPathOrigin};
+
+/// Cache for file contents to minimize disk reads during analysis.
+/// Files are read once and stored in memory for the duration of an analysis operation.
+pub struct FileCache {
+    cache: HashMap<PathBuf, String>,
+}
+
+impl FileCache {
+    pub fn new() -> Self {
+        Self {
+            cache: HashMap::new(),
+        }
+    }
+
+    /// Get file contents, reading from disk if not already cached
+    pub fn get(&mut self, path: &Path) -> Result<&str> {
+        // Use entry API to avoid double lookup
+        if !self.cache.contains_key(path) {
+            let content = fs::read_to_string(path)?;
+            self.cache.insert(path.to_path_buf(), content);
+        }
+        Ok(self.cache.get(path).unwrap())
+    }
+
+    /// Check if a file is already cached
+    pub fn contains(&self, path: &Path) -> bool {
+        self.cache.contains_key(path)
+    }
+}
+
+impl Default for FileCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct FunctionSignature {
@@ -50,10 +86,47 @@ pub struct ClassInfo {
     pub end_column: u32,
 }
 
+/// Represents a method within a class
+#[derive(Debug, Clone)]
+pub struct MethodInfo {
+    pub class_name: String,
+    pub method_name: String,
+    pub signature: FunctionSignature,
+    pub is_classmethod: bool,
+    pub is_staticmethod: bool,
+}
+
 #[derive(Debug, Clone)]
 pub enum DefinitionInfo {
     Function(FunctionSignature),
     Class(ClassInfo),
+    Method(MethodInfo),
+}
+
+impl DefinitionInfo {
+    /// Get the source location (start_line, start_col, end_line, end_col)
+    pub fn position(&self) -> (u32, u32, u32, u32) {
+        match self {
+            DefinitionInfo::Function(sig) => (
+                sig.start_line,
+                sig.start_column,
+                sig.end_line,
+                sig.end_column,
+            ),
+            DefinitionInfo::Class(info) => (
+                info.start_line,
+                info.start_column,
+                info.end_line,
+                info.end_column,
+            ),
+            DefinitionInfo::Method(info) => (
+                info.signature.start_line,
+                info.signature.start_column,
+                info.signature.end_line,
+                info.signature.end_column,
+            ),
+        }
+    }
 }
 
 pub struct PythonAnalyzer;
@@ -202,52 +275,196 @@ impl PythonAnalyzer {
         )
     }
 
-    /// Extract function signature from a parsed Python AST
-    /// This is a simplified extraction that visits the AST to find function definitions
+    /// Extract function signature from source code
     pub fn extract_function_signature(
-        file_path: &Path,
+        source: &str,
         function_name: &str,
     ) -> Result<FunctionSignature> {
-        let source = fs::read_to_string(file_path)?;
-        let parsed = parse_module(&source)?;
+        let parsed = parse_module(source)?;
 
         let mut visitor = FunctionExtractor {
             target_name: function_name.to_string(),
             result: None,
-            source,
+            source: source.to_string(),
         };
 
         visitor.visit_body(parsed.suite());
 
-        visitor.result.ok_or_else(|| {
-            anyhow::anyhow!(
-                "Function '{}' not found in {}",
-                function_name,
-                file_path.display()
-            )
-        })
+        visitor
+            .result
+            .ok_or_else(|| anyhow::anyhow!("Function '{}' not found", function_name))
     }
 
-    /// Extract class information from a parsed Python AST
-    pub fn extract_class_info(file_path: &Path, class_name: &str) -> Result<ClassInfo> {
-        let source = fs::read_to_string(file_path)?;
-        let parsed = parse_module(&source)?;
+    /// Extract class information from source code
+    pub fn extract_class_info(source: &str, class_name: &str) -> Result<ClassInfo> {
+        let parsed = parse_module(source)?;
 
         let mut visitor = ClassExtractor {
             target_name: class_name.to_string(),
             result: None,
-            source: source.clone(),
+            source: source.to_string(),
+        };
+
+        visitor.visit_body(parsed.suite());
+
+        visitor
+            .result
+            .ok_or_else(|| anyhow::anyhow!("Class '{}' not found", class_name))
+    }
+
+    /// Extract method information from source code
+    pub fn extract_method_info(
+        source: &str,
+        class_name: &str,
+        method_name: &str,
+    ) -> Result<MethodInfo> {
+        let parsed = parse_module(source)?;
+
+        let mut visitor = MethodExtractor {
+            class_name: class_name.to_string(),
+            method_name: method_name.to_string(),
+            result: None,
+            source: source.to_string(),
         };
 
         visitor.visit_body(parsed.suite());
 
         visitor.result.ok_or_else(|| {
             anyhow::anyhow!(
-                "Class '{}' not found in {}",
-                class_name,
-                file_path.display()
+                "Method '{}' not found in class '{}'",
+                method_name,
+                class_name
             )
         })
+    }
+
+    /// Extract class attribute from source code
+    pub fn extract_class_attribute(
+        source: &str,
+        class_name: &str,
+        attribute_name: &str,
+    ) -> Result<ClassAttributeInfo> {
+        let parsed = parse_module(source)?;
+
+        let mut visitor = ClassAttributeExtractor {
+            class_name: class_name.to_string(),
+            attribute_name: attribute_name.to_string(),
+            result: None,
+        };
+
+        visitor.visit_body(parsed.suite());
+
+        visitor.result.ok_or_else(|| {
+            anyhow::anyhow!(
+                "Attribute '{}' not found in class '{}'",
+                attribute_name,
+                class_name
+            )
+        })
+    }
+
+    /// Resolve an attribute chain through classes.
+    ///
+    /// Given a starting class and an attribute chain like ["nested", "nested_class"],
+    /// follows the chain by looking up each class attribute to find the final class/method.
+    ///
+    /// Returns the final resolved class name and the remaining method name (if any).
+    fn resolve_attribute_chain(
+        file_path: &Path,
+        starting_class: &str,
+        attribute_chain: &[&str],
+        search_paths: &[PathBuf],
+        file_cache: &mut FileCache,
+    ) -> Result<(PathBuf, String, Option<String>)> {
+        if attribute_chain.is_empty() {
+            anyhow::bail!("Empty attribute chain");
+        }
+
+        let mut current_file = file_path.to_path_buf();
+        let mut current_class = starting_class.to_string();
+        let mut resolver = ImportResolver::new(search_paths.to_vec());
+
+        // Process all but the last attribute (which might be a method)
+        for (i, attr) in attribute_chain.iter().enumerate() {
+            let is_last = i == attribute_chain.len() - 1;
+
+            // Read current file source
+            let source = file_cache.get(&current_file)?;
+
+            // First, check if this is a method on the current class
+            if is_last && Self::extract_method_info(source, &current_class, attr).is_ok() {
+                // It's a method - return the class and method name
+                return Ok((current_file, current_class, Some(attr.to_string())));
+            }
+
+            // Try to get the attribute as a class attribute
+            match Self::extract_class_attribute(source, &current_class, attr) {
+                Ok(attr_info) => {
+                    // The value could be a simple name or a dotted path
+                    let value_parts: Vec<&str> = attr_info.value.split('.').collect();
+
+                    if value_parts.len() == 1 {
+                        // Simple name - look for it in the same file first
+                        let new_class_name = value_parts[0];
+
+                        // Try direct lookup in current file
+                        if Self::extract_class_info(source, new_class_name).is_ok() {
+                            current_class = new_class_name.to_string();
+                            continue;
+                        }
+
+                        // Try resolving through imports
+                        if let Some((resolved_file, resolved_name)) =
+                            resolver.resolve_symbol(&current_file, new_class_name)
+                        {
+                            current_file = resolved_file;
+                            current_class = if resolved_name.is_empty() {
+                                new_class_name.to_string()
+                            } else {
+                                resolved_name
+                            };
+                            continue;
+                        }
+
+                        anyhow::bail!(
+                            "Could not resolve class '{}' from attribute '{}'",
+                            new_class_name,
+                            attr
+                        );
+                    } else {
+                        // Dotted path like "module.Class"
+                        let module_path = value_parts[..value_parts.len() - 1].join(".");
+                        let class_name = value_parts[value_parts.len() - 1];
+
+                        // Try to resolve the module
+                        if let Some(resolved_file) = resolver.resolve_module_path(&module_path) {
+                            current_file = resolved_file;
+                            current_class = class_name.to_string();
+                            continue;
+                        }
+
+                        anyhow::bail!(
+                            "Could not resolve module path '{}' from attribute '{}'",
+                            module_path,
+                            attr
+                        );
+                    }
+                }
+                Err(_) if is_last => {
+                    // Last attribute and not a class attribute - maybe it's a method
+                    // that we couldn't find (could be inherited, etc.)
+                    anyhow::bail!(
+                        "Attribute or method '{}' not found in class '{}'",
+                        attr,
+                        current_class
+                    );
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        // Reached end of chain without finding a method
+        Ok((current_file, current_class, None))
     }
 
     /// Build search paths from discovered site-packages
@@ -340,13 +557,16 @@ impl PythonAnalyzer {
         file_path: &Path,
         class_name: &str,
         search_paths: Vec<PathBuf>,
+        file_cache: &mut FileCache,
     ) -> Result<(ClassInfo, PathBuf)> {
-        // First try direct lookup
-        if let Ok(class_info) = Self::extract_class_info(file_path, class_name) {
+        // First try direct lookup using cache
+        if let Ok(source) = file_cache.get(file_path)
+            && let Ok(class_info) = Self::extract_class_info(source, class_name)
+        {
             return Ok((class_info, file_path.to_path_buf()));
         }
 
-        // Try to resolve through imports
+        // Try to resolve through imports (ImportResolver has its own cache that shares with us)
         let mut resolver = ImportResolver::new(search_paths);
         if let Some((resolved_file, resolved_name)) = resolver.resolve_symbol(file_path, class_name)
         {
@@ -355,7 +575,9 @@ impl PythonAnalyzer {
             } else {
                 resolved_name
             };
-            let class_info = Self::extract_class_info(&resolved_file, &actual_name)?;
+            // Use cache for the resolved file
+            let source = file_cache.get(&resolved_file)?;
+            let class_info = Self::extract_class_info(source, &actual_name)?;
             return Ok((class_info, resolved_file));
         }
 
@@ -372,9 +594,12 @@ impl PythonAnalyzer {
         file_path: &Path,
         function_name: &str,
         search_paths: Vec<PathBuf>,
+        file_cache: &mut FileCache,
     ) -> Result<(FunctionSignature, PathBuf)> {
-        // First try direct lookup
-        if let Ok(func_sig) = Self::extract_function_signature(file_path, function_name) {
+        // First try direct lookup using cache
+        if let Ok(source) = file_cache.get(file_path)
+            && let Ok(func_sig) = Self::extract_function_signature(source, function_name)
+        {
             return Ok((func_sig, file_path.to_path_buf()));
         }
 
@@ -388,7 +613,9 @@ impl PythonAnalyzer {
             } else {
                 resolved_name
             };
-            let func_sig = Self::extract_function_signature(&resolved_file, &actual_name)?;
+            // Use cache for the resolved file
+            let source = file_cache.get(&resolved_file)?;
+            let func_sig = Self::extract_function_signature(source, &actual_name)?;
             return Ok((func_sig, resolved_file));
         }
 
@@ -412,39 +639,204 @@ impl PythonAnalyzer {
     ) -> Result<(DefinitionInfo, PathBuf, String, String)> {
         let (module_path, symbol_name) = Self::split_target(target)?;
 
-        let (file_path, search_paths) =
-            Self::resolve_module(&module_path, workspace_root, python_interpreter)?;
+        // Create a shared file cache for all operations
+        let mut file_cache = FileCache::new();
 
-        // Try to extract as function first (with import resolution)
-        if let Ok((func_sig, resolved_file)) = Self::extract_function_signature_with_imports(
-            &file_path,
-            &symbol_name,
-            search_paths.clone(),
-        ) {
+        // Track whether we found the module but not the symbol
+        let mut module_found = false;
+
+        // First try standard resolution: module.symbol where symbol is a function or class
+        if let Ok((file_path, search_paths)) =
+            Self::resolve_module(&module_path, workspace_root, python_interpreter)
+        {
+            module_found = true;
+
+            // Try to extract as function first (with import resolution)
+            if let Ok((func_sig, resolved_file)) = Self::extract_function_signature_with_imports(
+                &file_path,
+                &symbol_name,
+                search_paths.clone(),
+                &mut file_cache,
+            ) {
+                return Ok((
+                    DefinitionInfo::Function(func_sig),
+                    resolved_file,
+                    module_path,
+                    symbol_name,
+                ));
+            }
+
+            // Try to extract as class (with import resolution)
+            if let Ok((class_info, resolved_file)) = Self::extract_class_info_with_imports(
+                &file_path,
+                &symbol_name,
+                search_paths,
+                &mut file_cache,
+            ) {
+                return Ok((
+                    DefinitionInfo::Class(class_info),
+                    resolved_file,
+                    module_path,
+                    symbol_name,
+                ));
+            }
+        }
+
+        // Try to interpret as Class.method pattern (e.g., "my_module.MyClass.from_config")
+        // or nested pattern (e.g., "my_module.OuterClass.nested.nested_class.method")
+        if let Some((resolved_file, class_name, method_name, search_paths)) =
+            Self::resolve_class_method_chain(
+                target,
+                workspace_root,
+                python_interpreter,
+                &mut file_cache,
+            )
+            && let Ok((method_info, final_file)) = Self::extract_method_info_with_imports(
+                &resolved_file,
+                &class_name,
+                &method_name,
+                search_paths,
+                &mut file_cache,
+            )
+        {
             return Ok((
-                DefinitionInfo::Function(func_sig),
-                resolved_file,
-                module_path,
-                symbol_name,
+                DefinitionInfo::Method(method_info),
+                final_file,
+                module_path.clone(),
+                format!("{}.{}", class_name, method_name),
             ));
         }
 
-        // Try to extract as class (with import resolution)
-        if let Ok((class_info, resolved_file)) =
-            Self::extract_class_info_with_imports(&file_path, &symbol_name, search_paths)
-        {
-            return Ok((
-                DefinitionInfo::Class(class_info),
-                resolved_file,
-                module_path,
+        // Return appropriate error based on whether module was found
+        if module_found {
+            anyhow::bail!(
+                "Symbol '{}' not found in module '{}'",
                 symbol_name,
-            ));
+                module_path
+            )
+        } else {
+            anyhow::bail!("Could not resolve module: '{}'", module_path)
+        }
+    }
+
+    /// Resolve a target string that may include a class method access pattern.
+    ///
+    /// This handles various patterns:
+    /// - Simple: `module.Class.method`
+    /// - Nested: `module.OuterClass.nested_attr.nested_attr.method`
+    ///
+    /// Returns (file_path, class_name, method_name, search_paths) if resolved.
+    fn resolve_class_method_chain(
+        target: &str,
+        workspace_root: Option<&Path>,
+        python_interpreter: Option<&str>,
+        file_cache: &mut FileCache,
+    ) -> Option<(PathBuf, String, String, Vec<PathBuf>)> {
+        let parts: Vec<&str> = target.split('.').collect();
+        if parts.len() < 3 {
+            return None;
+        }
+
+        // Try progressively shorter module paths
+        // For "a.b.c.D.e.f.method", try:
+        //   module="a.b.c.D.e.f" (fails - no method left)
+        //   module="a.b.c.D.e", attr_chain=["f"] (if f is a method of class from e)
+        //   module="a.b.c.D", attr_chain=["e", "f"] ...
+        //   module="a.b.c", attr_chain=["D", "e", "f"] (D is a class, e.f is attr chain + method)
+        //   etc.
+
+        for module_end_idx in (1..parts.len() - 1).rev() {
+            let module_path = parts[..module_end_idx].join(".");
+            let remaining_parts = &parts[module_end_idx..];
+
+            // Try to resolve the module
+            let Ok((file_path, search_paths)) =
+                Self::resolve_module(&module_path, workspace_root, python_interpreter)
+            else {
+                continue;
+            };
+
+            // The first remaining part should be a class (or function that returns a class, but we focus on classes)
+            let first_symbol = remaining_parts[0];
+
+            // Check if this is a class
+            if let Ok((class_info, resolved_file)) = Self::extract_class_info_with_imports(
+                &file_path,
+                first_symbol,
+                search_paths.clone(),
+                file_cache,
+            ) {
+                if remaining_parts.len() == 2 {
+                    // Simple case: Class.method
+                    let method_name = remaining_parts[1];
+                    // Read the resolved file source and check if method exists
+                    if let Ok(source) = file_cache.get(&resolved_file)
+                        && Self::extract_method_info(source, &class_info.name, method_name).is_ok()
+                    {
+                        return Some((
+                            resolved_file,
+                            class_info.name,
+                            method_name.to_string(),
+                            search_paths,
+                        ));
+                    }
+                } else if remaining_parts.len() > 2 {
+                    // Nested case: Class.attr1.attr2...method
+                    // Follow the attribute chain
+                    let attribute_chain = &remaining_parts[1..];
+                    if let Ok((final_file, final_class, Some(method_name))) =
+                        Self::resolve_attribute_chain(
+                            &resolved_file,
+                            &class_info.name,
+                            attribute_chain,
+                            &search_paths,
+                            file_cache,
+                        )
+                    {
+                        return Some((final_file, final_class, method_name, search_paths));
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Extract method info, following re-exports if necessary.
+    /// Returns the MethodInfo and the file path where it was found.
+    pub fn extract_method_info_with_imports(
+        file_path: &Path,
+        class_name: &str,
+        method_name: &str,
+        search_paths: Vec<PathBuf>,
+        file_cache: &mut FileCache,
+    ) -> Result<(MethodInfo, PathBuf)> {
+        // First try direct lookup using cache
+        if let Ok(source) = file_cache.get(file_path)
+            && let Ok(method_info) = Self::extract_method_info(source, class_name, method_name)
+        {
+            return Ok((method_info, file_path.to_path_buf()));
+        }
+
+        // Try to resolve class through imports, then find the method
+        let mut resolver = ImportResolver::new(search_paths);
+        if let Some((resolved_file, resolved_name)) = resolver.resolve_symbol(file_path, class_name)
+        {
+            let actual_class_name = if resolved_name.is_empty() {
+                class_name.to_string()
+            } else {
+                resolved_name
+            };
+            let source = file_cache.get(&resolved_file)?;
+            let method_info = Self::extract_method_info(source, &actual_class_name, method_name)?;
+            return Ok((method_info, resolved_file));
         }
 
         anyhow::bail!(
-            "Symbol '{}' not found in module '{}'",
-            symbol_name,
-            module_path
+            "Method '{}' not found in class '{}' in {} (also checked re-exports)",
+            method_name,
+            class_name,
+            file_path.display()
         )
     }
 
@@ -529,6 +921,41 @@ impl PythonAnalyzer {
                 Some(4),
             ));
         }
+
+        result.push_str("\n```");
+
+        result
+    }
+
+    /// Format a method for display (e.g., in hover)
+    /// Shows the method signature with @classmethod or @staticmethod decorator if applicable
+    pub fn format_method(method: &MethodInfo) -> String {
+        let mut result = String::new();
+        result.push_str("```python\n");
+
+        // Show decorator if applicable
+        if method.is_classmethod {
+            result.push_str("@classmethod\n");
+        } else if method.is_staticmethod {
+            result.push_str("@staticmethod\n");
+        }
+
+        let param_strs: Vec<String> = method
+            .signature
+            .parameters
+            .iter()
+            .map(Self::format_parameter)
+            .collect();
+
+        result.push_str(&Self::format_definition(
+            "def",
+            &method.signature.name,
+            &param_strs,
+            true,
+            method.signature.return_type.as_ref(),
+            method.signature.docstring.as_ref(),
+            None,
+        ));
 
         result.push_str("\n```");
 
@@ -667,6 +1094,129 @@ impl<'a> Visitor<'a> for ClassExtractor {
         // Continue walking
         ast::visitor::walk_stmt(self, stmt);
     }
+}
+
+/// Visitor to extract a specific method from a class
+struct MethodExtractor {
+    class_name: String,
+    method_name: String,
+    result: Option<MethodInfo>,
+    source: String,
+}
+
+/// Represents a class attribute assignment (e.g., `nested_class = ModelFactory`)
+#[derive(Debug, Clone)]
+pub struct ClassAttributeInfo {
+    pub name: String,
+    /// The value as a string (e.g., "ModelFactory", "SomeModule.SomeClass")
+    pub value: String,
+}
+
+/// Visitor to extract class attribute assignments from a class definition
+struct ClassAttributeExtractor {
+    class_name: String,
+    attribute_name: String,
+    result: Option<ClassAttributeInfo>,
+}
+
+impl<'a> Visitor<'a> for ClassAttributeExtractor {
+    fn visit_stmt(&mut self, stmt: &'a Stmt) {
+        if self.result.is_some() {
+            return; // Already found
+        }
+
+        if let Stmt::ClassDef(class_def) = stmt
+            && class_def.name.as_str() == self.class_name
+        {
+            // Look for attribute assignments within the class body
+            for class_stmt in &class_def.body {
+                // Handle simple assignments: `attr = SomeClass`
+                if let Stmt::Assign(assign) = class_stmt {
+                    for target in &assign.targets {
+                        if let Expr::Name(name) = target
+                            && name.id.as_str() == self.attribute_name
+                        {
+                            self.result = Some(ClassAttributeInfo {
+                                name: self.attribute_name.clone(),
+                                value: expr_to_string(&assign.value),
+                            });
+                            return;
+                        }
+                    }
+                }
+                // Handle annotated assignments: `attr: Type = SomeClass`
+                if let Stmt::AnnAssign(ann_assign) = class_stmt
+                    && let Expr::Name(name) = ann_assign.target.as_ref()
+                    && name.id.as_str() == self.attribute_name
+                    && let Some(value) = &ann_assign.value
+                {
+                    self.result = Some(ClassAttributeInfo {
+                        name: self.attribute_name.clone(),
+                        value: expr_to_string(value),
+                    });
+                    return;
+                }
+            }
+        }
+
+        // Continue walking to find nested classes
+        ast::visitor::walk_stmt(self, stmt);
+    }
+}
+
+impl<'a> Visitor<'a> for MethodExtractor {
+    fn visit_stmt(&mut self, stmt: &'a Stmt) {
+        if self.result.is_some() {
+            return; // Already found
+        }
+
+        if let Stmt::ClassDef(class_def) = stmt
+            && class_def.name.as_str() == self.class_name
+        {
+            // Look for the method within the class body
+            for class_stmt in &class_def.body {
+                if let Stmt::FunctionDef(func_def) = class_stmt
+                    && func_def.name.as_str() == self.method_name
+                {
+                    let signature = extract_function_signature_from_def(func_def, &self.source);
+
+                    // Check decorators for @classmethod or @staticmethod
+                    let (is_classmethod, is_staticmethod) =
+                        check_method_decorators(&func_def.decorator_list);
+
+                    self.result = Some(MethodInfo {
+                        class_name: self.class_name.clone(),
+                        method_name: self.method_name.clone(),
+                        signature,
+                        is_classmethod,
+                        is_staticmethod,
+                    });
+                    return;
+                }
+            }
+        }
+
+        // Continue walking to find nested classes
+        ast::visitor::walk_stmt(self, stmt);
+    }
+}
+
+/// Check if a function has @classmethod or @staticmethod decorators
+fn check_method_decorators(decorators: &[ast::Decorator]) -> (bool, bool) {
+    let mut is_classmethod = false;
+    let mut is_staticmethod = false;
+
+    for decorator in decorators {
+        if let Expr::Name(name) = &decorator.expression {
+            match name.id.as_str() {
+                "classmethod" => is_classmethod = true,
+                "staticmethod" => is_staticmethod = true,
+                _ => {}
+            }
+        }
+    }
+
+    (is_classmethod, is_staticmethod)
 }
 
 /// Convert a TextRange to line/column position
@@ -867,6 +1417,7 @@ fn expr_to_string(expr: &Expr) -> String {
 mod tests {
     use super::*;
     use std::env;
+    use std::fs;
 
     fn get_simple_test_dir() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -947,9 +1498,9 @@ mod tests {
     fn test_extract_simple_function() {
         let examples_dir = get_simple_test_dir();
         let test_file = examples_dir.join("my_module.py");
+        let source = fs::read_to_string(&test_file).unwrap();
 
-        let sig =
-            PythonAnalyzer::extract_function_signature(&test_file, "simple_function").unwrap();
+        let sig = PythonAnalyzer::extract_function_signature(&source, "simple_function").unwrap();
         assert_eq!(sig.name, "simple_function");
         assert_eq!(sig.parameters.len(), 0);
         assert!(sig.docstring.is_some());
@@ -960,9 +1511,10 @@ mod tests {
     fn test_extract_function_with_params() {
         let examples_dir = get_simple_test_dir();
         let test_file = examples_dir.join("my_module.py");
+        let source = fs::read_to_string(&test_file).unwrap();
 
         let sig =
-            PythonAnalyzer::extract_function_signature(&test_file, "function_with_params").unwrap();
+            PythonAnalyzer::extract_function_signature(&source, "function_with_params").unwrap();
         assert_eq!(sig.name, "function_with_params");
         assert_eq!(sig.parameters.len(), 3);
 
@@ -990,9 +1542,10 @@ mod tests {
     fn test_extract_function_with_return() {
         let examples_dir = get_simple_test_dir();
         let test_file = examples_dir.join("my_module.py");
+        let source = fs::read_to_string(&test_file).unwrap();
 
         let sig =
-            PythonAnalyzer::extract_function_signature(&test_file, "function_with_return").unwrap();
+            PythonAnalyzer::extract_function_signature(&source, "function_with_return").unwrap();
         assert_eq!(sig.name, "function_with_return");
         assert!(sig.return_type.is_some());
         assert_eq!(sig.return_type.as_ref().unwrap(), "int");
@@ -1002,9 +1555,9 @@ mod tests {
     fn test_extract_variadic_function() {
         let examples_dir = get_simple_test_dir();
         let test_file = examples_dir.join("my_module.py");
+        let source = fs::read_to_string(&test_file).unwrap();
 
-        let sig =
-            PythonAnalyzer::extract_function_signature(&test_file, "variadic_function").unwrap();
+        let sig = PythonAnalyzer::extract_function_signature(&source, "variadic_function").unwrap();
         assert_eq!(sig.name, "variadic_function");
         assert_eq!(sig.parameters.len(), 2);
 
@@ -1023,9 +1576,9 @@ mod tests {
     fn test_extract_complex_function() {
         let examples_dir = get_simple_test_dir();
         let test_file = examples_dir.join("my_module.py");
+        let source = fs::read_to_string(&test_file).unwrap();
 
-        let sig =
-            PythonAnalyzer::extract_function_signature(&test_file, "complex_function").unwrap();
+        let sig = PythonAnalyzer::extract_function_signature(&source, "complex_function").unwrap();
         assert_eq!(sig.name, "complex_function");
 
         // Should have: pos_only, regular, *args, keyword_only, another_kw, **kwargs
@@ -1047,8 +1600,9 @@ mod tests {
     fn test_extract_nonexistent_function() {
         let examples_dir = get_simple_test_dir();
         let test_file = examples_dir.join("my_module.py");
+        let source = fs::read_to_string(&test_file).unwrap();
 
-        let result = PythonAnalyzer::extract_function_signature(&test_file, "nonexistent");
+        let result = PythonAnalyzer::extract_function_signature(&source, "nonexistent");
         assert!(result.is_err());
     }
 
@@ -1058,8 +1612,9 @@ mod tests {
     fn test_extract_simple_class() {
         let examples_dir = get_simple_test_dir();
         let test_file = examples_dir.join("my_module.py");
+        let source = fs::read_to_string(&test_file).unwrap();
 
-        let class_info = PythonAnalyzer::extract_class_info(&test_file, "SimpleClass").unwrap();
+        let class_info = PythonAnalyzer::extract_class_info(&source, "SimpleClass").unwrap();
         assert_eq!(class_info.name, "SimpleClass");
         assert!(class_info.docstring.is_some());
         assert!(class_info.init_signature.is_none());
@@ -1069,8 +1624,9 @@ mod tests {
     fn test_extract_class_with_init() {
         let examples_dir = get_simple_test_dir();
         let test_file = examples_dir.join("my_module.py");
+        let source = fs::read_to_string(&test_file).unwrap();
 
-        let class_info = PythonAnalyzer::extract_class_info(&test_file, "ClassWithInit").unwrap();
+        let class_info = PythonAnalyzer::extract_class_info(&source, "ClassWithInit").unwrap();
         assert_eq!(class_info.name, "ClassWithInit");
         assert!(class_info.docstring.is_some());
         assert!(class_info.init_signature.is_some());
@@ -1102,8 +1658,9 @@ mod tests {
     fn test_extract_complex_class() {
         let examples_dir = get_simple_test_dir();
         let test_file = examples_dir.join("my_module.py");
+        let source = fs::read_to_string(&test_file).unwrap();
 
-        let class_info = PythonAnalyzer::extract_class_info(&test_file, "ComplexClass").unwrap();
+        let class_info = PythonAnalyzer::extract_class_info(&source, "ComplexClass").unwrap();
         assert_eq!(class_info.name, "ComplexClass");
         assert!(class_info.init_signature.is_some());
 
@@ -1116,8 +1673,9 @@ mod tests {
     fn test_extract_nonexistent_class() {
         let examples_dir = get_simple_test_dir();
         let test_file = examples_dir.join("my_module.py");
+        let source = fs::read_to_string(&test_file).unwrap();
 
-        let result = PythonAnalyzer::extract_class_info(&test_file, "NonexistentClass");
+        let result = PythonAnalyzer::extract_class_info(&source, "NonexistentClass");
         assert!(result.is_err());
     }
 
@@ -2125,6 +2683,286 @@ mod tests {
         );
     }
 
+    // ==================== classmethod and staticmethod tests ====================
+
+    #[test]
+    fn test_extract_classmethod() {
+        // Test: class_methods.ModelFactory.from_config should resolve to a classmethod
+        let workspace_dir = get_simple_test_dir();
+
+        let result = PythonAnalyzer::extract_definition_info(
+            "class_methods.ModelFactory.from_config",
+            Some(&workspace_dir),
+            None,
+        );
+
+        assert!(
+            result.is_ok(),
+            "Should resolve classmethod: {:?}",
+            result.err()
+        );
+        let (definition_info, _file_path, _module_path, _symbol_name) = result.unwrap();
+
+        match definition_info {
+            DefinitionInfo::Method(method_info) => {
+                assert_eq!(method_info.class_name, "ModelFactory");
+                assert_eq!(method_info.method_name, "from_config");
+                assert!(method_info.is_classmethod);
+                assert!(!method_info.is_staticmethod);
+                assert_eq!(method_info.signature.name, "from_config");
+                // Check parameters: cls and config
+                assert_eq!(method_info.signature.parameters.len(), 2);
+                assert_eq!(method_info.signature.parameters[0].name, "cls");
+                assert_eq!(method_info.signature.parameters[1].name, "config");
+            }
+            _ => panic!("Expected Method definition, got {:?}", definition_info),
+        }
+    }
+
+    #[test]
+    fn test_extract_staticmethod() {
+        // Test: class_methods.ModelFactory.compute_size should resolve to a staticmethod
+        let workspace_dir = get_simple_test_dir();
+
+        let result = PythonAnalyzer::extract_definition_info(
+            "class_methods.ModelFactory.compute_size",
+            Some(&workspace_dir),
+            None,
+        );
+
+        assert!(
+            result.is_ok(),
+            "Should resolve staticmethod: {:?}",
+            result.err()
+        );
+        let (definition_info, _file_path, _module_path, _symbol_name) = result.unwrap();
+
+        match definition_info {
+            DefinitionInfo::Method(method_info) => {
+                assert_eq!(method_info.class_name, "ModelFactory");
+                assert_eq!(method_info.method_name, "compute_size");
+                assert!(!method_info.is_classmethod);
+                assert!(method_info.is_staticmethod);
+                assert_eq!(method_info.signature.name, "compute_size");
+                // Check parameters: dim1 and dim2
+                assert_eq!(method_info.signature.parameters.len(), 2);
+                assert_eq!(method_info.signature.parameters[0].name, "dim1");
+                assert_eq!(method_info.signature.parameters[1].name, "dim2");
+            }
+            _ => panic!("Expected Method definition, got {:?}", definition_info),
+        }
+    }
+
+    #[test]
+    fn test_extract_classmethod_with_defaults() {
+        // Test: class_methods.ModelFactory.with_defaults has default parameter
+        let workspace_dir = get_simple_test_dir();
+
+        let result = PythonAnalyzer::extract_definition_info(
+            "class_methods.ModelFactory.with_defaults",
+            Some(&workspace_dir),
+            None,
+        );
+
+        assert!(
+            result.is_ok(),
+            "Should resolve classmethod: {:?}",
+            result.err()
+        );
+        let (definition_info, _file_path, _module_path, _symbol_name) = result.unwrap();
+
+        match definition_info {
+            DefinitionInfo::Method(method_info) => {
+                assert_eq!(method_info.class_name, "ModelFactory");
+                assert_eq!(method_info.method_name, "with_defaults");
+                assert!(method_info.is_classmethod);
+                // Check parameters: cls and output_dim (with default)
+                assert_eq!(method_info.signature.parameters.len(), 2);
+                assert_eq!(method_info.signature.parameters[1].name, "output_dim");
+                assert!(method_info.signature.parameters[1].has_default);
+            }
+            _ => panic!("Expected Method definition, got {:?}", definition_info),
+        }
+    }
+
+    #[test]
+    fn test_extract_classmethod_with_kwargs() {
+        // Test: class_methods.DataProcessor.create has **kwargs
+        let workspace_dir = get_simple_test_dir();
+
+        let result = PythonAnalyzer::extract_definition_info(
+            "class_methods.DataProcessor.create",
+            Some(&workspace_dir),
+            None,
+        );
+
+        assert!(
+            result.is_ok(),
+            "Should resolve classmethod: {:?}",
+            result.err()
+        );
+        let (definition_info, _file_path, _module_path, _symbol_name) = result.unwrap();
+
+        match definition_info {
+            DefinitionInfo::Method(method_info) => {
+                assert_eq!(method_info.class_name, "DataProcessor");
+                assert_eq!(method_info.method_name, "create");
+                assert!(method_info.is_classmethod);
+                // Check parameters: cls, name, **kwargs
+                assert_eq!(method_info.signature.parameters.len(), 3);
+                assert_eq!(method_info.signature.parameters[2].name, "kwargs");
+                assert!(method_info.signature.parameters[2].is_variadic_keyword);
+            }
+            _ => panic!("Expected Method definition, got {:?}", definition_info),
+        }
+    }
+
+    #[test]
+    fn test_format_classmethod() {
+        let method_info = MethodInfo {
+            class_name: "MyClass".to_string(),
+            method_name: "from_config".to_string(),
+            signature: FunctionSignature {
+                name: "from_config".to_string(),
+                parameters: vec![
+                    ParameterInfo {
+                        name: "cls".to_string(),
+                        type_annotation: None,
+                        default_value: None,
+                        has_default: false,
+                        is_variadic: false,
+                        is_variadic_keyword: false,
+                        is_keyword_only: false,
+                    },
+                    ParameterInfo {
+                        name: "config".to_string(),
+                        type_annotation: Some("dict".to_string()),
+                        default_value: None,
+                        has_default: false,
+                        is_variadic: false,
+                        is_variadic_keyword: false,
+                        is_keyword_only: false,
+                    },
+                ],
+                return_type: Some("MyClass".to_string()),
+                docstring: Some("Create from config".to_string()),
+                start_line: 0,
+                start_column: 0,
+                end_line: 5,
+                end_column: 5,
+            },
+            is_classmethod: true,
+            is_staticmethod: false,
+        };
+
+        let formatted = PythonAnalyzer::format_method(&method_info);
+        assert!(formatted.contains("@classmethod"));
+        assert!(formatted.contains("def from_config(cls, config: dict) -> MyClass"));
+        assert!(formatted.contains("Create from config"));
+    }
+
+    #[test]
+    fn test_format_staticmethod() {
+        let method_info = MethodInfo {
+            class_name: "MyClass".to_string(),
+            method_name: "helper".to_string(),
+            signature: FunctionSignature {
+                name: "helper".to_string(),
+                parameters: vec![ParameterInfo {
+                    name: "value".to_string(),
+                    type_annotation: Some("int".to_string()),
+                    default_value: None,
+                    has_default: false,
+                    is_variadic: false,
+                    is_variadic_keyword: false,
+                    is_keyword_only: false,
+                }],
+                return_type: Some("int".to_string()),
+                docstring: None,
+                start_line: 0,
+                start_column: 0,
+                end_line: 5,
+                end_column: 5,
+            },
+            is_classmethod: false,
+            is_staticmethod: true,
+        };
+
+        let formatted = PythonAnalyzer::format_method(&method_info);
+        assert!(formatted.contains("@staticmethod"));
+        assert!(formatted.contains("def helper(value: int) -> int"));
+    }
+
+    #[test]
+    fn test_extract_nested_classmethod() {
+        // Test: Nested class properties should resolve to a classmethod
+        // Path: NestedTwice.nested -> NestedExample, NestedExample.nested_class -> ModelFactory
+        // ModelFactory.from_config is a classmethod
+        let workspace_dir = get_simple_test_dir();
+
+        let result = PythonAnalyzer::extract_definition_info(
+            "class_methods.NestedTwice.nested.nested_class.from_config",
+            Some(&workspace_dir),
+            None,
+        );
+
+        assert!(
+            result.is_ok(),
+            "Should resolve classmethod: {:?}",
+            result.err()
+        );
+        let (definition_info, _file_path, _module_path, _symbol_name) = result.unwrap();
+
+        match definition_info {
+            DefinitionInfo::Method(method_info) => {
+                assert_eq!(method_info.class_name, "ModelFactory");
+                assert_eq!(method_info.method_name, "from_config");
+                assert!(method_info.is_classmethod);
+                assert!(!method_info.is_staticmethod);
+                // Check parameters: cls and config
+                assert_eq!(method_info.signature.parameters.len(), 2);
+                assert_eq!(method_info.signature.parameters[0].name, "cls");
+                assert_eq!(method_info.signature.parameters[1].name, "config");
+            }
+            _ => panic!("Expected Method definition, got {:?}", definition_info),
+        }
+    }
+
+    #[test]
+    fn test_extract_nested_staticmethod() {
+        // Test: Nested class properties should resolve to a staticmethod
+        // Path: NestedTwice.nested -> NestedExample, NestedExample.nested_class -> ModelFactory
+        // ModelFactory.compute_size is a staticmethod
+        let workspace_dir = get_simple_test_dir();
+
+        let result = PythonAnalyzer::extract_definition_info(
+            "class_methods.NestedTwice.nested.nested_class.compute_size",
+            Some(&workspace_dir),
+            None,
+        );
+
+        assert!(
+            result.is_ok(),
+            "Should resolve staticmethod: {:?}",
+            result.err()
+        );
+        let (definition_info, _file_path, _module_path, _symbol_name) = result.unwrap();
+
+        match definition_info {
+            DefinitionInfo::Method(method_info) => {
+                assert_eq!(method_info.class_name, "ModelFactory");
+                assert_eq!(method_info.method_name, "compute_size");
+                assert!(!method_info.is_classmethod);
+                assert!(method_info.is_staticmethod);
+                // Check parameters: dim1 and dim2
+                assert_eq!(method_info.signature.parameters.len(), 2);
+                assert_eq!(method_info.signature.parameters[0].name, "dim1");
+                assert_eq!(method_info.signature.parameters[1].name, "dim2");
+            }
+            _ => panic!("Expected Method definition, got {:?}", definition_info),
+        }
+    }
+
     // ==================== .pth file parsing tests ====================
 
     fn get_editable_test_dir() -> PathBuf {
@@ -2203,7 +3041,8 @@ mod tests {
                 .expect("Should resolve module");
 
         // Extract the class info
-        let class_info = PythonAnalyzer::extract_class_info(&module_path, "EditableModel")
+        let source = fs::read_to_string(&module_path).expect("Should read module file");
+        let class_info = PythonAnalyzer::extract_class_info(&source, "EditableModel")
             .expect("Should extract class info");
 
         assert_eq!(class_info.name, "EditableModel");

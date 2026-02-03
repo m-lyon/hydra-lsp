@@ -1,17 +1,16 @@
 ---
 source: tests/diagnostics.rs
-assertion_line: 405
 expression: summary
 ---
 - code: module-not-found
   end_char: 28
   line: 3
-  message: "Could not resolve module: 'made.up' (tried 2 search paths)"
+  message: "Could not resolve module: 'made.up'"
   severity: Error
   start_char: 14
 - code: module-not-found
   end_char: 27
   line: 11
-  message: "Could not resolve module: 'made.up' (tried 2 search paths)"
+  message: "Could not resolve module: 'made.up'"
   severity: Error
   start_char: 16

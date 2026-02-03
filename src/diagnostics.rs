@@ -188,6 +188,7 @@ pub fn validate_document(
                         continue;
                     }
                 }
+                DefinitionInfo::Method(method_info) => method_info.signature,
             };
 
             let parameter_diagnostics = validate_parameters(target, &signature);
