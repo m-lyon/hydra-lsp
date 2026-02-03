@@ -1,9 +1,10 @@
-use crate::python_analyzer::{ClassExtractor, ClassInfo, FunctionExtractor, FunctionSignature};
+use crate::python_analyzer::{
+    ClassExtractor, ClassInfo, FileCache, FunctionExtractor, FunctionSignature,
+};
 use ruff_python_ast::{self as ast, Expr, Stmt, visitor::Visitor};
 use ruff_python_parser::parse_module;
 use rustc_hash::FxHashSet;
 use std::collections::HashSet;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 const MAX_IMPORT_DEPTH: usize = 10;
@@ -32,6 +33,7 @@ pub struct ImportResolver {
     search_paths: Vec<PathBuf>,
     visited_files: HashSet<PathBuf>,
     depth: usize,
+    file_cache: FileCache,
 }
 
 impl ImportResolver {
@@ -40,6 +42,7 @@ impl ImportResolver {
             search_paths,
             visited_files: HashSet::new(),
             depth: 0,
+            file_cache: FileCache::new(),
         }
     }
 
@@ -72,7 +75,7 @@ impl ImportResolver {
     }
 
     /// Resolve a module path to a file path
-    fn resolve_module_path(&self, module_path: &str) -> Option<PathBuf> {
+    pub fn resolve_module_path(&self, module_path: &str) -> Option<PathBuf> {
         let module_parts: Vec<&str> = module_path.split('.').collect();
 
         for search_path in &self.search_paths {
@@ -142,9 +145,9 @@ impl ImportResolver {
     }
 
     /// Extract __all__ from a module
-    fn extract_dunder_all(&self, file_path: &Path) -> Option<FxHashSet<String>> {
-        let source = fs::read_to_string(file_path).ok()?;
-        let parsed = parse_module(&source).ok()?;
+    fn extract_dunder_all(&mut self, file_path: &Path) -> Option<FxHashSet<String>> {
+        let source = self.file_cache.get(file_path).ok()?;
+        let parsed = parse_module(source).ok()?;
 
         let mut dunder_all_finder = DunderAllFinder::default();
         dunder_all_finder.visit_body(parsed.suite());
@@ -152,9 +155,13 @@ impl ImportResolver {
     }
 
     /// Extract import information for a specific symbol from a module
-    fn find_import_for_symbol(&self, file_path: &Path, symbol_name: &str) -> Option<ImportInfo> {
-        let source = fs::read_to_string(file_path).ok()?;
-        let parsed = parse_module(&source).ok()?;
+    fn find_import_for_symbol(
+        &mut self,
+        file_path: &Path,
+        symbol_name: &str,
+    ) -> Option<ImportInfo> {
+        let source = self.file_cache.get(file_path).ok()?;
+        let parsed = parse_module(source).ok()?;
 
         let mut finder = ImportFinder {
             target_symbol: symbol_name.to_string(),
@@ -165,12 +172,12 @@ impl ImportResolver {
     }
 
     /// Extract all star imports from a module
-    fn find_star_imports(&self, file_path: &Path) -> Vec<ImportInfo> {
-        let source = match fs::read_to_string(file_path) {
+    fn find_star_imports(&mut self, file_path: &Path) -> Vec<ImportInfo> {
+        let source = match self.file_cache.get(file_path) {
             Ok(s) => s,
             Err(_) => return Vec::new(),
         };
-        let parsed = match parse_module(&source) {
+        let parsed = match parse_module(source) {
             Ok(p) => p,
             Err(_) => return Vec::new(),
         };
@@ -181,25 +188,25 @@ impl ImportResolver {
     }
 
     /// Check if a class is directly defined in the file
-    fn find_class_direct(&self, file_path: &Path, class_name: &str) -> Option<ClassInfo> {
-        let source = fs::read_to_string(file_path).ok()?;
-        let parsed = parse_module(&source).ok()?;
+    fn find_class_direct(&mut self, file_path: &Path, class_name: &str) -> Option<ClassInfo> {
+        let source = self.file_cache.get(file_path).ok()?;
+        let parsed = parse_module(source).ok()?;
 
-        let mut visitor = ClassExtractor::new(class_name.to_string(), source);
+        let mut visitor = ClassExtractor::new(class_name.to_string(), source.to_string());
         visitor.visit_body(parsed.suite());
         visitor.get_result()
     }
 
     /// Check if a function is directly defined in the file
     fn find_function_direct(
-        &self,
+        &mut self,
         file_path: &Path,
         function_name: &str,
     ) -> Option<FunctionSignature> {
-        let source = fs::read_to_string(file_path).ok()?;
-        let parsed = parse_module(&source).ok()?;
+        let source = self.file_cache.get(file_path).ok()?;
+        let parsed = parse_module(source).ok()?;
 
-        let mut visitor = FunctionExtractor::new(function_name.to_string(), source);
+        let mut visitor = FunctionExtractor::new(function_name.to_string(), source.to_string());
         visitor.visit_body(parsed.suite());
         visitor.get_result()
     }

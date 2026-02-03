@@ -25,8 +25,7 @@ class MyClass:
     test_file.flush().unwrap();
 
     // Test function extraction
-    let func_sig =
-        PythonAnalyzer::extract_function_signature(test_file.path(), "my_function").unwrap();
+    let func_sig = PythonAnalyzer::extract_function_signature(source, "my_function").unwrap();
 
     // The function should start at line 3
     assert_eq!(func_sig.start_line, 3, "Function should start at line 3");
@@ -63,12 +62,9 @@ class MyClass:
     def method(self):
         pass
 "#;
-    let mut test_file = NamedTempFile::new().unwrap();
-    test_file.write_all(source.as_bytes()).unwrap();
-    test_file.flush().unwrap();
 
     // Test class extraction
-    let class_info = PythonAnalyzer::extract_class_info(test_file.path(), "MyClass").unwrap();
+    let class_info = PythonAnalyzer::extract_class_info(source, "MyClass").unwrap();
 
     assert_eq!(class_info.start_line, 6, "Class should start at line 6");
     assert_eq!(class_info.start_column, 0, "Class should start at column 0");
@@ -94,13 +90,9 @@ fn test_indented_function() {
         """A nested function."""
         return arg.upper()
 "#;
-    let mut test_file = NamedTempFile::new().unwrap();
-    test_file.write_all(source.as_bytes()).unwrap();
-    test_file.flush().unwrap();
 
     // Test that we can extract the nested function
-    let func_sig =
-        PythonAnalyzer::extract_function_signature(test_file.path(), "nested_function").unwrap();
+    let func_sig = PythonAnalyzer::extract_function_signature(source, "nested_function").unwrap();
     // The function should start at line 1
     assert_eq!(
         func_sig.start_line, 1,
@@ -125,12 +117,9 @@ fn test_multiline_function() {
     """A function with multiple lines."""
     return (param1, param2, param3)
 "#;
-    let mut test_file = NamedTempFile::new().unwrap();
-    test_file.write_all(source.as_bytes()).unwrap();
-    test_file.flush().unwrap();
 
     let func_sig =
-        PythonAnalyzer::extract_function_signature(test_file.path(), "multiline_function").unwrap();
+        PythonAnalyzer::extract_function_signature(source, "multiline_function").unwrap();
 
     assert_eq!(
         func_sig.start_line, 0,
@@ -159,12 +148,8 @@ def target_function() -> None:
     """This function is at line 6."""
     pass
 "#;
-    let mut test_file = NamedTempFile::new().unwrap();
-    test_file.write_all(source.as_bytes()).unwrap();
-    test_file.flush().unwrap();
 
-    let func_sig =
-        PythonAnalyzer::extract_function_signature(test_file.path(), "target_function").unwrap();
+    let func_sig = PythonAnalyzer::extract_function_signature(source, "target_function").unwrap();
 
     assert_eq!(func_sig.start_line, 6, "Function should be at line 6");
 }
@@ -179,12 +164,8 @@ def unicode_function(name: str) -> str:
     """Function with unicode: émojis 🚀 こんにちは"""
     return f"Hello, {name}!"
 "#;
-    let mut test_file = NamedTempFile::new().unwrap();
-    test_file.write_all(source.as_bytes()).unwrap();
-    test_file.flush().unwrap();
 
-    let func_sig =
-        PythonAnalyzer::extract_function_signature(test_file.path(), "unicode_function").unwrap();
+    let func_sig = PythonAnalyzer::extract_function_signature(source, "unicode_function").unwrap();
 
     assert_eq!(
         func_sig.start_line, 3,
