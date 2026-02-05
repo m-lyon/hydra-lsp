@@ -2183,7 +2183,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_nested_inherted_staticmethod() {
+    fn test_extract_nested_inherited_staticmethod() {
         let workspace_dir = get_simple_test_dir();
 
         let result = PythonAnalyzer::extract_definition_info(
