@@ -617,6 +617,15 @@ test:
 
     if let Some(diag) = unknown_param {
         assert_eq!(diag.severity, Some(DiagnosticSeverity::ERROR));
+        insta::assert_snapshot!(
+            "diagnostic_inherited_init_unknown_param",
+            format!(
+                "Message: {}\nSeverity: {:?}\nCode: '{}'",
+                diag.message,
+                diag.severity.unwrap(),
+                extract_code(diag)
+            )
+        );
     }
 }
 

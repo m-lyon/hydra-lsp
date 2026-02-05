@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use ty_python_semantic::{PythonEnvironment, SysPrefixPathOrigin};
 
 /// Maximum depth for parent class resolution to prevent infinite loops
-const MAX_PARENT_DEPTH: usize = 100;
+const MAX_PARENT_DEPTH: usize = 1000;
 
 /// Cache for file contents to minimize disk reads during analysis.
 /// Files are read once and stored in memory for the duration of an analysis operation.
