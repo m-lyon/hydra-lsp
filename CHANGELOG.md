@@ -5,6 +5,7 @@
 - Added support for `_partial_`
 - Fixed issue of finding parent class docstring and signature when not overridden by child class
 - Fixed module resolution for `classmethod`s and `staticmethod`s
+- Refactored `PythonAnalyzer` to cache file reads
 
 ## [0.1.4]
 
