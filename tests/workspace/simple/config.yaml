@@ -15,3 +15,9 @@ dataset:
   _target_: my_module.DataLoader
   batch_size: 32
   shuffle: true
+
+# Test inheritance - child class inherits __init__ from parent
+inherited_config:
+  _target_: my_module.ChildWithoutInit
+  name: "test"
+  value: 42

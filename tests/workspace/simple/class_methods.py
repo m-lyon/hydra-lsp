@@ -99,13 +99,22 @@ class DataProcessor:
         return data
 
 
+class InheritedFactory(ModelFactory):
+    """A factory that inherits from ModelFactory without adding new methods."""
+
+
 class NestedExample:
     """A class with nested classmethods and staticmethods."""
 
     nested_class = ModelFactory
+    inherited_nested_class = InheritedFactory
 
 
 class NestedTwice:
     """A class with twice nested classmethods and staticmethods."""
 
     nested = NestedExample
+
+
+class InheritedNested(NestedTwice):
+    """A class that inherits from a class with nested classmethods and staticmethods."""

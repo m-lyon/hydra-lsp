@@ -212,3 +212,95 @@ test:
         panic!("Expected hover response but got None");
     }
 }
+
+#[tokio::test]
+async fn test_hover_on_child_class_inherits_init() {
+    let mut ctx = TestContext::new(TestWorkspace::Simple);
+    ctx.initialize().await;
+
+    // Test that hovering on ChildWithoutInit shows parent's __init__ signature
+    let content = r#"# @hydra
+test:
+  _target_: my_module.ChildWithoutInit
+  name: "test"
+  value: 42
+"#;
+    ctx.open_document("test.yaml", content.to_string()).await;
+
+    let res = ctx
+        .request::<request::HoverRequest>(HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                position: Position {
+                    line: 2,
+                    character: 16,
+                },
+                text_document: TextDocumentIdentifier {
+                    uri: ctx.doc_uri("test.yaml"),
+                },
+            },
+            work_done_progress_params: WorkDoneProgressParams {
+                work_done_token: None,
+            },
+        })
+        .await;
+
+    if let Some(hover) = res {
+        match hover.contents {
+            HoverContents::Markup(markup) => {
+                // Should show parent's __init__ signature with name and value params
+                insta::assert_snapshot!("hover_on_inherited_init", markup.value);
+            }
+            _ => {
+                panic!("Expected Markup hover content but got something else");
+            }
+        }
+    } else {
+        panic!("Expected hover response but got None");
+    }
+}
+
+#[tokio::test]
+async fn test_hover_on_grandchild_class_inherits_init() {
+    let mut ctx = TestContext::new(TestWorkspace::Simple);
+    ctx.initialize().await;
+
+    // Test that hovering on GrandchildWithoutInit shows grandparent's __init__ signature
+    let content = r#"# @hydra
+test:
+  _target_: my_module.GrandchildWithoutInit
+  name: "test"
+  value: 42
+"#;
+    ctx.open_document("test.yaml", content.to_string()).await;
+
+    let res = ctx
+        .request::<request::HoverRequest>(HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                position: Position {
+                    line: 2,
+                    character: 16,
+                },
+                text_document: TextDocumentIdentifier {
+                    uri: ctx.doc_uri("test.yaml"),
+                },
+            },
+            work_done_progress_params: WorkDoneProgressParams {
+                work_done_token: None,
+            },
+        })
+        .await;
+
+    if let Some(hover) = res {
+        match hover.contents {
+            HoverContents::Markup(markup) => {
+                // Should show grandparent's __init__ signature with name and value params
+                insta::assert_snapshot!("hover_on_grandchild_inherited_init", markup.value);
+            }
+            _ => {
+                panic!("Expected Markup hover content but got something else");
+            }
+        }
+    } else {
+        panic!("Expected hover response but got None");
+    }
+}

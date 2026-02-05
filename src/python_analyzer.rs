@@ -5,10 +5,13 @@ use ruff_python_ast::{self as ast, Expr, Stmt, visitor::Visitor};
 use ruff_python_parser::parse_module;
 use ruff_source_file::{LineIndex, PositionEncoding};
 use ruff_text_size::TextRange;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use ty_python_semantic::{PythonEnvironment, SysPrefixPathOrigin};
+
+/// Maximum depth for parent class resolution to prevent infinite loops
+const MAX_PARENT_DEPTH: usize = 1000;
 
 /// Cache for file contents to minimize disk reads during analysis.
 /// Files are read once and stored in memory for the duration of an analysis operation.
@@ -130,6 +133,23 @@ impl DefinitionInfo {
 }
 
 pub struct PythonAnalyzer;
+
+/// Result of resolving a class attribute chain
+enum ClassAttributeChainResult {
+    /// Chain resolved to a method
+    Method {
+        file_path: PathBuf,
+        class_name: String,
+        method_name: String,
+        search_paths: Vec<PathBuf>,
+    },
+    /// Chain resolved to a class
+    Class {
+        file_path: PathBuf,
+        class_name: String,
+        search_paths: Vec<PathBuf>,
+    },
+}
 
 impl PythonAnalyzer {
     /// Split a `_target_` string into module path and symbol name
@@ -363,6 +383,77 @@ impl PythonAnalyzer {
         })
     }
 
+    /// Extract a class attribute, searching parent classes if not found directly.
+    ///
+    /// Returns (ClassAttributeInfo, file_path, class_name) where the attribute was found.
+    fn extract_class_attribute_with_inheritance(
+        file_path: &Path,
+        class_name: &str,
+        attribute_name: &str,
+        search_paths: &[PathBuf],
+        file_cache: &mut FileCache,
+        visited: &mut HashSet<String>,
+    ) -> Result<(ClassAttributeInfo, PathBuf, String)> {
+        // Limit recursion depth
+        if visited.len() >= MAX_PARENT_DEPTH {
+            anyhow::bail!("Maximum inheritance depth exceeded");
+        }
+
+        // Check for cycles
+        let canonical_path = file_path
+            .canonicalize()
+            .unwrap_or_else(|_| file_path.to_path_buf());
+        let visit_key = format!("{}::{}", canonical_path.display(), class_name);
+        if visited.contains(&visit_key) {
+            anyhow::bail!("Cycle detected in inheritance chain");
+        }
+        visited.insert(visit_key);
+
+        // Read the source file
+        let source = file_cache.get(file_path)?;
+
+        // Try to find the attribute directly on this class
+        if let Ok(attr_info) = Self::extract_class_attribute(source, class_name, attribute_name) {
+            return Ok((attr_info, file_path.to_path_buf(), class_name.to_string()));
+        }
+
+        // Get the class info to find parent classes
+        let class_info = Self::extract_class_info(source, class_name)?;
+
+        // Search parent classes for the attribute
+        for base_class in &class_info.base_classes {
+            // Skip common base classes
+            if base_class == "object" || base_class == "ABC" || base_class == "Protocol" {
+                continue;
+            }
+
+            // Resolve the parent class to a file and name
+            let Some((parent_file, parent_class_name)) =
+                Self::resolve_base_class(base_class, file_path, search_paths)
+            else {
+                continue;
+            };
+
+            // Recursively search in parent class
+            if let Ok(result) = Self::extract_class_attribute_with_inheritance(
+                &parent_file,
+                &parent_class_name,
+                attribute_name,
+                search_paths,
+                file_cache,
+                visited,
+            ) {
+                return Ok(result);
+            }
+        }
+
+        anyhow::bail!(
+            "Attribute '{}' not found in class '{}' or its parents",
+            attribute_name,
+            class_name
+        )
+    }
+
     /// Resolve an attribute chain through classes.
     ///
     /// Given a starting class and an attribute chain like ["nested", "nested_class"],
@@ -388,18 +479,27 @@ impl PythonAnalyzer {
         for (i, attr) in attribute_chain.iter().enumerate() {
             let is_last = i == attribute_chain.len() - 1;
 
-            // Read current file source
-            let source = file_cache.get(&current_file)?;
-
             // First, check if this is a method on the current class
-            if is_last && Self::extract_method_info(source, &current_class, attr).is_ok() {
-                // It's a method - return the class and method name
-                return Ok((current_file, current_class, Some(attr.to_string())));
+            {
+                // Read current file source in its own scope to release borrow
+                let source = file_cache.get(&current_file)?;
+                if is_last && Self::extract_method_info(source, &current_class, attr).is_ok() {
+                    // It's a method - return the class and method name
+                    return Ok((current_file, current_class, Some(attr.to_string())));
+                }
             }
 
-            // Try to get the attribute as a class attribute
-            match Self::extract_class_attribute(source, &current_class, attr) {
-                Ok(attr_info) => {
+            // Try to get the attribute as a class attribute (with inheritance support)
+            let mut visited = HashSet::new();
+            match Self::extract_class_attribute_with_inheritance(
+                &current_file,
+                &current_class,
+                attr,
+                search_paths,
+                file_cache,
+                &mut visited,
+            ) {
+                Ok((attr_info, _attr_file, _attr_class)) => {
                     // The value could be a simple name or a dotted path
                     let value_parts: Vec<&str> = attr_info.value.split('.').collect();
 
@@ -408,6 +508,7 @@ impl PythonAnalyzer {
                         let new_class_name = value_parts[0];
 
                         // Try direct lookup in current file
+                        let source = file_cache.get(&current_file)?;
                         if Self::extract_class_info(source, new_class_name).is_ok() {
                             current_class = new_class_name.to_string();
                             continue;
@@ -551,8 +652,165 @@ impl PythonAnalyzer {
         paths
     }
 
+    /// Resolve a base class expression to its file path and actual class name.
+    ///
+    /// This function handles:
+    /// - Simple names: `ParentClass` - looks up in the current file's imports
+    /// - Qualified names: `module.ClassName` - resolves the module path
+    fn resolve_base_class(
+        base_class_expr: &str,
+        current_file: &Path,
+        search_paths: &[PathBuf],
+    ) -> Option<(PathBuf, String)> {
+        // Check if it's a qualified name (contains a dot)
+        if let Some(dot_pos) = base_class_expr.rfind('.') {
+            // Qualified name like `module.ClassName`
+            let module_path = &base_class_expr[..dot_pos];
+            let class_name = &base_class_expr[dot_pos + 1..];
+
+            // Try to resolve the module
+            if let Ok(file_path) = Self::resolve_module_with_search_paths(module_path, search_paths)
+            {
+                return Some((file_path, class_name.to_string()));
+            }
+        }
+
+        // Simple name - try to resolve through imports in the current file
+        let mut resolver = ImportResolver::new(search_paths.to_vec());
+        if let Some((resolved_file, resolved_name)) =
+            resolver.resolve_symbol(current_file, base_class_expr)
+        {
+            let actual_name = if resolved_name.is_empty() {
+                base_class_expr.to_string()
+            } else {
+                resolved_name
+            };
+            return Some((resolved_file, actual_name));
+        }
+
+        // Check if the class is defined in the same file
+        if let Ok(source) = fs::read_to_string(current_file)
+            && let Ok(parsed) = parse_module(&source)
+        {
+            let mut visitor = ClassExtractor::new(base_class_expr.to_string(), source);
+            visitor.visit_body(parsed.suite());
+            if visitor.get_result().is_some() {
+                return Some((current_file.to_path_buf(), base_class_expr.to_string()));
+            }
+        }
+
+        None
+    }
+
+    /// Resolve missing properties (docstring, __init__) from parent classes.
+    ///
+    /// This follows Python's MRO (left-to-right for simple cases) and searches
+    /// parent classes recursively when properties are not found in the child.
+    fn resolve_from_parents(
+        base_classes: &[String],
+        current_file: &Path,
+        search_paths: &[PathBuf],
+        file_cache: &mut FileCache,
+        visited: &mut HashSet<String>,
+        needs_docstring: bool,
+        needs_init: bool,
+    ) -> (Option<String>, Option<FunctionSignature>) {
+        // Base case: nothing needed
+        if !needs_docstring && !needs_init {
+            return (None, None);
+        }
+
+        // Limit recursion depth via visited set size
+        if visited.len() >= MAX_PARENT_DEPTH {
+            return (None, None);
+        }
+
+        let mut found_docstring: Option<String> = None;
+        let mut found_init: Option<FunctionSignature> = None;
+
+        // Iterate through base classes in MRO order (left-to-right)
+        for base_class in base_classes {
+            // Skip common base classes that won't have useful info
+            if base_class == "object" || base_class == "ABC" || base_class == "Protocol" {
+                continue;
+            }
+
+            // Resolve the base class to a file and name
+            let Some((parent_file, parent_class_name)) =
+                Self::resolve_base_class(base_class, current_file, search_paths)
+            else {
+                continue;
+            };
+
+            // Check for cycles using (file, class_name) as key
+            // This allows multiple classes in the same file to be visited
+            let canonical_path = parent_file
+                .canonicalize()
+                .unwrap_or_else(|_| parent_file.clone());
+            let visit_key = format!("{}::{}", canonical_path.display(), parent_class_name);
+            if visited.contains(&visit_key) {
+                continue;
+            }
+            visited.insert(visit_key);
+
+            // Extract the parent class info using cache
+            let source = match file_cache.get(&parent_file) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let parent_info = match Self::extract_class_info(source, &parent_class_name) {
+                Ok(info) => info,
+                Err(_) => continue,
+            };
+
+            // Check if the parent has what we need
+            if needs_docstring && found_docstring.is_none() && parent_info.docstring.is_some() {
+                found_docstring = parent_info.docstring.clone();
+            }
+
+            if needs_init && found_init.is_none() && parent_info.init_signature.is_some() {
+                found_init = parent_info.init_signature.clone();
+            }
+
+            // If we still need something, recurse into grandparents
+            let still_needs_docstring = needs_docstring && found_docstring.is_none();
+            let still_needs_init = needs_init && found_init.is_none();
+
+            if still_needs_docstring || still_needs_init {
+                let (grandparent_docstring, grandparent_init) = Self::resolve_from_parents(
+                    &parent_info.base_classes,
+                    &parent_file,
+                    search_paths,
+                    file_cache,
+                    visited,
+                    still_needs_docstring,
+                    still_needs_init,
+                );
+
+                if still_needs_docstring && found_docstring.is_none() {
+                    found_docstring = grandparent_docstring;
+                }
+                if still_needs_init && found_init.is_none() {
+                    found_init = grandparent_init;
+                }
+            }
+
+            // If we found everything, stop searching
+            if (!needs_docstring || found_docstring.is_some())
+                && (!needs_init || found_init.is_some())
+            {
+                break;
+            }
+        }
+
+        (found_docstring, found_init)
+    }
+
     /// Extract class information, following re-exports if necessary.
     /// Returns the ClassInfo and the file path where it was found.
+    ///
+    /// This also resolves missing properties (docstring, __init__) from parent classes
+    /// when they are not defined in the child class.
     pub fn extract_class_info_with_imports(
         file_path: &Path,
         class_name: &str,
@@ -560,32 +818,63 @@ impl PythonAnalyzer {
         file_cache: &mut FileCache,
     ) -> Result<(ClassInfo, PathBuf)> {
         // First try direct lookup using cache
-        if let Ok(source) = file_cache.get(file_path)
+        let (mut class_info, resolved_file) = if let Ok(source) = file_cache.get(file_path)
             && let Ok(class_info) = Self::extract_class_info(source, class_name)
         {
-            return Ok((class_info, file_path.to_path_buf()));
-        }
-
-        // Try to resolve through imports (ImportResolver has its own cache that shares with us)
-        let mut resolver = ImportResolver::new(search_paths);
-        if let Some((resolved_file, resolved_name)) = resolver.resolve_symbol(file_path, class_name)
-        {
-            let actual_name = if resolved_name.is_empty() {
-                class_name.to_string()
+            (class_info, file_path.to_path_buf())
+        } else {
+            // Try to resolve through imports
+            let mut resolver = ImportResolver::new(search_paths.clone());
+            if let Some((resolved_file, resolved_name)) =
+                resolver.resolve_symbol(file_path, class_name)
+            {
+                let actual_name = if resolved_name.is_empty() {
+                    class_name.to_string()
+                } else {
+                    resolved_name
+                };
+                // Use cache for the resolved file
+                let source = file_cache.get(&resolved_file)?;
+                let class_info = Self::extract_class_info(source, &actual_name)?;
+                (class_info, resolved_file)
             } else {
-                resolved_name
-            };
-            // Use cache for the resolved file
-            let source = file_cache.get(&resolved_file)?;
-            let class_info = Self::extract_class_info(source, &actual_name)?;
-            return Ok((class_info, resolved_file));
+                anyhow::bail!(
+                    "Class '{}' not found in {} (also checked re-exports)",
+                    class_name,
+                    file_path.display()
+                )
+            }
+        };
+
+        // Resolve missing properties from parent classes
+        if class_info.docstring.is_none() || class_info.init_signature.is_none() {
+            let mut visited = HashSet::new();
+            // Use (file, class_name) as key to allow visiting multiple classes in same file
+            let canonical_path = resolved_file
+                .canonicalize()
+                .unwrap_or_else(|_| resolved_file.clone());
+            let visit_key = format!("{}::{}", canonical_path.display(), class_info.name);
+            visited.insert(visit_key);
+
+            let (parent_docstring, parent_init) = Self::resolve_from_parents(
+                &class_info.base_classes,
+                &resolved_file,
+                &search_paths,
+                file_cache,
+                &mut visited,
+                class_info.docstring.is_none(),
+                class_info.init_signature.is_none(),
+            );
+
+            if class_info.docstring.is_none() {
+                class_info.docstring = parent_docstring;
+            }
+            if class_info.init_signature.is_none() {
+                class_info.init_signature = parent_init;
+            }
         }
 
-        anyhow::bail!(
-            "Class '{}' not found in {} (also checked re-exports)",
-            class_name,
-            file_path.display()
-        )
+        Ok((class_info, resolved_file))
     }
 
     /// Extract function signature, following re-exports if necessary.
@@ -684,27 +973,55 @@ impl PythonAnalyzer {
 
         // Try to interpret as Class.method pattern (e.g., "my_module.MyClass.from_config")
         // or nested pattern (e.g., "my_module.OuterClass.nested.nested_class.method")
-        if let Some((resolved_file, class_name, method_name, search_paths)) =
-            Self::resolve_class_method_chain(
-                target,
-                workspace_root,
-                python_interpreter,
-                &mut file_cache,
-            )
-            && let Ok((method_info, final_file)) = Self::extract_method_info_with_imports(
-                &resolved_file,
-                &class_name,
-                &method_name,
-                search_paths,
-                &mut file_cache,
-            )
-        {
-            return Ok((
-                DefinitionInfo::Method(method_info),
-                final_file,
-                module_path.clone(),
-                format!("{}.{}", class_name, method_name),
-            ));
+        // or nested class pattern (e.g., "my_module.OuterClass.nested.nested_class")
+        if let Some(result) = Self::resolve_class_attribute_chain(
+            target,
+            workspace_root,
+            python_interpreter,
+            &mut file_cache,
+        ) {
+            match result {
+                ClassAttributeChainResult::Method {
+                    file_path: resolved_file,
+                    class_name,
+                    method_name,
+                    search_paths,
+                } => {
+                    if let Ok((method_info, final_file)) = Self::extract_method_info_with_imports(
+                        &resolved_file,
+                        &class_name,
+                        &method_name,
+                        search_paths,
+                        &mut file_cache,
+                    ) {
+                        return Ok((
+                            DefinitionInfo::Method(method_info),
+                            final_file,
+                            module_path.clone(),
+                            format!("{}.{}", class_name, method_name),
+                        ));
+                    }
+                }
+                ClassAttributeChainResult::Class {
+                    file_path: resolved_file,
+                    class_name,
+                    search_paths,
+                } => {
+                    if let Ok((class_info, final_file)) = Self::extract_class_info_with_imports(
+                        &resolved_file,
+                        &class_name,
+                        search_paths,
+                        &mut file_cache,
+                    ) {
+                        return Ok((
+                            DefinitionInfo::Class(class_info),
+                            final_file,
+                            module_path.clone(),
+                            class_name,
+                        ));
+                    }
+                }
+            }
         }
 
         // Return appropriate error based on whether module was found
@@ -719,19 +1036,20 @@ impl PythonAnalyzer {
         }
     }
 
-    /// Resolve a target string that may include a class method access pattern.
+    /// Resolve a target string that may include a class attribute chain pattern.
     ///
     /// This handles various patterns:
-    /// - Simple: `module.Class.method`
-    /// - Nested: `module.OuterClass.nested_attr.nested_attr.method`
+    /// - Simple method: `module.Class.method`
+    /// - Nested method: `module.OuterClass.nested_attr.nested_attr.method`
+    /// - Nested class: `module.OuterClass.nested_attr.nested_class`
     ///
-    /// Returns (file_path, class_name, method_name, search_paths) if resolved.
-    fn resolve_class_method_chain(
+    /// Returns either a Method or Class result depending on what the chain resolves to.
+    fn resolve_class_attribute_chain(
         target: &str,
         workspace_root: Option<&Path>,
         python_interpreter: Option<&str>,
         file_cache: &mut FileCache,
-    ) -> Option<(PathBuf, String, String, Vec<PathBuf>)> {
+    ) -> Option<ClassAttributeChainResult> {
         let parts: Vec<&str> = target.split('.').collect();
         if parts.len() < 3 {
             return None;
@@ -773,18 +1091,18 @@ impl PythonAnalyzer {
                     if let Ok(source) = file_cache.get(&resolved_file)
                         && Self::extract_method_info(source, &class_info.name, method_name).is_ok()
                     {
-                        return Some((
-                            resolved_file,
-                            class_info.name,
-                            method_name.to_string(),
+                        return Some(ClassAttributeChainResult::Method {
+                            file_path: resolved_file,
+                            class_name: class_info.name,
+                            method_name: method_name.to_string(),
                             search_paths,
-                        ));
+                        });
                     }
                 } else if remaining_parts.len() > 2 {
-                    // Nested case: Class.attr1.attr2...method
+                    // Nested case: Class.attr1.attr2...method_or_class
                     // Follow the attribute chain
                     let attribute_chain = &remaining_parts[1..];
-                    if let Ok((final_file, final_class, Some(method_name))) =
+                    if let Ok((final_file, final_class, method_name_opt)) =
                         Self::resolve_attribute_chain(
                             &resolved_file,
                             &class_info.name,
@@ -793,7 +1111,20 @@ impl PythonAnalyzer {
                             file_cache,
                         )
                     {
-                        return Some((final_file, final_class, method_name, search_paths));
+                        if let Some(method_name) = method_name_opt {
+                            return Some(ClassAttributeChainResult::Method {
+                                file_path: final_file,
+                                class_name: final_class,
+                                method_name,
+                                search_paths,
+                            });
+                        } else {
+                            return Some(ClassAttributeChainResult::Class {
+                                file_path: final_file,
+                                class_name: final_class,
+                                search_paths,
+                            });
+                        }
                     }
                 }
             }
@@ -1677,6 +2008,244 @@ mod tests {
 
         let result = PythonAnalyzer::extract_class_info(&source, "NonexistentClass");
         assert!(result.is_err());
+    }
+
+    // ==================== inherited class tests ====================
+
+    #[test]
+    fn test_extract_child_without_init_inherits_from_parent() {
+        let examples_dir = get_simple_test_dir();
+        let test_file = examples_dir.join("my_module.py");
+
+        // First verify that direct extraction does NOT give us __init__
+        let source = fs::read_to_string(&test_file).unwrap();
+        let direct_info = PythonAnalyzer::extract_class_info(&source, "ChildWithoutInit").unwrap();
+        assert_eq!(direct_info.name, "ChildWithoutInit");
+        assert!(
+            direct_info.init_signature.is_none(),
+            "Direct extraction should not have __init__"
+        );
+        assert!(direct_info.docstring.is_some(), "Should have own docstring");
+
+        // Now verify that extract_class_info_with_imports gives us inherited __init__
+        let search_paths = vec![examples_dir.clone()];
+        let mut file_cache = FileCache::new();
+        let (class_info, _) = PythonAnalyzer::extract_class_info_with_imports(
+            &test_file,
+            "ChildWithoutInit",
+            search_paths,
+            &mut file_cache,
+        )
+        .unwrap();
+
+        assert_eq!(class_info.name, "ChildWithoutInit");
+        assert!(
+            class_info.init_signature.is_some(),
+            "Should inherit __init__ from parent"
+        );
+
+        let init_sig = class_info.init_signature.as_ref().unwrap();
+        assert_eq!(init_sig.name, "__init__");
+        // Should have: self, name, value from ParentWithInit
+        assert_eq!(init_sig.parameters.len(), 3);
+        assert_eq!(init_sig.parameters[0].name, "self");
+        assert_eq!(init_sig.parameters[1].name, "name");
+        assert_eq!(init_sig.parameters[2].name, "value");
+
+        // Check that the child's own docstring is preserved
+        assert!(class_info.docstring.is_some());
+        assert!(
+            class_info
+                .docstring
+                .as_ref()
+                .unwrap()
+                .contains("inherits __init__")
+        );
+    }
+
+    #[test]
+    fn test_extract_grandchild_without_init_inherits_from_grandparent() {
+        let examples_dir = get_simple_test_dir();
+        let test_file = examples_dir.join("my_module.py");
+
+        let search_paths = vec![examples_dir.clone()];
+        let mut file_cache = FileCache::new();
+        let (class_info, _) = PythonAnalyzer::extract_class_info_with_imports(
+            &test_file,
+            "GrandchildWithoutInit",
+            search_paths,
+            &mut file_cache,
+        )
+        .unwrap();
+
+        assert_eq!(class_info.name, "GrandchildWithoutInit");
+        assert!(
+            class_info.init_signature.is_some(),
+            "Should inherit __init__ from grandparent through parent"
+        );
+
+        let init_sig = class_info.init_signature.as_ref().unwrap();
+        // Should have: self, name, value from ParentWithInit (grandparent)
+        assert_eq!(init_sig.parameters.len(), 3);
+        assert_eq!(init_sig.parameters[1].name, "name");
+        assert_eq!(init_sig.parameters[2].name, "value");
+    }
+
+    #[test]
+    fn test_extract_child_with_own_init_does_not_inherit() {
+        let examples_dir = get_simple_test_dir();
+        let test_file = examples_dir.join("my_module.py");
+
+        let search_paths = vec![examples_dir.clone()];
+        let mut file_cache = FileCache::new();
+        let (class_info, _) = PythonAnalyzer::extract_class_info_with_imports(
+            &test_file,
+            "ChildWithOwnInit",
+            search_paths,
+            &mut file_cache,
+        )
+        .unwrap();
+
+        assert_eq!(class_info.name, "ChildWithOwnInit");
+        assert!(
+            class_info.init_signature.is_some(),
+            "Should have its own __init__"
+        );
+
+        let init_sig = class_info.init_signature.as_ref().unwrap();
+        // Should have: self, name, extra (from ChildWithOwnInit, NOT from parent)
+        assert_eq!(init_sig.parameters.len(), 3);
+        assert_eq!(init_sig.parameters[1].name, "name");
+        assert_eq!(
+            init_sig.parameters[2].name, "extra",
+            "Should have child's 'extra' param, not parent's 'value'"
+        );
+    }
+
+    #[test]
+    fn test_extract_definition_child_without_init() {
+        let examples_dir = get_simple_test_dir();
+
+        let result = PythonAnalyzer::extract_definition_info(
+            "my_module.ChildWithoutInit",
+            Some(&examples_dir),
+            None,
+        );
+        assert!(result.is_ok());
+        let (definition_info, _file_path, _module_path, _symbol_name) = result.unwrap();
+
+        match definition_info {
+            DefinitionInfo::Class(class_info) => {
+                assert_eq!(class_info.name, "ChildWithoutInit");
+                assert!(
+                    class_info.init_signature.is_some(),
+                    "Should have inherited __init__"
+                );
+
+                let init_sig = class_info.init_signature.as_ref().unwrap();
+                // Should have inherited params from ParentWithInit
+                assert_eq!(init_sig.parameters.len(), 3);
+                assert_eq!(init_sig.parameters[1].name, "name");
+            }
+            _ => panic!("Expected Class definition"),
+        }
+    }
+
+    #[test]
+    fn test_extract_nested_inherited_classmethod() {
+        let examples_dir = get_simple_test_dir();
+
+        let result = PythonAnalyzer::extract_definition_info(
+            "class_methods.InheritedNested.nested.nested_class.from_config",
+            Some(&examples_dir),
+            None,
+        );
+        assert!(
+            result.is_ok(),
+            "Should resolve classmethod: {:?}",
+            result.err()
+        );
+        let (definition_info, _file_path, _module_path, _symbol_name) = result.unwrap();
+
+        match definition_info {
+            DefinitionInfo::Method(method_info) => {
+                assert_eq!(method_info.class_name, "ModelFactory");
+                assert_eq!(method_info.method_name, "from_config");
+                assert!(method_info.is_classmethod);
+                assert!(!method_info.is_staticmethod);
+                // Check parameters: cls and config
+                assert_eq!(method_info.signature.parameters.len(), 2);
+                assert_eq!(method_info.signature.parameters[0].name, "cls");
+                assert_eq!(method_info.signature.parameters[1].name, "config");
+            }
+            _ => panic!("Expected Method definition, got {:?}", definition_info),
+        }
+    }
+
+    #[test]
+    fn test_extract_nested_inherited_staticmethod() {
+        let workspace_dir = get_simple_test_dir();
+
+        let result = PythonAnalyzer::extract_definition_info(
+            "class_methods.InheritedNested.nested.nested_class.compute_size",
+            Some(&workspace_dir),
+            None,
+        );
+
+        assert!(
+            result.is_ok(),
+            "Should resolve staticmethod: {:?}",
+            result.err()
+        );
+        let (definition_info, _file_path, _module_path, _symbol_name) = result.unwrap();
+
+        match definition_info {
+            DefinitionInfo::Method(method_info) => {
+                assert_eq!(method_info.class_name, "ModelFactory");
+                assert_eq!(method_info.method_name, "compute_size");
+                assert!(!method_info.is_classmethod);
+                assert!(method_info.is_staticmethod);
+                // Check parameters: dim1 and dim2
+                assert_eq!(method_info.signature.parameters.len(), 2);
+                assert_eq!(method_info.signature.parameters[0].name, "dim1");
+                assert_eq!(method_info.signature.parameters[1].name, "dim2");
+            }
+            _ => panic!("Expected Method definition, got {:?}", definition_info),
+        }
+    }
+
+    #[test]
+    fn test_extract_nested_inherited_init() {
+        let examples_dir = get_simple_test_dir();
+
+        let result = PythonAnalyzer::extract_definition_info(
+            "class_methods.NestedTwice.nested.inherited_nested_class",
+            Some(&examples_dir),
+            None,
+        );
+        assert!(
+            result.is_ok(),
+            "Should resolve classmethod: {:?}",
+            result.err()
+        );
+        let (definition_info, _file_path, _module_path, _symbol_name) = result.unwrap();
+
+        match definition_info {
+            DefinitionInfo::Class(class_info) => {
+                assert_eq!(class_info.name, "InheritedFactory");
+                assert!(
+                    class_info.init_signature.is_some(),
+                    "Should have inherited __init__"
+                );
+
+                let init_sig = class_info.init_signature.as_ref().unwrap();
+                // Should have inherited params from ModelFactory
+                assert_eq!(init_sig.parameters.len(), 3);
+                assert_eq!(init_sig.parameters[1].name, "input_dim");
+                assert_eq!(init_sig.parameters[2].name, "output_dim");
+            }
+            _ => panic!("Expected Class definition"),
+        }
     }
 
     // ==================== extract_definition_info tests ====================

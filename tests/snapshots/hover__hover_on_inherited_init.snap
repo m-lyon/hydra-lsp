@@ -1,0 +1,16 @@
+---
+source: tests/hover.rs
+expression: markup.value
+---
+```python
+class ChildWithoutInit(ParentWithInit):
+    """Child class that inherits __init__ from parent."""
+
+    def __init__(self, name: str, value: int = 0):
+        """Initialize parent.
+
+        Args:
+            name: The name parameter
+            value: Optional value (default: 0)
+        """
+```
