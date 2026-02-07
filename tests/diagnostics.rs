@@ -659,3 +659,97 @@ test:
         errors
     );
 }
+
+// ==================== Parameter Position Tests (Issue #19) ====================
+
+#[tokio::test]
+async fn test_diagnostics_params_before_target() {
+    let mut ctx = TestContext::new(TestWorkspace::Diagnostics);
+    ctx.initialize().await;
+
+    // Parameters defined before _target_ should get diagnostics on the correct lines
+    let content = r#"# @hydra
+my_module:
+  bap: false
+  boop: true
+  _target_: my_module.DataLoader
+  beep: 42
+  another: 123
+"#;
+    ctx.open_document("params_before.yaml", content.to_string())
+        .await;
+
+    let dp = ctx.recv::<PublishDiagnosticsParams>().await;
+    let diagnostics = dp.diagnostics;
+
+    let unknown_params: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.message.contains("Unknown parameter"))
+        .collect();
+
+    // bap, boop, beep, another are all unknown for DataLoader
+    assert_eq!(
+        unknown_params.len(),
+        4,
+        "Should have 4 unknown parameter errors, got: {:?}",
+        unknown_params
+    );
+
+    // Verify each diagnostic appears on the correct line (0-indexed)
+    let find_diag = |name: &str| {
+        unknown_params
+            .iter()
+            .find(|d| d.message.contains(name))
+            .unwrap_or_else(|| panic!("Missing diagnostic for '{}'", name))
+    };
+    assert_eq!(find_diag("bap").range.start.line, 2, "bap should be on line 2");
+    assert_eq!(find_diag("boop").range.start.line, 3, "boop should be on line 3");
+    assert_eq!(find_diag("beep").range.start.line, 5, "beep should be on line 5");
+    assert_eq!(
+        find_diag("another").range.start.line,
+        6,
+        "another should be on line 6"
+    );
+}
+
+#[tokio::test]
+async fn test_diagnostics_comment_between_target_and_params() {
+    let mut ctx = TestContext::new(TestWorkspace::Diagnostics);
+    ctx.initialize().await;
+
+    // A comment between _target_ and params should not shift diagnostic positions
+    let content = r#"# @hydra
+my_module:
+  _target_: my_module.DataLoader
+  # this is a comment
+  beep: 42
+  shuffle: true
+"#;
+    ctx.open_document("comment_between.yaml", content.to_string())
+        .await;
+
+    let dp = ctx.recv::<PublishDiagnosticsParams>().await;
+    let diagnostics = dp.diagnostics;
+
+    let unknown_params: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.message.contains("Unknown parameter"))
+        .collect();
+
+    assert_eq!(
+        unknown_params.len(),
+        1,
+        "Should have 1 unknown parameter error for 'beep', got: {:?}",
+        unknown_params
+    );
+
+    // beep should be on line 4, not line 3 (where the comment is)
+    assert_eq!(
+        unknown_params[0].range.start.line, 4,
+        "beep diagnostic should be on line 4, not on the comment line"
+    );
+    assert!(
+        unknown_params[0].message.contains("beep"),
+        "Diagnostic should be for 'beep'"
+    );
+}
