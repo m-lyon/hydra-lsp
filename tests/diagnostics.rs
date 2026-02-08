@@ -660,7 +660,7 @@ test:
     );
 }
 
-// ==================== Parameter Position Tests (Issue #19) ====================
+// ==================== Parameter Position Tests ====================
 
 #[tokio::test]
 async fn test_diagnostics_params_before_target() {
@@ -671,9 +671,11 @@ async fn test_diagnostics_params_before_target() {
     let content = r#"# @hydra
 my_module:
   bap: false
+  # comment
   boop: true
   _target_: my_module.DataLoader
   beep: 42
+  # second comment
   another: 123
 "#;
     ctx.open_document("params_before.yaml", content.to_string())
@@ -702,13 +704,25 @@ my_module:
             .find(|d| d.message.contains(name))
             .unwrap_or_else(|| panic!("Missing diagnostic for '{}'", name))
     };
-    assert_eq!(find_diag("bap").range.start.line, 2, "bap should be on line 2");
-    assert_eq!(find_diag("boop").range.start.line, 3, "boop should be on line 3");
-    assert_eq!(find_diag("beep").range.start.line, 5, "beep should be on line 5");
+    assert_eq!(
+        find_diag("bap").range.start.line,
+        2,
+        "bap should be on line 2"
+    );
+    assert_eq!(
+        find_diag("boop").range.start.line,
+        4,
+        "boop should be on line 4"
+    );
+    assert_eq!(
+        find_diag("beep").range.start.line,
+        6,
+        "beep should be on line 6"
+    );
     assert_eq!(
         find_diag("another").range.start.line,
-        6,
-        "another should be on line 6"
+        8,
+        "another should be on line 8"
     );
 }
 
