@@ -403,8 +403,8 @@ impl YamlParser {
                     target.value_start = potential_value_start as u32;
                 }
 
-                // Find parameter positions in subsequent lines
-                Self::find_parameter_positions(content, line_num + 1, &mut target);
+                // Find parameter positions in surrounding lines
+                Self::find_parameter_positions(content, line_num, &mut target);
                 positioned_targets.push(target);
             }
         }
@@ -413,27 +413,89 @@ impl YamlParser {
     }
 
     /// Find positions for parameters associated with a `_target_`
-    fn find_parameter_positions(content: &str, start_line: usize, target_info: &mut TargetInfo) {
+    fn find_parameter_positions(content: &str, target_line: usize, target_info: &mut TargetInfo) {
         let lines: Vec<&str> = content.lines().collect();
-        if start_line >= lines.len() {
+
+        let mut remaining_params: HashMap<String, Parameter> =
+            std::mem::take(&mut target_info.parameters)
+                .into_iter()
+                .map(|mut p| {
+                    let key = std::mem::take(&mut p.key);
+                    (key, p)
+                })
+                .collect();
+
+        if remaining_params.is_empty() {
             return;
         }
 
-        let mut remaining_params = std::mem::take(&mut target_info.parameters);
+        let indent = target_info.key_start as usize;
 
-        // Look through subsequent lines for parameters at the same or deeper indentation
-        for (idx, line) in lines.iter().enumerate().skip(start_line) {
+        // Helper closure to process lines and update parameters
+        let mut process_line = |idx: usize, line: &str| -> bool {
             if remaining_params.is_empty() {
-                return;
+                return false; // Stop if we've found all parameters
             }
-
+            let trimmed = line.trim_start();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                return true; // Skip empty lines and comments
+            }
             let line_indent = line.find(|c: char| !c.is_whitespace()).unwrap_or(0);
-
-            if line_indent == target_info.key_start as usize {
-                // Same indentation as target so we're looking at a paremeter line
-                let mut param = remaining_params.remove(0);
+            if line_indent < indent {
+                return false; // Stop if we've left the current scope
+            }
+            if line_indent == indent
+                && let Some(key) = Self::extract_yaml_key(line)
+                && let Some(mut param) = remaining_params.remove(&key)
+            {
                 param.line = idx as u32;
+                param.key = key;
                 target_info.parameters.push(param);
+            }
+            true
+        };
+
+        // Scan backward from target line to find parameters before _target_
+        for (idx, line) in lines
+            .iter()
+            .enumerate()
+            .rev()
+            .skip(lines.len() - target_line)
+        {
+            if !process_line(idx, line) {
+                break;
+            }
+        }
+
+        // Scan forward from after target line to find parameters after _target_
+        for (idx, line) in lines.iter().enumerate().skip(target_line + 1) {
+            if !process_line(idx, line) {
+                break;
+            }
+        }
+    }
+
+    /// Extract the YAML key name from a line
+    fn extract_yaml_key(line: &str) -> Option<String> {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('"') || trimmed.starts_with('\'') {
+            let quote = trimmed.chars().next()?;
+            let end = trimmed[1..].find(quote)?;
+            let key = &trimmed[1..end + 1];
+            // Verify there's a colon after the closing quote
+            let after_quote = &trimmed[end + 2..];
+            if after_quote.trim_start().starts_with(':') {
+                Some(key.to_string())
+            } else {
+                None
+            }
+        } else {
+            let colon_pos = trimmed.find(':')?;
+            let key = trimmed[..colon_pos].trim();
+            if key.is_empty() {
+                None
+            } else {
+                Some(key.to_string())
             }
         }
     }
@@ -1841,5 +1903,52 @@ training:
             "Third target should be made.up.mod"
         );
         assert_eq!(targets[2].line, 11, "Third target should be on line 11");
+    }
+
+    #[test]
+    fn test_params_before_target_get_correct_lines() {
+        let content = r#"
+my_module:
+  bap: false
+  # comment
+  boop: true
+  _target_: myproject.Model
+  beep: 42
+  # comment
+  another: 123
+  # comment
+"#;
+        let (targets, _) = YamlParser::parse(content).unwrap();
+        assert_eq!(targets.len(), 1);
+        let target = &targets[0];
+        assert_eq!(target.line, 5);
+
+        // Verify each parameter has the correct line
+        let find_param = |key: &str| target.parameters.iter().find(|p| p.key == key).unwrap();
+        assert_eq!(find_param("bap").line, 2, "bap should be on line 2");
+        assert_eq!(find_param("boop").line, 4, "boop should be on line 4");
+        assert_eq!(find_param("beep").line, 6, "beep should be on line 6");
+        assert_eq!(find_param("another").line, 8, "another should be on line 8");
+    }
+
+    #[test]
+    fn test_params_only_before_target() {
+        let content = r#"
+my_module:
+  shuffle: true
+  batch_size: 32
+  _target_: myproject.Model
+"#;
+        let (targets, _) = YamlParser::parse(content).unwrap();
+        assert_eq!(targets.len(), 1);
+        let target = &targets[0];
+
+        let find_param = |key: &str| target.parameters.iter().find(|p| p.key == key).unwrap();
+        assert_eq!(find_param("shuffle").line, 2, "shuffle should be on line 2");
+        assert_eq!(
+            find_param("batch_size").line,
+            3,
+            "batch_size should be on line 3"
+        );
     }
 }
