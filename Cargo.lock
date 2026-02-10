@@ -790,7 +790,7 @@ checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
 
 [[package]]
 name = "hydra-lsp"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -798,6 +798,7 @@ dependencies = [
  "colored 2.2.0",
  "dashmap 6.1.0",
  "fs_extra",
+ "hashlink",
  "insta",
  "parking_lot",
  "ruff_db",

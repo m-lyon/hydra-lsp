@@ -1,3 +1,4 @@
+use hashlink::LinkedHashMap;
 use saphyr::{LoadableYamlNode, MarkedYamlOwned};
 use std::collections::HashMap;
 use std::fmt;
@@ -90,7 +91,6 @@ impl HydraSemanticToken {
 pub const TARGET_KEY: &str = "_target_";
 pub const PARTIAL_KEY: &str = "_partial_";
 
-/// Replacement for serde_yaml::Value
 #[derive(Debug, Clone)]
 pub enum YamlValue {
     Null,
@@ -99,7 +99,7 @@ pub enum YamlValue {
     Float(f64),
     String(String),
     Sequence(Vec<YamlValue>),
-    Mapping(Vec<(String, YamlValue)>),
+    Mapping(LinkedHashMap<String, YamlValue>),
 }
 
 impl YamlValue {
@@ -115,18 +115,18 @@ impl YamlValue {
     }
 }
 
-/// Error type for YAML parsing, replacing serde_yaml::Error
+/// Error type for YAML parsing
 #[derive(Debug)]
 pub enum YamlParseError {
     ScanError(saphyr::ScanError),
-    EmptyDocument,
+    MiscError(String),
 }
 
 impl fmt::Display for YamlParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             YamlParseError::ScanError(e) => write!(f, "{}", e),
-            YamlParseError::EmptyDocument => write!(f, "Empty YAML document"),
+            YamlParseError::MiscError(msg) => write!(f, "{}", msg),
         }
     }
 }
@@ -134,8 +134,8 @@ impl fmt::Display for YamlParseError {
 impl std::error::Error for YamlParseError {}
 
 impl From<saphyr::ScanError> for YamlParseError {
-    fn from(e: saphyr::ScanError) -> Self {
-        YamlParseError::ScanError(e)
+    fn from(err: saphyr::ScanError) -> Self {
+        YamlParseError::ScanError(err)
     }
 }
 
@@ -146,12 +146,6 @@ pub struct Parameter {
     pub value: YamlValue,
     pub line: u32,
     pub key: String,
-}
-
-impl Parameter {
-    fn new_value(key: String, value: YamlValue, line: u32) -> Self {
-        Self { line, key, value }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -182,7 +176,7 @@ impl TargetInfo {
     }
 }
 
-/// Convert a saphyr MarkedYamlOwned node to our YamlValue
+/// Convert a saphyr MarkedYamlOwned node to YamlValue
 fn node_to_yaml_value(node: &MarkedYamlOwned) -> YamlValue {
     let data = &node.data;
     if data.is_null() {
@@ -219,8 +213,14 @@ impl YamlParser {
     /// Returns a vector of TargetInfo and a line-to-index lookup map
     pub fn parse(content: &str) -> Result<(Vec<TargetInfo>, HashMap<u32, usize>), YamlParseError> {
         let docs = MarkedYamlOwned::load_from_str(content)?;
-        if docs.is_empty() {
-            return Err(YamlParseError::EmptyDocument);
+        if content.trim().is_empty() {
+            return Ok((Vec::new(), HashMap::new()));
+        }
+
+        if docs.len() > 1 {
+            return Err(YamlParseError::MiscError(
+                "Multiple YAML documents are not supported".to_string(),
+            ));
         }
 
         let mut targets = Vec::new();
@@ -359,7 +359,6 @@ impl YamlParser {
                 .find(|(k, _)| k.data.as_str() == Some(TARGET_KEY));
 
             if let Some((key_node, value_node)) = target_entry {
-                // Only process if value is a string
                 if let Some(target_str) = value_node.data.as_str() {
                     // Saphyr lines are 1-indexed, LSP is 0-indexed
                     let line = (key_node.span.start.line() - 1) as u32;
@@ -412,8 +411,8 @@ impl YamlParser {
     }
 
     /// Extract parameters from a mapping that contains a `_target_` key
-    fn extract_parameters_marked<'a>(
-        map_entries: impl IntoIterator<Item = (&'a MarkedYamlOwned, &'a MarkedYamlOwned)>,
+    fn extract_parameters_marked(
+        map_entries: &LinkedHashMap<MarkedYamlOwned, MarkedYamlOwned>,
         content: &str,
         targets: &mut Vec<TargetInfo>,
     ) -> Vec<Parameter> {
@@ -428,7 +427,11 @@ impl YamlParser {
 
                 let line = (key_node.span.start.line() - 1) as u32;
                 let value = node_to_yaml_value(val_node);
-                parameters.push(Parameter::new_value(key_str.to_string(), value, line));
+                parameters.push(Parameter {
+                    key: key_str.to_string(),
+                    value,
+                    line,
+                });
             }
         }
 

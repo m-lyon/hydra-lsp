@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.1.6]
+
+- Refactored `yaml` parsing from `serde_yaml` to `saphyr`
+
 ## [0.1.5]
 
 - Added support for `_partial_`

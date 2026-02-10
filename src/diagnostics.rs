@@ -214,6 +214,7 @@ mod tests {
     use super::*;
     use crate::python_analyzer::ParameterInfo;
     use crate::yaml_parser::{Parameter, YamlValue};
+    use hashlink::LinkedHashMap;
     use std::path::PathBuf;
 
     fn get_simple_test_dir() -> PathBuf {
@@ -596,10 +597,13 @@ mod tests {
     #[test]
     fn test_validate_nested_target_valid() {
         // Create a nested target parameter
+        let mut mapping = LinkedHashMap::new();
+        mapping.insert(
+            "_target_".to_string(),
+            YamlValue::String("test_module.SimpleClass".to_string()),
+        );
         let params = vec![Parameter {
-            value: YamlValue::Mapping(vec![
-                ("_target_".to_string(), YamlValue::String("test_module.SimpleClass".to_string())),
-            ]),
+            value: YamlValue::Mapping(mapping),
             line: 1,
             key: "value".to_string(),
         }];
