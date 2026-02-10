@@ -352,40 +352,40 @@ impl YamlParser {
         content: &str,
         targets: &mut Vec<TargetInfo>,
     ) {
-        if let Some(map) = node.data.as_mapping() {
-            // Check if this mapping has a _target_ key
+        if node.data.contains_mapping_key(TARGET_KEY) {
+            let map = node.data.as_mapping().expect("Expected a mapping node");
             let target_entry = map
                 .iter()
-                .find(|(k, _)| k.data.as_str() == Some(TARGET_KEY));
+                .find(|(k, _)| k.data.as_str() == Some(TARGET_KEY))
+                .expect("Expected _target_ key");
+            let (key_node, value_node) = target_entry;
 
-            if let Some((key_node, value_node)) = target_entry {
-                if let Some(target_str) = value_node.data.as_str() {
-                    // Saphyr lines are 1-indexed, LSP is 0-indexed
-                    let line = (key_node.span.start.line() - 1) as u32;
-                    let key_start = key_node.span.start.col() as u32;
+            if let Some(target_str) = value_node.data.as_str() {
+                // Saphyr lines are 1-indexed, LSP is 0-indexed
+                let line = (key_node.span.start.line() - 1) as u32;
+                let key_start = key_node.span.start.col() as u32;
 
-                    // For value_start: check if the value is quoted
-                    let value_start = Self::compute_value_start(value_node, content);
+                // For value_start: check if the value is quoted
+                let value_start = Self::compute_value_start(value_node, content);
 
-                    // Create the target immediately to preserve order
-                    let target_index = targets.len();
-                    targets.push(TargetInfo {
-                        value: target_str.to_string(),
-                        parameters: Vec::new(),
-                        line,
-                        key_start,
-                        value_start,
-                    });
+                // Create the target immediately to preserve order
+                let target_index = targets.len();
+                targets.push(TargetInfo {
+                    value: target_str.to_string(),
+                    parameters: Vec::new(),
+                    line,
+                    key_start,
+                    value_start,
+                });
 
-                    // Extract parameters from all other keys in this mapping
-                    let parameters = Self::extract_parameters_marked(map, content, targets);
-                    targets[target_index].parameters = parameters;
-                }
-            } else {
-                // No _target_ found, recursively process nested mappings
-                for (_key, val) in map {
-                    Self::extract_targets_marked(val, content, targets);
-                }
+                // Extract parameters from all other keys in this mapping
+                let parameters = Self::extract_parameters_marked(map, content, targets);
+                targets[target_index].parameters = parameters;
+            }
+        } else if let Some(map) = node.data.as_mapping() {
+            // No _target_ found, recursively process nested mappings
+            for (_key, val) in map {
+                Self::extract_targets_marked(val, content, targets);
             }
         } else if let Some(seq) = node.data.as_sequence() {
             for item in seq {
