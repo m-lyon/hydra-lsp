@@ -213,7 +213,8 @@ pub fn validate_document(
 mod tests {
     use super::*;
     use crate::python_analyzer::ParameterInfo;
-    use crate::yaml_parser::Parameter;
+    use crate::yaml_parser::{Parameter, YamlValue};
+    use hashlink::LinkedHashMap;
     use std::path::PathBuf;
 
     fn get_simple_test_dir() -> PathBuf {
@@ -283,7 +284,7 @@ mod tests {
     #[test]
     fn test_validate_unknown_param_without_kwargs() {
         let params = vec![Parameter {
-            value: serde_yaml::Value::Null,
+            value: YamlValue::Null,
             line: 1,
             key: "unknown_param".to_string(),
         }];
@@ -329,7 +330,7 @@ mod tests {
     #[test]
     fn test_validate_unknown_param_with_kwargs() {
         let params = vec![Parameter {
-            value: serde_yaml::Value::Null,
+            value: YamlValue::Null,
             line: 1,
             key: "any_param".to_string(),
         }];
@@ -566,7 +567,7 @@ mod tests {
     #[test]
     fn test_validate_document_with_parameter_validation() {
         let params = vec![Parameter {
-            value: serde_yaml::Value::Number(serde_yaml::Number::from(42)),
+            value: YamlValue::Integer(42),
             line: 1,
             key: "value".to_string(),
         }];
@@ -596,14 +597,13 @@ mod tests {
     #[test]
     fn test_validate_nested_target_valid() {
         // Create a nested target parameter
-        let mut nested_map = serde_yaml::Mapping::new();
-        nested_map.insert(
-            serde_yaml::Value::String("_target_".to_string()),
-            serde_yaml::Value::String("test_module.SimpleClass".to_string()),
+        let mut mapping = LinkedHashMap::new();
+        mapping.insert(
+            "_target_".to_string(),
+            YamlValue::String("test_module.SimpleClass".to_string()),
         );
-
         let params = vec![Parameter {
-            value: serde_yaml::Value::Mapping(nested_map),
+            value: YamlValue::Mapping(mapping),
             line: 1,
             key: "value".to_string(),
         }];
@@ -640,7 +640,7 @@ mod tests {
     fn test_partial_true_skips_missing_required_params() {
         // When _partial_: true, missing required parameters should not be reported
         let params = vec![Parameter {
-            value: serde_yaml::Value::Bool(true),
+            value: YamlValue::Bool(true),
             line: 1,
             key: "_partial_".to_string(),
         }];
@@ -696,7 +696,7 @@ mod tests {
     fn test_partial_false_reports_missing_required_params() {
         // When _partial_: false, missing required parameters should still be reported
         let params = vec![Parameter {
-            value: serde_yaml::Value::Bool(false),
+            value: YamlValue::Bool(false),
             line: 1,
             key: "_partial_".to_string(),
         }];
@@ -752,7 +752,7 @@ mod tests {
     fn test_partial_key_not_reported_as_unknown_param() {
         // The _partial_ key itself should not be reported as unknown parameter
         let params = vec![Parameter {
-            value: serde_yaml::Value::Bool(true),
+            value: YamlValue::Bool(true),
             line: 1,
             key: "_partial_".to_string(),
         }];
@@ -797,17 +797,17 @@ mod tests {
         // Test _partial_ with other valid and invalid parameters
         let params = vec![
             Parameter {
-                value: serde_yaml::Value::Bool(true),
+                value: YamlValue::Bool(true),
                 line: 1,
                 key: "_partial_".to_string(),
             },
             Parameter {
-                value: serde_yaml::Value::String("value".to_string()),
+                value: YamlValue::String("value".to_string()),
                 line: 2,
                 key: "valid_param".to_string(),
             },
             Parameter {
-                value: serde_yaml::Value::String("value".to_string()),
+                value: YamlValue::String("value".to_string()),
                 line: 3,
                 key: "unknown_param".to_string(),
             },

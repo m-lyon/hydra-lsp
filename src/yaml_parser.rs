@@ -1,5 +1,7 @@
-use serde_yaml::Value;
-use std::collections::{HashMap, VecDeque};
+use hashlink::LinkedHashMap;
+use saphyr::{LoadableYamlNode, MarkedYamlOwned};
+use std::collections::HashMap;
+use std::fmt;
 use tower_lsp::lsp_types::Position;
 
 /// Represents a semantic token in the document (internal representation)
@@ -89,23 +91,61 @@ impl HydraSemanticToken {
 pub const TARGET_KEY: &str = "_target_";
 pub const PARTIAL_KEY: &str = "_partial_";
 
+#[derive(Debug, Clone)]
+pub enum YamlValue {
+    Null,
+    Bool(bool),
+    Integer(i64),
+    Float(f64),
+    String(String),
+    Sequence(Vec<YamlValue>),
+    Mapping(LinkedHashMap<String, YamlValue>),
+}
+
+impl YamlValue {
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            YamlValue::Bool(b) => Some(*b),
+            _ => None,
+        }
+    }
+
+    pub fn is_mapping(&self) -> bool {
+        matches!(self, YamlValue::Mapping(_))
+    }
+}
+
+/// Error type for YAML parsing
+#[derive(Debug)]
+pub enum YamlParseError {
+    ScanError(saphyr::ScanError),
+    MiscError(String),
+}
+
+impl fmt::Display for YamlParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            YamlParseError::ScanError(e) => write!(f, "{}", e),
+            YamlParseError::MiscError(msg) => write!(f, "{}", msg),
+        }
+    }
+}
+
+impl std::error::Error for YamlParseError {}
+
+impl From<saphyr::ScanError> for YamlParseError {
+    fn from(err: saphyr::ScanError) -> Self {
+        YamlParseError::ScanError(err)
+    }
+}
+
 /// Represents a parameter in a YAML configuration with position information
 /// Can either be a simple value or a nested target
 #[derive(Debug, Clone)]
 pub struct Parameter {
-    pub value: Value,
+    pub value: YamlValue,
     pub line: u32,
     pub key: String,
-}
-
-impl Parameter {
-    fn new_value(key: String, value: Value) -> Self {
-        Self {
-            line: 0,
-            key,
-            value,
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -123,16 +163,6 @@ pub struct TargetInfo {
 }
 
 impl TargetInfo {
-    fn new(value: String, parameters: Vec<Parameter>) -> Self {
-        Self {
-            value,
-            parameters,
-            line: 0,
-            key_start: 0,
-            value_start: 0,
-        }
-    }
-
     /// Get the end position of the target value
     pub fn value_end(&self) -> u32 {
         self.value_start + self.value.len() as u32
@@ -146,22 +176,55 @@ impl TargetInfo {
     }
 }
 
+/// Convert a saphyr MarkedYamlOwned node to YamlValue
+fn node_to_yaml_value(node: &MarkedYamlOwned) -> YamlValue {
+    let data = &node.data;
+    if data.is_null() {
+        YamlValue::Null
+    } else if let Some(b) = data.as_bool() {
+        YamlValue::Bool(b)
+    } else if let Some(i) = data.as_integer() {
+        YamlValue::Integer(i)
+    } else if let Some(f) = data.as_floating_point() {
+        YamlValue::Float(f)
+    } else if let Some(s) = data.as_str() {
+        YamlValue::String(s.to_string())
+    } else if let Some(seq) = data.as_sequence() {
+        YamlValue::Sequence(seq.iter().map(node_to_yaml_value).collect())
+    } else if let Some(map) = data.as_mapping() {
+        let entries = map
+            .iter()
+            .filter_map(|(k, v)| {
+                let key_str = k.data.as_str()?.to_string();
+                Some((key_str, node_to_yaml_value(v)))
+            })
+            .collect();
+        YamlValue::Mapping(entries)
+    } else {
+        YamlValue::Null
+    }
+}
+
 #[derive(Debug)]
 pub struct YamlParser;
 
 impl YamlParser {
     /// Parse YAML content and extract all `_target_` references with their parameters
     /// Returns a vector of TargetInfo and a line-to-index lookup map
-    pub fn parse(
-        content: &str,
-    ) -> Result<(Vec<TargetInfo>, HashMap<u32, usize>), serde_yaml::Error> {
-        // Changed return type
-        let value: Value = serde_yaml::from_str(content)?;
-        let mut targets: VecDeque<TargetInfo> = VecDeque::new();
-        Self::extract_targets(&value, &mut targets);
+    pub fn parse(content: &str) -> Result<(Vec<TargetInfo>, HashMap<u32, usize>), YamlParseError> {
+        let docs = MarkedYamlOwned::load_from_str(content)?;
+        if content.trim().is_empty() {
+            return Ok((Vec::new(), HashMap::new()));
+        }
 
-        // Find positions for all targets
-        let targets = Self::find_positions(content, targets);
+        if docs.len() > 1 {
+            return Err(YamlParseError::MiscError(
+                "Multiple YAML documents are not supported".to_string(),
+            ));
+        }
+
+        let mut targets = Vec::new();
+        Self::extract_targets_marked(&docs[0], content, &mut targets);
 
         // Build line-to-index lookup map
         let mut line_map = HashMap::new();
@@ -283,11 +346,103 @@ impl YamlParser {
         }
     }
 
+    /// Recursively extract all `_target_` references from a marked YAML node
+    fn extract_targets_marked(
+        node: &MarkedYamlOwned,
+        content: &str,
+        targets: &mut Vec<TargetInfo>,
+    ) {
+        if let Some(map) = node.data.as_mapping() {
+            // Check if this mapping has a _target_ key
+            let target_entry = map
+                .iter()
+                .find(|(k, _)| k.data.as_str() == Some(TARGET_KEY));
+
+            if let Some((key_node, value_node)) = target_entry {
+                if let Some(target_str) = value_node.data.as_str() {
+                    // Saphyr lines are 1-indexed, LSP is 0-indexed
+                    let line = (key_node.span.start.line() - 1) as u32;
+                    let key_start = key_node.span.start.col() as u32;
+
+                    // For value_start: check if the value is quoted
+                    let value_start = Self::compute_value_start(value_node, content);
+
+                    // Create the target immediately to preserve order
+                    let target_index = targets.len();
+                    targets.push(TargetInfo {
+                        value: target_str.to_string(),
+                        parameters: Vec::new(),
+                        line,
+                        key_start,
+                        value_start,
+                    });
+
+                    // Extract parameters from all other keys in this mapping
+                    let parameters = Self::extract_parameters_marked(map, content, targets);
+                    targets[target_index].parameters = parameters;
+                }
+            } else {
+                // No _target_ found, recursively process nested mappings
+                for (_key, val) in map {
+                    Self::extract_targets_marked(val, content, targets);
+                }
+            }
+        } else if let Some(seq) = node.data.as_sequence() {
+            for item in seq {
+                Self::extract_targets_marked(item, content, targets);
+            }
+        }
+    }
+
+    /// Compute the value_start position for a target value node.
+    /// If the value is quoted, skip the opening quote character.
+    fn compute_value_start(value_node: &MarkedYamlOwned, content: &str) -> u32 {
+        let col = value_node.span.start.col() as u32;
+        let byte_index = value_node.span.start.index();
+
+        // Check if the character at the span start is a quote
+        if byte_index < content.len() {
+            let ch = content.as_bytes()[byte_index];
+            if ch == b'"' || ch == b'\'' {
+                return col + 1;
+            }
+        }
+        col
+    }
+
+    /// Extract parameters from a mapping that contains a `_target_` key
+    fn extract_parameters_marked(
+        map_entries: &LinkedHashMap<MarkedYamlOwned, MarkedYamlOwned>,
+        content: &str,
+        targets: &mut Vec<TargetInfo>,
+    ) -> Vec<Parameter> {
+        let mut parameters = Vec::new();
+
+        for (key_node, val_node) in map_entries {
+            if let Some(key_str) = key_node.data.as_str()
+                && key_str != TARGET_KEY
+            {
+                // Recursively check for nested targets
+                Self::extract_targets_marked(val_node, content, targets);
+
+                let line = (key_node.span.start.line() - 1) as u32;
+                let value = node_to_yaml_value(val_node);
+                parameters.push(Parameter {
+                    key: key_str.to_string(),
+                    value,
+                    line,
+                });
+            }
+        }
+
+        parameters
+    }
+
     /// Find the target info at a specific position
     pub fn find_target_at_position(
         content: &str,
         position: Position,
-    ) -> Result<Option<TargetInfo>, serde_yaml::Error> {
+    ) -> Result<Option<TargetInfo>, YamlParseError> {
         let (targets, line_map) = Self::parse(content)?;
         if let Some(line_index) = line_map.get(&position.line) {
             let target = &targets[*line_index];
@@ -299,212 +454,11 @@ impl YamlParser {
         Ok(None)
     }
 
-    /// Recursively extract all `_target_` references from YAML value and build tree structure
-    fn extract_targets(value: &Value, targets: &mut VecDeque<TargetInfo>) {
-        match value {
-            Value::Mapping(map) => {
-                // Check if this mapping has a _target_ key
-                if let Some(Value::String(target_str)) = map.get(TARGET_KEY) {
-                    // Create and push the target immediately to preserve order
-                    let target_index = targets.len();
-                    targets.push_back(TargetInfo::new(target_str.clone(), Vec::new()));
-
-                    // Extract parameters, checking for nested targets
-                    let parameters = Self::extract_parameters(map, targets);
-
-                    // Update the target with the collected parameters
-                    targets[target_index].parameters = parameters;
-                } else {
-                    // If no _target_ found, recursively process nested mappings
-                    for (_key, val) in map {
-                        Self::extract_targets(val, targets);
-                    }
-                }
-            }
-            Value::Sequence(seq) => {
-                // Recursively process sequences
-                for item in seq {
-                    Self::extract_targets(item, targets);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// Extract parameters from a mapping that contains a `_target_` key
-    fn extract_parameters(
-        map: &serde_yaml::Mapping,
-        targets: &mut VecDeque<TargetInfo>,
-    ) -> Vec<Parameter> {
-        let mut parameters = Vec::new();
-
-        for (key, val) in map {
-            if let Value::String(key_str) = key {
-                // The _target_ key itself is not a parameter, but is the target identifier
-                if key_str != TARGET_KEY {
-                    // Recursively check for nested targets in parameter values
-                    Self::extract_targets(val, targets);
-
-                    // Simple value (string, number, mapping without _target_, etc.)
-                    parameters.push(Parameter::new_value(key_str.clone(), val.clone()));
-                }
-            }
-        }
-
-        parameters
-    }
-
-    /// Find the actual line and column positions of `_target_` occurrences in the text
-    fn find_positions(content: &str, targets: VecDeque<TargetInfo>) -> Vec<TargetInfo> {
-        let mut targets = targets;
-        let mut positioned_targets = Vec::new();
-        for (line_num, line) in content.lines().enumerate() {
-            if targets.is_empty() {
-                return positioned_targets;
-            }
-            // Look for _target_ followed by optional whitespace and colon
-            if let Some((col, quote_offset)) = Self::find_valid_target_key(line) {
-                // Find the colon position after potential whitespace (and closing quote if present)
-                let after_target = col + quote_offset + TARGET_KEY.len();
-                let colon_offset = match line[after_target..].find(':') {
-                    Some(offset) => offset,
-                    None => continue, // No colon found, skip this line
-                };
-
-                let after_colon = after_target + colon_offset + 1;
-                // find the value start position (first non-whitespace after colon)
-                let value_info = line[after_colon..].find(|c: char| !c.is_whitespace());
-
-                // Check if there's a value and it's not a comment
-                if value_info.is_none() {
-                    // Empty value, skip this line
-                    continue;
-                }
-
-                let value_offset = value_info.unwrap();
-                let potential_value_start = after_colon + value_offset;
-                let value_char = line.chars().nth(potential_value_start);
-
-                // If the value is a comment, skip this line
-                if value_char == Some('#') {
-                    continue;
-                }
-
-                // Now we know this is a valid _target_ with a value, consume a target from the queue
-                let mut target = targets.pop_front().unwrap();
-                target.line = line_num as u32;
-                target.key_start = col as u32;
-
-                // Set the value start position
-                if value_char == Some('"') || value_char == Some('\'') {
-                    // Skip the opening quote
-                    target.value_start = (potential_value_start + 1) as u32;
-                } else {
-                    target.value_start = potential_value_start as u32;
-                }
-
-                // Find parameter positions in surrounding lines
-                Self::find_parameter_positions(content, line_num, &mut target);
-                positioned_targets.push(target);
-            }
-        }
-
-        positioned_targets
-    }
-
-    /// Find positions for parameters associated with a `_target_`
-    fn find_parameter_positions(content: &str, target_line: usize, target_info: &mut TargetInfo) {
-        let lines: Vec<&str> = content.lines().collect();
-
-        let mut remaining_params: HashMap<String, Parameter> =
-            std::mem::take(&mut target_info.parameters)
-                .into_iter()
-                .map(|mut p| {
-                    let key = std::mem::take(&mut p.key);
-                    (key, p)
-                })
-                .collect();
-
-        if remaining_params.is_empty() {
-            return;
-        }
-
-        let indent = target_info.key_start as usize;
-
-        // Helper closure to process lines and update parameters
-        let mut process_line = |idx: usize, line: &str| -> bool {
-            if remaining_params.is_empty() {
-                return false; // Stop if we've found all parameters
-            }
-            let trimmed = line.trim_start();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
-                return true; // Skip empty lines and comments
-            }
-            let line_indent = line.find(|c: char| !c.is_whitespace()).unwrap_or(0);
-            if line_indent < indent {
-                return false; // Stop if we've left the current scope
-            }
-            if line_indent == indent
-                && let Some(key) = Self::extract_yaml_key(line)
-                && let Some(mut param) = remaining_params.remove(&key)
-            {
-                param.line = idx as u32;
-                param.key = key;
-                target_info.parameters.push(param);
-            }
-            true
-        };
-
-        // Scan backward from target line to find parameters before _target_
-        for (idx, line) in lines
-            .iter()
-            .enumerate()
-            .rev()
-            .skip(lines.len() - target_line)
-        {
-            if !process_line(idx, line) {
-                break;
-            }
-        }
-
-        // Scan forward from after target line to find parameters after _target_
-        for (idx, line) in lines.iter().enumerate().skip(target_line + 1) {
-            if !process_line(idx, line) {
-                break;
-            }
-        }
-    }
-
-    /// Extract the YAML key name from a line
-    fn extract_yaml_key(line: &str) -> Option<String> {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with('"') || trimmed.starts_with('\'') {
-            let quote = trimmed.chars().next()?;
-            let end = trimmed[1..].find(quote)?;
-            let key = &trimmed[1..end + 1];
-            // Verify there's a colon after the closing quote
-            let after_quote = &trimmed[end + 2..];
-            if after_quote.trim_start().starts_with(':') {
-                Some(key.to_string())
-            } else {
-                None
-            }
-        } else {
-            let colon_pos = trimmed.find(':')?;
-            let key = trimmed[..colon_pos].trim();
-            if key.is_empty() {
-                None
-            } else {
-                Some(key.to_string())
-            }
-        }
-    }
-
     /// Get completion context at a position
     pub fn get_completion_context(
         content: &str,
         position: Position,
-    ) -> Result<CompletionContext, serde_yaml::Error> {
+    ) -> Result<CompletionContext, YamlParseError> {
         let lines: Vec<&str> = content.lines().collect();
         if position.line as usize >= lines.len() {
             return Ok(CompletionContext::Unknown);
@@ -560,7 +514,7 @@ impl YamlParser {
     fn find_target_in_scope(
         content: &str,
         position: Position,
-    ) -> Result<Option<&str>, serde_yaml::Error> {
+    ) -> Result<Option<&str>, YamlParseError> {
         let lines: Vec<&str> = content.lines().collect();
         if position.line as usize >= lines.len() {
             return Ok(None);
@@ -748,7 +702,7 @@ impl YamlParser {
     /// Returns the length of the tokenized value (for position tracking in sequences).
     /// `in_array` controls delimiter detection: arrays use `,`/`]`, top-level uses `#`/whitespace.
     fn tokenize_value(
-        value: &Value,
+        value: &YamlValue,
         line: &str,
         pos: usize,
         line_num: u32,
@@ -762,7 +716,7 @@ impl YamlParser {
         let remaining = &line[pos..];
 
         match value {
-            Value::Number(_) => {
+            YamlValue::Integer(_) | YamlValue::Float(_) => {
                 let num_len = remaining
                     .find(|c: char| {
                         !c.is_numeric() && c != '.' && c != '-' && c != 'e' && c != 'E' && c != '+'
@@ -778,7 +732,7 @@ impl YamlParser {
                 }
                 num_len
             }
-            Value::String(_) => {
+            YamlValue::String(_) => {
                 if remaining.starts_with('"') || remaining.starts_with('\'') {
                     // Quoted string - find closing quote
                     let quote = remaining.chars().next().unwrap();
@@ -816,7 +770,7 @@ impl YamlParser {
                     str_len
                 }
             }
-            Value::Bool(_) => {
+            YamlValue::Bool(_) => {
                 let bool_len = remaining
                     .find(|c: char| c.is_whitespace() || c == '#' || c == ',' || c == ']')
                     .unwrap_or(remaining.len());
@@ -830,7 +784,7 @@ impl YamlParser {
                 }
                 bool_len
             }
-            Value::Sequence(seq) => {
+            YamlValue::Sequence(seq) => {
                 // Tokenize array elements individually
                 Self::tokenize_sequence_values(seq, line, pos, line_num, tokens)
             }
@@ -856,7 +810,7 @@ impl YamlParser {
     /// Handles inline arrays like [0.9, 0.999] or ["hello", "world"].
     /// Returns the total length consumed including brackets.
     fn tokenize_sequence_values(
-        seq: &[Value],
+        seq: &[YamlValue],
         line: &str,
         start_pos: usize,
         line_num: u32,
@@ -1123,11 +1077,10 @@ config:
         assert_eq!(first_model.parameters.len(), 1);
 
         // Check the size value
-
-        if let Value::Number(num) = &first_model.parameters.first().unwrap().value {
-            assert_eq!(num.as_i64(), Some(128));
+        if let YamlValue::Integer(val) = &first_model.parameters.first().unwrap().value {
+            assert_eq!(*val, 128);
         } else {
-            panic!("Expected Number value");
+            panic!("Expected Integer value");
         }
 
         // Second occurrence (line 6)
@@ -1139,10 +1092,10 @@ config:
         assert_eq!(second_model.parameters.len(), 1);
 
         // Check the size value
-        if let Value::Number(num) = &second_model.parameters.first().unwrap().value {
-            assert_eq!(num.as_i64(), Some(256));
+        if let YamlValue::Integer(val) = &second_model.parameters.first().unwrap().value {
+            assert_eq!(*val, 256);
         } else {
-            panic!("Expected Number value");
+            panic!("Expected Integer value");
         }
     }
 
@@ -1168,20 +1121,12 @@ config:
         let target_at_line_6 = targets.get(1).unwrap();
 
         // Verify both targets are correct
-        if let Value::Number(num) = &target_at_line_3.parameters.first().unwrap().value {
-            assert_eq!(
-                num.as_i64(),
-                Some(128),
-                "Line 3's target should have size: 128"
-            );
+        if let YamlValue::Integer(val) = &target_at_line_3.parameters.first().unwrap().value {
+            assert_eq!(*val, 128, "Line 3's target should have size: 128");
         }
 
-        if let Value::Number(num) = &target_at_line_6.parameters.first().unwrap().value {
-            assert_eq!(
-                num.as_i64(),
-                Some(256),
-                "Line 6's target should have size: 256"
-            );
+        if let YamlValue::Integer(val) = &target_at_line_6.parameters.first().unwrap().value {
+            assert_eq!(*val, 256, "Line 6's target should have size: 256");
         }
     }
 
@@ -1305,7 +1250,7 @@ training:
         // Test that we can handle _target_: with empty value
         let content = r#"
 model:
-  _target_: 
+  _target_:
   hidden_size: 256
 "#;
         let (targets, _) = YamlParser::parse(content).unwrap();
@@ -1317,7 +1262,7 @@ model:
         // Test that we can handle _target_: with empty value among valid targets
         let content = r#"
 model:
-  _target_: 
+  _target_:
   hidden_size: 256
 another:
   _target_: myproject.Model
@@ -1333,7 +1278,7 @@ another:
 
     #[test]
     fn test_commented_out_target_value() {
-        // Test that we can handle _target_: with empty value
+        // Test that we can handle _target_: with commented value
         let content = r#"
 model:
   _target_: # comment
@@ -1345,7 +1290,7 @@ model:
 
     #[test]
     fn test_commented_out_target_value_with_one_valid() {
-        // Test that we can handle _target_: with empty value among valid targets
+        // Test that we can handle _target_: with commented value among valid targets
         let content = r#"
 model:
   _target_: # comment
@@ -1417,7 +1362,6 @@ model:
   "_target_: myproject.Model
   hidden_size: 256
 "#;
-        // serde_yaml should fail to parse this as it's invalid YAML
         let result = YamlParser::parse(content);
         assert!(
             result.is_err(),
@@ -1450,7 +1394,6 @@ model:
   "_target_': myproject.Model
   hidden_size: 256
 "#;
-        // serde_yaml should fail to parse this as it's invalid YAML
         let result = YamlParser::parse(content);
         assert!(
             result.is_err(),
@@ -1487,7 +1430,6 @@ model:
         assert_eq!(targets.len(), 1);
 
         let target = targets.first().unwrap();
-        // serde_yaml strips the quotes from the value
         assert_eq!(target.value, "myproject.Model");
         assert_eq!(target.line, 2);
         // value_start should point to the first character of the actual value (after the quote)
@@ -1506,7 +1448,6 @@ model:
         assert_eq!(targets.len(), 1);
 
         let target = targets.first().unwrap();
-        // serde_yaml strips the quotes from the value
         assert_eq!(target.value, "myproject.Model");
         assert_eq!(target.line, 2);
         // value_start should point to the first character of the actual value (after the quote)
@@ -1826,7 +1767,7 @@ items:
         let yaml = r#"
 valid:
   _target_: some.module.Class
-  
+
 invalid_target_key: this is not a target
 "#;
         // Should detect as hydra file because of the valid _target_
