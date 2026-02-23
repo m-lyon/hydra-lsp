@@ -1,10 +1,11 @@
 use parking_lot::RwLock;
+use std::collections::HashSet;
 use std::sync::Arc;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
 
-use crate::diagnostics;
+use crate::diagnostics::{self, DiagnosticRule};
 use crate::document::DocumentStore;
 use crate::python_analyzer::{DefinitionInfo, ParameterInfo, PythonAnalyzer};
 use crate::yaml_parser::{CompletionContext, HydraSemanticToken, YamlParser};
@@ -49,11 +50,18 @@ fn build_signature_params(
     (param_strs.join(", "), param_infos)
 }
 
+/// Server-wide settings for Hydra LSP.
+#[derive(Debug, Default)]
+pub struct Settings {
+    pub python_interpreter: Option<String>,
+    pub disabled_rules: HashSet<DiagnosticRule>,
+}
+
 #[derive(Debug)]
 pub struct HydraLspBackend {
     pub client: Client,
     pub documents: Arc<DocumentStore>,
-    pub python_interpreter: Arc<RwLock<Option<String>>>,
+    pub settings: Arc<RwLock<Settings>>,
 }
 
 impl HydraLspBackend {
@@ -61,7 +69,7 @@ impl HydraLspBackend {
         Self {
             client,
             documents: Arc::new(DocumentStore::new()),
-            python_interpreter: Arc::new(RwLock::new(None)),
+            settings: Arc::new(RwLock::new(Settings::default())),
         }
     }
 }
@@ -79,19 +87,55 @@ impl LanguageServer for HydraLspBackend {
             )
             .await;
 
-        // Parse initialization options to extract Python interpreter
+        // Parse initialization options
         if let Some(init_options) = params.initialization_options
             && let Some(settings) = init_options.get("settings")
-            && let Some(python_interpreter) = settings.get("pythonInterpreter")
-            && let Some(interpreter_path) = python_interpreter.as_str()
         {
-            *self.python_interpreter.write() = Some(interpreter_path.to_string());
-            self.client
-                .log_message(
-                    MessageType::INFO,
-                    format!("Python interpreter configured: {}", interpreter_path),
-                )
-                .await;
+            // Extract values without holding the lock across awaits
+            let interpreter_path = settings
+                .get("pythonInterpreter")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+
+            let mut parsed_rules = HashSet::new();
+            if let Some(disabled_rules) = settings.get("disabledRules")
+                && let Some(rules_array) = disabled_rules.as_array()
+            {
+                for rule_value in rules_array {
+                    if let Some(rule_str) = rule_value.as_str()
+                        && let Some(rule) = DiagnosticRule::from_code(rule_str)
+                    {
+                        parsed_rules.insert(rule);
+                    }
+                }
+            }
+
+            // Write settings under the lock (no awaits)
+            {
+                let mut s = self.settings.write();
+                if interpreter_path.is_some() {
+                    s.python_interpreter = interpreter_path.clone();
+                }
+                s.disabled_rules = parsed_rules.clone();
+            }
+
+            // Log after releasing the lock
+            if let Some(ref path) = interpreter_path {
+                self.client
+                    .log_message(
+                        MessageType::INFO,
+                        format!("Python interpreter configured: {}", path),
+                    )
+                    .await;
+            }
+            if !parsed_rules.is_empty() {
+                self.client
+                    .log_message(
+                        MessageType::INFO,
+                        format!("Disabled rules: {:?}", parsed_rules),
+                    )
+                    .await;
+            }
         }
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
@@ -250,15 +294,17 @@ impl LanguageServer for HydraLspBackend {
             .ok()
             .and_then(|path| path.parent().map(|p| p.to_path_buf()));
 
-        // Get the python interpreter path
-        let python_interpreter = self.python_interpreter.read().clone();
+        // Try to extract Python definition information (avoid cloning settings)
+        let extract_result = {
+            let settings = self.settings.read();
+            PythonAnalyzer::extract_definition_info(
+                &target_info.value,
+                workspace_root.as_deref(),
+                settings.python_interpreter.as_deref(),
+            )
+        };
 
-        // Try to extract Python definition information
-        match PythonAnalyzer::extract_definition_info(
-            &target_info.value,
-            workspace_root.as_deref(),
-            python_interpreter.as_deref(),
-        ) {
+        match extract_result {
             Ok((definition_info, _file_path, _module_path, _symbol_name)) => {
                 let hover_content = match definition_info {
                     DefinitionInfo::Function(sig) => PythonAnalyzer::format_function(&sig),
@@ -456,15 +502,17 @@ impl LanguageServer for HydraLspBackend {
             .ok()
             .and_then(|path| path.parent().map(|p| p.to_path_buf()));
 
-        // Get the python interpreter path
-        let python_interpreter = self.python_interpreter.read().clone();
+        // Try to extract Python definition information (avoid cloning settings)
+        let extract_result = {
+            let settings = self.settings.read();
+            PythonAnalyzer::extract_definition_info(
+                &target_info.value,
+                workspace_root.as_deref(),
+                settings.python_interpreter.as_deref(),
+            )
+        };
 
-        // Try to extract Python definition information
-        match PythonAnalyzer::extract_definition_info(
-            &target_info.value,
-            workspace_root.as_deref(),
-            python_interpreter.as_deref(),
-        ) {
+        match extract_result {
             Ok((definition_info, _file_path, _module_path, _symbol_name)) => {
                 let (signature_label, parameters, doc_string) = match definition_info {
                     DefinitionInfo::Function(sig) => {
@@ -575,32 +623,32 @@ impl LanguageServer for HydraLspBackend {
             .ok()
             .and_then(|path| path.parent().map(|p| p.to_path_buf()));
 
-        // Get the python interpreter path
-        let python_interpreter = self.python_interpreter.read().clone();
-
         // Extract definition info to get the line number
-        let (file_path, start_line, start_col, end_line, end_col) =
-            match PythonAnalyzer::extract_definition_info(
+        let extract_result = {
+            let settings = self.settings.read();
+            PythonAnalyzer::extract_definition_info(
                 &target_info.value,
                 workspace_root.as_deref(),
-                python_interpreter.as_deref(),
-            ) {
-                Ok((definition_info, file_path, _module_path, _symbol_name)) => {
-                    let (start_line, start_col, end_line, end_col) = definition_info.position();
-                    (file_path, start_line, start_col, end_line, end_col)
+                settings.python_interpreter.as_deref(),
+            )
+        };
+        let (file_path, start_line, start_col, end_line, end_col) = match extract_result {
+            Ok((definition_info, file_path, _module_path, _symbol_name)) => {
+                let (start_line, start_col, end_line, end_col) = definition_info.position();
+                (file_path, start_line, start_col, end_line, end_col)
+            }
+            Err(e) => {
+                let error_msg = e.to_string();
+                if error_msg.starts_with("Invalid _target_ format:") {
+                    self.client.log_message(MessageType::ERROR, error_msg).await;
+                } else {
+                    self.client
+                        .log_message(MessageType::WARNING, error_msg)
+                        .await;
                 }
-                Err(e) => {
-                    let error_msg = e.to_string();
-                    if error_msg.starts_with("Invalid _target_ format:") {
-                        self.client.log_message(MessageType::ERROR, error_msg).await;
-                    } else {
-                        self.client
-                            .log_message(MessageType::WARNING, error_msg)
-                            .await;
-                    }
-                    return Ok(None);
-                }
-            };
+                return Ok(None);
+            }
+        };
 
         // Convert file path to URI
         let target_uri = match Url::from_file_path(&file_path) {
@@ -680,16 +728,19 @@ impl HydraLspBackend {
             .ok()
             .and_then(|path| path.parent().map(|p| p.to_path_buf()));
 
-        // Get the python interpreter path
-        let python_interpreter = self.python_interpreter.read().clone();
-
         match YamlParser::parse(content) {
-            Ok((targets, _line_map)) => {
-                let diagnostics = diagnostics::validate_document(
-                    targets,
-                    workspace_root.as_deref(),
-                    python_interpreter.as_deref(),
-                );
+            Ok(mut parsed_content) => {
+                let diagnostics = {
+                    let settings = self.settings.read();
+                    parsed_content
+                        .file_suppressions
+                        .extend(&settings.disabled_rules);
+                    diagnostics::validate_document(
+                        parsed_content,
+                        workspace_root.as_deref(),
+                        settings.python_interpreter.as_deref(),
+                    )
+                };
                 self.client
                     .publish_diagnostics(uri.clone(), diagnostics, None)
                     .await;

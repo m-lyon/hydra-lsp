@@ -1,8 +1,11 @@
 use hashlink::LinkedHashMap;
 use saphyr::{LoadableYamlNode, MarkedYamlOwned};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::error::Error;
 use std::fmt;
 use tower_lsp::lsp_types::Position;
+
+use crate::diagnostics::DiagnosticRule;
 
 /// Represents a semantic token in the document (internal representation)
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,7 +134,7 @@ impl fmt::Display for YamlParseError {
     }
 }
 
-impl std::error::Error for YamlParseError {}
+impl Error for YamlParseError {}
 
 impl From<saphyr::ScanError> for YamlParseError {
     fn from(err: saphyr::ScanError) -> Self {
@@ -146,6 +149,8 @@ pub struct Parameter {
     pub value: YamlValue,
     pub line: u32,
     pub key: String,
+    /// Diagnostic rules suppressed by an inline comment on this parameter's line.
+    pub suppressed_rules: HashSet<DiagnosticRule>,
 }
 
 #[derive(Debug, Clone)]
@@ -160,6 +165,10 @@ pub struct TargetInfo {
     pub key_start: u32,
     /// The start position of the target value in the line
     pub value_start: u32,
+    /// Diagnostic rules suppressed by an inline comment on the `_target_` line.
+    pub suppressed_rules: HashSet<DiagnosticRule>,
+    /// Whether the `_partial_` parameter is set to true for this target
+    pub is_partial: bool,
 }
 
 impl TargetInfo {
@@ -167,13 +176,15 @@ impl TargetInfo {
     pub fn value_end(&self) -> u32 {
         self.value_start + self.value.len() as u32
     }
+}
 
-    /// Check if `_partial_` is set to true for this target
-    pub fn is_partial(&self) -> bool {
-        self.parameters
-            .iter()
-            .any(|p| p.key == PARTIAL_KEY && p.value.as_bool() == Some(true))
-    }
+pub struct ParsedContent {
+    /// All targets found in the document, in the order they appear
+    pub targets: Vec<TargetInfo>,
+    /// Mapping from line number to index in the targets vector for quick lookup
+    pub line_map: HashMap<u32, usize>,
+    /// File-wide diagnostic suppressions from header comments
+    pub file_suppressions: HashSet<DiagnosticRule>,
 }
 
 /// Convert a saphyr MarkedYamlOwned node to YamlValue
@@ -211,10 +222,14 @@ pub struct YamlParser;
 impl YamlParser {
     /// Parse YAML content and extract all `_target_` references with their parameters
     /// Returns a vector of TargetInfo and a line-to-index lookup map
-    pub fn parse(content: &str) -> Result<(Vec<TargetInfo>, HashMap<u32, usize>), YamlParseError> {
+    pub fn parse(content: &str) -> Result<ParsedContent, YamlParseError> {
         let docs = MarkedYamlOwned::load_from_str(content)?;
         if content.trim().is_empty() {
-            return Ok((Vec::new(), HashMap::new()));
+            return Ok(ParsedContent {
+                targets: Vec::new(),
+                line_map: HashMap::new(),
+                file_suppressions: HashSet::new(),
+            });
         }
 
         if docs.len() > 1 {
@@ -224,7 +239,10 @@ impl YamlParser {
         }
 
         let mut targets = Vec::new();
-        Self::extract_targets_marked(&docs[0], content, &mut targets);
+        Self::extract_targets(&docs[0], content, &mut targets);
+
+        // Parse file-wide suppressions from header comments before any YAML content
+        let file_suppressions = Self::get_filewide_suppressions(content);
 
         // Build line-to-index lookup map
         let mut line_map = HashMap::new();
@@ -232,7 +250,14 @@ impl YamlParser {
             line_map.insert(target.line, idx);
         }
 
-        Ok((targets, line_map))
+        // Attach suppression comments from the raw content to targets/parameters
+        Self::attach_suppressions(content, &mut targets, &line_map);
+
+        Ok(ParsedContent {
+            targets,
+            line_map,
+            file_suppressions,
+        })
     }
 
     /// Check if a YAML file is a Hydra configuration file
@@ -346,12 +371,81 @@ impl YamlParser {
         }
     }
 
-    /// Recursively extract all `_target_` references from a marked YAML node
-    fn extract_targets_marked(
-        node: &MarkedYamlOwned,
+    /// Parse a `# hydrust: ignore[...]` comment, returning the set of rules.
+    fn parse_ignore_comment(text: &str) -> Option<HashSet<DiagnosticRule>> {
+        let trimmed = text.trim();
+        let rest = trimmed.strip_prefix("# hydrust: ignore[")?;
+        let rest = rest.strip_suffix(']')?;
+        let mut rules = HashSet::new();
+        for part in rest.split(',') {
+            let code = part.trim();
+            if let Some(rule) = DiagnosticRule::from_code(code) {
+                rules.insert(rule);
+            }
+        }
+        if rules.is_empty() { None } else { Some(rules) }
+    }
+
+    /// Extract an inline ignore directive from a line that contains YAML content
+    /// followed by a `# hydrust: ignore[...]` comment.
+    fn extract_inline_ignore(line: &str) -> Option<HashSet<DiagnosticRule>> {
+        let idx = line.find("# hydrust: ignore[")?;
+        let comment_part = &line[idx..];
+        Self::parse_ignore_comment(comment_part)
+    }
+
+    fn get_filewide_suppressions(content: &str) -> HashSet<DiagnosticRule> {
+        let mut file_wide = HashSet::new();
+
+        // Header = leading blanks + comment lines. Stop once we see real YAML content.
+        for line in content.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if trimmed.starts_with('#') {
+                if let Some(rules) = Self::parse_ignore_comment(trimmed) {
+                    file_wide.extend(rules);
+                }
+                continue;
+            }
+            break;
+        }
+        file_wide
+    }
+
+    /// Attach suppression comments from raw content to the parsed targets and parameters.
+    /// This is necessary because saphyr's MarkedYamlOwned does not preserve comments, so we need to
+    /// map line numbers back to the original content to find any inline suppression comments.
+    fn attach_suppressions(
         content: &str,
-        targets: &mut Vec<TargetInfo>,
+        targets: &mut [TargetInfo],
+        line_map: &HashMap<u32, usize>,
     ) {
+        let mut line_to_parameters: HashMap<u32, (usize, usize)> = HashMap::new();
+
+        for &i in line_map.values() {
+            for (pi, param) in targets[i].parameters.iter().enumerate() {
+                line_to_parameters.insert(param.line, (i, pi));
+            }
+        }
+
+        for (line_num, line) in content.lines().enumerate() {
+            let line_num = line_num as u32;
+            if (line_map.contains_key(&line_num) || line_to_parameters.contains_key(&line_num))
+                && let Some(rules) = Self::extract_inline_ignore(line)
+            {
+                if let Some(&ti) = line_map.get(&line_num) {
+                    targets[ti].suppressed_rules.extend(rules);
+                } else if let Some(&(ti, pi)) = line_to_parameters.get(&line_num) {
+                    targets[ti].parameters[pi].suppressed_rules.extend(rules);
+                }
+            }
+        }
+    }
+
+    /// Recursively extract all `_target_` references from a marked YAML node
+    fn extract_targets(node: &MarkedYamlOwned, content: &str, targets: &mut Vec<TargetInfo>) {
         if node.data.contains_mapping_key(TARGET_KEY) {
             let map = node.data.as_mapping().expect("Expected a mapping node");
             let target_entry = map
@@ -360,6 +454,17 @@ impl YamlParser {
                 .expect("Expected _target_ key");
             let (key_node, value_node) = target_entry;
 
+            let is_partial = if node.data.contains_mapping_key(PARTIAL_KEY) {
+                map.iter()
+                    .find(|(k, _)| k.data.as_str() == Some(PARTIAL_KEY))
+                    .expect("Expected _partial_ key")
+                    .1
+                    .data
+                    .as_bool()
+                    .unwrap_or(false)
+            } else {
+                false
+            };
             if let Some(target_str) = value_node.data.as_str() {
                 // Saphyr lines are 1-indexed, LSP is 0-indexed
                 let line = (key_node.span.start.line() - 1) as u32;
@@ -376,20 +481,22 @@ impl YamlParser {
                     line,
                     key_start,
                     value_start,
+                    suppressed_rules: HashSet::new(),
+                    is_partial,
                 });
 
                 // Extract parameters from all other keys in this mapping
-                let parameters = Self::extract_parameters_marked(map, content, targets);
+                let parameters = Self::extract_parameters(map, content, targets);
                 targets[target_index].parameters = parameters;
             }
         } else if let Some(map) = node.data.as_mapping() {
             // No _target_ found, recursively process nested mappings
             for (_key, val) in map {
-                Self::extract_targets_marked(val, content, targets);
+                Self::extract_targets(val, content, targets);
             }
         } else if let Some(seq) = node.data.as_sequence() {
             for item in seq {
-                Self::extract_targets_marked(item, content, targets);
+                Self::extract_targets(item, content, targets);
             }
         }
     }
@@ -411,7 +518,7 @@ impl YamlParser {
     }
 
     /// Extract parameters from a mapping that contains a `_target_` key
-    fn extract_parameters_marked(
+    fn extract_parameters(
         map_entries: &LinkedHashMap<MarkedYamlOwned, MarkedYamlOwned>,
         content: &str,
         targets: &mut Vec<TargetInfo>,
@@ -421,9 +528,10 @@ impl YamlParser {
         for (key_node, val_node) in map_entries {
             if let Some(key_str) = key_node.data.as_str()
                 && key_str != TARGET_KEY
+                && key_str != PARTIAL_KEY
             {
                 // Recursively check for nested targets
-                Self::extract_targets_marked(val_node, content, targets);
+                Self::extract_targets(val_node, content, targets);
 
                 let line = (key_node.span.start.line() - 1) as u32;
                 let value = node_to_yaml_value(val_node);
@@ -431,6 +539,7 @@ impl YamlParser {
                     key: key_str.to_string(),
                     value,
                     line,
+                    suppressed_rules: HashSet::new(),
                 });
             }
         }
@@ -443,9 +552,9 @@ impl YamlParser {
         content: &str,
         position: Position,
     ) -> Result<Option<TargetInfo>, YamlParseError> {
-        let (targets, line_map) = Self::parse(content)?;
-        if let Some(line_index) = line_map.get(&position.line) {
-            let target = &targets[*line_index];
+        let parsed_content = Self::parse(content)?;
+        if let Some(&line_index) = parsed_content.line_map.get(&position.line) {
+            let target = &parsed_content.targets[line_index];
             // Check if the column is within the function definition
             if position.character > target.value_start && position.character < target.value_end() {
                 return Ok(Some(target.clone()));
@@ -557,12 +666,12 @@ impl YamlParser {
         let mut tokens = Vec::new();
 
         // Parse the YAML to get targets and their parameters
-        let Ok((targets, _)) = Self::parse(content) else {
+        let Ok(parsed_content) = Self::parse(content) else {
             return tokens;
         };
 
         // Generate tokens for each target
-        for target in targets {
+        for target in parsed_content.targets {
             // Tokenize the _target_ value
             Self::tokenize_target_value(&target, &mut tokens);
 
@@ -896,14 +1005,14 @@ model:
   hidden_size: 256
   num_layers: 12
 "#;
-        let (targets, line_map) = YamlParser::parse(content).unwrap();
-        assert_eq!(targets.len(), 1);
-        assert_eq!(line_map.len(), 1);
-        let target = targets.first().unwrap();
+        let parsed_content = YamlParser::parse(content).unwrap();
+        assert_eq!(parsed_content.targets.len(), 1);
+        assert_eq!(parsed_content.line_map.len(), 1);
+        let target = parsed_content.targets.first().unwrap();
         assert_eq!(target.value, "myproject.Model");
         assert_eq!(target.parameters.len(), 2);
         assert_eq!(target.line, 2);
-        assert_eq!(*line_map.get(&2).unwrap(), 0);
+        assert_eq!(parsed_content.line_map.get(&2).unwrap(), &0);
         assert_eq!(target.key_start, 2);
     }
 
@@ -919,24 +1028,32 @@ model:
     _target_: myproject.Decoder
     layers: 6
 "#;
-        let (targets, line_map) = YamlParser::parse(content).unwrap();
-        assert_eq!(targets.len(), 3, "Should have 3 targets total");
-        assert_eq!(line_map.len(), 3, "Line map should have 3 entries");
+        let parsed_content = YamlParser::parse(content).unwrap();
+        assert_eq!(
+            parsed_content.targets.len(),
+            3,
+            "Should have 3 targets total"
+        );
+        assert_eq!(
+            parsed_content.line_map.len(),
+            3,
+            "Line map should have 3 entries"
+        );
 
-        let model = targets.first().unwrap();
+        let model = parsed_content.targets.first().unwrap();
         assert_eq!(model.parameters.len(), 2);
         assert_eq!(model.line, 2);
-        assert_eq!(*line_map.get(&2).unwrap(), 0);
+        assert_eq!(parsed_content.line_map.get(&2).unwrap(), &0);
 
-        let encoder = targets.get(1).unwrap();
+        let encoder = parsed_content.targets.get(1).unwrap();
         assert_eq!(encoder.parameters.len(), 1);
         assert_eq!(encoder.line, 4);
-        assert_eq!(*line_map.get(&4).unwrap(), 1);
+        assert_eq!(parsed_content.line_map.get(&4).unwrap(), &1);
 
-        let decoder = targets.get(2).unwrap();
+        let decoder = parsed_content.targets.get(2).unwrap();
         assert_eq!(decoder.parameters.len(), 1);
         assert_eq!(decoder.line, 7);
-        assert_eq!(*line_map.get(&7).unwrap(), 2);
+        assert_eq!(parsed_content.line_map.get(&7).unwrap(), &2);
     }
 
     #[test]
@@ -1064,36 +1181,40 @@ config:
     _target_: myproject.Model
     size: 256
 "#;
-        let (targets, line_map) = YamlParser::parse(content).unwrap();
-        assert_eq!(targets.len(), 2, "Should have 2 targets");
-        assert_eq!(line_map.len(), 2, "Line map should have 2 entries");
+        let parsed_content = YamlParser::parse(content).unwrap();
+        assert_eq!(parsed_content.targets.len(), 2, "Should have 2 targets");
+        assert_eq!(
+            parsed_content.line_map.len(),
+            2,
+            "Line map should have 2 entries"
+        );
 
         // First occurrence (line 3)
-        let first_model = targets.first().unwrap();
+        let first_model = parsed_content.targets.first().unwrap();
         assert_eq!(first_model.value, "myproject.Model");
         assert_eq!(first_model.line, 3);
-        assert_eq!(*line_map.get(&3).unwrap(), 0);
+        assert_eq!(parsed_content.line_map.get(&3).unwrap(), &0);
         assert_eq!(first_model.key_start, 4);
         assert_eq!(first_model.parameters.len(), 1);
 
         // Check the size value
         if let YamlValue::Integer(val) = &first_model.parameters.first().unwrap().value {
-            assert_eq!(*val, 128);
+            assert_eq!(val, &128);
         } else {
             panic!("Expected Integer value");
         }
 
         // Second occurrence (line 6)
-        let second_model = targets.get(1).unwrap();
+        let second_model = parsed_content.targets.get(1).unwrap();
         assert_eq!(second_model.value, "myproject.Model");
         assert_eq!(second_model.line, 6);
-        assert_eq!(*line_map.get(&6).unwrap(), 1);
+        assert_eq!(parsed_content.line_map.get(&6).unwrap(), &1);
         assert_eq!(second_model.key_start, 4);
         assert_eq!(second_model.parameters.len(), 1);
 
         // Check the size value
         if let YamlValue::Integer(val) = &second_model.parameters.first().unwrap().value {
-            assert_eq!(*val, 256);
+            assert_eq!(val, &256);
         } else {
             panic!("Expected Integer value");
         }
@@ -1111,22 +1232,26 @@ config:
     _target_: myproject.Model
     size: 256
 "#;
-        let (targets, line_map) = YamlParser::parse(content).unwrap();
-        assert_eq!(targets.len(), 2, "Should have 2 targets");
-        assert_eq!(line_map.len(), 2, "Line map should have 2 entries");
-        assert_eq!(*line_map.get(&3).unwrap(), 0);
-        assert_eq!(*line_map.get(&6).unwrap(), 1);
+        let parsed_content = YamlParser::parse(content).unwrap();
+        assert_eq!(parsed_content.targets.len(), 2, "Should have 2 targets");
+        assert_eq!(
+            parsed_content.line_map.len(),
+            2,
+            "Line map should have 2 entries"
+        );
+        assert_eq!(parsed_content.line_map.get(&3).unwrap(), &0);
+        assert_eq!(parsed_content.line_map.get(&6).unwrap(), &1);
 
-        let target_at_line_3 = targets.first().unwrap();
-        let target_at_line_6 = targets.get(1).unwrap();
+        let target_at_line_3 = parsed_content.targets.first().unwrap();
+        let target_at_line_6 = parsed_content.targets.get(1).unwrap();
 
         // Verify both targets are correct
         if let YamlValue::Integer(val) = &target_at_line_3.parameters.first().unwrap().value {
-            assert_eq!(*val, 128, "Line 3's target should have size: 128");
+            assert_eq!(val, &128, "Line 3's target should have size: 128");
         }
 
         if let YamlValue::Integer(val) = &target_at_line_6.parameters.first().unwrap().value {
-            assert_eq!(*val, 256, "Line 6's target should have size: 256");
+            assert_eq!(val, &256, "Line 6's target should have size: 256");
         }
     }
 
@@ -1141,19 +1266,23 @@ another:
   _target_	: another.Model
   param: value
 "#;
-        let (targets, line_map) = YamlParser::parse(content).unwrap();
-        assert_eq!(targets.len(), 2, "Should have 2 targets");
-        assert_eq!(line_map.len(), 2, "Line map should have 2 entries");
+        let parsed_content = YamlParser::parse(content).unwrap();
+        assert_eq!(parsed_content.targets.len(), 2, "Should have 2 targets");
+        assert_eq!(
+            parsed_content.line_map.len(),
+            2,
+            "Line map should have 2 entries"
+        );
 
         // First target with spaces before colon
-        let first = targets.first().unwrap();
+        let first = parsed_content.targets.first().unwrap();
         assert_eq!(first.value, "myproject.Model");
         assert_eq!(first.line, 2);
         assert_eq!(first.key_start, 2);
         assert_eq!(first.parameters.len(), 1);
 
         // Second target with tab before colon
-        let second = targets.get(1).unwrap();
+        let second = parsed_content.targets.get(1).unwrap();
         assert_eq!(second.value, "another.Model");
         assert_eq!(second.line, 5);
         assert_eq!(second.key_start, 2);
@@ -1168,11 +1297,15 @@ model:
   "_target_": myproject.Model
   hidden_size: 256
 "#;
-        let (targets, line_map) = YamlParser::parse(content).unwrap();
-        assert_eq!(targets.len(), 1, "Should have 1 target");
-        assert_eq!(line_map.len(), 1, "Line map should have 1 entry");
+        let parsed_content = YamlParser::parse(content).unwrap();
+        assert_eq!(parsed_content.targets.len(), 1, "Should have 1 target");
+        assert_eq!(
+            parsed_content.line_map.len(),
+            1,
+            "Line map should have 1 entry"
+        );
 
-        let target = targets.first().unwrap();
+        let target = parsed_content.targets.first().unwrap();
         assert_eq!(target.value, "myproject.Model");
         assert_eq!(target.line, 2);
         assert_eq!(target.key_start, 2); // Position of opening quote
@@ -1187,11 +1320,15 @@ model:
   '_target_': myproject.Model
   hidden_size: 256
 "#;
-        let (targets, line_map) = YamlParser::parse(content).unwrap();
-        assert_eq!(targets.len(), 1, "Should have 1 target");
-        assert_eq!(line_map.len(), 1, "Line map should have 1 entry");
+        let parsed_content = YamlParser::parse(content).unwrap();
+        assert_eq!(parsed_content.targets.len(), 1, "Should have 1 target");
+        assert_eq!(
+            parsed_content.line_map.len(),
+            1,
+            "Line map should have 1 entry"
+        );
 
-        let target = targets.first().unwrap();
+        let target = parsed_content.targets.first().unwrap();
         assert_eq!(target.value, "myproject.Model");
         assert_eq!(target.line, 2);
         assert_eq!(target.key_start, 2); // Position of opening quote
@@ -1209,16 +1346,20 @@ another:
   '_target_'	: another.Model
   param: value
 "#;
-        let (targets, line_map) = YamlParser::parse(content).unwrap();
-        assert_eq!(targets.len(), 2, "Should have 2 targets");
-        assert_eq!(line_map.len(), 2, "Line map should have 2 entries");
+        let parsed_content = YamlParser::parse(content).unwrap();
+        assert_eq!(parsed_content.targets.len(), 2, "Should have 2 targets");
+        assert_eq!(
+            parsed_content.line_map.len(),
+            2,
+            "Line map should have 2 entries"
+        );
 
-        let first = targets.first().unwrap();
+        let first = parsed_content.targets.first().unwrap();
         assert_eq!(first.value, "myproject.Model");
         assert_eq!(first.line, 2);
         assert_eq!(first.key_start, 2);
 
-        let second = targets.get(1).unwrap();
+        let second = parsed_content.targets.get(1).unwrap();
         assert_eq!(second.value, "another.Model");
         assert_eq!(second.line, 5);
         assert_eq!(second.key_start, 2);
@@ -1235,11 +1376,15 @@ training:
       - _target_: package.debug.Logger
         project_name: my_project
 "#;
-        let (targets, line_map) = YamlParser::parse(content).unwrap();
-        assert_eq!(targets.len(), 1, "Should have 1 target");
-        assert_eq!(line_map.len(), 1, "Line map should have 1 entry");
+        let parsed_content = YamlParser::parse(content).unwrap();
+        assert_eq!(parsed_content.targets.len(), 1, "Should have 1 target");
+        assert_eq!(
+            parsed_content.line_map.len(),
+            1,
+            "Line map should have 1 entry"
+        );
 
-        let target = targets.first().unwrap();
+        let target = parsed_content.targets.first().unwrap();
         assert_eq!(target.value, "package.debug.Logger");
         assert_eq!(target.line, 5);
         assert_eq!(target.key_start, 8);
@@ -1253,8 +1398,8 @@ model:
   _target_:
   hidden_size: 256
 "#;
-        let (targets, _) = YamlParser::parse(content).unwrap();
-        assert_eq!(targets.len(), 0, "Should have 0 targets");
+        let parsed_content = YamlParser::parse(content).unwrap();
+        assert_eq!(parsed_content.targets.len(), 0, "Should have 0 targets");
     }
 
     #[test]
@@ -1268,9 +1413,9 @@ another:
   _target_: myproject.Model
   param: value
 "#;
-        let (targets, _) = YamlParser::parse(content).unwrap();
-        assert_eq!(targets.len(), 1, "Should have 1 target");
-        let target = targets.first().unwrap();
+        let parsed_content = YamlParser::parse(content).unwrap();
+        assert_eq!(parsed_content.targets.len(), 1, "Should have 1 target");
+        let target = parsed_content.targets.first().unwrap();
         assert_eq!(target.value, "myproject.Model");
         assert_eq!(target.line, 5);
         assert_eq!(target.key_start, 2);
@@ -1284,8 +1429,8 @@ model:
   _target_: # comment
   hidden_size: 256
 "#;
-        let (targets, _) = YamlParser::parse(content).unwrap();
-        assert_eq!(targets.len(), 0, "Should have 0 targets");
+        let parsed_content = YamlParser::parse(content).unwrap();
+        assert_eq!(parsed_content.targets.len(), 0, "Should have 0 targets");
     }
 
     #[test]
@@ -1299,9 +1444,9 @@ another:
   _target_: myproject.Model
   param: value
 "#;
-        let (targets, _) = YamlParser::parse(content).unwrap();
-        assert_eq!(targets.len(), 1, "Should have 1 target");
-        let target = targets.first().unwrap();
+        let parsed_content = YamlParser::parse(content).unwrap();
+        assert_eq!(parsed_content.targets.len(), 1, "Should have 1 target");
+        let target = parsed_content.targets.first().unwrap();
         assert_eq!(target.value, "myproject.Model");
         assert_eq!(target.line, 5);
         assert_eq!(target.key_start, 2);
@@ -1377,10 +1522,10 @@ model:
   _target_": myproject.Model
   hidden_size: 256
 "#;
-        let (targets, _) = YamlParser::parse(content).unwrap();
+        let parsed_content = YamlParser::parse(content).unwrap();
         // Should not find the target because there's an unexpected quote
         assert_eq!(
-            targets.len(),
+            parsed_content.targets.len(),
             0,
             "Should not find target with invalid closing quote"
         );
@@ -1426,10 +1571,10 @@ model:
   _target_: "myproject.Model"
   hidden_size: 256
 "#;
-        let (targets, _) = YamlParser::parse(content).unwrap();
-        assert_eq!(targets.len(), 1);
+        let parsed_content = YamlParser::parse(content).unwrap();
+        assert_eq!(parsed_content.targets.len(), 1);
 
-        let target = targets.first().unwrap();
+        let target = parsed_content.targets.first().unwrap();
         assert_eq!(target.value, "myproject.Model");
         assert_eq!(target.line, 2);
         // value_start should point to the first character of the actual value (after the quote)
@@ -1444,10 +1589,10 @@ model:
   _target_: 'myproject.Model'
   hidden_size: 256
 "#;
-        let (targets, _) = YamlParser::parse(content).unwrap();
-        assert_eq!(targets.len(), 1);
+        let parsed_content = YamlParser::parse(content).unwrap();
+        assert_eq!(parsed_content.targets.len(), 1);
 
-        let target = targets.first().unwrap();
+        let target = parsed_content.targets.first().unwrap();
         assert_eq!(target.value, "myproject.Model");
         assert_eq!(target.line, 2);
         // value_start should point to the first character of the actual value (after the quote)
@@ -1462,10 +1607,10 @@ model:
   "_target_": "myproject.Model"
   hidden_size: 256
 "#;
-        let (targets, _) = YamlParser::parse(content).unwrap();
-        assert_eq!(targets.len(), 1);
+        let parsed_content = YamlParser::parse(content).unwrap();
+        assert_eq!(parsed_content.targets.len(), 1);
 
-        let target = targets.first().unwrap();
+        let target = parsed_content.targets.first().unwrap();
         assert_eq!(target.value, "myproject.Model");
         assert_eq!(target.line, 2);
         assert_eq!(target.key_start, 2); // Position of opening quote of key
@@ -1744,8 +1889,8 @@ items:
         // Parse and verify all targets are found
         let result = YamlParser::parse(yaml);
         assert!(result.is_ok());
-        let (targets, _) = result.unwrap();
-        assert_eq!(targets.len(), 3); // config._target_, items[0]._target_, items[1]._target_
+        let parsed_content = result.unwrap();
+        assert_eq!(parsed_content.targets.len(), 3); // config._target_, items[0]._target_, items[1]._target_
     }
 
     #[test]
@@ -1775,10 +1920,10 @@ invalid_target_key: this is not a target
 
         let result = YamlParser::parse(yaml);
         assert!(result.is_ok());
-        let (targets, _) = result.unwrap();
+        let parsed_content = result.unwrap();
         // Should only find the one valid target
-        assert_eq!(targets.len(), 1);
-        assert_eq!(targets[0].value, "some.module.Class");
+        assert_eq!(parsed_content.targets.len(), 1);
+        assert_eq!(parsed_content.targets[0].value, "some.module.Class");
     }
 
     #[test]
@@ -1789,9 +1934,9 @@ invalid_target_key: this is not a target
 
         let result = YamlParser::parse(yaml);
         assert!(result.is_ok());
-        let (targets, _) = result.unwrap();
-        assert_eq!(targets.len(), 1);
-        assert_eq!(targets[0].value, "some.module.Class");
+        let parsed_content = result.unwrap();
+        assert_eq!(parsed_content.targets.len(), 1);
+        assert_eq!(parsed_content.targets[0].value, "some.module.Class");
     }
 
     #[test]
@@ -1802,9 +1947,9 @@ invalid_target_key: this is not a target
 
         let result = YamlParser::parse(yaml);
         assert!(result.is_ok());
-        let (targets, _) = result.unwrap();
-        assert_eq!(targets.len(), 1);
-        assert_eq!(targets[0].value, "some.module.Class");
+        let parsed_content = result.unwrap();
+        assert_eq!(parsed_content.targets.len(), 1);
+        assert_eq!(parsed_content.targets[0].value, "some.module.Class");
     }
 
     #[test]
@@ -1822,28 +1967,41 @@ training:
     partial_optimizer:
       _target_: made.up.mod
 "#;
-        let (targets, _line_map) = YamlParser::parse(content).unwrap();
+        let parsed_content = YamlParser::parse(content).unwrap();
 
-        assert_eq!(targets.len(), 3, "Should have 3 targets total");
+        assert_eq!(
+            parsed_content.targets.len(),
+            3,
+            "Should have 3 targets total"
+        );
 
         // Expected order based on document line order
         assert_eq!(
-            targets[0].value, "made.up.Module",
+            parsed_content.targets[0].value, "made.up.Module",
             "First target should be made.up.Module"
         );
-        assert_eq!(targets[0].line, 3, "First target should be on line 3");
+        assert_eq!(
+            parsed_content.targets[0].line, 3,
+            "First target should be on line 3"
+        );
 
         assert_eq!(
-            targets[1].value, "DataLoader",
+            parsed_content.targets[1].value, "DataLoader",
             "Second target should be DataLoader"
         );
-        assert_eq!(targets[1].line, 7, "Second target should be on line 7");
+        assert_eq!(
+            parsed_content.targets[1].line, 7,
+            "Second target should be on line 7"
+        );
 
         assert_eq!(
-            targets[2].value, "made.up.mod",
+            parsed_content.targets[2].value, "made.up.mod",
             "Third target should be made.up.mod"
         );
-        assert_eq!(targets[2].line, 11, "Third target should be on line 11");
+        assert_eq!(
+            parsed_content.targets[2].line, 11,
+            "Third target should be on line 11"
+        );
     }
 
     #[test]
@@ -1859,9 +2017,9 @@ my_module:
   another: 123
   # comment
 "#;
-        let (targets, _) = YamlParser::parse(content).unwrap();
-        assert_eq!(targets.len(), 1);
-        let target = &targets[0];
+        let parsed_content = YamlParser::parse(content).unwrap();
+        assert_eq!(parsed_content.targets.len(), 1);
+        let target = &parsed_content.targets[0];
         assert_eq!(target.line, 5);
 
         // Verify each parameter has the correct line
@@ -1880,9 +2038,9 @@ my_module:
   batch_size: 32
   _target_: myproject.Model
 "#;
-        let (targets, _) = YamlParser::parse(content).unwrap();
-        assert_eq!(targets.len(), 1);
-        let target = &targets[0];
+        let parsed_content = YamlParser::parse(content).unwrap();
+        assert_eq!(parsed_content.targets.len(), 1);
+        let target = &parsed_content.targets[0];
 
         let find_param = |key: &str| target.parameters.iter().find(|p| p.key == key).unwrap();
         assert_eq!(find_param("shuffle").line, 2, "shuffle should be on line 2");
@@ -1890,6 +2048,317 @@ my_module:
             find_param("batch_size").line,
             3,
             "batch_size should be on line 3"
+        );
+    }
+
+    // ==================== parsing _partial_ tests ====================
+    #[test]
+    fn test_partial_true_sets_is_partial_and_excludes_parameter() {
+        let content = r#"
+model:
+  _target_: myproject.Model
+  _partial_: true
+  hidden_size: 256
+"#;
+        let parsed_content = YamlParser::parse(content).unwrap();
+        assert_eq!(parsed_content.targets.len(), 1);
+
+        let target = &parsed_content.targets[0];
+        assert_eq!(target.value, "myproject.Model");
+        assert!(
+            target.is_partial,
+            "Expected is_partial=true when _partial_: true"
+        );
+        assert!(
+            target.parameters.iter().all(|p| p.key != PARTIAL_KEY),
+            "_partial_ should not be included in parameters"
+        );
+
+        let hidden = target
+            .parameters
+            .iter()
+            .find(|p| p.key == "hidden_size")
+            .expect("Expected hidden_size parameter");
+        assert_eq!(hidden.line, 4);
+        match hidden.value {
+            YamlValue::Integer(v) => assert_eq!(v, 256),
+            _ => panic!("Expected Integer value for hidden_size"),
+        }
+    }
+
+    #[test]
+    fn test_partial_before_target_still_applies() {
+        let content = r#"
+model:
+  _partial_: true
+  _target_: myproject.Model
+  hidden_size: 256
+"#;
+        let parsed_content = YamlParser::parse(content).unwrap();
+        assert_eq!(parsed_content.targets.len(), 1);
+
+        let target = &parsed_content.targets[0];
+        assert_eq!(target.value, "myproject.Model");
+        assert_eq!(target.line, 3, "_target_ should be on line 3");
+        assert!(
+            target.is_partial,
+            "Expected is_partial=true when _partial_ precedes _target_"
+        );
+        assert!(
+            target.parameters.iter().all(|p| p.key != PARTIAL_KEY),
+            "_partial_ should not be included in parameters"
+        );
+    }
+
+    #[test]
+    fn test_partial_false_or_missing_defaults_to_false() {
+        // Missing _partial_
+        let content_missing = r#"
+model:
+  _target_: myproject.Model
+  hidden_size: 256
+"#;
+        let parsed_missing = YamlParser::parse(content_missing).unwrap();
+        assert_eq!(parsed_missing.targets.len(), 1);
+        assert!(
+            !parsed_missing.targets[0].is_partial,
+            "Expected is_partial=false when _partial_ is absent"
+        );
+
+        // Explicit _partial_: false
+        let content_false = r#"
+model:
+  _target_: myproject.Model
+  _partial_: false
+  hidden_size: 256
+"#;
+        let parsed_false = YamlParser::parse(content_false).unwrap();
+        assert_eq!(parsed_false.targets.len(), 1);
+        assert!(
+            !parsed_false.targets[0].is_partial,
+            "Expected is_partial=false when _partial_: false"
+        );
+    }
+
+    #[test]
+    fn test_partial_non_bool_value_is_treated_as_false() {
+        // Quoted "true" is a string, not a YAML bool.
+        let content = r#"
+model:
+  _target_: myproject.Model
+  _partial_: "true"
+  hidden_size: 256
+"#;
+        let parsed_content = YamlParser::parse(content).unwrap();
+        assert_eq!(parsed_content.targets.len(), 1);
+
+        let target = &parsed_content.targets[0];
+        assert_eq!(target.value, "myproject.Model");
+        assert!(
+            !target.is_partial,
+            "Expected is_partial=false when _partial_ is a string"
+        );
+    }
+
+    #[test]
+    fn test_partial_does_not_create_target_without_target_key() {
+        let content = r#"
+model:
+  _partial_: true
+  hidden_size: 256
+"#;
+        let parsed_content = YamlParser::parse(content).unwrap();
+        assert_eq!(
+            parsed_content.targets.len(),
+            0,
+            "Should not create a target when _target_ is missing"
+        );
+    }
+
+    #[test]
+    fn test_partial_in_list_items() {
+        let content = r#"
+items:
+  - _target_: a.b.C
+    _partial_: true
+  - _partial_: true
+    _target_: a.b.D
+"#;
+        let parsed_content = YamlParser::parse(content).unwrap();
+        assert_eq!(
+            parsed_content.targets.len(),
+            2,
+            "Should find two list item targets"
+        );
+
+        let first = &parsed_content.targets[0];
+        assert_eq!(first.value, "a.b.C");
+        assert_eq!(first.line, 2);
+        assert_eq!(first.key_start, 4, "Key should start after `  - `");
+        assert!(first.is_partial);
+
+        let second = &parsed_content.targets[1];
+        assert_eq!(second.value, "a.b.D");
+        assert_eq!(second.line, 5);
+        assert_eq!(
+            second.key_start, 4,
+            "Key should start after indentation for list item mapping"
+        );
+        assert!(second.is_partial);
+    }
+
+    #[test]
+    fn test_partial_nested_targets_independent_flags() {
+        let content = r#"
+outer:
+  _target_: pkg.Outer
+  _partial_: true
+  inner:
+    _target_: pkg.Inner
+    _partial_: false
+"#;
+        let parsed_content = YamlParser::parse(content).unwrap();
+        assert_eq!(parsed_content.targets.len(), 2);
+
+        let outer = &parsed_content.targets[0];
+        assert_eq!(outer.value, "pkg.Outer");
+        assert!(outer.is_partial);
+
+        let inner = &parsed_content.targets[1];
+        assert_eq!(inner.value, "pkg.Inner");
+        assert!(!inner.is_partial);
+    }
+
+    // ==================== suppression comment tests ====================
+
+    #[test]
+    fn test_file_suppression_in_header() {
+        let content = "\
+# hydrust: ignore[missing-argument, unknown-argument]
+# @hydra
+db:
+  _target_: my_module.DB
+  host: localhost
+";
+        let parsed_content = YamlParser::parse(content).unwrap();
+        assert_eq!(parsed_content.targets.len(), 1);
+        assert!(
+            parsed_content
+                .file_suppressions
+                .contains(&DiagnosticRule::MissingArgument)
+        );
+        assert!(
+            parsed_content
+                .file_suppressions
+                .contains(&DiagnosticRule::UnknownArgument)
+        );
+        assert!(parsed_content.targets[0].suppressed_rules.is_empty());
+    }
+
+    #[test]
+    fn test_file_suppression_with_blanks_in_header() {
+        let content = "\
+# hydrust: ignore[unresolved-import]
+
+# @hydra
+
+db:
+  _target_: my_module.DB
+";
+        let parsed_content = YamlParser::parse(content).unwrap();
+        assert_eq!(parsed_content.targets.len(), 1);
+        assert!(
+            parsed_content
+                .file_suppressions
+                .contains(&DiagnosticRule::UnresolvedImport)
+        );
+    }
+
+    #[test]
+    fn test_inline_suppression_on_target_line() {
+        let content = "\
+db:
+  _target_: my_module.DB # hydrust: ignore[invalid-target]
+  host: localhost
+";
+        let parsed_content = YamlParser::parse(content).unwrap();
+        assert_eq!(parsed_content.targets.len(), 1);
+        assert!(
+            parsed_content.targets[0]
+                .suppressed_rules
+                .contains(&DiagnosticRule::InvalidTarget)
+        );
+        assert!(parsed_content.file_suppressions.is_empty());
+    }
+
+    #[test]
+    fn test_inline_suppression_on_parameter_line() {
+        let content = "\
+db:
+  _target_: my_module.DB
+  host: localhost # hydrust: ignore[unknown-argument]
+";
+        let parsed_content = YamlParser::parse(content).unwrap();
+        assert_eq!(parsed_content.targets.len(), 1);
+        let param = parsed_content.targets[0]
+            .parameters
+            .iter()
+            .find(|p| p.key == "host")
+            .unwrap();
+        assert!(
+            param
+                .suppressed_rules
+                .contains(&DiagnosticRule::UnknownArgument)
+        );
+    }
+
+    #[test]
+    fn test_suppression_comment_after_content_not_file_wide() {
+        // A suppression comment that appears after YAML content starts
+        // should NOT be treated as file-wide.
+        let content = "\
+db:
+  _target_: my_module.DB
+# hydrust: ignore[missing-argument]
+  host: localhost
+";
+        let parsed_content = YamlParser::parse(content).unwrap();
+        assert_eq!(parsed_content.targets.len(), 1);
+        assert!(parsed_content.file_suppressions.is_empty());
+    }
+
+    #[test]
+    fn test_invalid_suppression_rule_ignored() {
+        let content = "\
+# hydrust: ignore[fake-rule]
+db:
+  _target_: my_module.DB
+";
+        let parsed_content = YamlParser::parse(content).unwrap();
+        assert_eq!(parsed_content.targets.len(), 1);
+        assert!(parsed_content.file_suppressions.is_empty());
+    }
+    #[test]
+    fn test_file_suppression_multiple_header_comment_lines() {
+        let content = "\
+# hydrust: ignore[missing-argument]
+  # hydrust: ignore[unknown-argument]
+# @hydra
+
+db:
+  _target_: my_module.DB
+  host: localhost
+";
+        let parsed_content = YamlParser::parse(content).unwrap();
+        assert!(
+            parsed_content
+                .file_suppressions
+                .contains(&DiagnosticRule::MissingArgument)
+        );
+        assert!(
+            parsed_content
+                .file_suppressions
+                .contains(&DiagnosticRule::UnknownArgument)
         );
     }
 }

@@ -3,4 +3,4 @@ source: tests/diagnostics.rs
 expression: "format!(\"Message: {}\\nCode: '{}'\", diag.message, extract_code(diag))"
 ---
 Message: Could not resolve module: 'nonexistent.module'
-Code: 'module-not-found'
+Code: 'unresolved-import'

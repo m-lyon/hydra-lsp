@@ -5,16 +5,20 @@
 
 use std::fmt;
 use std::fs;
+use std::io::stderr;
 use std::path::{Path, PathBuf};
+use std::process;
 
 use clap::{Parser, ValueEnum};
 use colored::Colorize;
 use tower_lsp::lsp_types::DiagnosticSeverity;
 use tracing::{Level, debug, error, info, warn};
 
-use hydra_lsp::diagnostics::validate_document;
+use hydra_lsp::diagnostics::{DiagnosticRule, validate_document};
 use hydra_lsp::python_analyzer::PythonAnalyzer;
 use hydra_lsp::yaml_parser::YamlParser;
+
+use std::collections::HashSet;
 
 /// CLI tool for diagnosing Hydra YAML configuration files
 #[derive(Parser)]
@@ -44,6 +48,11 @@ struct Args {
     /// Show detailed resolution steps for each target
     #[arg(long)]
     trace_resolution: bool,
+
+    /// Disable a diagnostic rule (can be repeated). Valid rules: missing-argument,
+    /// unknown-argument, unresolved-reference, unresolved-import, invalid-target
+    #[arg(long = "disable-rule", value_name = "RULE")]
+    disable_rules: Vec<String>,
 }
 
 struct OptionalPath<'a>(Option<&'a PathBuf>);
@@ -66,6 +75,7 @@ impl fmt::Debug for Args {
             .field("verbosity", &self.verbosity)
             .field("format", &self.format)
             .field("trace_resolution", &self.trace_resolution)
+            .field("disable_rules", &self.disable_rules)
             .finish()
     }
 }
@@ -113,7 +123,7 @@ fn main() {
     let level: Level = args.verbosity.into();
     tracing_subscriber::fmt()
         .with_max_level(level)
-        .with_writer(std::io::stderr)
+        .with_writer(stderr)
         .with_ansi(true)
         .init();
 
@@ -122,11 +132,11 @@ fn main() {
 
     // Run the main logic and handle errors
     match run(&args) {
-        Ok(exit_code) => std::process::exit(exit_code),
+        Ok(exit_code) => process::exit(exit_code),
         Err(e) => {
             error!("Fatal error: {}", e);
             eprintln!("{}: {}", "Error".red().bold(), e);
-            std::process::exit(2);
+            process::exit(2);
         }
     }
 }
@@ -160,6 +170,29 @@ fn run(args: &Args) -> anyhow::Result<i32> {
         info!("Python interpreter: {}", py);
     }
 
+    // Parse disabled rules
+    let mut disabled_rules = HashSet::new();
+    for rule_str in &args.disable_rules {
+        match DiagnosticRule::from_code(rule_str) {
+            Some(rule) => {
+                disabled_rules.insert(rule);
+            }
+            None => {
+                warn!("Unknown diagnostic rule: '{}', ignoring", rule_str);
+                eprintln!(
+                    "{}: Unknown diagnostic rule '{}'. Valid rules: {}",
+                    "Warning".yellow().bold(),
+                    rule_str,
+                    DiagnosticRule::all()
+                        .iter()
+                        .map(|r| r.as_code())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+        }
+    }
+
     // Read file content
     let content = fs::read_to_string(&file_path)?;
     debug!("File content length: {} bytes", content.len());
@@ -175,7 +208,7 @@ fn run(args: &Args) -> anyhow::Result<i32> {
 
     // Parse YAML and extract targets
     info!("Parsing YAML content...");
-    let (targets, _line_map) = match YamlParser::parse(&content) {
+    let mut parsed_content = match YamlParser::parse(&content) {
         Ok(result) => result,
         Err(e) => {
             error!("Failed to parse YAML: {}", e);
@@ -184,12 +217,15 @@ fn run(args: &Args) -> anyhow::Result<i32> {
         }
     };
 
-    info!("Found {} _target_ definitions", targets.len());
+    info!(
+        "Found {} _target_ definitions",
+        parsed_content.targets.len()
+    );
 
     // If trace_resolution is enabled, show detailed info for each target
     if args.trace_resolution {
         println!("\n{}", "=== Target Resolution Trace ===".cyan().bold());
-        for (i, target) in targets.iter().enumerate() {
+        for (i, target) in parsed_content.targets.iter().enumerate() {
             trace_target_resolution(
                 i,
                 target,
@@ -202,8 +238,9 @@ fn run(args: &Args) -> anyhow::Result<i32> {
 
     // Run diagnostics
     info!("Running diagnostics...");
+    parsed_content.file_suppressions.extend(disabled_rules);
     let diagnostics = validate_document(
-        targets.clone(),
+        parsed_content,
         workspace_root.as_deref(),
         python_interpreter.as_deref(),
     );

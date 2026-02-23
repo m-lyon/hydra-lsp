@@ -1,8 +1,9 @@
 # Changelog
 
-## [0.1.6]
+## [0.2.0]
 
 - Refactored `yaml` parsing from `serde_yaml` to `saphyr`
+- Added suppression comments
 
 ## [0.1.5]
 
