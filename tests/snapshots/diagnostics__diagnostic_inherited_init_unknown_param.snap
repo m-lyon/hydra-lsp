@@ -4,4 +4,4 @@ expression: "format!(\"Message: {}\\nSeverity: {:?}\\nCode: '{}'\", diag.message
 ---
 Message: Unknown parameter 'unknown_param' for '__init__'
 Severity: Error
-Code: 'unknown-parameter'
+Code: 'unknown-argument'

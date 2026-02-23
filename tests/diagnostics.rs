@@ -1,5 +1,6 @@
 mod common;
 
+use std::fs;
 use tower_lsp::lsp_types::*;
 
 use crate::common::*;
@@ -20,7 +21,7 @@ async fn test_diagnostics_multiple_errors() {
     let mut ctx = TestContext::new(TestWorkspace::Diagnostics);
     ctx.initialize().await;
 
-    let content = std::fs::read_to_string(ctx.workspace.path().join("config.yaml")).unwrap();
+    let content = fs::read_to_string(ctx.workspace.path().join("config.yaml")).unwrap();
     ctx.open_document("config.yaml", content).await;
 
     // Receive diagnostics
@@ -56,7 +57,7 @@ async fn test_diagnostics_unknown_param() {
     let mut ctx = TestContext::new(TestWorkspace::Diagnostics);
     ctx.initialize().await;
 
-    let content = std::fs::read_to_string(ctx.workspace.path().join("config.yaml")).unwrap();
+    let content = fs::read_to_string(ctx.workspace.path().join("config.yaml")).unwrap();
     ctx.open_document("config.yaml", content).await;
 
     let dp = ctx.recv::<PublishDiagnosticsParams>().await;
@@ -145,7 +146,7 @@ model:
         assert_eq!(diag.severity, Some(DiagnosticSeverity::ERROR));
         assert_eq!(
             diag.code,
-            Some(NumberOrString::String("module-not-found".to_string()))
+            Some(NumberOrString::String("unresolved-import".to_string()))
         );
         insta::assert_snapshot!(
             "diagnostic_module_not_found",
@@ -184,7 +185,7 @@ model:
         assert_eq!(diag.severity, Some(DiagnosticSeverity::ERROR));
         assert_eq!(
             diag.code,
-            Some(NumberOrString::String("symbol-not-found".to_string()))
+            Some(NumberOrString::String("unresolved-reference".to_string()))
         );
         insta::assert_snapshot!(
             "diagnostic_symbol_not_found",
@@ -243,7 +244,7 @@ def flexible_function(required_param: str, **kwargs):
     """Function that accepts any additional keyword arguments."""
     pass
 "#;
-    std::fs::write(ctx.workspace.path().join("kwargs_module.py"), py_content).unwrap();
+    fs::write(ctx.workspace.path().join("kwargs_module.py"), py_content).unwrap();
 
     let yaml_content = r#"# @hydra
 model:
@@ -294,7 +295,7 @@ async fn test_nested_diagnostics_all_valid() {
     let mut ctx = TestContext::new(TestWorkspace::Nested);
     ctx.initialize().await;
 
-    let content = std::fs::read_to_string(ctx.workspace.path().join("config.yaml")).unwrap();
+    let content = fs::read_to_string(ctx.workspace.path().join("config.yaml")).unwrap();
     ctx.open_document("config.yaml", content).await;
 
     let dp = ctx.recv::<PublishDiagnosticsParams>().await;
@@ -323,7 +324,7 @@ async fn test_nested_diagnostics_all_errors() {
     let mut ctx = TestContext::new(TestWorkspace::Nested);
     ctx.initialize().await;
 
-    let content = std::fs::read_to_string(ctx.workspace.path().join("config.yaml")).unwrap();
+    let content = fs::read_to_string(ctx.workspace.path().join("config.yaml")).unwrap();
     ctx.open_document("config.yaml", content).await;
 
     let dp = ctx.recv::<PublishDiagnosticsParams>().await;

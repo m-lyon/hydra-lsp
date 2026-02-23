@@ -4,4 +4,4 @@ expression: "format!(\"Message: {}\\nSeverity: {:?}\\nCode: '{}'\", diag.message
 ---
 Message: Missing required parameter 'name' for '__init__'
 Severity: Error
-Code: 'missing-parameter'
+Code: 'missing-argument'

@@ -2,13 +2,13 @@
 source: tests/diagnostics.rs
 expression: summary
 ---
-- code: module-not-found
+- code: unresolved-import
   end_char: 28
   line: 3
   message: "Could not resolve module: 'made.up'"
   severity: Error
   start_char: 14
-- code: module-not-found
+- code: unresolved-import
   end_char: 27
   line: 11
   message: "Could not resolve module: 'made.up'"
