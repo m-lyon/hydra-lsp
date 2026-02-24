@@ -73,7 +73,11 @@ pub struct ParameterInfo {
 
 impl ParameterInfo {
     pub fn is_required(&self) -> bool {
-        !self.has_default && !self.is_variadic && !self.is_variadic_keyword && self.name != "self"
+        !self.has_default
+            && !self.is_variadic
+            && !self.is_variadic_keyword
+            && self.name != "self"
+            && self.name != "cls"
     }
 }
 

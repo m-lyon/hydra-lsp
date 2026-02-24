@@ -148,7 +148,7 @@ fn validate_parameters(
     let expected_params: HashSet<String> = signature
         .parameters
         .iter()
-        .filter(|p| p.name != "self" && !p.is_variadic && !p.is_variadic_keyword)
+        .filter(|p| p.name != "self" && p.name != "cls" && !p.is_variadic && !p.is_variadic_keyword)
         .map(|p| p.name.clone())
         .collect();
 
@@ -459,6 +459,110 @@ mod tests {
                 .any(|d| d.severity == Some(DiagnosticSeverity::HINT))
         );
         assert!(diagnostics.iter().any(|d| d.message.contains("**kwargs")));
+    }
+
+    #[test]
+    fn test_classmethod_cls_not_required() {
+        // cls should not be reported as a missing required parameter for classmethods
+        let target_info = make_target("my.Class.from_config", Vec::new(), 0, 0, 0, false);
+
+        let signature = FunctionSignature {
+            name: "from_config".to_string(),
+            parameters: vec![
+                ParameterInfo {
+                    name: "cls".to_string(),
+                    type_annotation: None,
+                    default_value: None,
+                    has_default: false,
+                    is_variadic: false,
+                    is_variadic_keyword: false,
+                    is_keyword_only: false,
+                },
+                ParameterInfo {
+                    name: "config_path".to_string(),
+                    type_annotation: Some("str".to_string()),
+                    default_value: None,
+                    has_default: false,
+                    is_variadic: false,
+                    is_variadic_keyword: false,
+                    is_keyword_only: false,
+                },
+            ],
+            return_type: None,
+            docstring: None,
+            start_line: 1,
+            start_column: 1,
+            end_line: 1,
+            end_column: 1,
+        };
+
+        let diagnostics = validate_parameters(&target_info, &signature, &HashSet::new());
+        // Should only report missing 'config_path', not 'cls'
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "Expected 1 diagnostic, got: {:?}",
+            diagnostics
+        );
+        assert!(
+            diagnostics[0].message.contains("config_path"),
+            "Should report missing 'config_path', not 'cls': {}",
+            diagnostics[0].message
+        );
+        assert!(
+            !diagnostics[0].message.contains("cls"),
+            "Should not mention 'cls' as missing: {}",
+            diagnostics[0].message
+        );
+    }
+
+    #[test]
+    fn test_classmethod_cls_not_unknown_param() {
+        // cls should not appear in expected params, so providing it should be flagged as unknown
+        // But more importantly, not providing it should not be an error
+        let params = vec![make_param(
+            "config_path",
+            YamlValue::String("path/to/config".to_string()),
+            2,
+        )];
+        let target_info = make_target("my.Class.from_config", params, 0, 0, 0, false);
+
+        let signature = FunctionSignature {
+            name: "from_config".to_string(),
+            parameters: vec![
+                ParameterInfo {
+                    name: "cls".to_string(),
+                    type_annotation: None,
+                    default_value: None,
+                    has_default: false,
+                    is_variadic: false,
+                    is_variadic_keyword: false,
+                    is_keyword_only: false,
+                },
+                ParameterInfo {
+                    name: "config_path".to_string(),
+                    type_annotation: Some("str".to_string()),
+                    default_value: None,
+                    has_default: false,
+                    is_variadic: false,
+                    is_variadic_keyword: false,
+                    is_keyword_only: false,
+                },
+            ],
+            return_type: None,
+            docstring: None,
+            start_line: 1,
+            start_column: 1,
+            end_line: 1,
+            end_column: 1,
+        };
+
+        let diagnostics = validate_parameters(&target_info, &signature, &HashSet::new());
+        assert!(
+            diagnostics.is_empty(),
+            "Should have no diagnostics when all required params are provided, but got: {:?}",
+            diagnostics
+        );
     }
 
     // ==================== validate_target tests ====================

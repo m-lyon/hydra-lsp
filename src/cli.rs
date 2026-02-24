@@ -361,7 +361,7 @@ fn format_signature_brief(sig: &hydra_lsp::python_analyzer::FunctionSignature) -
     let params: Vec<String> = sig
         .parameters
         .iter()
-        .filter(|p| p.name != "self")
+        .filter(|p| p.name != "self" && p.name != "cls")
         .map(|p| {
             let mut s = p.name.clone();
             if let Some(ref ty) = p.type_annotation {
