@@ -39,9 +39,12 @@ fn to_parameter_information(p: &ParameterInfo) -> ParameterInformation {
 /// Build signature label and parameter information from a list of parameters
 fn build_signature_params(
     params: &[ParameterInfo],
-    filter_param: &str,
+    filter_param: Option<&str>,
 ) -> (String, Vec<ParameterInformation>) {
-    let filtered: Vec<_> = params.iter().filter(|p| p.name != filter_param).collect();
+    let filtered: Vec<_> = params
+        .iter()
+        .filter(|p| filter_param.map_or(true, |f| p.name != f))
+        .collect();
     let param_strs: Vec<String> = filtered.iter().map(|p| format_param_label(p)).collect();
     let param_infos: Vec<ParameterInformation> = filtered
         .iter()
@@ -514,21 +517,18 @@ impl LanguageServer for HydraLspBackend {
 
         match extract_result {
             Ok((definition_info, _file_path, _module_path, _symbol_name)) => {
-                let implicit_param = definition_info
-                    .implicit_param()
-                    .map(String::from)
-                    .unwrap_or_default();
-                let (signature_label, parameters, doc_string) = match definition_info {
+                let implicit_param = definition_info.implicit_param();
+                let (signature_label, parameters, doc_string) = match &definition_info {
                     DefinitionInfo::Function(sig) => {
                         let (params_str, params) =
-                            build_signature_params(&sig.parameters, &implicit_param);
+                            build_signature_params(&sig.parameters, implicit_param);
                         let label = format!("{}({})", sig.name, params_str);
                         (label, params, sig.docstring.clone())
                     }
                     DefinitionInfo::Class(class_info) => {
                         if let Some(init_sig) = &class_info.init_signature {
                             let (params_str, params) =
-                                build_signature_params(&init_sig.parameters, &implicit_param);
+                                build_signature_params(&init_sig.parameters, implicit_param);
                             let label = format!("{}({})", class_info.name, params_str);
                             (label, params, class_info.docstring.clone())
                         } else {
@@ -539,7 +539,7 @@ impl LanguageServer for HydraLspBackend {
                     DefinitionInfo::Method(method_info) => {
                         let sig = &method_info.signature;
                         let (params_str, params) =
-                            build_signature_params(&sig.parameters, &implicit_param);
+                            build_signature_params(&sig.parameters, implicit_param);
                         let label =
                             format!("{}.{}({})", method_info.class_name, sig.name, params_str);
                         (label, params, sig.docstring.clone())
