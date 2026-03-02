@@ -768,3 +768,40 @@ my_module:
         "Diagnostic should be for 'beep'"
     );
 }
+
+#[tokio::test]
+async fn test_diagnostics_classmethod_no_cls_error() {
+    let mut ctx = TestContext::new(TestWorkspace::Diagnostics);
+    ctx.initialize().await;
+
+    // A classmethod target with all required params (except cls) should have no diagnostics
+    let content = r#"# @hydra
+loader:
+  _target_: my_module.DataLoader.from_config
+  config_path: "/path/to/config"
+"#;
+    ctx.open_document("classmethod.yaml", content.to_string())
+        .await;
+
+    let dp = ctx.recv::<PublishDiagnosticsParams>().await;
+    let diagnostics = dp.diagnostics;
+
+    // Should NOT have a diagnostic for missing 'cls'
+    let cls_diagnostics: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.message.contains("cls"))
+        .collect();
+
+    assert!(
+        cls_diagnostics.is_empty(),
+        "Should not report 'cls' as a missing parameter for classmethods, got: {:?}",
+        cls_diagnostics
+    );
+
+    // Should have no diagnostics at all since config_path is provided
+    assert!(
+        diagnostics.is_empty(),
+        "Should have no diagnostics for valid classmethod usage, got: {:?}",
+        diagnostics
+    );
+}

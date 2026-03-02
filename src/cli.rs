@@ -289,13 +289,14 @@ fn trace_target_resolution(
             println!("  {} {}", "Symbol:".dimmed(), symbol_name);
             println!("  {} {}", "Definition found:".green(), file_path.display());
 
-            match def_info {
+            let implicit_param = def_info.implicit_param();
+            match &def_info {
                 hydra_lsp::python_analyzer::DefinitionInfo::Function(sig) => {
                     println!("  {} Function", "Type:".dimmed());
                     println!(
                         "  {} {}",
                         "Signature:".dimmed(),
-                        format_signature_brief(&sig)
+                        format_signature_brief(sig, implicit_param)
                     );
                 }
                 hydra_lsp::python_analyzer::DefinitionInfo::Class(class_info) => {
@@ -304,7 +305,7 @@ fn trace_target_resolution(
                         println!(
                             "  {} {}",
                             "__init__:".dimmed(),
-                            format_signature_brief(init_sig)
+                            format_signature_brief(init_sig, implicit_param)
                         );
                     } else {
                         println!("  {} (no __init__ found)", "__init__:".dimmed());
@@ -327,7 +328,7 @@ fn trace_target_resolution(
                     println!(
                         "  {} {}",
                         "Signature:".dimmed(),
-                        format_signature_brief(&method_info.signature)
+                        format_signature_brief(&method_info.signature, implicit_param)
                     );
                 }
             }
@@ -357,11 +358,14 @@ fn trace_target_resolution(
     }
 }
 
-fn format_signature_brief(sig: &hydra_lsp::python_analyzer::FunctionSignature) -> String {
+fn format_signature_brief(
+    sig: &hydra_lsp::python_analyzer::FunctionSignature,
+    implicit_param: Option<&str>,
+) -> String {
     let params: Vec<String> = sig
         .parameters
         .iter()
-        .filter(|p| p.name != "self")
+        .filter(|p| Some(p.name.as_str()) != implicit_param)
         .map(|p| {
             let mut s = p.name.clone();
             if let Some(ref ty) = p.type_annotation {

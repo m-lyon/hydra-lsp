@@ -4,6 +4,8 @@
 
 - Refactored `yaml` parsing from `serde_yaml` to `saphyr`
 - Added suppression comments
+- Fixed issue where `missing-argument` diagnostic appeared for `cls` in class methods
+- Fixed issue whereby non-conventionally named first arguments would not be filtered out in instance and class methods
 
 ## [0.1.5]
 

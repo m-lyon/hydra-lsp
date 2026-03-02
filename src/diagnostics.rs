@@ -129,10 +129,15 @@ fn validate_target(
     }
 }
 
-/// Validate parameters against a function signature
+/// Validate parameters against a function signature.
+///
+/// `implicit_param` is the name of the implicit first parameter (e.g. `self` / `cls`)
+/// that should be excluded from validation. Pass `None` for plain functions and
+/// static methods.
 fn validate_parameters(
     target_info: &TargetInfo,
     signature: &FunctionSignature,
+    implicit_param: Option<&str>,
     file_suppressions: &HashSet<DiagnosticRule>,
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
@@ -144,11 +149,13 @@ fn validate_parameters(
         .map(|param| param.key.clone())
         .collect();
 
-    // Get expected parameter names from signature (excluding self)
+    // Get expected parameter names from signature (excluding the implicit parameter)
     let expected_params: HashSet<String> = signature
         .parameters
         .iter()
-        .filter(|p| p.name != "self" && !p.is_variadic && !p.is_variadic_keyword)
+        .filter(|p| {
+            Some(p.name.as_str()) != implicit_param && !p.is_variadic && !p.is_variadic_keyword
+        })
         .map(|p| p.name.clone())
         .collect();
 
@@ -179,6 +186,7 @@ fn validate_parameters(
     if !target_info.is_partial {
         for param in &signature.parameters {
             if param.is_required()
+                && Some(param.name.as_str()) != implicit_param
                 && !param_names.contains(&param.name)
                 && !file_suppressions.contains(&DiagnosticRule::MissingArgument)
                 && !target_info
@@ -250,23 +258,28 @@ pub fn validate_document(
         diagnostics.extend(target_diagnostics);
 
         // Try to resolve the target and validate parameters
-        if let Some(definition_info) = definition_info {
+        if let Some(definition_info) = &definition_info {
+            let implicit_param = definition_info.implicit_param();
             let signature = match definition_info {
                 DefinitionInfo::Function(sig) => sig,
                 DefinitionInfo::Class(class_info) => {
                     // For classes, use the __init__ signature if available
-                    if let Some(init_sig) = class_info.init_signature {
+                    if let Some(init_sig) = &class_info.init_signature {
                         init_sig
                     } else {
                         // Class with no __init__, no parameters to validate
                         continue;
                     }
                 }
-                DefinitionInfo::Method(method_info) => method_info.signature,
+                DefinitionInfo::Method(method_info) => &method_info.signature,
             };
 
-            let parameter_diagnostics =
-                validate_parameters(target, &signature, &parsed_content.file_suppressions);
+            let parameter_diagnostics = validate_parameters(
+                target,
+                signature,
+                implicit_param,
+                &parsed_content.file_suppressions,
+            );
             diagnostics.extend(parameter_diagnostics);
         }
         // If Python analysis fails, we've already added a basic validation diagnostic above
@@ -366,7 +379,8 @@ mod tests {
             end_column: 1,
         };
 
-        let diagnostics = validate_parameters(&target_info, &signature, &HashSet::new());
+        let diagnostics =
+            validate_parameters(&target_info, &signature, Some("self"), &HashSet::new());
         assert_eq!(diagnostics.len(), 1);
         assert!(
             diagnostics[0]
@@ -405,7 +419,8 @@ mod tests {
             end_column: 1,
         };
 
-        let diagnostics = validate_parameters(&target_info, &signature, &HashSet::new());
+        let diagnostics =
+            validate_parameters(&target_info, &signature, Some("self"), &HashSet::new());
         assert_eq!(diagnostics.len(), 1);
         assert!(diagnostics[0].message.contains("Unknown parameter"));
         assert_eq!(
@@ -451,7 +466,8 @@ mod tests {
             end_column: 1,
         };
 
-        let diagnostics = validate_parameters(&target_info, &signature, &HashSet::new());
+        let diagnostics =
+            validate_parameters(&target_info, &signature, Some("self"), &HashSet::new());
         // Should be a HINT, not ERROR
         assert!(
             diagnostics
@@ -459,6 +475,253 @@ mod tests {
                 .any(|d| d.severity == Some(DiagnosticSeverity::HINT))
         );
         assert!(diagnostics.iter().any(|d| d.message.contains("**kwargs")));
+    }
+
+    #[test]
+    fn test_classmethod_cls_not_required() {
+        // cls should not be reported as a missing required parameter for classmethods
+        let target_info = make_target("my.Class.from_config", Vec::new(), 0, 0, 0, false);
+
+        let signature = FunctionSignature {
+            name: "from_config".to_string(),
+            parameters: vec![
+                ParameterInfo {
+                    name: "cls".to_string(),
+                    type_annotation: None,
+                    default_value: None,
+                    has_default: false,
+                    is_variadic: false,
+                    is_variadic_keyword: false,
+                    is_keyword_only: false,
+                },
+                ParameterInfo {
+                    name: "config_path".to_string(),
+                    type_annotation: Some("str".to_string()),
+                    default_value: None,
+                    has_default: false,
+                    is_variadic: false,
+                    is_variadic_keyword: false,
+                    is_keyword_only: false,
+                },
+            ],
+            return_type: None,
+            docstring: None,
+            start_line: 1,
+            start_column: 1,
+            end_line: 1,
+            end_column: 1,
+        };
+
+        let diagnostics =
+            validate_parameters(&target_info, &signature, Some("cls"), &HashSet::new());
+        // Should only report missing 'config_path', not 'cls'
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "Expected 1 diagnostic, got: {:?}",
+            diagnostics
+        );
+        assert!(
+            diagnostics[0].message.contains("config_path"),
+            "Should report missing 'config_path', not 'cls': {}",
+            diagnostics[0].message
+        );
+        assert!(
+            !diagnostics[0].message.contains("cls"),
+            "Should not mention 'cls' as missing: {}",
+            diagnostics[0].message
+        );
+    }
+
+    #[test]
+    fn test_classmethod_cls_not_unknown_param() {
+        // cls should not appear in expected params, so providing it should be flagged as unknown
+        // But more importantly, not providing it should not be an error
+        let params = vec![make_param(
+            "config_path",
+            YamlValue::String("path/to/config".to_string()),
+            2,
+        )];
+        let target_info = make_target("my.Class.from_config", params, 0, 0, 0, false);
+
+        let signature = FunctionSignature {
+            name: "from_config".to_string(),
+            parameters: vec![
+                ParameterInfo {
+                    name: "cls".to_string(),
+                    type_annotation: None,
+                    default_value: None,
+                    has_default: false,
+                    is_variadic: false,
+                    is_variadic_keyword: false,
+                    is_keyword_only: false,
+                },
+                ParameterInfo {
+                    name: "config_path".to_string(),
+                    type_annotation: Some("str".to_string()),
+                    default_value: None,
+                    has_default: false,
+                    is_variadic: false,
+                    is_variadic_keyword: false,
+                    is_keyword_only: false,
+                },
+            ],
+            return_type: None,
+            docstring: None,
+            start_line: 1,
+            start_column: 1,
+            end_line: 1,
+            end_column: 1,
+        };
+
+        let diagnostics =
+            validate_parameters(&target_info, &signature, Some("cls"), &HashSet::new());
+        assert!(
+            diagnostics.is_empty(),
+            "Should have no diagnostics when all required params are provided, but got: {:?}",
+            diagnostics
+        );
+    }
+
+    #[test]
+    fn test_non_conventional_self_name_filtered() {
+        // Instance method using "this" instead of "self" should still be filtered
+        let target_info = make_target("my.Class", Vec::new(), 0, 0, 0, false);
+
+        let signature = FunctionSignature {
+            name: "__init__".to_string(),
+            parameters: vec![
+                ParameterInfo {
+                    name: "this".to_string(),
+                    type_annotation: None,
+                    default_value: None,
+                    has_default: false,
+                    is_variadic: false,
+                    is_variadic_keyword: false,
+                    is_keyword_only: false,
+                },
+                ParameterInfo {
+                    name: "value".to_string(),
+                    type_annotation: Some("int".to_string()),
+                    default_value: None,
+                    has_default: false,
+                    is_variadic: false,
+                    is_variadic_keyword: false,
+                    is_keyword_only: false,
+                },
+            ],
+            return_type: None,
+            docstring: None,
+            start_line: 1,
+            start_column: 1,
+            end_line: 1,
+            end_column: 1,
+        };
+
+        // "this" is the implicit first param, so it should be filtered
+        let diagnostics =
+            validate_parameters(&target_info, &signature, Some("this"), &HashSet::new());
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "Expected 1 diagnostic for missing 'value', got: {:?}",
+            diagnostics
+        );
+        assert!(
+            diagnostics[0].message.contains("value"),
+            "Should report missing 'value', not 'this': {}",
+            diagnostics[0].message
+        );
+        assert!(
+            !diagnostics[0].message.contains("this"),
+            "Should not mention 'this' as missing: {}",
+            diagnostics[0].message
+        );
+    }
+
+    #[test]
+    fn test_non_conventional_cls_name_filtered() {
+        // Classmethod using "klass" instead of "cls" should still be filtered
+        let params = vec![make_param(
+            "config_path",
+            YamlValue::String("path".to_string()),
+            2,
+        )];
+        let target_info = make_target("my.Class.from_config", params, 0, 0, 0, false);
+
+        let signature = FunctionSignature {
+            name: "from_config".to_string(),
+            parameters: vec![
+                ParameterInfo {
+                    name: "klass".to_string(),
+                    type_annotation: None,
+                    default_value: None,
+                    has_default: false,
+                    is_variadic: false,
+                    is_variadic_keyword: false,
+                    is_keyword_only: false,
+                },
+                ParameterInfo {
+                    name: "config_path".to_string(),
+                    type_annotation: Some("str".to_string()),
+                    default_value: None,
+                    has_default: false,
+                    is_variadic: false,
+                    is_variadic_keyword: false,
+                    is_keyword_only: false,
+                },
+            ],
+            return_type: None,
+            docstring: None,
+            start_line: 1,
+            start_column: 1,
+            end_line: 1,
+            end_column: 1,
+        };
+
+        // "klass" is the implicit first param, so it should be filtered
+        let diagnostics =
+            validate_parameters(&target_info, &signature, Some("klass"), &HashSet::new());
+        assert!(
+            diagnostics.is_empty(),
+            "Should have no diagnostics when all required params are provided, but got: {:?}",
+            diagnostics
+        );
+    }
+
+    #[test]
+    fn test_staticmethod_no_implicit_param() {
+        // Static methods have no implicit parameter to filter
+        let target_info = make_target("my.Class.create", Vec::new(), 0, 0, 0, false);
+
+        let signature = FunctionSignature {
+            name: "create".to_string(),
+            parameters: vec![ParameterInfo {
+                name: "value".to_string(),
+                type_annotation: Some("int".to_string()),
+                default_value: None,
+                has_default: false,
+                is_variadic: false,
+                is_variadic_keyword: false,
+                is_keyword_only: false,
+            }],
+            return_type: None,
+            docstring: None,
+            start_line: 1,
+            start_column: 1,
+            end_line: 1,
+            end_column: 1,
+        };
+
+        // No implicit param for static methods
+        let diagnostics = validate_parameters(&target_info, &signature, None, &HashSet::new());
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "Expected 1 diagnostic for missing 'value', got: {:?}",
+            diagnostics
+        );
+        assert!(diagnostics[0].message.contains("value"));
     }
 
     // ==================== validate_target tests ====================
@@ -746,7 +1009,8 @@ mod tests {
             end_column: 1,
         };
 
-        let diagnostics = validate_parameters(&target_info, &signature, &HashSet::new());
+        let diagnostics =
+            validate_parameters(&target_info, &signature, Some("self"), &HashSet::new());
         assert!(
             diagnostics.is_empty(),
             "Should have no diagnostics when _partial_: true, but got: {:?}",
@@ -788,7 +1052,8 @@ mod tests {
             end_column: 1,
         };
 
-        let diagnostics = validate_parameters(&target_info, &signature, &HashSet::new());
+        let diagnostics =
+            validate_parameters(&target_info, &signature, Some("self"), &HashSet::new());
         assert_eq!(diagnostics.len(), 1);
         assert!(
             diagnostics[0]
@@ -844,7 +1109,8 @@ mod tests {
             end_column: 1,
         };
 
-        let diagnostics = validate_parameters(&target_info, &signature, &HashSet::new());
+        let diagnostics =
+            validate_parameters(&target_info, &signature, Some("self"), &HashSet::new());
         assert_eq!(diagnostics.len(), 1);
         assert!(diagnostics[0].message.contains("unknown_param"));
         assert!(diagnostics[0].message.contains("Unknown parameter"));

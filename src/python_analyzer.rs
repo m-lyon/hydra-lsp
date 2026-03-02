@@ -73,7 +73,7 @@ pub struct ParameterInfo {
 
 impl ParameterInfo {
     pub fn is_required(&self) -> bool {
-        !self.has_default && !self.is_variadic && !self.is_variadic_keyword && self.name != "self"
+        !self.has_default && !self.is_variadic && !self.is_variadic_keyword
     }
 }
 
@@ -128,6 +128,39 @@ impl DefinitionInfo {
                 info.signature.end_line,
                 info.signature.end_column,
             ),
+        }
+    }
+
+    /// Return the name of the implicit first parameter (e.g. `self` or `cls`) that
+    /// should be excluded from user-facing parameter lists, or `None` when no
+    /// implicit parameter exists.
+    ///
+    /// Rather than hard-coding `"self"` and `"cls"`, this inspects the method
+    /// kind and returns the *actual* name of the first parameter:
+    ///
+    /// * Regular instance methods / `__init__` → first parameter (conventionally `self`)
+    /// * `@classmethod` → first parameter (conventionally `cls`)
+    /// * `@staticmethod` / plain functions → `None`
+    pub fn implicit_param(&self) -> Option<&str> {
+        match self {
+            DefinitionInfo::Function(_) => None,
+            DefinitionInfo::Class(class_info) => class_info
+                .init_signature
+                .as_ref()
+                .and_then(|sig| sig.parameters.first())
+                .map(|p| p.name.as_str()),
+            DefinitionInfo::Method(method_info) => {
+                if method_info.is_staticmethod {
+                    None
+                } else {
+                    // Both instance methods and classmethods have an implicit first param
+                    method_info
+                        .signature
+                        .parameters
+                        .first()
+                        .map(|p| p.name.as_str())
+                }
+            }
         }
     }
 }
@@ -3623,5 +3656,236 @@ mod tests {
         assert_eq!(init_sig.parameters.len(), 3);
         assert_eq!(init_sig.parameters[1].name, "input_size");
         assert_eq!(init_sig.parameters[2].name, "output_size");
+    }
+
+    // ==================== implicit_param tests ====================
+
+    #[test]
+    fn test_implicit_param_function() {
+        let def = DefinitionInfo::Function(FunctionSignature {
+            name: "my_func".to_string(),
+            parameters: vec![ParameterInfo {
+                name: "x".to_string(),
+                type_annotation: None,
+                default_value: None,
+                has_default: false,
+                is_variadic: false,
+                is_variadic_keyword: false,
+                is_keyword_only: false,
+            }],
+            return_type: None,
+            docstring: None,
+            start_line: 0,
+            start_column: 0,
+            end_line: 0,
+            end_column: 0,
+        });
+        assert_eq!(def.implicit_param(), None);
+    }
+
+    #[test]
+    fn test_implicit_param_class_init() {
+        let def = DefinitionInfo::Class(ClassInfo {
+            name: "MyClass".to_string(),
+            base_classes: vec![],
+            docstring: None,
+            init_signature: Some(FunctionSignature {
+                name: "__init__".to_string(),
+                parameters: vec![
+                    ParameterInfo {
+                        name: "self".to_string(),
+                        type_annotation: None,
+                        default_value: None,
+                        has_default: false,
+                        is_variadic: false,
+                        is_variadic_keyword: false,
+                        is_keyword_only: false,
+                    },
+                    ParameterInfo {
+                        name: "value".to_string(),
+                        type_annotation: None,
+                        default_value: None,
+                        has_default: false,
+                        is_variadic: false,
+                        is_variadic_keyword: false,
+                        is_keyword_only: false,
+                    },
+                ],
+                return_type: None,
+                docstring: None,
+                start_line: 0,
+                start_column: 0,
+                end_line: 0,
+                end_column: 0,
+            }),
+            start_line: 0,
+            start_column: 0,
+            end_line: 0,
+            end_column: 0,
+        });
+        assert_eq!(def.implicit_param(), Some("self"));
+    }
+
+    #[test]
+    fn test_implicit_param_class_init_non_conventional() {
+        let def = DefinitionInfo::Class(ClassInfo {
+            name: "MyClass".to_string(),
+            base_classes: vec![],
+            docstring: None,
+            init_signature: Some(FunctionSignature {
+                name: "__init__".to_string(),
+                parameters: vec![ParameterInfo {
+                    name: "this".to_string(),
+                    type_annotation: None,
+                    default_value: None,
+                    has_default: false,
+                    is_variadic: false,
+                    is_variadic_keyword: false,
+                    is_keyword_only: false,
+                }],
+                return_type: None,
+                docstring: None,
+                start_line: 0,
+                start_column: 0,
+                end_line: 0,
+                end_column: 0,
+            }),
+            start_line: 0,
+            start_column: 0,
+            end_line: 0,
+            end_column: 0,
+        });
+        assert_eq!(def.implicit_param(), Some("this"));
+    }
+
+    #[test]
+    fn test_implicit_param_class_no_init() {
+        let def = DefinitionInfo::Class(ClassInfo {
+            name: "MyClass".to_string(),
+            base_classes: vec![],
+            docstring: None,
+            init_signature: None,
+            start_line: 0,
+            start_column: 0,
+            end_line: 0,
+            end_column: 0,
+        });
+        assert_eq!(def.implicit_param(), None);
+    }
+
+    #[test]
+    fn test_implicit_param_instance_method() {
+        let def = DefinitionInfo::Method(MethodInfo {
+            class_name: "MyClass".to_string(),
+            method_name: "do_thing".to_string(),
+            signature: FunctionSignature {
+                name: "do_thing".to_string(),
+                parameters: vec![ParameterInfo {
+                    name: "self".to_string(),
+                    type_annotation: None,
+                    default_value: None,
+                    has_default: false,
+                    is_variadic: false,
+                    is_variadic_keyword: false,
+                    is_keyword_only: false,
+                }],
+                return_type: None,
+                docstring: None,
+                start_line: 0,
+                start_column: 0,
+                end_line: 0,
+                end_column: 0,
+            },
+            is_classmethod: false,
+            is_staticmethod: false,
+        });
+        assert_eq!(def.implicit_param(), Some("self"));
+    }
+
+    #[test]
+    fn test_implicit_param_classmethod() {
+        let def = DefinitionInfo::Method(MethodInfo {
+            class_name: "MyClass".to_string(),
+            method_name: "from_config".to_string(),
+            signature: FunctionSignature {
+                name: "from_config".to_string(),
+                parameters: vec![ParameterInfo {
+                    name: "cls".to_string(),
+                    type_annotation: None,
+                    default_value: None,
+                    has_default: false,
+                    is_variadic: false,
+                    is_variadic_keyword: false,
+                    is_keyword_only: false,
+                }],
+                return_type: None,
+                docstring: None,
+                start_line: 0,
+                start_column: 0,
+                end_line: 0,
+                end_column: 0,
+            },
+            is_classmethod: true,
+            is_staticmethod: false,
+        });
+        assert_eq!(def.implicit_param(), Some("cls"));
+    }
+
+    #[test]
+    fn test_implicit_param_classmethod_non_conventional() {
+        let def = DefinitionInfo::Method(MethodInfo {
+            class_name: "MyClass".to_string(),
+            method_name: "from_config".to_string(),
+            signature: FunctionSignature {
+                name: "from_config".to_string(),
+                parameters: vec![ParameterInfo {
+                    name: "klass".to_string(),
+                    type_annotation: None,
+                    default_value: None,
+                    has_default: false,
+                    is_variadic: false,
+                    is_variadic_keyword: false,
+                    is_keyword_only: false,
+                }],
+                return_type: None,
+                docstring: None,
+                start_line: 0,
+                start_column: 0,
+                end_line: 0,
+                end_column: 0,
+            },
+            is_classmethod: true,
+            is_staticmethod: false,
+        });
+        assert_eq!(def.implicit_param(), Some("klass"));
+    }
+
+    #[test]
+    fn test_implicit_param_staticmethod() {
+        let def = DefinitionInfo::Method(MethodInfo {
+            class_name: "MyClass".to_string(),
+            method_name: "helper".to_string(),
+            signature: FunctionSignature {
+                name: "helper".to_string(),
+                parameters: vec![ParameterInfo {
+                    name: "value".to_string(),
+                    type_annotation: None,
+                    default_value: None,
+                    has_default: false,
+                    is_variadic: false,
+                    is_variadic_keyword: false,
+                    is_keyword_only: false,
+                }],
+                return_type: None,
+                docstring: None,
+                start_line: 0,
+                start_column: 0,
+                end_line: 0,
+                end_column: 0,
+            },
+            is_classmethod: false,
+            is_staticmethod: true,
+        });
+        assert_eq!(def.implicit_param(), None);
     }
 }

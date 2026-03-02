@@ -6,6 +6,10 @@ class DataLoader:
         self.batch_size = batch_size
         self.shuffle = shuffle
 
+    @classmethod
+    def from_config(cls, config_path: str, batch_size: int = 32):
+        return cls(batch_size=batch_size)
+
 
 def create_model(input_dim: int, output_dim: int, hidden_dim: int = 128):
     return None
