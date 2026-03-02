@@ -154,9 +154,7 @@ fn validate_parameters(
         .parameters
         .iter()
         .filter(|p| {
-            Some(p.name.as_str()) != implicit_param
-                && !p.is_variadic
-                && !p.is_variadic_keyword
+            Some(p.name.as_str()) != implicit_param && !p.is_variadic && !p.is_variadic_keyword
         })
         .map(|p| p.name.clone())
         .collect();
@@ -260,26 +258,26 @@ pub fn validate_document(
         diagnostics.extend(target_diagnostics);
 
         // Try to resolve the target and validate parameters
-        if let Some(definition_info) = definition_info {
-            let implicit_param = definition_info.implicit_param().map(String::from);
+        if let Some(definition_info) = &definition_info {
+            let implicit_param = definition_info.implicit_param();
             let signature = match definition_info {
                 DefinitionInfo::Function(sig) => sig,
                 DefinitionInfo::Class(class_info) => {
                     // For classes, use the __init__ signature if available
-                    if let Some(init_sig) = class_info.init_signature {
+                    if let Some(init_sig) = &class_info.init_signature {
                         init_sig
                     } else {
                         // Class with no __init__, no parameters to validate
                         continue;
                     }
                 }
-                DefinitionInfo::Method(method_info) => method_info.signature,
+                DefinitionInfo::Method(method_info) => &method_info.signature,
             };
 
             let parameter_diagnostics = validate_parameters(
                 target,
-                &signature,
-                implicit_param.as_deref(),
+                signature,
+                implicit_param,
                 &parsed_content.file_suppressions,
             );
             diagnostics.extend(parameter_diagnostics);

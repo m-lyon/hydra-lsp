@@ -43,7 +43,7 @@ fn build_signature_params(
 ) -> (String, Vec<ParameterInformation>) {
     let filtered: Vec<_> = params
         .iter()
-        .filter(|p| filter_param.map_or(true, |f| p.name != f))
+        .filter(|p| filter_param.is_none_or(|f| p.name != f))
         .collect();
     let param_strs: Vec<String> = filtered.iter().map(|p| format_param_label(p)).collect();
     let param_infos: Vec<ParameterInformation> = filtered

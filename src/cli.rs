@@ -289,14 +289,14 @@ fn trace_target_resolution(
             println!("  {} {}", "Symbol:".dimmed(), symbol_name);
             println!("  {} {}", "Definition found:".green(), file_path.display());
 
-            let implicit_param = def_info.implicit_param().map(String::from);
-            match def_info {
+            let implicit_param = def_info.implicit_param();
+            match &def_info {
                 hydra_lsp::python_analyzer::DefinitionInfo::Function(sig) => {
                     println!("  {} Function", "Type:".dimmed());
                     println!(
                         "  {} {}",
                         "Signature:".dimmed(),
-                        format_signature_brief(&sig, implicit_param.as_deref())
+                        format_signature_brief(sig, implicit_param)
                     );
                 }
                 hydra_lsp::python_analyzer::DefinitionInfo::Class(class_info) => {
@@ -305,7 +305,7 @@ fn trace_target_resolution(
                         println!(
                             "  {} {}",
                             "__init__:".dimmed(),
-                            format_signature_brief(init_sig, implicit_param.as_deref())
+                            format_signature_brief(init_sig, implicit_param)
                         );
                     } else {
                         println!("  {} (no __init__ found)", "__init__:".dimmed());
@@ -328,7 +328,7 @@ fn trace_target_resolution(
                     println!(
                         "  {} {}",
                         "Signature:".dimmed(),
-                        format_signature_brief(&method_info.signature, implicit_param.as_deref())
+                        format_signature_brief(&method_info.signature, implicit_param)
                     );
                 }
             }
