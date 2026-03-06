@@ -5,7 +5,7 @@ use std::fmt;
 use std::path::Path;
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 
-/// Diagnostic rule codes for Hydra LSP diagnostics.
+/// Diagnostic rule codes for Hydrust diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DiagnosticRule {
     MissingArgument,

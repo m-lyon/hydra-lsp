@@ -1,4 +1,4 @@
-# Hydra LSP - Copilot Instructions
+# Hydrust - Copilot Instructions
 
 ## Project Overview
 

@@ -185,6 +185,66 @@ impl TestContext {
         self.send(&notification).await;
     }
 
+    pub async fn initialize_with_settings(&mut self, settings: serde_json::Value) {
+        let initialize = r#"{
+            "capabilities": {
+                "general": {
+                    "positionEncodings": ["utf-8", "utf-32", "utf-16"]
+                },
+                "textDocument": {
+                    "hover": {
+                        "contentFormat": ["markdown"]
+                    },
+                    "completion": {
+                        "completionItem": {
+                            "snippetSupport": true,
+                            "deprecatedSupport": true
+                        }
+                    },
+                    "signatureHelp": {
+                        "signatureInformation": {
+                            "documentationFormat": ["markdown"],
+                            "parameterInformation": {
+                                "labelOffsetSupport": true
+                            }
+                        }
+                    },
+                    "definition": {},
+                    "publishDiagnostics": {
+                        "versionSupport": true
+                    }
+                },
+                "workspace": {
+                    "workspaceFolders": true,
+                    "didChangeConfiguration": {
+                        "dynamicRegistration": false
+                    }
+                }
+            },
+            "clientInfo": {
+                "name": "test-client",
+                "version": "0.1.0"
+            },
+            "processId": null,
+            "rootPath": null,
+            "rootUri": null,
+            "workspaceFolders": null
+        }"#;
+        let mut initialize: <lsp_types::request::Initialize as Request>::Params =
+            serde_json::from_str(initialize).unwrap();
+        let workspace_url = Url::from_file_path(self.workspace.path()).unwrap();
+        initialize.root_uri = Some(workspace_url.clone());
+        initialize.workspace_folders = Some(vec![WorkspaceFolder {
+            name: "test".to_owned(),
+            uri: workspace_url.clone(),
+        }]);
+        initialize.initialization_options = Some(serde_json::json!({ "settings": settings }));
+        self.request::<lsp_types::request::Initialize>(initialize)
+            .await;
+        self.notify::<lsp_types::notification::Initialized>(InitializedParams {})
+            .await;
+    }
+
     pub async fn initialize(&mut self) {
         // Real set of initialize params with workspace configuration
         let initialize = r#"{

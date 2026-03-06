@@ -1,6 +1,6 @@
 # Integration Tests
 
-This directory contains integration tests for the Hydra LSP server.
+This directory contains integration tests for Hydrust Server.
 
 ## Running Tests
 
