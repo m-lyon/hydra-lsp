@@ -53,11 +53,69 @@ fn build_signature_params(
     (param_strs.join(", "), param_infos)
 }
 
+/// Feature toggle settings for individual LSP capabilities.
+#[derive(Debug, Clone, Copy)]
+pub struct FeatureToggles {
+    pub hover: bool,
+    pub completion: bool,
+    pub signature_help: bool,
+    pub goto_definition: bool,
+    pub semantic_tokens: bool,
+    pub diagnostics: bool,
+}
+
+impl Default for FeatureToggles {
+    fn default() -> Self {
+        Self {
+            hover: true,
+            completion: true,
+            signature_help: true,
+            goto_definition: true,
+            semantic_tokens: true,
+            diagnostics: true,
+        }
+    }
+}
+
+impl FeatureToggles {
+    /// Parse feature toggles from a JSON settings object.
+    fn from_json(settings: &serde_json::Value) -> Self {
+        fn bool_setting(settings: &serde_json::Value, key: &str) -> bool {
+            settings.get(key).and_then(|v| v.as_bool()).unwrap_or(true)
+        }
+        Self {
+            hover: bool_setting(settings, "enableHover"),
+            completion: bool_setting(settings, "enableCompletion"),
+            signature_help: bool_setting(settings, "enableSignatureHelp"),
+            goto_definition: bool_setting(settings, "enableGotoDefinition"),
+            semantic_tokens: bool_setting(settings, "enableSemanticTokens"),
+            diagnostics: bool_setting(settings, "enableDiagnostics"),
+        }
+    }
+
+    /// Return names of disabled features, if any.
+    fn disabled_names(&self) -> Vec<&'static str> {
+        [
+            (!self.hover, "hover"),
+            (!self.completion, "completion"),
+            (!self.signature_help, "signatureHelp"),
+            (!self.goto_definition, "gotoDefinition"),
+            (!self.semantic_tokens, "semanticTokens"),
+            (!self.diagnostics, "diagnostics"),
+        ]
+        .into_iter()
+        .filter(|(disabled, _)| *disabled)
+        .map(|(_, name)| name)
+        .collect()
+    }
+}
+
 /// Server-wide settings for Hydra LSP.
 #[derive(Debug, Default)]
 pub struct Settings {
     pub python_interpreter: Option<String>,
     pub disabled_rules: HashSet<DiagnosticRule>,
+    pub features: FeatureToggles,
 }
 
 #[derive(Debug)]
@@ -113,13 +171,17 @@ impl LanguageServer for HydraLspBackend {
                 }
             }
 
+            // Parse feature toggle settings
+            let toggles = FeatureToggles::from_json(settings);
+
             // Write settings under the lock (no awaits)
             {
                 let mut s = self.settings.write();
                 if interpreter_path.is_some() {
                     s.python_interpreter = interpreter_path.clone();
                 }
-                s.disabled_rules = parsed_rules.clone();
+                s.disabled_rules = parsed_rules;
+                s.features = toggles;
             }
 
             // Log after releasing the lock
@@ -131,11 +193,23 @@ impl LanguageServer for HydraLspBackend {
                     )
                     .await;
             }
-            if !parsed_rules.is_empty() {
+
+            if !self.settings.read().disabled_rules.is_empty() {
                 self.client
                     .log_message(
                         MessageType::INFO,
-                        format!("Disabled rules: {:?}", parsed_rules),
+                        format!("Disabled rules: {:?}", self.settings.read().disabled_rules),
+                    )
+                    .await;
+            }
+
+            // Log disabled features
+            let disabled_features = toggles.disabled_names();
+            if !disabled_features.is_empty() {
+                self.client
+                    .log_message(
+                        MessageType::INFO,
+                        format!("Disabled features: {:?}", disabled_features),
                     )
                     .await;
             }
@@ -209,7 +283,7 @@ impl LanguageServer for HydraLspBackend {
         self.documents.insert(uri.clone(), text.clone(), version);
 
         // Publish diagnostics if this is a Hydra file
-        if YamlParser::is_hydra_file(&text) {
+        if YamlParser::is_hydra_file(&text) && self.settings.read().features.diagnostics {
             self.publish_diagnostics_for_document(&uri, &text).await;
         }
 
@@ -228,7 +302,8 @@ impl LanguageServer for HydraLspBackend {
                 .update(uri.clone(), change.text.clone(), version);
 
             // Re-publish diagnostics if this is a Hydra file
-            if YamlParser::is_hydra_file(&change.text) {
+            if YamlParser::is_hydra_file(&change.text) && self.settings.read().features.diagnostics
+            {
                 self.publish_diagnostics_for_document(&uri, &change.text)
                     .await;
             }
@@ -258,6 +333,9 @@ impl LanguageServer for HydraLspBackend {
     }
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
+        if !self.settings.read().features.hover {
+            return Ok(None);
+        }
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
 
@@ -349,6 +427,9 @@ impl LanguageServer for HydraLspBackend {
     }
 
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
+        if !self.settings.read().features.completion {
+            return Ok(None);
+        }
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
 
@@ -473,6 +554,9 @@ impl LanguageServer for HydraLspBackend {
     }
 
     async fn signature_help(&self, params: SignatureHelpParams) -> Result<Option<SignatureHelp>> {
+        if !self.settings.read().features.signature_help {
+            return Ok(None);
+        }
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
 
@@ -587,6 +671,9 @@ impl LanguageServer for HydraLspBackend {
         &self,
         params: GotoDefinitionParams,
     ) -> Result<Option<GotoDefinitionResponse>> {
+        if !self.settings.read().features.goto_definition {
+            return Ok(None);
+        }
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
 
@@ -679,6 +766,9 @@ impl LanguageServer for HydraLspBackend {
         &self,
         params: SemanticTokensParams,
     ) -> Result<Option<SemanticTokensResult>> {
+        if !self.settings.read().features.semantic_tokens {
+            return Ok(None);
+        }
         let uri = params.text_document.uri;
 
         // Get document content
