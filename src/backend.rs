@@ -110,7 +110,7 @@ impl FeatureToggles {
     }
 }
 
-/// Server-wide settings for Hydra LSP.
+/// Server-wide settings for Hydrust Server.
 #[derive(Debug, Default)]
 pub struct Settings {
     pub python_interpreter: Option<String>,
@@ -142,7 +142,7 @@ impl LanguageServer for HydraLspBackend {
             .log_message(
                 MessageType::INFO,
                 format!(
-                    "Hydra LSP server initializing with options: {:?}",
+                    "Hydrust Server initializing with options: {:?}",
                     params.initialization_options
                 ),
             )
@@ -267,7 +267,7 @@ impl LanguageServer for HydraLspBackend {
 
     async fn initialized(&self, _params: InitializedParams) {
         self.client
-            .log_message(MessageType::INFO, "Hydra LSP server initialized")
+            .log_message(MessageType::INFO, "Hydrust Server initialized")
             .await;
     }
 

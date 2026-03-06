@@ -1,4 +1,4 @@
-"""Test module for Hydra LSP integration tests."""
+"""Test module for Hydrust Server integration tests."""
 
 
 class DataLoader:
