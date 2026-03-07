@@ -631,21 +631,25 @@ impl LanguageServer for HydraLspBackend {
                     }
                 };
 
-                let active_parameter = parameters
-                    .iter()
-                    .position(|p| match &p.label {
-                        ParameterLabel::Simple(name) => {
-                            // Extract just the param name (before ':')
-                            let param_name = name
-                                .split(':')
-                                .next()
-                                .unwrap_or(name)
-                                .trim();
-                            param_name == current_param_key
-                        }
-                        ParameterLabel::LabelOffsets(_) => false,
-                    })
-                    .map(|i| i as u32);
+                // Use an out-of-bounds index when the YAML key doesn't match any
+                // parameter, so the client doesn't default to highlighting index 0.
+                let active_parameter = Some(
+                    parameters
+                        .iter()
+                        .position(|p| match &p.label {
+                            ParameterLabel::Simple(name) => {
+                                // Extract just the param name (before ':')
+                                let param_name = name
+                                    .split(':')
+                                    .next()
+                                    .unwrap_or(name)
+                                    .trim();
+                                param_name == current_param_key
+                            }
+                            ParameterLabel::LabelOffsets(_) => false,
+                        })
+                        .unwrap_or(parameters.len()) as u32,
+                );
 
                 Ok(Some(SignatureHelp {
                     signatures: vec![SignatureInformation {

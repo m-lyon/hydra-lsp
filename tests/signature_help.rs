@@ -245,9 +245,14 @@ test:
             !sig_help.signatures.is_empty(),
             "Should still return signature"
         );
+        let param_count = sig_help.signatures[0]
+            .parameters
+            .as_ref()
+            .map_or(0, |p| p.len()) as u32;
         assert_eq!(
-            sig_help.active_parameter, None,
-            "active_parameter should be None for unknown param"
+            sig_help.active_parameter,
+            Some(param_count),
+            "active_parameter should be out-of-bounds so no param is highlighted"
         );
     } else {
         panic!("Expected signature help but got None");
