@@ -2,6 +2,6 @@
 source: tests/diagnostics.rs
 expression: "format!(\"Message: {}\\nSeverity: {:?}\\nCode: '{}'\", diag.message,\ndiag.severity.unwrap(), extract_code(diag))"
 ---
-Message: Missing required parameter 'name' for '__init__'
+Message: Missing required parameter 'name' for 'ChildWithoutInit.__init__'
 Severity: Error
 Code: 'missing-argument'

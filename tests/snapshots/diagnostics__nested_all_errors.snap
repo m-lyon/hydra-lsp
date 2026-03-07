@@ -5,30 +5,30 @@ expression: summary
 - code: missing-argument
   end_char: 34
   line: 25
-  message: "Missing required parameter 'd_value' for '__init__'"
+  message: "Missing required parameter 'd_value' for 'ClassD.__init__'"
   severity: Error
   start_char: 18
 - code: missing-argument
   end_char: 30
   line: 34
-  message: "Missing required parameter 'b_value' for '__init__'"
+  message: "Missing required parameter 'b_value' for 'ClassB.__init__'"
   severity: Error
   start_char: 14
 - code: missing-argument
   end_char: 34
   line: 38
-  message: "Missing required parameter 'd_value' for '__init__'"
+  message: "Missing required parameter 'd_value' for 'ClassD.__init__'"
   severity: Error
   start_char: 18
 - code: missing-argument
   end_char: 30
   line: 46
-  message: "Missing required parameter 'b_value' for '__init__'"
+  message: "Missing required parameter 'b_value' for 'ClassB.__init__'"
   severity: Error
   start_char: 14
 - code: unknown-argument
   end_char: 15
   line: 52
-  message: "Unknown parameter 'x_value' for '__init__'"
+  message: "Unknown parameter 'x_value' for 'ClassD.__init__'"
   severity: Error
   start_char: 8

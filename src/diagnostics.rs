@@ -260,12 +260,17 @@ pub fn validate_document(
         // Try to resolve the target and validate parameters
         if let Some(definition_info) = &definition_info {
             let implicit_param = definition_info.implicit_param();
+            let owned_signature;
             let signature = match definition_info {
                 DefinitionInfo::Function(sig) => sig,
                 DefinitionInfo::Class(class_info) => {
                     // For classes, use the __init__ signature if available
                     if let Some(init_sig) = &class_info.init_signature {
-                        init_sig
+                        owned_signature = FunctionSignature {
+                            name: format!("{}.{}", class_info.name, init_sig.name),
+                            ..init_sig.clone()
+                        };
+                        &owned_signature
                     } else {
                         // Class with no __init__, no parameters to validate
                         continue;
