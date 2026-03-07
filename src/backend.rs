@@ -29,10 +29,12 @@ fn format_param_label(p: &ParameterInfo) -> String {
 fn to_parameter_information(p: &ParameterInfo) -> ParameterInformation {
     ParameterInformation {
         label: ParameterLabel::Simple(format_param_label(p)),
-        documentation: p
-            .default_value
-            .as_ref()
-            .map(|dv| Documentation::String(format!("Default: {}", dv))),
+        documentation: p.default_value.as_ref().map(|dv| {
+            Documentation::MarkupContent(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: format!("Default: `{}`", dv),
+            })
+        }),
     }
 }
 
@@ -226,7 +228,7 @@ impl LanguageServer for HydraLspBackend {
                     ..Default::default()
                 }),
                 signature_help_provider: Some(SignatureHelpOptions {
-                    trigger_characters: Some(vec!["(".to_string(), ",".to_string()]),
+                    trigger_characters: Some(vec![":".to_string()]),
                     retrigger_characters: None,
                     work_done_progress_options: WorkDoneProgressOptions::default(),
                 }),
@@ -571,17 +573,18 @@ impl LanguageServer for HydraLspBackend {
             return Ok(None);
         }
 
-        // Find _target_ at or near cursor position to get context
-        let target_info = match YamlParser::find_target_at_position(&document.content, position) {
-            Ok(Some(info)) => info,
-            Ok(None) => return Ok(None),
-            Err(e) => {
-                self.client
-                    .log_message(MessageType::ERROR, format!("YAML parse error: {}", e))
-                    .await;
-                return Ok(None);
-            }
-        };
+        // Find target info for the parameter line at cursor position
+        let (target_value, current_param_key) =
+            match YamlParser::find_target_for_parameter_line(&document.content, position) {
+                Ok(Some(result)) => result,
+                Ok(None) => return Ok(None),
+                Err(e) => {
+                    self.client
+                        .log_message(MessageType::ERROR, format!("YAML parse error: {}", e))
+                        .await;
+                    return Ok(None);
+                }
+            };
 
         // Try to get the workspace root from the URI
         let workspace_root = uri
@@ -593,7 +596,7 @@ impl LanguageServer for HydraLspBackend {
         let extract_result = {
             let settings = self.settings.read();
             PythonAnalyzer::extract_definition_info(
-                &target_info.value,
+                &target_value,
                 workspace_root.as_deref(),
                 settings.python_interpreter.as_deref(),
             )
@@ -602,22 +605,22 @@ impl LanguageServer for HydraLspBackend {
         match extract_result {
             Ok((definition_info, _file_path, _module_path, _symbol_name)) => {
                 let implicit_param = definition_info.implicit_param();
-                let (signature_label, parameters, doc_string) = match &definition_info {
+                let (signature_label, parameters) = match &definition_info {
                     DefinitionInfo::Function(sig) => {
                         let (params_str, params) =
                             build_signature_params(&sig.parameters, implicit_param);
                         let label = format!("{}({})", sig.name, params_str);
-                        (label, params, sig.docstring.clone())
+                        (label, params)
                     }
                     DefinitionInfo::Class(class_info) => {
                         if let Some(init_sig) = &class_info.init_signature {
                             let (params_str, params) =
                                 build_signature_params(&init_sig.parameters, implicit_param);
                             let label = format!("{}({})", class_info.name, params_str);
-                            (label, params, class_info.docstring.clone())
+                            (label, params)
                         } else {
                             let label = format!("{}()", class_info.name);
-                            (label, vec![], class_info.docstring.clone())
+                            (label, vec![])
                         }
                     }
                     DefinitionInfo::Method(method_info) => {
@@ -626,19 +629,30 @@ impl LanguageServer for HydraLspBackend {
                             build_signature_params(&sig.parameters, implicit_param);
                         let label =
                             format!("{}.{}({})", method_info.class_name, sig.name, params_str);
-                        (label, params, sig.docstring.clone())
+                        (label, params)
                     }
                 };
+
+                // Use an out-of-bounds index when the YAML key doesn't match any
+                // parameter, so the client doesn't default to highlighting index 0.
+                let active_parameter = Some(
+                    parameters
+                        .iter()
+                        .position(|p| match &p.label {
+                            ParameterLabel::Simple(name) => {
+                                // Extract just the param name (before ':')
+                                let param_name = name.split(':').next().unwrap_or(name).trim();
+                                param_name == current_param_key
+                            }
+                            ParameterLabel::LabelOffsets(_) => false,
+                        })
+                        .unwrap_or(parameters.len()) as u32,
+                );
 
                 Ok(Some(SignatureHelp {
                     signatures: vec![SignatureInformation {
                         label: signature_label,
-                        documentation: doc_string.map(|ds| {
-                            Documentation::MarkupContent(MarkupContent {
-                                kind: MarkupKind::Markdown,
-                                value: ds,
-                            })
-                        }),
+                        documentation: None,
                         parameters: if parameters.is_empty() {
                             None
                         } else {
@@ -647,7 +661,7 @@ impl LanguageServer for HydraLspBackend {
                         active_parameter: None,
                     }],
                     active_signature: Some(0),
-                    active_parameter: None,
+                    active_parameter,
                 }))
             }
             Err(e) => {

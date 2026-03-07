@@ -3,6 +3,7 @@
 ## [0.2.1]
 
 - Added class name for `__init__` diagnostics
+- Implemented `signature_help` for parameters
 
 ## [0.2.0]
 
