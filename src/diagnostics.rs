@@ -137,6 +137,7 @@ fn validate_target(
 fn validate_parameters(
     target_info: &TargetInfo,
     signature: &FunctionSignature,
+    display_name: &str,
     implicit_param: Option<&str>,
     file_suppressions: &HashSet<DiagnosticRule>,
 ) -> Vec<Diagnostic> {
@@ -177,7 +178,7 @@ fn validate_parameters(
                 param.key.len() as u32 + target_info.key_start,
                 DiagnosticSeverity::ERROR,
                 Some(DiagnosticRule::UnknownArgument),
-                format!("Unknown parameter '{}' for '{}'", param.key, signature.name),
+                format!("Unknown parameter '{}' for '{}'", param.key, display_name),
             ));
         }
     }
@@ -201,7 +202,7 @@ fn validate_parameters(
                     Some(DiagnosticRule::MissingArgument),
                     format!(
                         "Missing required parameter '{}' for '{}'",
-                        param.name, signature.name
+                        param.name, display_name
                     ),
                 ));
             }
@@ -260,28 +261,26 @@ pub fn validate_document(
         // Try to resolve the target and validate parameters
         if let Some(definition_info) = &definition_info {
             let implicit_param = definition_info.implicit_param();
-            let owned_signature;
-            let signature = match definition_info {
-                DefinitionInfo::Function(sig) => sig,
+            let (signature, display_name) = match definition_info {
+                DefinitionInfo::Function(sig) => (sig, sig.name.clone()),
                 DefinitionInfo::Class(class_info) => {
                     // For classes, use the __init__ signature if available
                     if let Some(init_sig) = &class_info.init_signature {
-                        owned_signature = FunctionSignature {
-                            name: format!("{}.{}", class_info.name, init_sig.name),
-                            ..init_sig.clone()
-                        };
-                        &owned_signature
+                        (init_sig, format!("{}.{}", class_info.name, init_sig.name))
                     } else {
                         // Class with no __init__, no parameters to validate
                         continue;
                     }
                 }
-                DefinitionInfo::Method(method_info) => &method_info.signature,
+                DefinitionInfo::Method(method_info) => {
+                    (&method_info.signature, method_info.signature.name.clone())
+                }
             };
 
             let parameter_diagnostics = validate_parameters(
                 target,
                 signature,
+                &display_name,
                 implicit_param,
                 &parsed_content.file_suppressions,
             );
@@ -384,8 +383,13 @@ mod tests {
             end_column: 1,
         };
 
-        let diagnostics =
-            validate_parameters(&target_info, &signature, Some("self"), &HashSet::new());
+        let diagnostics = validate_parameters(
+            &target_info,
+            &signature,
+            &signature.name,
+            Some("self"),
+            &HashSet::new(),
+        );
         assert_eq!(diagnostics.len(), 1);
         assert!(
             diagnostics[0]
@@ -424,8 +428,13 @@ mod tests {
             end_column: 1,
         };
 
-        let diagnostics =
-            validate_parameters(&target_info, &signature, Some("self"), &HashSet::new());
+        let diagnostics = validate_parameters(
+            &target_info,
+            &signature,
+            &signature.name,
+            Some("self"),
+            &HashSet::new(),
+        );
         assert_eq!(diagnostics.len(), 1);
         assert!(diagnostics[0].message.contains("Unknown parameter"));
         assert_eq!(
@@ -471,8 +480,13 @@ mod tests {
             end_column: 1,
         };
 
-        let diagnostics =
-            validate_parameters(&target_info, &signature, Some("self"), &HashSet::new());
+        let diagnostics = validate_parameters(
+            &target_info,
+            &signature,
+            &signature.name,
+            Some("self"),
+            &HashSet::new(),
+        );
         // Should be a HINT, not ERROR
         assert!(
             diagnostics
@@ -517,8 +531,13 @@ mod tests {
             end_column: 1,
         };
 
-        let diagnostics =
-            validate_parameters(&target_info, &signature, Some("cls"), &HashSet::new());
+        let diagnostics = validate_parameters(
+            &target_info,
+            &signature,
+            &signature.name,
+            Some("cls"),
+            &HashSet::new(),
+        );
         // Should only report missing 'config_path', not 'cls'
         assert_eq!(
             diagnostics.len(),
@@ -579,8 +598,13 @@ mod tests {
             end_column: 1,
         };
 
-        let diagnostics =
-            validate_parameters(&target_info, &signature, Some("cls"), &HashSet::new());
+        let diagnostics = validate_parameters(
+            &target_info,
+            &signature,
+            &signature.name,
+            Some("cls"),
+            &HashSet::new(),
+        );
         assert!(
             diagnostics.is_empty(),
             "Should have no diagnostics when all required params are provided, but got: {:?}",
@@ -624,8 +648,13 @@ mod tests {
         };
 
         // "this" is the implicit first param, so it should be filtered
-        let diagnostics =
-            validate_parameters(&target_info, &signature, Some("this"), &HashSet::new());
+        let diagnostics = validate_parameters(
+            &target_info,
+            &signature,
+            &signature.name,
+            Some("this"),
+            &HashSet::new(),
+        );
         assert_eq!(
             diagnostics.len(),
             1,
@@ -685,8 +714,13 @@ mod tests {
         };
 
         // "klass" is the implicit first param, so it should be filtered
-        let diagnostics =
-            validate_parameters(&target_info, &signature, Some("klass"), &HashSet::new());
+        let diagnostics = validate_parameters(
+            &target_info,
+            &signature,
+            &signature.name,
+            Some("klass"),
+            &HashSet::new(),
+        );
         assert!(
             diagnostics.is_empty(),
             "Should have no diagnostics when all required params are provided, but got: {:?}",
@@ -719,7 +753,13 @@ mod tests {
         };
 
         // No implicit param for static methods
-        let diagnostics = validate_parameters(&target_info, &signature, None, &HashSet::new());
+        let diagnostics = validate_parameters(
+            &target_info,
+            &signature,
+            &signature.name,
+            None,
+            &HashSet::new(),
+        );
         assert_eq!(
             diagnostics.len(),
             1,
@@ -1014,8 +1054,13 @@ mod tests {
             end_column: 1,
         };
 
-        let diagnostics =
-            validate_parameters(&target_info, &signature, Some("self"), &HashSet::new());
+        let diagnostics = validate_parameters(
+            &target_info,
+            &signature,
+            &signature.name,
+            Some("self"),
+            &HashSet::new(),
+        );
         assert!(
             diagnostics.is_empty(),
             "Should have no diagnostics when _partial_: true, but got: {:?}",
@@ -1057,8 +1102,13 @@ mod tests {
             end_column: 1,
         };
 
-        let diagnostics =
-            validate_parameters(&target_info, &signature, Some("self"), &HashSet::new());
+        let diagnostics = validate_parameters(
+            &target_info,
+            &signature,
+            &signature.name,
+            Some("self"),
+            &HashSet::new(),
+        );
         assert_eq!(diagnostics.len(), 1);
         assert!(
             diagnostics[0]
@@ -1114,8 +1164,13 @@ mod tests {
             end_column: 1,
         };
 
-        let diagnostics =
-            validate_parameters(&target_info, &signature, Some("self"), &HashSet::new());
+        let diagnostics = validate_parameters(
+            &target_info,
+            &signature,
+            &signature.name,
+            Some("self"),
+            &HashSet::new(),
+        );
         assert_eq!(diagnostics.len(), 1);
         assert!(diagnostics[0].message.contains("unknown_param"));
         assert!(diagnostics[0].message.contains("Unknown parameter"));
