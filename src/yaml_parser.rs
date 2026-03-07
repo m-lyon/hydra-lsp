@@ -563,12 +563,12 @@ impl YamlParser {
         Ok(None)
     }
 
-    /// Find the target info and parameter key for a parameter line at the given position.
+    /// Find the target value and parameter key for a parameter line at the given position.
     /// Returns `None` if the cursor is on a `_target_` line or an unrelated line.
     pub fn find_target_for_parameter_line(
         content: &str,
         position: Position,
-    ) -> Result<Option<(TargetInfo, String)>, YamlParseError> {
+    ) -> Result<Option<(String, String)>, YamlParseError> {
         let parsed_content = Self::parse(content)?;
         // If cursor is on a _target_ line, return None
         if parsed_content.line_map.contains_key(&position.line) {
@@ -578,7 +578,7 @@ impl YamlParser {
         for target in &parsed_content.targets {
             for param in &target.parameters {
                 if param.line == position.line {
-                    return Ok(Some((target.clone(), param.key.clone())));
+                    return Ok(Some((target.value.clone(), param.key.clone())));
                 }
             }
         }
@@ -2393,11 +2393,12 @@ model:
   num_layers: 12
 "#;
         let position = Position::new(3, 5); // on hidden_size line
-        let result = YamlParser::find_target_for_parameter_line(content, position)
-            .unwrap()
-            .unwrap();
-        assert_eq!(result.0.value, "myproject.Model");
-        assert_eq!(result.1, "hidden_size");
+        let (target_value, param_key) =
+            YamlParser::find_target_for_parameter_line(content, position)
+                .unwrap()
+                .unwrap();
+        assert_eq!(target_value, "myproject.Model");
+        assert_eq!(param_key, "hidden_size");
     }
 
     #[test]
@@ -2410,6 +2411,25 @@ model:
         let position = Position::new(2, 10); // on _target_ line
         let result = YamlParser::find_target_for_parameter_line(content, position).unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_find_target_for_parameter_line_second_target() {
+        let content = r#"
+model:
+  _target_: myproject.Model
+  hidden_size: 256
+optimizer:
+  _target_: myproject.Optimizer
+  lr: 0.001
+"#;
+        // Cursor on lr line (parameter of second target)
+        let (target_value, param_key) =
+            YamlParser::find_target_for_parameter_line(content, Position::new(6, 5))
+                .unwrap()
+                .unwrap();
+        assert_eq!(target_value, "myproject.Optimizer");
+        assert_eq!(param_key, "lr");
     }
 
     #[test]

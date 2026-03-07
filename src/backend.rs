@@ -572,7 +572,7 @@ impl LanguageServer for HydraLspBackend {
         }
 
         // Find target info for the parameter line at cursor position
-        let (target_info, current_param_key) =
+        let (target_value, current_param_key) =
             match YamlParser::find_target_for_parameter_line(&document.content, position) {
                 Ok(Some(result)) => result,
                 Ok(None) => return Ok(None),
@@ -594,7 +594,7 @@ impl LanguageServer for HydraLspBackend {
         let extract_result = {
             let settings = self.settings.read();
             PythonAnalyzer::extract_definition_info(
-                &target_info.value,
+                &target_value,
                 workspace_root.as_deref(),
                 settings.python_interpreter.as_deref(),
             )
@@ -661,7 +661,7 @@ impl LanguageServer for HydraLspBackend {
                         } else {
                             Some(parameters)
                         },
-                        active_parameter,
+                        active_parameter: None,
                     }],
                     active_signature: Some(0),
                     active_parameter,
