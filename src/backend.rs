@@ -29,10 +29,12 @@ fn format_param_label(p: &ParameterInfo) -> String {
 fn to_parameter_information(p: &ParameterInfo) -> ParameterInformation {
     ParameterInformation {
         label: ParameterLabel::Simple(format_param_label(p)),
-        documentation: p
-            .default_value
-            .as_ref()
-            .map(|dv| Documentation::String(format!("Default: {}", dv))),
+        documentation: p.default_value.as_ref().map(|dv| {
+            Documentation::MarkupContent(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: format!("Default: `{}`", dv),
+            })
+        }),
     }
 }
 
@@ -603,22 +605,22 @@ impl LanguageServer for HydraLspBackend {
         match extract_result {
             Ok((definition_info, _file_path, _module_path, _symbol_name)) => {
                 let implicit_param = definition_info.implicit_param();
-                let (signature_label, parameters, doc_string) = match &definition_info {
+                let (signature_label, parameters) = match &definition_info {
                     DefinitionInfo::Function(sig) => {
                         let (params_str, params) =
                             build_signature_params(&sig.parameters, implicit_param);
                         let label = format!("{}({})", sig.name, params_str);
-                        (label, params, sig.docstring.clone())
+                        (label, params)
                     }
                     DefinitionInfo::Class(class_info) => {
                         if let Some(init_sig) = &class_info.init_signature {
                             let (params_str, params) =
                                 build_signature_params(&init_sig.parameters, implicit_param);
                             let label = format!("{}({})", class_info.name, params_str);
-                            (label, params, class_info.docstring.clone())
+                            (label, params)
                         } else {
                             let label = format!("{}()", class_info.name);
-                            (label, vec![], class_info.docstring.clone())
+                            (label, vec![])
                         }
                     }
                     DefinitionInfo::Method(method_info) => {
@@ -627,7 +629,7 @@ impl LanguageServer for HydraLspBackend {
                             build_signature_params(&sig.parameters, implicit_param);
                         let label =
                             format!("{}.{}({})", method_info.class_name, sig.name, params_str);
-                        (label, params, sig.docstring.clone())
+                        (label, params)
                     }
                 };
 
@@ -639,11 +641,7 @@ impl LanguageServer for HydraLspBackend {
                         .position(|p| match &p.label {
                             ParameterLabel::Simple(name) => {
                                 // Extract just the param name (before ':')
-                                let param_name = name
-                                    .split(':')
-                                    .next()
-                                    .unwrap_or(name)
-                                    .trim();
+                                let param_name = name.split(':').next().unwrap_or(name).trim();
                                 param_name == current_param_key
                             }
                             ParameterLabel::LabelOffsets(_) => false,
@@ -654,12 +652,7 @@ impl LanguageServer for HydraLspBackend {
                 Ok(Some(SignatureHelp {
                     signatures: vec![SignatureInformation {
                         label: signature_label,
-                        documentation: doc_string.map(|ds| {
-                            Documentation::MarkupContent(MarkupContent {
-                                kind: MarkupKind::Markdown,
-                                value: ds,
-                            })
-                        }),
+                        documentation: None,
                         parameters: if parameters.is_empty() {
                             None
                         } else {
