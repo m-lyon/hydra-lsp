@@ -563,6 +563,28 @@ impl YamlParser {
         Ok(None)
     }
 
+    /// Find the target info and parameter key for a parameter line at the given position.
+    /// Returns `None` if the cursor is on a `_target_` line or an unrelated line.
+    pub fn find_target_for_parameter_line(
+        content: &str,
+        position: Position,
+    ) -> Result<Option<(TargetInfo, String)>, YamlParseError> {
+        let parsed_content = Self::parse(content)?;
+        // If cursor is on a _target_ line, return None
+        if parsed_content.line_map.contains_key(&position.line) {
+            return Ok(None);
+        }
+        // Search targets for a parameter on this line
+        for target in &parsed_content.targets {
+            for param in &target.parameters {
+                if param.line == position.line {
+                    return Ok(Some((target.clone(), param.key.clone())));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     /// Get completion context at a position
     pub fn get_completion_context(
         content: &str,
@@ -2360,5 +2382,45 @@ db:
                 .file_suppressions
                 .contains(&DiagnosticRule::UnknownArgument)
         );
+    }
+
+    #[test]
+    fn test_find_target_for_parameter_line_on_param() {
+        let content = r#"
+model:
+  _target_: myproject.Model
+  hidden_size: 256
+  num_layers: 12
+"#;
+        let position = Position::new(3, 5); // on hidden_size line
+        let result = YamlParser::find_target_for_parameter_line(content, position)
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.0.value, "myproject.Model");
+        assert_eq!(result.1, "hidden_size");
+    }
+
+    #[test]
+    fn test_find_target_for_parameter_line_on_target() {
+        let content = r#"
+model:
+  _target_: myproject.Model
+  hidden_size: 256
+"#;
+        let position = Position::new(2, 10); // on _target_ line
+        let result = YamlParser::find_target_for_parameter_line(content, position).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_find_target_for_parameter_line_unrelated() {
+        let content = r#"
+model:
+  _target_: myproject.Model
+  hidden_size: 256
+"#;
+        let position = Position::new(1, 2); // on "model:" line
+        let result = YamlParser::find_target_for_parameter_line(content, position).unwrap();
+        assert!(result.is_none());
     }
 }

@@ -226,7 +226,7 @@ impl LanguageServer for HydraLspBackend {
                     ..Default::default()
                 }),
                 signature_help_provider: Some(SignatureHelpOptions {
-                    trigger_characters: Some(vec!["(".to_string(), ",".to_string()]),
+                    trigger_characters: Some(vec![":".to_string()]),
                     retrigger_characters: None,
                     work_done_progress_options: WorkDoneProgressOptions::default(),
                 }),
@@ -571,17 +571,18 @@ impl LanguageServer for HydraLspBackend {
             return Ok(None);
         }
 
-        // Find _target_ at or near cursor position to get context
-        let target_info = match YamlParser::find_target_at_position(&document.content, position) {
-            Ok(Some(info)) => info,
-            Ok(None) => return Ok(None),
-            Err(e) => {
-                self.client
-                    .log_message(MessageType::ERROR, format!("YAML parse error: {}", e))
-                    .await;
-                return Ok(None);
-            }
-        };
+        // Find target info for the parameter line at cursor position
+        let (target_info, current_param_key) =
+            match YamlParser::find_target_for_parameter_line(&document.content, position) {
+                Ok(Some(result)) => result,
+                Ok(None) => return Ok(None),
+                Err(e) => {
+                    self.client
+                        .log_message(MessageType::ERROR, format!("YAML parse error: {}", e))
+                        .await;
+                    return Ok(None);
+                }
+            };
 
         // Try to get the workspace root from the URI
         let workspace_root = uri
@@ -630,6 +631,22 @@ impl LanguageServer for HydraLspBackend {
                     }
                 };
 
+                let active_parameter = parameters
+                    .iter()
+                    .position(|p| match &p.label {
+                        ParameterLabel::Simple(name) => {
+                            // Extract just the param name (before ':')
+                            let param_name = name
+                                .split(':')
+                                .next()
+                                .unwrap_or(name)
+                                .trim();
+                            param_name == current_param_key
+                        }
+                        ParameterLabel::LabelOffsets(_) => false,
+                    })
+                    .map(|i| i as u32);
+
                 Ok(Some(SignatureHelp {
                     signatures: vec![SignatureInformation {
                         label: signature_label,
@@ -644,10 +661,10 @@ impl LanguageServer for HydraLspBackend {
                         } else {
                             Some(parameters)
                         },
-                        active_parameter: None,
+                        active_parameter,
                     }],
                     active_signature: Some(0),
-                    active_parameter: None,
+                    active_parameter,
                 }))
             }
             Err(e) => {
