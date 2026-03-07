@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.2.1]
+
+- Added class name for `__init__` diagnostics
+
 ## [0.2.0]
 
 - Refactored `yaml` parsing from `serde_yaml` to `saphyr`
