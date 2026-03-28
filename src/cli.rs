@@ -219,13 +219,13 @@ fn run(args: &Args) -> anyhow::Result<i32> {
 
     info!(
         "Found {} _target_ definitions",
-        parsed_content.targets.len()
+        parsed_content.hydra_objects.len()
     );
 
     // If trace_resolution is enabled, show detailed info for each target
     if args.trace_resolution {
         println!("\n{}", "=== Target Resolution Trace ===".cyan().bold());
-        for (i, target) in parsed_content.targets.iter().enumerate() {
+        for (i, target) in parsed_content.hydra_objects.iter().enumerate() {
             trace_target_resolution(
                 i,
                 target,
@@ -269,7 +269,7 @@ fn run(args: &Args) -> anyhow::Result<i32> {
 
 fn trace_target_resolution(
     index: usize,
-    target: &hydra_lsp::yaml_parser::TargetInfo,
+    hydra_object: &hydra_lsp::yaml_parser::HydraObject,
     workspace_root: Option<&Path>,
     python_interpreter: Option<&str>,
 ) {
@@ -277,13 +277,16 @@ fn trace_target_resolution(
         "\n{} [{}] {} (line {})",
         "Target".blue().bold(),
         index + 1,
-        target.value.yellow(),
-        target.line + 1
+        hydra_object.target.value.yellow(),
+        hydra_object.target.line + 1
     );
 
     // Try to extract definition info
-    match PythonAnalyzer::extract_definition_info(&target.value, workspace_root, python_interpreter)
-    {
+    match PythonAnalyzer::extract_definition_info(
+        &hydra_object.target.value,
+        workspace_root,
+        python_interpreter,
+    ) {
         Ok((def_info, file_path, module_path, symbol_name)) => {
             println!("  {} {}", "Module:".dimmed(), module_path);
             println!("  {} {}", "Symbol:".dimmed(), symbol_name);
@@ -346,14 +349,21 @@ fn trace_target_resolution(
     }
 
     // Show parameters
-    if !target.parameters.is_empty() {
+    if !hydra_object.parameters.is_empty() {
         println!(
             "  {} {} parameters",
             "Parameters:".dimmed(),
-            target.parameters.len()
+            hydra_object.parameters.len()
         );
-        for param in &target.parameters {
-            println!("    - {} (line {})", param.key.cyan(), param.line + 1);
+        for param in &hydra_object.parameters {
+            match param {
+                hydra_lsp::yaml_parser::Parameter::Keyword { key, line, .. } => {
+                    println!("    - {} (line {})", key.cyan(), line + 1);
+                }
+                hydra_lsp::yaml_parser::Parameter::Positional { line, .. } => {
+                    println!("    - {} (line {})", "<positional>".cyan(), line + 1);
+                }
+            }
         }
     }
 }

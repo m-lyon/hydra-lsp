@@ -2,12 +2,14 @@
 source: tests/semantic_tokens.rs
 expression: token_summary
 ---
-- "delta_line=2, delta_start=12, length=9, type=Namespace, modifiers=0"
+- "delta_line=2, delta_start=2, length=8, type=Property, modifiers=0"
+- "delta_line=0, delta_start=10, length=9, type=Namespace, modifiers=0"
 - "delta_line=0, delta_start=10, length=10, type=Class, modifiers=0"
 - "delta_line=1, delta_start=2, length=4, type=Parameter, modifiers=0"
 - "delta_line=0, delta_start=6, length=7, type=String, modifiers=0"
 - "delta_line=1, delta_start=2, length=5, type=Parameter, modifiers=0"
-- "delta_line=1, delta_start=14, length=9, type=Namespace, modifiers=0"
+- "delta_line=1, delta_start=4, length=8, type=Property, modifiers=0"
+- "delta_line=0, delta_start=10, length=9, type=Namespace, modifiers=0"
 - "delta_line=0, delta_start=10, length=10, type=Class, modifiers=0"
 - "delta_line=1, delta_start=4, length=5, type=Parameter, modifiers=0"
 - "delta_line=0, delta_start=7, length=2, type=Number, modifiers=0"

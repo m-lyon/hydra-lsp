@@ -8,7 +8,10 @@ use tower_lsp::{Client, LanguageServer};
 use crate::diagnostics::{self, DiagnosticRule};
 use crate::document::DocumentStore;
 use crate::python_analyzer::{DefinitionInfo, ParameterInfo, PythonAnalyzer};
-use crate::yaml_parser::{CompletionContext, HydraSemanticToken, YamlParser};
+use crate::yaml_parser::{
+    ARGS_KEY, CONVERT_KEY, CompletionContext, ConvertMode, HydraSemanticToken, PARTIAL_KEY,
+    ParameterContext, RECURSIVE_KEY, YamlParser,
+};
 
 /// Format a parameter as a string for signature labels (e.g., "*args", "name: str")
 fn format_param_label(p: &ParameterInfo) -> String {
@@ -228,7 +231,12 @@ impl LanguageServer for HydraLspBackend {
                     ..Default::default()
                 }),
                 signature_help_provider: Some(SignatureHelpOptions {
-                    trigger_characters: Some(vec![":".to_string()]),
+                    trigger_characters: Some(vec![
+                        ":".to_string(),
+                        "-".to_string(),
+                        "[".to_string(),
+                        ",".to_string(),
+                    ]),
                     retrigger_characters: None,
                     work_done_progress_options: WorkDoneProgressOptions::default(),
                 }),
@@ -353,7 +361,7 @@ impl LanguageServer for HydraLspBackend {
         }
 
         // Find _target_ at cursor position
-        let target_info = match YamlParser::find_target_at_position(&document.content, position) {
+        let hydra_object = match YamlParser::find_target_at_position(&document.content, position) {
             Ok(Some(info)) => info,
             Ok(None) => return Ok(None),
             Err(e) => {
@@ -367,7 +375,7 @@ impl LanguageServer for HydraLspBackend {
         self.client
             .log_message(
                 MessageType::LOG,
-                format!("Found target at position: {:?}", target_info),
+                format!("Found target at position: {:?}", hydra_object),
             )
             .await;
 
@@ -381,7 +389,7 @@ impl LanguageServer for HydraLspBackend {
         let extract_result = {
             let settings = self.settings.read();
             PythonAnalyzer::extract_definition_info(
-                &target_info.value,
+                &hydra_object.target.value,
                 workspace_root.as_deref(),
                 settings.python_interpreter.as_deref(),
             )
@@ -398,12 +406,12 @@ impl LanguageServer for HydraLspBackend {
                 };
                 let range = Range {
                     start: Position {
-                        line: target_info.line,
-                        character: target_info.value_start,
+                        line: hydra_object.target.line,
+                        character: hydra_object.target.value_start,
                     },
                     end: Position {
-                        line: target_info.line,
-                        character: target_info.value_end(),
+                        line: hydra_object.target.line,
+                        character: hydra_object.target_value_end(),
                     },
                 };
 
@@ -523,7 +531,40 @@ impl LanguageServer for HydraLspBackend {
                 parameter,
                 partial,
             } => {
-                // TODO: Resolve target and parameter type to provide value completions
+                // Provide completions for Hydra keyword values
+                let param_str = parameter.as_str();
+                if param_str == PARTIAL_KEY || param_str == RECURSIVE_KEY {
+                    return Ok(Some(CompletionResponse::Array(vec![
+                        CompletionItem {
+                            label: "true".to_string(),
+                            kind: Some(CompletionItemKind::VALUE),
+                            detail: Some("Boolean value".to_string()),
+                            ..Default::default()
+                        },
+                        CompletionItem {
+                            label: "false".to_string(),
+                            kind: Some(CompletionItemKind::VALUE),
+                            detail: Some("Boolean value".to_string()),
+                            ..Default::default()
+                        },
+                    ])));
+                }
+                if param_str == CONVERT_KEY {
+                    let items = ConvertMode::variants()
+                        .iter()
+                        .map(|v| CompletionItem {
+                            label: v.to_string(),
+                            kind: Some(CompletionItemKind::ENUM_MEMBER),
+                            detail: Some(format!("{} convert mode", v)),
+                            ..Default::default()
+                        })
+                        .collect();
+                    return Ok(Some(CompletionResponse::Array(items)));
+                }
+                if param_str == ARGS_KEY {
+                    return Ok(None);
+                }
+
                 self.client
                     .log_message(
                         MessageType::INFO,
@@ -534,21 +575,6 @@ impl LanguageServer for HydraLspBackend {
                     )
                     .await;
 
-                // For demonstration, return some placeholder value completions
-                // Ok(Some(CompletionResponse::Array(vec![
-                //     CompletionItem {
-                //         label: "true".to_string(),
-                //         kind: Some(CompletionItemKind::VALUE),
-                //         detail: Some("Boolean value".to_string()),
-                //         ..Default::default()
-                //     },
-                //     CompletionItem {
-                //         label: "false".to_string(),
-                //         kind: Some(CompletionItemKind::VALUE),
-                //         detail: Some("Boolean value".to_string()),
-                //         ..Default::default()
-                //     },
-                // ])))
                 Ok(None) // Placeholder: no completions yet
             }
             crate::yaml_parser::CompletionContext::Unknown => Ok(None),
@@ -574,7 +600,7 @@ impl LanguageServer for HydraLspBackend {
         }
 
         // Find target info for the parameter line at cursor position
-        let (target_value, current_param_key) =
+        let (target_value, param_context) =
             match YamlParser::find_target_for_parameter_line(&document.content, position) {
                 Ok(Some(result)) => result,
                 Ok(None) => return Ok(None),
@@ -635,19 +661,33 @@ impl LanguageServer for HydraLspBackend {
 
                 // Use an out-of-bounds index when the YAML key doesn't match any
                 // parameter, so the client doesn't default to highlighting index 0.
-                let active_parameter = Some(
-                    parameters
+                let active_parameter = Some(match &param_context {
+                    ParameterContext::Keyword(key) => parameters
                         .iter()
                         .position(|p| match &p.label {
                             ParameterLabel::Simple(name) => {
                                 // Extract just the param name (before ':')
                                 let param_name = name.split(':').next().unwrap_or(name).trim();
-                                param_name == current_param_key
+                                param_name == key
                             }
                             ParameterLabel::LabelOffsets(_) => false,
                         })
-                        .unwrap_or(parameters.len()) as u32,
-                );
+                        .unwrap_or(parameters.len())
+                        as u32,
+                    ParameterContext::Positional(_) => {
+                        // For positional args, highlight the *args parameter
+                        parameters
+                            .iter()
+                            .position(|p| match &p.label {
+                                ParameterLabel::Simple(name) => {
+                                    let param_name = name.split(':').next().unwrap_or(name).trim();
+                                    param_name.starts_with('*') && !param_name.starts_with("**")
+                                }
+                                ParameterLabel::LabelOffsets(_) => false,
+                            })
+                            .unwrap_or(parameters.len()) as u32
+                    }
+                });
 
                 Ok(Some(SignatureHelp {
                     signatures: vec![SignatureInformation {
@@ -724,7 +764,7 @@ impl LanguageServer for HydraLspBackend {
         let extract_result = {
             let settings = self.settings.read();
             PythonAnalyzer::extract_definition_info(
-                &target_info.value,
+                &target_info.target.value,
                 workspace_root.as_deref(),
                 settings.python_interpreter.as_deref(),
             )

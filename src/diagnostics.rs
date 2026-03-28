@@ -1,5 +1,8 @@
-use crate::python_analyzer::{DefinitionInfo, FunctionSignature, PythonAnalyzer};
-use crate::yaml_parser::{ParsedContent, TargetInfo};
+use crate::python_analyzer::{DefinitionInfo, FunctionSignature, ParameterInfo, PythonAnalyzer};
+use crate::yaml_parser::{
+    ARGS_KEY, CONVERT_KEY, ConvertMode, HydraObject, PARTIAL_KEY, Parameter, ParsedContent,
+    RECURSIVE_KEY,
+};
 use std::collections::HashSet;
 use std::fmt;
 use std::path::Path;
@@ -12,7 +15,9 @@ pub enum DiagnosticRule {
     UnknownArgument,
     UnresolvedReference,
     UnresolvedImport,
-    InvalidTarget,
+    InvalidHydraParameter,
+    ParameterAlreadyAssigned,
+    TooManyPositionalArguments,
 }
 
 impl DiagnosticRule {
@@ -23,7 +28,9 @@ impl DiagnosticRule {
             DiagnosticRule::UnknownArgument => "unknown-argument",
             DiagnosticRule::UnresolvedReference => "unresolved-reference",
             DiagnosticRule::UnresolvedImport => "unresolved-import",
-            DiagnosticRule::InvalidTarget => "invalid-target",
+            DiagnosticRule::InvalidHydraParameter => "invalid-hydra-parameter",
+            DiagnosticRule::ParameterAlreadyAssigned => "parameter-already-assigned",
+            DiagnosticRule::TooManyPositionalArguments => "too-many-positional-arguments",
         }
     }
 
@@ -34,7 +41,9 @@ impl DiagnosticRule {
             "unknown-argument" => Some(DiagnosticRule::UnknownArgument),
             "unresolved-reference" => Some(DiagnosticRule::UnresolvedReference),
             "unresolved-import" => Some(DiagnosticRule::UnresolvedImport),
-            "invalid-target" => Some(DiagnosticRule::InvalidTarget),
+            "invalid-hydra-parameter" => Some(DiagnosticRule::InvalidHydraParameter),
+            "parameter-already-assigned" => Some(DiagnosticRule::ParameterAlreadyAssigned),
+            "too-many-positional-arguments" => Some(DiagnosticRule::TooManyPositionalArguments),
             _ => None,
         }
     }
@@ -46,7 +55,9 @@ impl DiagnosticRule {
             DiagnosticRule::UnknownArgument,
             DiagnosticRule::UnresolvedReference,
             DiagnosticRule::UnresolvedImport,
-            DiagnosticRule::InvalidTarget,
+            DiagnosticRule::InvalidHydraParameter,
+            DiagnosticRule::ParameterAlreadyAssigned,
+            DiagnosticRule::TooManyPositionalArguments,
         ]
     }
 }
@@ -87,7 +98,7 @@ fn create_diagnostic(
 /// Validate a Hydra `_target_` entry. Returns diagnostics and optionally the resolved
 /// DefinitionInfo.
 fn validate_target(
-    target_info: &TargetInfo,
+    hydra_obj: &HydraObject,
     workspace_root: Option<&Path>,
     python_interpreter: Option<&str>,
     file_suppressions: &HashSet<DiagnosticRule>,
@@ -95,7 +106,7 @@ fn validate_target(
     let mut diagnostics = Vec::new();
 
     match PythonAnalyzer::extract_definition_info(
-        &target_info.value,
+        &hydra_obj.target.value,
         workspace_root,
         python_interpreter,
     ) {
@@ -108,17 +119,17 @@ fn validate_target(
                 (DiagnosticRule::UnresolvedImport, error_msg)
             } else if error_msg.starts_with("Invalid _target_ format:") {
                 (
-                    DiagnosticRule::InvalidTarget,
+                    DiagnosticRule::InvalidHydraParameter,
                     format!("{}. Expected format: 'module.path.SymbolName'", error_msg),
                 )
             } else {
                 (DiagnosticRule::UnresolvedReference, error_msg)
             };
-            if !file_suppressions.contains(&rule) && !target_info.suppressed_rules.contains(&rule) {
+            if !file_suppressions.contains(&rule) && !hydra_obj.suppressed_rules.contains(&rule) {
                 diagnostics.push(create_diagnostic(
-                    target_info.line,
-                    target_info.value_start,
-                    target_info.value_end(),
+                    hydra_obj.target.line,
+                    hydra_obj.target.value_start,
+                    hydra_obj.target_value_end(),
                     DiagnosticSeverity::ERROR,
                     Some(rule),
                     msg,
@@ -135,7 +146,7 @@ fn validate_target(
 /// that should be excluded from validation. Pass `None` for plain functions and
 /// static methods.
 fn validate_parameters(
-    target_info: &TargetInfo,
+    hydra_obj: &HydraObject,
     signature: &FunctionSignature,
     display_name: &str,
     implicit_param: Option<&str>,
@@ -143,11 +154,16 @@ fn validate_parameters(
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
 
-    // Get parameter names from YAML
-    let param_names: HashSet<String> = target_info
+    let key_start = hydra_obj.target.key_start;
+
+    // Get parameter names from YAML (only keyword params, not positional)
+    let param_names: HashSet<String> = hydra_obj
         .parameters
         .iter()
-        .map(|param| param.key.clone())
+        .filter_map(|p| match p {
+            Parameter::Keyword { key, .. } => Some(key.clone()),
+            Parameter::Positional { .. } => None,
+        })
         .collect();
 
     // Get expected parameter names from signature (excluding the implicit parameter)
@@ -160,44 +176,70 @@ fn validate_parameters(
         .map(|p| p.name.clone())
         .collect();
 
-    // Check if function accepts **kwargs
+    // Determine which signature params are satisfied by positional args from _args_
+    let num_positional_args = hydra_obj
+        .parameters
+        .iter()
+        .filter(|p| matches!(p, Parameter::Positional { .. }))
+        .count();
+
+    let positional_eligible: Vec<&ParameterInfo> = signature
+        .parameters
+        .iter()
+        .filter(|p| {
+            Some(p.name.as_str()) != implicit_param
+                && !p.is_variadic
+                && !p.is_variadic_keyword
+                && !p.is_keyword_only
+        })
+        .collect();
+
+    let positionally_covered: HashSet<String> = positional_eligible
+        .iter()
+        .take(num_positional_args)
+        .map(|p| p.name.clone())
+        .collect();
+
+    // Check if function accepts *args or **kwargs
+    let has_variadic = signature.parameters.iter().any(|p| p.is_variadic);
     let has_kwargs = signature.parameters.iter().any(|p| p.is_variadic_keyword);
 
-    // Check for unknown parameters
-    for param in &target_info.parameters {
-        if !expected_params.contains(&param.key)
+    // Check for unknown parameters (only keyword params)
+    for param in &hydra_obj.parameters {
+        if let Parameter::Keyword { key, line, .. } = param
+            && !expected_params.contains(key)
             && !has_kwargs
             && !file_suppressions.contains(&DiagnosticRule::UnknownArgument)
-            && !target_info
+            && !hydra_obj
                 .suppressed_rules
                 .contains(&DiagnosticRule::UnknownArgument)
         {
             diagnostics.push(create_diagnostic(
-                param.line,
-                target_info.key_start,
-                param.key.len() as u32 + target_info.key_start,
+                *line,
+                key_start,
+                key.len() as u32 + key_start,
                 DiagnosticSeverity::ERROR,
                 Some(DiagnosticRule::UnknownArgument),
-                format!("Unknown parameter '{}' for '{}'", param.key, display_name),
+                format!("Unknown parameter '{}' for '{}'", key, display_name),
             ));
         }
     }
 
-    // Check for missing required parameters (skip if is _partial_)
-    if !target_info.is_partial {
+    if !hydra_obj.is_partial() {
         for param in &signature.parameters {
             if param.is_required()
                 && Some(param.name.as_str()) != implicit_param
                 && !param_names.contains(&param.name)
+                && !positionally_covered.contains(&param.name)
                 && !file_suppressions.contains(&DiagnosticRule::MissingArgument)
-                && !target_info
+                && !hydra_obj
                     .suppressed_rules
                     .contains(&DiagnosticRule::MissingArgument)
             {
                 diagnostics.push(create_diagnostic(
-                    target_info.line,
-                    target_info.value_start,
-                    target_info.value_end(),
+                    hydra_obj.target.line,
+                    hydra_obj.target.value_start,
+                    hydra_obj.target_value_end(),
                     DiagnosticSeverity::ERROR,
                     Some(DiagnosticRule::MissingArgument),
                     format!(
@@ -209,6 +251,56 @@ fn validate_parameters(
         }
     }
 
+    // Check for parameters provided both positionally via _args_ and as keyword args
+    for param_name in &positionally_covered {
+        if param_names.contains(param_name)
+            && let Some(Parameter::Keyword { key, line, .. }) = hydra_obj
+                .parameters
+                .iter()
+                .find(|p| matches!(p, Parameter::Keyword { key, .. } if key == param_name))
+            && !file_suppressions.contains(&DiagnosticRule::ParameterAlreadyAssigned)
+            && !hydra_obj
+                .suppressed_rules
+                .contains(&DiagnosticRule::ParameterAlreadyAssigned)
+        {
+            diagnostics.push(create_diagnostic(
+                    *line,
+                    key_start,
+                    key.len() as u32 + key_start,
+                    DiagnosticSeverity::ERROR,
+                    Some(DiagnosticRule::ParameterAlreadyAssigned),
+                    format!(
+                        "'{}' got multiple values for argument '{}' (already provided positionally via _args_)",
+                        display_name, param_name
+                    ),
+                ));
+        }
+    }
+
+    // Check for too many positional arguments
+    if num_positional_args > positional_eligible.len()
+        && !has_variadic
+        && !file_suppressions.contains(&DiagnosticRule::TooManyPositionalArguments)
+        && !hydra_obj
+            .suppressed_rules
+            .contains(&DiagnosticRule::TooManyPositionalArguments)
+        && let Some(ref hp) = hydra_obj.args
+    {
+        diagnostics.push(create_diagnostic(
+            hp.line,
+            hp.key_start,
+            hp.key_start + ARGS_KEY.len() as u32,
+            DiagnosticSeverity::ERROR,
+            Some(DiagnosticRule::TooManyPositionalArguments),
+            format!(
+                "'{}' takes {} positional argument(s) but {} were given via _args_",
+                display_name,
+                positional_eligible.len(),
+                num_positional_args
+            ),
+        ));
+    }
+
     // If **kwargs present, give a warning instead of error for unknown params
     if has_kwargs && !param_names.is_subset(&expected_params) {
         let unknown: Vec<_> = param_names.difference(&expected_params).collect();
@@ -218,17 +310,19 @@ fn validate_parameters(
             });
 
             for param_name in unknown {
-                if let Some(param_value) =
-                    target_info.parameters.iter().find(|p| p.key == *param_name)
+                if let Some(Parameter::Keyword { key, line, .. }) = hydra_obj
+                    .parameters
+                    .iter()
+                    .find(|p| matches!(p, Parameter::Keyword { key, .. } if key == param_name))
                     && !file_suppressions.contains(&DiagnosticRule::UnknownArgument)
-                    && !target_info
+                    && !hydra_obj
                         .suppressed_rules
                         .contains(&DiagnosticRule::UnknownArgument)
                 {
                     diagnostics.push(create_diagnostic(
-                        param_value.line,
-                        target_info.key_start,
-                        target_info.key_start + param_value.key.len() as u32,
+                        *line,
+                        key_start,
+                        key_start + key.len() as u32,
                         DiagnosticSeverity::HINT,
                         None,
                         format!("Parameter '{}' will be passed via **kwargs", param_name),
@@ -236,6 +330,85 @@ fn validate_parameters(
                 }
             }
         }
+    }
+
+    diagnostics
+}
+
+/// Validate Hydra keyword values (_partial_, _recursive_, _convert_, _args_).
+fn validate_hydra_keywords(
+    hydra_obj: &HydraObject,
+    file_suppressions: &HashSet<DiagnosticRule>,
+) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+
+    if file_suppressions.contains(&DiagnosticRule::InvalidHydraParameter)
+        || hydra_obj
+            .suppressed_rules
+            .contains(&DiagnosticRule::InvalidHydraParameter)
+    {
+        return diagnostics;
+    }
+
+    let mut check_keyword =
+        |keyword: &str, hp_invalid: bool, hp_line: u32, hp_key_start: u32, msg: String| {
+            if hp_invalid {
+                diagnostics.push(create_diagnostic(
+                    hp_line,
+                    hp_key_start,
+                    hp_key_start + keyword.len() as u32,
+                    DiagnosticSeverity::ERROR,
+                    Some(DiagnosticRule::InvalidHydraParameter),
+                    msg,
+                ));
+            }
+        };
+
+    if let Some(ref hp) = hydra_obj.partial {
+        check_keyword(
+            PARTIAL_KEY,
+            hp.invalid,
+            hp.line,
+            hp.key_start,
+            format!(
+                "Invalid value for '{}': must be a boolean (true or false)",
+                PARTIAL_KEY
+            ),
+        );
+    }
+    if let Some(ref hp) = hydra_obj.recursive {
+        check_keyword(
+            RECURSIVE_KEY,
+            hp.invalid,
+            hp.line,
+            hp.key_start,
+            format!(
+                "Invalid value for '{}': must be a boolean (true or false)",
+                RECURSIVE_KEY
+            ),
+        );
+    }
+    if let Some(ref hp) = hydra_obj.convert {
+        check_keyword(
+            CONVERT_KEY,
+            hp.invalid,
+            hp.line,
+            hp.key_start,
+            format!(
+                "Invalid value for '{}': must be one of: {}",
+                CONVERT_KEY,
+                ConvertMode::variants().join(", ")
+            ),
+        );
+    }
+    if let Some(ref hp) = hydra_obj.args {
+        check_keyword(
+            ARGS_KEY,
+            hp.invalid,
+            hp.line,
+            hp.key_start,
+            format!("Invalid value for '{}': must be a list", ARGS_KEY),
+        );
     }
 
     diagnostics
@@ -249,7 +422,7 @@ pub fn validate_document(
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
 
-    for target in &parsed_content.targets {
+    for target in &parsed_content.hydra_objects {
         let (target_diagnostics, definition_info) = validate_target(
             target,
             workspace_root,
@@ -287,6 +460,11 @@ pub fn validate_document(
             diagnostics.extend(parameter_diagnostics);
         }
         // If Python analysis fails, we've already added a basic validation diagnostic above
+
+        // Validate Hydra keyword values
+        let keyword_diagnostics =
+            validate_hydra_keywords(target, &parsed_content.file_suppressions);
+        diagnostics.extend(keyword_diagnostics);
     }
 
     // Sort all diagnostics by position for consistent ordering
@@ -305,7 +483,7 @@ pub fn validate_document(
 mod tests {
     use super::*;
     use crate::python_analyzer::ParameterInfo;
-    use crate::yaml_parser::{Parameter, YamlValue};
+    use crate::yaml_parser::{HydraParameter, Parameter, YamlValue};
     use hashlink::LinkedHashMap;
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -317,32 +495,53 @@ mod tests {
             .join("simple")
     }
 
-    /// Helper to create a TargetInfo with default suppression fields.
-    fn make_target(
+    /// Helper to create a HydraObject with default suppression fields.
+    fn build_hydra_object(
         value: &str,
         parameters: Vec<Parameter>,
         line: u32,
         key_start: u32,
         value_start: u32,
         is_partial: bool,
-    ) -> TargetInfo {
-        TargetInfo {
-            value: value.to_string(),
+    ) -> HydraObject {
+        HydraObject {
+            target: HydraParameter {
+                value: value.to_string(),
+                line,
+                invalid: false,
+                key_start,
+                value_start,
+                value_end: value_start + value.len() as u32,
+            },
             parameters,
-            line,
-            key_start,
-            value_start,
             suppressed_rules: HashSet::new(),
-            is_partial,
+            partial: if is_partial {
+                Some(HydraParameter {
+                    value: true,
+                    line: 0,
+                    invalid: false,
+                    key_start: 0,
+                    value_start: 0,
+                    value_end: 0,
+                })
+            } else {
+                None
+            },
+            recursive: None,
+            convert: None,
+            args: None,
         }
     }
 
-    /// Helper to create a Parameter with default suppression fields.
+    /// Helper to create a keyword Parameter with default suppression fields.
     fn make_param(key: &str, value: YamlValue, line: u32) -> Parameter {
-        Parameter {
+        Parameter::Keyword {
             key: key.to_string(),
             value,
             line,
+            key_start: 0,
+            value_start: 0,
+            value_end: 0,
             suppressed_rules: HashSet::new(),
         }
     }
@@ -351,7 +550,7 @@ mod tests {
 
     #[test]
     fn test_validate_missing_required_param() {
-        let target_info = make_target("my.Class", Vec::new(), 0, 0, 0, false);
+        let hydra_obj = build_hydra_object("my.Class", Vec::new(), 0, 0, 0, false);
 
         let signature = FunctionSignature {
             name: "Class".to_string(),
@@ -384,7 +583,7 @@ mod tests {
         };
 
         let diagnostics = validate_parameters(
-            &target_info,
+            &hydra_obj,
             &signature,
             &signature.name,
             Some("self"),
@@ -407,7 +606,7 @@ mod tests {
     #[test]
     fn test_validate_unknown_param_without_kwargs() {
         let params = vec![make_param("unknown_param", YamlValue::Null, 1)];
-        let target_info = make_target("my.Class", params, 0, 0, 0, false);
+        let hydra_obj = build_hydra_object("my.Class", params, 0, 0, 0, false);
 
         let signature = FunctionSignature {
             name: "Class".to_string(),
@@ -429,7 +628,7 @@ mod tests {
         };
 
         let diagnostics = validate_parameters(
-            &target_info,
+            &hydra_obj,
             &signature,
             &signature.name,
             Some("self"),
@@ -448,7 +647,7 @@ mod tests {
     #[test]
     fn test_validate_unknown_param_with_kwargs() {
         let params = vec![make_param("any_param", YamlValue::Null, 1)];
-        let target_info = make_target("my.Class", params, 0, 0, 0, false);
+        let hydra_obj = build_hydra_object("my.Class", params, 0, 0, 0, false);
 
         let signature = FunctionSignature {
             name: "Class".to_string(),
@@ -481,7 +680,7 @@ mod tests {
         };
 
         let diagnostics = validate_parameters(
-            &target_info,
+            &hydra_obj,
             &signature,
             &signature.name,
             Some("self"),
@@ -499,7 +698,7 @@ mod tests {
     #[test]
     fn test_classmethod_cls_not_required() {
         // cls should not be reported as a missing required parameter for classmethods
-        let target_info = make_target("my.Class.from_config", Vec::new(), 0, 0, 0, false);
+        let hydra_obj = build_hydra_object("my.Class.from_config", Vec::new(), 0, 0, 0, false);
 
         let signature = FunctionSignature {
             name: "from_config".to_string(),
@@ -532,7 +731,7 @@ mod tests {
         };
 
         let diagnostics = validate_parameters(
-            &target_info,
+            &hydra_obj,
             &signature,
             &signature.name,
             Some("cls"),
@@ -566,7 +765,7 @@ mod tests {
             YamlValue::String("path/to/config".to_string()),
             2,
         )];
-        let target_info = make_target("my.Class.from_config", params, 0, 0, 0, false);
+        let hydra_obj = build_hydra_object("my.Class.from_config", params, 0, 0, 0, false);
 
         let signature = FunctionSignature {
             name: "from_config".to_string(),
@@ -599,7 +798,7 @@ mod tests {
         };
 
         let diagnostics = validate_parameters(
-            &target_info,
+            &hydra_obj,
             &signature,
             &signature.name,
             Some("cls"),
@@ -615,7 +814,7 @@ mod tests {
     #[test]
     fn test_non_conventional_self_name_filtered() {
         // Instance method using "this" instead of "self" should still be filtered
-        let target_info = make_target("my.Class", Vec::new(), 0, 0, 0, false);
+        let hydra_obj = build_hydra_object("my.Class", Vec::new(), 0, 0, 0, false);
 
         let signature = FunctionSignature {
             name: "__init__".to_string(),
@@ -649,7 +848,7 @@ mod tests {
 
         // "this" is the implicit first param, so it should be filtered
         let diagnostics = validate_parameters(
-            &target_info,
+            &hydra_obj,
             &signature,
             &signature.name,
             Some("this"),
@@ -681,7 +880,7 @@ mod tests {
             YamlValue::String("path".to_string()),
             2,
         )];
-        let target_info = make_target("my.Class.from_config", params, 0, 0, 0, false);
+        let hydra_obj = build_hydra_object("my.Class.from_config", params, 0, 0, 0, false);
 
         let signature = FunctionSignature {
             name: "from_config".to_string(),
@@ -715,7 +914,7 @@ mod tests {
 
         // "klass" is the implicit first param, so it should be filtered
         let diagnostics = validate_parameters(
-            &target_info,
+            &hydra_obj,
             &signature,
             &signature.name,
             Some("klass"),
@@ -731,7 +930,7 @@ mod tests {
     #[test]
     fn test_staticmethod_no_implicit_param() {
         // Static methods have no implicit parameter to filter
-        let target_info = make_target("my.Class.create", Vec::new(), 0, 0, 0, false);
+        let hydra_obj = build_hydra_object("my.Class.create", Vec::new(), 0, 0, 0, false);
 
         let signature = FunctionSignature {
             name: "create".to_string(),
@@ -754,7 +953,7 @@ mod tests {
 
         // No implicit param for static methods
         let diagnostics = validate_parameters(
-            &target_info,
+            &hydra_obj,
             &signature,
             &signature.name,
             None,
@@ -773,7 +972,7 @@ mod tests {
 
     #[test]
     fn test_validate_target_invalid_format() {
-        let target_info = make_target(
+        let hydra_obj = build_hydra_object(
             "InvalidTarget",
             Vec::new(),
             0,
@@ -783,21 +982,21 @@ mod tests {
         );
 
         let (diagnostics, _definition_info) =
-            validate_target(&target_info, None, None, &HashSet::new());
+            validate_target(&hydra_obj, None, None, &HashSet::new());
         assert_eq!(diagnostics.len(), 1);
         assert!(diagnostics[0].message.contains("Invalid _target_ format"));
         assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
         assert_eq!(
             diagnostics[0].code,
             Some(tower_lsp::lsp_types::NumberOrString::String(
-                "invalid-target".to_string()
+                "invalid-hydra-parameter".to_string()
             ))
         );
     }
 
     #[test]
     fn test_validate_target_module_not_found() {
-        let target_info = make_target(
+        let hydra_obj = build_hydra_object(
             "nonexistent.module.Class",
             Vec::new(),
             0,
@@ -807,7 +1006,7 @@ mod tests {
         );
 
         let (diagnostics, _definition_info) = validate_target(
-            &target_info,
+            &hydra_obj,
             Some(&get_simple_test_dir()),
             None,
             &HashSet::new(),
@@ -829,7 +1028,7 @@ mod tests {
 
     #[test]
     fn test_validate_target_symbol_not_found() {
-        let target_info = make_target(
+        let hydra_obj = build_hydra_object(
             "my_module.NonExistentClass",
             Vec::new(),
             0,
@@ -840,7 +1039,7 @@ mod tests {
 
         let resources_dir = get_simple_test_dir();
         let (diagnostics, _definition_info) =
-            validate_target(&target_info, Some(&resources_dir), None, &HashSet::new());
+            validate_target(&hydra_obj, Some(&resources_dir), None, &HashSet::new());
         assert_eq!(diagnostics.len(), 1);
         assert!(diagnostics[0].message.contains("Symbol"));
         assert!(diagnostics[0].message.contains("not found"));
@@ -855,7 +1054,7 @@ mod tests {
 
     #[test]
     fn test_validate_target_valid_class() {
-        let target_info = make_target(
+        let hydra_obj = build_hydra_object(
             "my_module.ClassWithInit",
             Vec::new(),
             0,
@@ -866,7 +1065,7 @@ mod tests {
 
         let resources_dir = get_simple_test_dir();
         let (diagnostics, _definition_info) =
-            validate_target(&target_info, Some(&resources_dir), None, &HashSet::new());
+            validate_target(&hydra_obj, Some(&resources_dir), None, &HashSet::new());
 
         assert!(
             !diagnostics
@@ -884,7 +1083,7 @@ mod tests {
 
     #[test]
     fn test_validate_target_valid_function() {
-        let target_info = make_target(
+        let hydra_obj = build_hydra_object(
             "my_module.simple_function",
             Vec::new(),
             0,
@@ -895,7 +1094,7 @@ mod tests {
 
         let resources_dir = get_simple_test_dir();
         let (diagnostics, _definition_info) =
-            validate_target(&target_info, Some(&resources_dir), None, &HashSet::new());
+            validate_target(&hydra_obj, Some(&resources_dir), None, &HashSet::new());
 
         assert!(
             !diagnostics
@@ -917,13 +1116,14 @@ mod tests {
     fn test_validate_document_multiple_targets() {
         let vs = 10 + "_target_:".len() as u32 + 1;
         let targets = vec![
-            make_target("my_module.simple_function", Vec::new(), 0, 10, vs, false),
-            make_target("InvalidTarget", Vec::new(), 2, 10, vs, false),
-            make_target("nonexistent.Module", Vec::new(), 4, 10, vs, false),
+            build_hydra_object("my_module.simple_function", Vec::new(), 0, 10, vs, false),
+            build_hydra_object("InvalidTarget", Vec::new(), 2, 10, vs, false),
+            build_hydra_object("nonexistent.Module", Vec::new(), 4, 10, vs, false),
         ];
         let parsed_content: ParsedContent = ParsedContent {
-            targets,
-            line_map: HashMap::new(),
+            hydra_objects: targets,
+            target_line_map: HashMap::new(),
+            param_line_map: HashMap::new(),
             file_suppressions: HashSet::new(),
         };
 
@@ -950,7 +1150,7 @@ mod tests {
     fn test_validate_document_with_parameter_validation() {
         let params = vec![make_param("value", YamlValue::Integer(42), 1)];
         let vs = 10 + "_target_:".len() as u32 + 1;
-        let targets = vec![make_target(
+        let targets = vec![build_hydra_object(
             "my_module.ClassWithInit",
             params,
             0,
@@ -959,8 +1159,9 @@ mod tests {
             false,
         )];
         let parsed_content: ParsedContent = ParsedContent {
-            targets,
-            line_map: HashMap::new(),
+            hydra_objects: targets,
+            target_line_map: HashMap::new(),
+            param_line_map: HashMap::new(),
             file_suppressions: HashSet::new(),
         };
 
@@ -986,7 +1187,7 @@ mod tests {
         );
         let params = vec![make_param("value", YamlValue::Mapping(mapping), 1)];
         let vs = 10 + "_target_:".len() as u32 + 1;
-        let targets = vec![make_target(
+        let targets = vec![build_hydra_object(
             "my_module.function_with_params",
             params,
             0,
@@ -997,8 +1198,9 @@ mod tests {
 
         let resources_dir = get_simple_test_dir();
         let parsed_content: ParsedContent = ParsedContent {
-            targets,
-            line_map: HashMap::new(),
+            hydra_objects: targets,
+            target_line_map: HashMap::new(),
+            param_line_map: HashMap::new(),
             file_suppressions: HashSet::new(),
         };
 
@@ -1022,7 +1224,7 @@ mod tests {
 
     #[test]
     fn test_partial_true_skips_missing_required_params() {
-        let target_info = make_target("my.Class", Vec::new(), 0, 0, 0, true);
+        let hydra_obj = build_hydra_object("my.Class", Vec::new(), 0, 0, 0, true);
 
         let signature = FunctionSignature {
             name: "Class".to_string(),
@@ -1055,7 +1257,7 @@ mod tests {
         };
 
         let diagnostics = validate_parameters(
-            &target_info,
+            &hydra_obj,
             &signature,
             &signature.name,
             Some("self"),
@@ -1070,7 +1272,7 @@ mod tests {
 
     #[test]
     fn test_partial_false_reports_missing_required_params() {
-        let target_info = make_target("my.Class", Vec::new(), 0, 0, 0, false);
+        let hydra_obj = build_hydra_object("my.Class", Vec::new(), 0, 0, 0, false);
 
         let signature = FunctionSignature {
             name: "Class".to_string(),
@@ -1103,7 +1305,7 @@ mod tests {
         };
 
         let diagnostics = validate_parameters(
-            &target_info,
+            &hydra_obj,
             &signature,
             &signature.name,
             Some("self"),
@@ -1123,7 +1325,7 @@ mod tests {
             make_param("valid_param", YamlValue::String("value".to_string()), 2),
             make_param("unknown_param", YamlValue::String("value".to_string()), 3),
         ];
-        let target_info = make_target("my.Class", params, 0, 0, 0, true);
+        let hydra_obj = build_hydra_object("my.Class", params, 0, 0, 0, true);
 
         let signature = FunctionSignature {
             name: "Class".to_string(),
@@ -1165,7 +1367,7 @@ mod tests {
         };
 
         let diagnostics = validate_parameters(
-            &target_info,
+            &hydra_obj,
             &signature,
             &signature.name,
             Some("self"),
@@ -1197,13 +1399,14 @@ mod tests {
     #[test]
     fn test_validate_document_with_file_suppression() {
         let vs = 10 + "_target_:".len() as u32 + 1;
-        let target = make_target("InvalidTarget", Vec::new(), 2, 10, vs, false);
+        let hydra_object = build_hydra_object("InvalidTarget", Vec::new(), 2, 10, vs, false);
         let mut file_suppressions = HashSet::new();
-        file_suppressions.insert(DiagnosticRule::InvalidTarget);
-        let targets = vec![target];
+        file_suppressions.insert(DiagnosticRule::InvalidHydraParameter);
+        let targets = vec![hydra_object];
         let parsed_content: ParsedContent = ParsedContent {
-            targets,
-            line_map: HashMap::new(),
+            hydra_objects: targets,
+            target_line_map: HashMap::new(),
+            param_line_map: HashMap::new(),
             file_suppressions,
         };
 
@@ -1219,14 +1422,15 @@ mod tests {
     #[test]
     fn test_validate_document_with_inline_suppression_on_target() {
         let vs = 10 + "_target_:".len() as u32 + 1;
-        let mut target = make_target("InvalidTarget", Vec::new(), 2, 10, vs, false);
-        target
+        let mut hydra_object = build_hydra_object("InvalidTarget", Vec::new(), 2, 10, vs, false);
+        hydra_object
             .suppressed_rules
-            .insert(DiagnosticRule::InvalidTarget);
-        let targets = vec![target];
+            .insert(DiagnosticRule::InvalidHydraParameter);
+        let targets = vec![hydra_object];
         let parsed_content: ParsedContent = ParsedContent {
-            targets,
-            line_map: HashMap::new(),
+            hydra_objects: targets,
+            target_line_map: HashMap::new(),
+            param_line_map: HashMap::new(),
             file_suppressions: HashSet::new(),
         };
 
@@ -1236,6 +1440,155 @@ mod tests {
             diagnostics.is_empty(),
             "Should have no diagnostics when rule is inline-suppressed on target, but got: {:?}",
             diagnostics
+        );
+    }
+
+    // ==================== Invalid Keyword Value Tests ====================
+
+    #[test]
+    fn test_invalid_recursive_value_diagnostic() {
+        let mut hydra_object = build_hydra_object("InvalidTarget", Vec::new(), 0, 0, 0, false);
+        hydra_object.recursive = Some(HydraParameter {
+            value: false,
+            line: 1,
+            invalid: true,
+            key_start: 0,
+            value_start: 0,
+            value_end: 0,
+        });
+        let parsed_content = ParsedContent {
+            hydra_objects: vec![hydra_object],
+            target_line_map: HashMap::new(),
+            param_line_map: HashMap::new(),
+            file_suppressions: HashSet::new(),
+        };
+
+        let diagnostics = validate_document(parsed_content, None, None);
+        let keyword_diags: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.message.contains("_recursive_"))
+            .collect();
+        assert_eq!(keyword_diags.len(), 1);
+        assert!(keyword_diags[0].message.contains("boolean"));
+        assert_eq!(
+            keyword_diags[0].code,
+            Some(tower_lsp::lsp_types::NumberOrString::String(
+                "invalid-hydra-parameter".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_invalid_convert_value_diagnostic() {
+        let mut hydra_object = build_hydra_object("InvalidTarget", Vec::new(), 0, 0, 0, false);
+        hydra_object.convert = Some(HydraParameter {
+            value: crate::yaml_parser::ConvertMode::None,
+            line: 1,
+            invalid: true,
+            key_start: 0,
+            value_start: 0,
+            value_end: 0,
+        });
+        let parsed_content = ParsedContent {
+            hydra_objects: vec![hydra_object],
+            target_line_map: HashMap::new(),
+            param_line_map: HashMap::new(),
+            file_suppressions: HashSet::new(),
+        };
+
+        let diagnostics = validate_document(parsed_content, None, None);
+        let keyword_diags: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.message.contains("_convert_"))
+            .collect();
+        assert_eq!(keyword_diags.len(), 1);
+        assert!(
+            keyword_diags[0]
+                .message
+                .contains("none, partial, all, object")
+        );
+        assert_eq!(
+            keyword_diags[0].code,
+            Some(tower_lsp::lsp_types::NumberOrString::String(
+                "invalid-hydra-parameter".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_invalid_args_value_diagnostic() {
+        let mut hydra_object = build_hydra_object("InvalidTarget", Vec::new(), 0, 0, 0, false);
+        hydra_object.args = Some(HydraParameter {
+            value: (),
+            line: 1,
+            invalid: true,
+            key_start: 0,
+            value_start: 0,
+            value_end: 0,
+        });
+        let parsed_content = ParsedContent {
+            hydra_objects: vec![hydra_object],
+            target_line_map: HashMap::new(),
+            param_line_map: HashMap::new(),
+            file_suppressions: HashSet::new(),
+        };
+
+        let diagnostics = validate_document(parsed_content, None, None);
+        let keyword_diags: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.message.contains("_args_"))
+            .collect();
+        assert_eq!(keyword_diags.len(), 1);
+        assert!(keyword_diags[0].message.contains("list"));
+    }
+
+    #[test]
+    fn test_valid_keywords_no_diagnostics() {
+        let mut hydra_object = build_hydra_object("InvalidTarget", Vec::new(), 0, 0, 0, false);
+        hydra_object.recursive = Some(HydraParameter {
+            value: true,
+            line: 1,
+            invalid: false,
+            key_start: 0,
+            value_start: 0,
+            value_end: 0,
+        });
+        hydra_object.convert = Some(HydraParameter {
+            value: crate::yaml_parser::ConvertMode::All,
+            line: 2,
+            invalid: false,
+            key_start: 0,
+            value_start: 0,
+            value_end: 0,
+        });
+        hydra_object.args = Some(HydraParameter {
+            value: (),
+            line: 3,
+            invalid: false,
+            key_start: 0,
+            value_start: 0,
+            value_end: 0,
+        });
+        let parsed_content = ParsedContent {
+            hydra_objects: vec![hydra_object],
+            target_line_map: HashMap::new(),
+            param_line_map: HashMap::new(),
+            file_suppressions: HashSet::new(),
+        };
+
+        let diagnostics = validate_document(parsed_content, None, None);
+        let keyword_diags: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| {
+                d.message.contains("_recursive_")
+                    || d.message.contains("_convert_")
+                    || d.message.contains("_args_")
+            })
+            .collect();
+        assert!(
+            keyword_diags.is_empty(),
+            "Valid keywords should produce no keyword diagnostics, got: {:?}",
+            keyword_diags
         );
     }
 }

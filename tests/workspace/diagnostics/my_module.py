@@ -19,3 +19,15 @@ class Config:
     def __init__(self, name: str, value: float):
         self.name = name
         self.value = value
+
+
+def my_func(arg1, arg2, *args, **kwargs):
+    pass
+
+
+def strict_func(arg1, arg2):
+    pass
+
+
+def mixed_func(arg1, *args, kw_only):
+    pass

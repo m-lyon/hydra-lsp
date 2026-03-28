@@ -224,7 +224,7 @@ model:
         assert_eq!(diag.severity, Some(DiagnosticSeverity::ERROR));
         assert_eq!(
             diag.code,
-            Some(NumberOrString::String("invalid-target".to_string()))
+            Some(NumberOrString::String("invalid-hydra-parameter".to_string()))
         );
         insta::assert_snapshot!(
             "diagnostic_invalid_format",
@@ -803,5 +803,382 @@ loader:
         diagnostics.is_empty(),
         "Should have no diagnostics for valid classmethod usage, got: {:?}",
         diagnostics
+    );
+}
+
+// ==================== Hydra Keyword Integration Tests ====================
+
+#[tokio::test]
+async fn test_hydra_keywords_not_reported_as_unknown() {
+    let mut ctx = TestContext::new(TestWorkspace::Simple);
+    ctx.initialize().await;
+
+    let content = r#"
+model:
+  _target_: my_module.DataLoader
+  _partial_: true
+  _recursive_: false
+  _convert_: all
+  _args_: [1, 2]
+  batch_size: 32
+"#;
+    ctx.open_document("keywords.yaml", content.to_string())
+        .await;
+
+    let dp = ctx.recv::<PublishDiagnosticsParams>().await;
+    let diagnostics = dp.diagnostics;
+
+    // None of the hydra keywords should be reported as unknown parameters
+    let unknown_keyword_diags: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| {
+            d.message.contains("Unknown parameter")
+                && (d.message.contains("_partial_")
+                    || d.message.contains("_recursive_")
+                    || d.message.contains("_convert_")
+                    || d.message.contains("_args_"))
+        })
+        .collect();
+
+    assert!(
+        unknown_keyword_diags.is_empty(),
+        "Hydra keywords should not be reported as unknown parameters, got: {:?}",
+        unknown_keyword_diags
+    );
+}
+
+#[tokio::test]
+async fn test_invalid_recursive_value_diagnostic() {
+    let mut ctx = TestContext::new(TestWorkspace::Simple);
+    ctx.initialize().await;
+
+    let content = r#"
+model:
+  _target_: my_module.DataLoader
+  _recursive_: "yes"
+  batch_size: 32
+"#;
+    ctx.open_document("invalid_recursive.yaml", content.to_string())
+        .await;
+
+    let dp = ctx.recv::<PublishDiagnosticsParams>().await;
+    let diagnostics = dp.diagnostics;
+
+    let keyword_diag = diagnostics
+        .iter()
+        .find(|d| d.message.contains("_recursive_") && d.message.contains("boolean"));
+
+    assert!(
+        keyword_diag.is_some(),
+        "Should have diagnostic for invalid _recursive_ value, got: {:?}",
+        diagnostics
+    );
+
+    if let Some(diag) = keyword_diag {
+        assert_eq!(diag.severity, Some(DiagnosticSeverity::ERROR));
+        assert_eq!(
+            diag.code,
+            Some(NumberOrString::String("invalid-hydra-parameter".to_string()))
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_invalid_convert_value_diagnostic() {
+    let mut ctx = TestContext::new(TestWorkspace::Simple);
+    ctx.initialize().await;
+
+    let content = r#"
+model:
+  _target_: my_module.DataLoader
+  _convert_: invalid_mode
+  batch_size: 32
+"#;
+    ctx.open_document("invalid_convert.yaml", content.to_string())
+        .await;
+
+    let dp = ctx.recv::<PublishDiagnosticsParams>().await;
+    let diagnostics = dp.diagnostics;
+
+    let keyword_diag = diagnostics
+        .iter()
+        .find(|d| d.message.contains("_convert_") && d.message.contains("must be one of"));
+
+    assert!(
+        keyword_diag.is_some(),
+        "Should have diagnostic for invalid _convert_ value, got: {:?}",
+        diagnostics
+    );
+
+    if let Some(diag) = keyword_diag {
+        assert_eq!(diag.severity, Some(DiagnosticSeverity::ERROR));
+        assert_eq!(
+            diag.code,
+            Some(NumberOrString::String("invalid-hydra-parameter".to_string()))
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_invalid_args_value_diagnostic() {
+    let mut ctx = TestContext::new(TestWorkspace::Simple);
+    ctx.initialize().await;
+
+    let content = r#"
+model:
+  _target_: my_module.DataLoader
+  _args_: "not a list"
+  batch_size: 32
+"#;
+    ctx.open_document("invalid_args.yaml", content.to_string())
+        .await;
+
+    let dp = ctx.recv::<PublishDiagnosticsParams>().await;
+    let diagnostics = dp.diagnostics;
+
+    let keyword_diag = diagnostics
+        .iter()
+        .find(|d| d.message.contains("_args_") && d.message.contains("list"));
+
+    assert!(
+        keyword_diag.is_some(),
+        "Should have diagnostic for invalid _args_ value, got: {:?}",
+        diagnostics
+    );
+
+    if let Some(diag) = keyword_diag {
+        assert_eq!(diag.severity, Some(DiagnosticSeverity::ERROR));
+        assert_eq!(
+            diag.code,
+            Some(NumberOrString::String("invalid-hydra-parameter".to_string()))
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_valid_hydra_keywords_no_keyword_diagnostics() {
+    let mut ctx = TestContext::new(TestWorkspace::Simple);
+    ctx.initialize().await;
+
+    let content = r#"
+model:
+  _target_: my_module.DataLoader
+  _recursive_: true
+  _convert_: partial
+  _args_: [1, 2, 3]
+  batch_size: 32
+"#;
+    ctx.open_document("valid_keywords.yaml", content.to_string())
+        .await;
+
+    let dp = ctx.recv::<PublishDiagnosticsParams>().await;
+    let diagnostics = dp.diagnostics;
+
+    let keyword_diags: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| {
+            d.code == Some(NumberOrString::String("invalid-hydra-parameter".to_string()))
+        })
+        .collect();
+
+    assert!(
+        keyword_diags.is_empty(),
+        "Valid keywords should produce no keyword diagnostics, got: {:?}",
+        keyword_diags
+    );
+}
+
+#[tokio::test]
+async fn test_args_satisfies_positional_params() {
+    let mut ctx = TestContext::new(TestWorkspace::Simple);
+    ctx.initialize().await;
+
+    let content = r#"
+func:
+  _target_: my_module.strict_func
+  _args_: [10, 20]
+"#;
+    ctx.open_document("args_satisfy.yaml", content.to_string())
+        .await;
+
+    let dp = ctx.recv::<PublishDiagnosticsParams>().await;
+    let diagnostics = dp.diagnostics;
+
+    let missing_diags: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.message.contains("Missing required parameter"))
+        .collect();
+
+    assert!(
+        missing_diags.is_empty(),
+        "_args_ should satisfy positional parameters, got: {:?}",
+        missing_diags
+    );
+}
+
+#[tokio::test]
+async fn test_args_partially_satisfies_positional_params() {
+    let mut ctx = TestContext::new(TestWorkspace::Simple);
+    ctx.initialize().await;
+
+    let content = r#"
+func:
+  _target_: my_module.strict_func
+  _args_: [10]
+"#;
+    ctx.open_document("args_partial.yaml", content.to_string())
+        .await;
+
+    let dp = ctx.recv::<PublishDiagnosticsParams>().await;
+    let diagnostics = dp.diagnostics;
+
+    let missing_diags: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.message.contains("Missing required parameter"))
+        .collect();
+
+    assert_eq!(
+        missing_diags.len(),
+        1,
+        "Should have exactly one missing parameter diagnostic, got: {:?}",
+        missing_diags
+    );
+    assert!(
+        missing_diags[0].message.contains("arg2"),
+        "Should report arg2 as missing, got: {:?}",
+        missing_diags[0].message
+    );
+}
+
+#[tokio::test]
+async fn test_args_multiple_values_error() {
+    let mut ctx = TestContext::new(TestWorkspace::Simple);
+    ctx.initialize().await;
+
+    let content = r#"
+func:
+  _target_: my_module.strict_func
+  _args_: [10, 20]
+  arg1: 10
+"#;
+    ctx.open_document("args_multiple_values.yaml", content.to_string())
+        .await;
+
+    let dp = ctx.recv::<PublishDiagnosticsParams>().await;
+    let diagnostics = dp.diagnostics;
+
+    let already_assigned: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| {
+            d.code == Some(NumberOrString::String("parameter-already-assigned".to_string()))
+        })
+        .collect();
+
+    assert_eq!(
+        already_assigned.len(),
+        1,
+        "Should have one parameter-already-assigned diagnostic, got: {:?}",
+        diagnostics
+    );
+    assert!(
+        already_assigned[0].message.contains("arg1"),
+        "Should mention arg1 in error, got: {:?}",
+        already_assigned[0].message
+    );
+}
+
+#[tokio::test]
+async fn test_args_with_variadic_no_overflow_error() {
+    let mut ctx = TestContext::new(TestWorkspace::Simple);
+    ctx.initialize().await;
+
+    let content = r#"
+func:
+  _target_: my_module.my_func
+  _args_: [10, 20, 30]
+"#;
+    ctx.open_document("args_variadic.yaml", content.to_string())
+        .await;
+
+    let dp = ctx.recv::<PublishDiagnosticsParams>().await;
+    let diagnostics = dp.diagnostics;
+
+    assert!(
+        diagnostics.is_empty(),
+        "Should have no diagnostics when *args absorbs extra positional args, got: {:?}",
+        diagnostics
+    );
+}
+
+#[tokio::test]
+async fn test_args_too_many_positional() {
+    let mut ctx = TestContext::new(TestWorkspace::Simple);
+    ctx.initialize().await;
+
+    let content = r#"
+func:
+  _target_: my_module.strict_func
+  _args_: [10, 20, 30]
+"#;
+    ctx.open_document("args_too_many.yaml", content.to_string())
+        .await;
+
+    let dp = ctx.recv::<PublishDiagnosticsParams>().await;
+    let diagnostics = dp.diagnostics;
+
+    let too_many: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| {
+            d.code
+                == Some(NumberOrString::String(
+                    "too-many-positional-arguments".to_string(),
+                ))
+        })
+        .collect();
+
+    assert_eq!(
+        too_many.len(),
+        1,
+        "Should have one too-many-positional-arguments diagnostic, got: {:?}",
+        diagnostics
+    );
+    assert!(
+        too_many[0].message.contains("2 positional argument(s)"),
+        "Should mention the expected count, got: {:?}",
+        too_many[0].message
+    );
+}
+
+#[tokio::test]
+async fn test_args_with_keyword_only_not_satisfied() {
+    let mut ctx = TestContext::new(TestWorkspace::Simple);
+    ctx.initialize().await;
+
+    let content = r#"
+func:
+  _target_: my_module.mixed_func
+  _args_: [10, 20]
+"#;
+    ctx.open_document("args_kw_only.yaml", content.to_string())
+        .await;
+
+    let dp = ctx.recv::<PublishDiagnosticsParams>().await;
+    let diagnostics = dp.diagnostics;
+
+    let missing_diags: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.message.contains("Missing required parameter"))
+        .collect();
+
+    assert_eq!(
+        missing_diags.len(),
+        1,
+        "Should have one missing parameter diagnostic for keyword-only param, got: {:?}",
+        diagnostics
+    );
+    assert!(
+        missing_diags[0].message.contains("kw_only"),
+        "Should report kw_only as missing, got: {:?}",
+        missing_diags[0].message
     );
 }

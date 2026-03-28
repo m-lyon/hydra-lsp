@@ -93,15 +93,62 @@ impl HydraSemanticToken {
 
 pub const TARGET_KEY: &str = "_target_";
 pub const PARTIAL_KEY: &str = "_partial_";
+pub const ARGS_KEY: &str = "_args_";
+pub const RECURSIVE_KEY: &str = "_recursive_";
+pub const CONVERT_KEY: &str = "_convert_";
+pub const HYDRA_KEYWORDS: &[&str] = &[
+    TARGET_KEY,
+    PARTIAL_KEY,
+    ARGS_KEY,
+    RECURSIVE_KEY,
+    CONVERT_KEY,
+];
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConvertMode {
+    None,
+    Partial,
+    All,
+    Object,
+}
+
+impl ConvertMode {
+    pub fn variants() -> &'static [&'static str] {
+        &["none", "partial", "all", "object"]
+    }
+}
+
+impl std::str::FromStr for ConvertMode {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "none" => Ok(ConvertMode::None),
+            "partial" => Ok(ConvertMode::Partial),
+            "all" => Ok(ConvertMode::All),
+            "object" => Ok(ConvertMode::Object),
+            _ => Err(()),
+        }
+    }
+}
+
+/// A YAML value paired with its source position, used for sequence elements.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PositionedValue {
+    pub value: YamlValue,
+    pub line: u32,
+    pub start: u32,
+    pub end: u32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum YamlValue {
     Null,
     Bool(bool),
     Integer(i64),
     Float(f64),
     String(String),
-    Sequence(Vec<YamlValue>),
+    Sequence(Vec<PositionedValue>),
     Mapping(LinkedHashMap<String, YamlValue>),
 }
 
@@ -142,47 +189,147 @@ impl From<saphyr::ScanError> for YamlParseError {
     }
 }
 
-/// Represents a parameter in a YAML configuration with position information
-/// Can either be a simple value or a nested target
+/// Represents a parameter in a YAML configuration with position information.
+/// Can be either a keyword argument (with a key) or a positional argument (from `_args_`).
 #[derive(Debug, Clone)]
-pub struct Parameter {
-    pub value: YamlValue,
+pub enum Parameter {
+    Keyword {
+        key: String,
+        value: YamlValue,
+        line: u32,
+        key_start: u32,
+        value_start: u32,
+        value_end: u32,
+        suppressed_rules: HashSet<DiagnosticRule>,
+    },
+    Positional {
+        value: YamlValue,
+        line: u32,
+        value_start: u32,
+        value_end: u32,
+        suppressed_rules: HashSet<DiagnosticRule>,
+    },
+}
+
+impl Parameter {
+    pub fn line(&self) -> u32 {
+        match self {
+            Parameter::Keyword { line, .. } | Parameter::Positional { line, .. } => *line,
+        }
+    }
+
+    pub fn key(&self) -> Option<&str> {
+        match self {
+            Parameter::Keyword { key, .. } => Some(key),
+            Parameter::Positional { .. } => None,
+        }
+    }
+
+    pub fn value(&self) -> &YamlValue {
+        match self {
+            Parameter::Keyword { value, .. } | Parameter::Positional { value, .. } => value,
+        }
+    }
+
+    pub fn suppressed_rules(&self) -> &HashSet<DiagnosticRule> {
+        match self {
+            Parameter::Keyword {
+                suppressed_rules, ..
+            }
+            | Parameter::Positional {
+                suppressed_rules, ..
+            } => suppressed_rules,
+        }
+    }
+
+    pub fn suppressed_rules_mut(&mut self) -> &mut HashSet<DiagnosticRule> {
+        match self {
+            Parameter::Keyword {
+                suppressed_rules, ..
+            }
+            | Parameter::Positional {
+                suppressed_rules, ..
+            } => suppressed_rules,
+        }
+    }
+}
+
+/// Trait for accessing position/span fields of hydra keyword parameters,
+/// regardless of the value type `T`.
+trait HydraKeywordSpan {
+    fn line(&self) -> u32;
+    fn invalid(&self) -> bool;
+    fn key_start(&self) -> u32;
+    fn value_start(&self) -> u32;
+    fn value_end(&self) -> u32;
+}
+
+/// A Hydra keyword parameter with its parsed value and position information.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HydraParameter<T> {
+    pub value: T,
     pub line: u32,
-    pub key: String,
-    /// Diagnostic rules suppressed by an inline comment on this parameter's line.
-    pub suppressed_rules: HashSet<DiagnosticRule>,
+    pub invalid: bool,
+    pub key_start: u32,
+    pub value_start: u32,
+    pub value_end: u32,
+}
+
+impl<T> HydraKeywordSpan for HydraParameter<T> {
+    fn line(&self) -> u32 {
+        self.line
+    }
+    fn invalid(&self) -> bool {
+        self.invalid
+    }
+    fn key_start(&self) -> u32 {
+        self.key_start
+    }
+    fn value_start(&self) -> u32 {
+        self.value_start
+    }
+    fn value_end(&self) -> u32 {
+        self.value_end
+    }
 }
 
 #[derive(Debug, Clone)]
-pub struct TargetInfo {
-    /// The target value (class/function path)
-    pub value: String,
-    /// Parameters for the target
+pub struct HydraObject {
+    /// The `_target_` keyword
+    pub target: HydraParameter<String>,
+    /// Parameters for the target (keyword arguments + positional from `_args_`)
     pub parameters: Vec<Parameter>,
-    /// The line number where the `_target_` key is located
-    pub line: u32,
-    /// The start position of the `_target_` key in the line
-    pub key_start: u32,
-    /// The start position of the target value in the line
-    pub value_start: u32,
     /// Diagnostic rules suppressed by an inline comment on the `_target_` line.
     pub suppressed_rules: HashSet<DiagnosticRule>,
-    /// Whether the `_partial_` parameter is set to true for this target
-    pub is_partial: bool,
+    /// The `_partial_` keyword (if present)
+    pub partial: Option<HydraParameter<bool>>,
+    /// The `_recursive_` keyword (if present)
+    pub recursive: Option<HydraParameter<bool>>,
+    /// The `_convert_` keyword (if present)
+    pub convert: Option<HydraParameter<ConvertMode>>,
+    /// The `_args_` keyword (if present)
+    pub args: Option<HydraParameter<()>>,
 }
 
-impl TargetInfo {
+impl HydraObject {
     /// Get the end position of the target value
-    pub fn value_end(&self) -> u32 {
-        self.value_start + self.value.len() as u32
+    pub fn target_value_end(&self) -> u32 {
+        self.target.value_start + self.target.value.len() as u32
+    }
+
+    /// Check if this HydraObject is marked as partial
+    pub fn is_partial(&self) -> bool {
+        self.partial.as_ref().is_some_and(|p| !p.invalid && p.value)
     }
 }
 
 pub struct ParsedContent {
-    /// All targets found in the document, in the order they appear
-    pub targets: Vec<TargetInfo>,
-    /// Mapping from line number to index in the targets vector for quick lookup
-    pub line_map: HashMap<u32, usize>,
+    /// All hydra objects found in the document, in the order they appear
+    pub hydra_objects: Vec<HydraObject>,
+    /// Mapping from line number to index in the hydra_objects vector for quick lookup
+    pub target_line_map: HashMap<u32, usize>,
+    /// Mapping from parameter line number to (hydra_objects index, parameter context)
+    pub param_line_map: HashMap<u32, (usize, ParameterContext)>,
     /// File-wide diagnostic suppressions from header comments
     pub file_suppressions: HashSet<DiagnosticRule>,
 }
@@ -201,7 +348,16 @@ fn node_to_yaml_value(node: &MarkedYamlOwned) -> YamlValue {
     } else if let Some(s) = data.as_str() {
         YamlValue::String(s.to_string())
     } else if let Some(seq) = data.as_sequence() {
-        YamlValue::Sequence(seq.iter().map(node_to_yaml_value).collect())
+        YamlValue::Sequence(
+            seq.iter()
+                .map(|item| PositionedValue {
+                    value: node_to_yaml_value(item),
+                    line: (item.span.start.line() - 1) as u32,
+                    start: item.span.start.col() as u32,
+                    end: item.span.end.col() as u32,
+                })
+                .collect(),
+        )
     } else if let Some(map) = data.as_mapping() {
         let entries = map
             .iter()
@@ -226,8 +382,9 @@ impl YamlParser {
         let docs = MarkedYamlOwned::load_from_str(content)?;
         if content.trim().is_empty() {
             return Ok(ParsedContent {
-                targets: Vec::new(),
-                line_map: HashMap::new(),
+                hydra_objects: Vec::new(),
+                target_line_map: HashMap::new(),
+                param_line_map: HashMap::new(),
                 file_suppressions: HashSet::new(),
             });
         }
@@ -238,41 +395,45 @@ impl YamlParser {
             ));
         }
 
-        let mut targets = Vec::new();
-        Self::extract_targets(&docs[0], content, &mut targets);
+        let mut hydra_objects = Vec::new();
+        Self::extract_hydra_objects(&docs[0], content, &mut hydra_objects);
 
         // Parse file-wide suppressions from header comments before any YAML content
         let file_suppressions = Self::get_filewide_suppressions(content);
 
-        // Build line-to-index lookup map
-        let mut line_map = HashMap::new();
-        for (idx, target) in targets.iter().enumerate() {
-            line_map.insert(target.line, idx);
+        // Build line-to-index and param-line-to-index lookup maps
+        let mut target_line_map = HashMap::new();
+        let mut param_line_map = HashMap::new();
+        for (target_idx, hydra_obj) in hydra_objects.iter().enumerate() {
+            target_line_map.insert(hydra_obj.target.line, target_idx);
+            let mut param_index = 0u32;
+            for param in &hydra_obj.parameters {
+                let context = match param {
+                    Parameter::Keyword { key, .. } => ParameterContext::Keyword(key.clone()),
+                    Parameter::Positional { .. } => {
+                        let ctx = ParameterContext::Positional(param_index);
+                        param_index += 1;
+                        ctx
+                    }
+                };
+                param_line_map.insert(param.line(), (target_idx, context));
+            }
         }
 
         // Attach suppression comments from the raw content to targets/parameters
-        Self::attach_suppressions(content, &mut targets, &line_map);
+        Self::attach_suppressions(content, &mut hydra_objects, &target_line_map);
 
         Ok(ParsedContent {
-            targets,
-            line_map,
+            hydra_objects,
+            target_line_map,
+            param_line_map,
             file_suppressions,
         })
     }
 
     /// Check if a YAML file is a Hydra configuration file
     pub fn is_hydra_file(content: &str) -> bool {
-        // Strategy 1: Check for comment markers
-        if Self::has_hydra_comment(content) {
-            return true;
-        }
-
-        // Strategy 2: Check for _target_ keyword
-        if Self::has_target_keyword(content) {
-            return true;
-        }
-
-        false
+        Self::has_hydra_comment(content) || Self::has_target_keyword(content)
     }
 
     /// Check for Hydra comment markers (# @hydra, # @package, # hydra:)
@@ -419,14 +580,14 @@ impl YamlParser {
     /// map line numbers back to the original content to find any inline suppression comments.
     fn attach_suppressions(
         content: &str,
-        targets: &mut [TargetInfo],
+        hydra_objects: &mut [HydraObject],
         line_map: &HashMap<u32, usize>,
     ) {
         let mut line_to_parameters: HashMap<u32, (usize, usize)> = HashMap::new();
 
         for &i in line_map.values() {
-            for (pi, param) in targets[i].parameters.iter().enumerate() {
-                line_to_parameters.insert(param.line, (i, pi));
+            for (pi, param) in hydra_objects[i].parameters.iter().enumerate() {
+                line_to_parameters.insert(param.line(), (i, pi));
             }
         }
 
@@ -436,16 +597,142 @@ impl YamlParser {
                 && let Some(rules) = Self::extract_inline_ignore(line)
             {
                 if let Some(&ti) = line_map.get(&line_num) {
-                    targets[ti].suppressed_rules.extend(rules);
+                    hydra_objects[ti].suppressed_rules.extend(rules);
                 } else if let Some(&(ti, pi)) = line_to_parameters.get(&line_num) {
-                    targets[ti].parameters[pi].suppressed_rules.extend(rules);
+                    hydra_objects[ti].parameters[pi]
+                        .suppressed_rules_mut()
+                        .extend(rules);
                 }
             }
         }
     }
 
-    /// Recursively extract all `_target_` references from a marked YAML node
-    fn extract_targets(node: &MarkedYamlOwned, content: &str, targets: &mut Vec<TargetInfo>) {
+    /// Extract a boolean Hydra keyword from a mapping, returning `Some(HydraParameter)` if present.
+    fn extract_bool_keyword(
+        map: &LinkedHashMap<MarkedYamlOwned, MarkedYamlOwned>,
+        keyword: &str,
+    ) -> Option<HydraParameter<bool>> {
+        let (key_n, val_node) = map.iter().find(|(k, _)| k.data.as_str() == Some(keyword))?;
+        let line = (key_n.span.start.line() - 1) as u32;
+        let key_start = key_n.span.start.col() as u32;
+        let value_start = val_node.span.start.col() as u32;
+        let value_end = val_node.span.end.col() as u32;
+        match val_node.data.as_bool() {
+            Some(b) => Some(HydraParameter {
+                value: b,
+                line,
+                invalid: false,
+                key_start,
+                value_start,
+                value_end,
+            }),
+            None => Some(HydraParameter {
+                value: false,
+                line,
+                invalid: true,
+                key_start,
+                value_start,
+                value_end,
+            }),
+        }
+    }
+
+    /// Extract the `_convert_` Hydra keyword from a mapping.
+    fn extract_convert_keyword(
+        map: &LinkedHashMap<MarkedYamlOwned, MarkedYamlOwned>,
+    ) -> Option<HydraParameter<ConvertMode>> {
+        let (key_n, val_node) = map
+            .iter()
+            .find(|(k, _)| k.data.as_str() == Some(CONVERT_KEY))?;
+        let line = (key_n.span.start.line() - 1) as u32;
+        let key_start = key_n.span.start.col() as u32;
+        let value_start = val_node.span.start.col() as u32;
+        let value_end = val_node.span.end.col() as u32;
+        match val_node
+            .data
+            .as_str()
+            .and_then(|s| s.parse::<ConvertMode>().ok())
+        {
+            Some(mode) => Some(HydraParameter {
+                value: mode,
+                line,
+                invalid: false,
+                key_start,
+                value_start,
+                value_end,
+            }),
+            None => Some(HydraParameter {
+                value: ConvertMode::None,
+                line,
+                invalid: true,
+                key_start,
+                value_start,
+                value_end,
+            }),
+        }
+    }
+
+    /// Extract the `_args_` Hydra keyword from a mapping.
+    /// Returns the HydraParameter and any positional parameters parsed from the list.
+    fn extract_args_keyword(
+        map: &LinkedHashMap<MarkedYamlOwned, MarkedYamlOwned>,
+    ) -> Option<(HydraParameter<()>, Vec<Parameter>)> {
+        let (key_n, val_node) = map
+            .iter()
+            .find(|(k, _)| k.data.as_str() == Some(ARGS_KEY))?;
+        let line = (key_n.span.start.line() - 1) as u32;
+        let key_start = key_n.span.start.col() as u32;
+        let value_start = val_node.span.start.col() as u32;
+        let value_end = val_node.span.end.col() as u32;
+        if let Some(seq) = val_node.data.as_sequence() {
+            let positional_params: Vec<Parameter> = seq
+                .iter()
+                .map(|item| {
+                    let arg_line = (item.span.start.line() - 1) as u32;
+                    let arg_value_start = item.span.start.col() as u32;
+                    let arg_value_end = item.span.end.col() as u32;
+                    Parameter::Positional {
+                        value: node_to_yaml_value(item),
+                        line: arg_line,
+                        value_start: arg_value_start,
+                        value_end: arg_value_end,
+                        suppressed_rules: HashSet::new(),
+                    }
+                })
+                .collect();
+            Some((
+                HydraParameter {
+                    value: (),
+                    line,
+                    invalid: false,
+                    key_start,
+                    value_start,
+                    value_end,
+                },
+                positional_params,
+            ))
+        } else {
+            Some((
+                HydraParameter {
+                    value: (),
+                    line,
+                    invalid: true,
+                    key_start,
+                    value_start,
+                    value_end,
+                },
+                Vec::new(),
+            ))
+        }
+    }
+
+    /// Recursively extract all `_target_` references and their parameters
+    /// from a marked YAML node
+    fn extract_hydra_objects(
+        node: &MarkedYamlOwned,
+        content: &str,
+        hydra_objects: &mut Vec<HydraObject>,
+    ) {
         if node.data.contains_mapping_key(TARGET_KEY) {
             let map = node.data.as_mapping().expect("Expected a mapping node");
             let target_entry = map
@@ -454,17 +741,11 @@ impl YamlParser {
                 .expect("Expected _target_ key");
             let (key_node, value_node) = target_entry;
 
-            let is_partial = if node.data.contains_mapping_key(PARTIAL_KEY) {
-                map.iter()
-                    .find(|(k, _)| k.data.as_str() == Some(PARTIAL_KEY))
-                    .expect("Expected _partial_ key")
-                    .1
-                    .data
-                    .as_bool()
-                    .unwrap_or(false)
-            } else {
-                false
-            };
+            let partial = Self::extract_bool_keyword(map, PARTIAL_KEY);
+            let recursive = Self::extract_bool_keyword(map, RECURSIVE_KEY);
+            let convert = Self::extract_convert_keyword(map);
+            let args_result = Self::extract_args_keyword(map);
+
             if let Some(target_str) = value_node.data.as_str() {
                 // Saphyr lines are 1-indexed, LSP is 0-indexed
                 let line = (key_node.span.start.line() - 1) as u32;
@@ -472,31 +753,46 @@ impl YamlParser {
 
                 // For value_start: check if the value is quoted
                 let value_start = Self::compute_value_start(value_node, content);
+                let value_end = value_start + target_str.len() as u32;
 
                 // Create the target immediately to preserve order
-                let target_index = targets.len();
-                targets.push(TargetInfo {
-                    value: target_str.to_string(),
+                let obj_index = hydra_objects.len();
+                let (args, positional_params) = match args_result {
+                    Some((hp, params)) => (Some(hp), params),
+                    None => (None, Vec::new()),
+                };
+
+                hydra_objects.push(HydraObject {
+                    target: HydraParameter {
+                        value: target_str.to_string(),
+                        line,
+                        invalid: false,
+                        key_start,
+                        value_start,
+                        value_end,
+                    },
                     parameters: Vec::new(),
-                    line,
-                    key_start,
-                    value_start,
                     suppressed_rules: HashSet::new(),
-                    is_partial,
+                    partial,
+                    recursive,
+                    convert,
+                    args,
                 });
 
-                // Extract parameters from all other keys in this mapping
-                let parameters = Self::extract_parameters(map, content, targets);
-                targets[target_index].parameters = parameters;
+                // Extract keyword parameters from all other keys in this mapping
+                let mut parameters = Self::extract_parameters(map, content, hydra_objects);
+                // Add positional parameters from _args_
+                parameters.extend(positional_params);
+                hydra_objects[obj_index].parameters = parameters;
             }
         } else if let Some(map) = node.data.as_mapping() {
             // No _target_ found, recursively process nested mappings
             for (_key, val) in map {
-                Self::extract_targets(val, content, targets);
+                Self::extract_hydra_objects(val, content, hydra_objects);
             }
         } else if let Some(seq) = node.data.as_sequence() {
             for item in seq {
-                Self::extract_targets(item, content, targets);
+                Self::extract_hydra_objects(item, content, hydra_objects);
             }
         }
     }
@@ -521,24 +817,29 @@ impl YamlParser {
     fn extract_parameters(
         map_entries: &LinkedHashMap<MarkedYamlOwned, MarkedYamlOwned>,
         content: &str,
-        targets: &mut Vec<TargetInfo>,
+        hydra_objects: &mut Vec<HydraObject>,
     ) -> Vec<Parameter> {
         let mut parameters = Vec::new();
 
         for (key_node, val_node) in map_entries {
             if let Some(key_str) = key_node.data.as_str()
-                && key_str != TARGET_KEY
-                && key_str != PARTIAL_KEY
+                && !HYDRA_KEYWORDS.contains(&key_str)
             {
                 // Recursively check for nested targets
-                Self::extract_targets(val_node, content, targets);
+                Self::extract_hydra_objects(val_node, content, hydra_objects);
 
                 let line = (key_node.span.start.line() - 1) as u32;
+                let key_start = key_node.span.start.col() as u32;
+                let value_start = val_node.span.start.col() as u32;
+                let value_end = val_node.span.end.col() as u32;
                 let value = node_to_yaml_value(val_node);
-                parameters.push(Parameter {
+                parameters.push(Parameter::Keyword {
                     key: key_str.to_string(),
                     value,
                     line,
+                    key_start,
+                    value_start,
+                    value_end,
                     suppressed_rules: HashSet::new(),
                 });
             }
@@ -551,36 +852,37 @@ impl YamlParser {
     pub fn find_target_at_position(
         content: &str,
         position: Position,
-    ) -> Result<Option<TargetInfo>, YamlParseError> {
+    ) -> Result<Option<HydraObject>, YamlParseError> {
         let parsed_content = Self::parse(content)?;
-        if let Some(&line_index) = parsed_content.line_map.get(&position.line) {
-            let target = &parsed_content.targets[line_index];
+        if let Some(&line_index) = parsed_content.target_line_map.get(&position.line) {
+            let hydra_object = &parsed_content.hydra_objects[line_index];
             // Check if the column is within the function definition
-            if position.character > target.value_start && position.character < target.value_end() {
-                return Ok(Some(target.clone()));
+            if position.character > hydra_object.target.value_start
+                && position.character < hydra_object.target_value_end()
+            {
+                return Ok(Some(hydra_object.clone()));
             }
         }
         Ok(None)
     }
 
-    /// Find the target value and parameter key for a parameter line at the given position.
+    /// Find the target value and parameter context for a parameter line at the given
+    /// position.
+    ///
     /// Returns `None` if the cursor is on a `_target_` line or an unrelated line.
     pub fn find_target_for_parameter_line(
         content: &str,
         position: Position,
-    ) -> Result<Option<(String, String)>, YamlParseError> {
+    ) -> Result<Option<(String, ParameterContext)>, YamlParseError> {
         let parsed_content = Self::parse(content)?;
         // If cursor is on a _target_ line, return None
-        if parsed_content.line_map.contains_key(&position.line) {
+        if parsed_content.target_line_map.contains_key(&position.line) {
             return Ok(None);
         }
-        // Search targets for a parameter on this line
-        for target in &parsed_content.targets {
-            for param in &target.parameters {
-                if param.line == position.line {
-                    return Ok(Some((target.value.clone(), param.key.clone())));
-                }
-            }
+        // Look up the parameter line in the precomputed map
+        if let Some((idx, context)) = parsed_content.param_line_map.get(&position.line) {
+            let hydra_object = &parsed_content.hydra_objects[*idx];
+            return Ok(Some((hydra_object.target.value.clone(), context.clone())));
         }
         Ok(None)
     }
@@ -693,12 +995,9 @@ impl YamlParser {
         };
 
         // Generate tokens for each target
-        for target in parsed_content.targets {
-            // Tokenize the _target_ value
-            Self::tokenize_target_value(&target, &mut tokens);
-
-            // Tokenize parameter keys
-            Self::tokenize_parameters(&target, content, &mut tokens);
+        for hydra_obj in &parsed_content.hydra_objects {
+            Self::tokenize_hydra_keywords(hydra_obj, &mut tokens);
+            Self::tokenize_parameters(hydra_obj, &mut tokens);
         }
 
         // Sort tokens by position (line, then start character)
@@ -708,11 +1007,12 @@ impl YamlParser {
     }
 
     /// Tokenize a _target_ value, splitting it into namespace and class/function parts
-    fn tokenize_target_value(target: &TargetInfo, tokens: &mut Vec<HydraSemanticToken>) {
-        let value = &target.value;
-        let line = target.line;
-        let start = target.value_start;
-
+    fn tokenize_target_value(
+        value: &str,
+        line: u32,
+        start: u32,
+        tokens: &mut Vec<HydraSemanticToken>,
+    ) {
         // Split by dots to identify module path vs class/function name
         if let Some(last_dot) = value.rfind('.') {
             // Everything before the last dot is the module path
@@ -780,208 +1080,138 @@ impl YamlParser {
         }
     }
 
-    /// Tokenize parameter keys and values
-    fn tokenize_parameters(
-        target: &TargetInfo,
-        content: &str,
+    /// Tokenize parameter keys and values using stored position data
+    fn tokenize_parameters(hydra_object: &HydraObject, tokens: &mut Vec<HydraSemanticToken>) {
+        for param in &hydra_object.parameters {
+            let (param_key, param_value, param_line, key_start, value_start, value_end) =
+                match param {
+                    Parameter::Keyword {
+                        key,
+                        value,
+                        line,
+                        key_start,
+                        value_start,
+                        value_end,
+                        ..
+                    } => (key, value, *line, *key_start, *value_start, *value_end),
+                    Parameter::Positional { .. } => continue,
+                };
+
+            // Token for parameter key
+            tokens.push(HydraSemanticToken {
+                line: param_line,
+                start_char: key_start,
+                length: param_key.len() as u32,
+                token_type: SemanticTokenType::Parameter,
+            });
+
+            // Token(s) for parameter value
+            if let YamlValue::Sequence(elements) = param_value {
+                for elem in elements {
+                    let length = elem.end.saturating_sub(elem.start);
+                    if length == 0 {
+                        continue;
+                    }
+                    let token_type = match &elem.value {
+                        YamlValue::Integer(_) | YamlValue::Float(_) => SemanticTokenType::Number,
+                        YamlValue::String(_) => SemanticTokenType::String,
+                        YamlValue::Bool(_) => SemanticTokenType::Property,
+                        _ => SemanticTokenType::Property,
+                    };
+                    tokens.push(HydraSemanticToken {
+                        line: elem.line,
+                        start_char: elem.start,
+                        length,
+                        token_type,
+                    });
+                }
+            } else {
+                let length = value_end.saturating_sub(value_start);
+                if length == 0 {
+                    continue;
+                }
+                let token_type = match param_value {
+                    YamlValue::Integer(_) | YamlValue::Float(_) => SemanticTokenType::Number,
+                    YamlValue::String(_) => SemanticTokenType::String,
+                    YamlValue::Bool(_) => SemanticTokenType::Property,
+                    _ => SemanticTokenType::Property,
+                };
+                tokens.push(HydraSemanticToken {
+                    line: param_line,
+                    start_char: value_start,
+                    length,
+                    token_type,
+                });
+            }
+        }
+    }
+
+    /// Tokenize all hydra keyword keys and their values, including `_target_`
+    fn tokenize_hydra_keywords(hydra_object: &HydraObject, tokens: &mut Vec<HydraSemanticToken>) {
+        // Tokenize _target_ key and value
+        let target = &hydra_object.target;
+        tokens.push(HydraSemanticToken {
+            line: target.line,
+            start_char: target.key_start,
+            length: TARGET_KEY.len() as u32,
+            token_type: SemanticTokenType::Property,
+        });
+        Self::tokenize_target_value(&target.value, target.line, target.value_start, tokens);
+
+        if let Some(ref hp) = hydra_object.partial {
+            Self::emit_keyword_tokens(PARTIAL_KEY, hp, Some(SemanticTokenType::Property), tokens);
+        }
+        if let Some(ref hp) = hydra_object.recursive {
+            Self::emit_keyword_tokens(RECURSIVE_KEY, hp, Some(SemanticTokenType::Property), tokens);
+        }
+        if let Some(ref hp) = hydra_object.convert {
+            Self::emit_keyword_tokens(CONVERT_KEY, hp, Some(SemanticTokenType::String), tokens);
+        }
+        if let Some(ref hp) = hydra_object.args {
+            // _args_ values are lists, individual elements handled as positional parameters
+            Self::emit_keyword_tokens(ARGS_KEY, hp, None, tokens);
+        }
+    }
+
+    /// Emit key and optional value tokens for a hydra keyword.
+    /// Uses `HydraKeywordSpan` to access position fields without requiring a specific generic type.
+    fn emit_keyword_tokens(
+        keyword: &str,
+        hp: &dyn HydraKeywordSpan,
+        value_token_type: Option<SemanticTokenType>,
         tokens: &mut Vec<HydraSemanticToken>,
     ) {
-        let lines: Vec<&str> = content.lines().collect();
-
-        for param in &target.parameters {
-            let param_line = param.line as usize;
-            if param_line >= lines.len() {
-                continue;
-            }
-
-            let line = lines[param_line];
-            let param_key = &param.key;
-
-            // Find the parameter key in the line
-            if let Some(key_pos) = line.find(param_key) {
-                // Token for parameter key
+        // Key token
+        tokens.push(HydraSemanticToken {
+            line: hp.line(),
+            start_char: hp.key_start(),
+            length: keyword.len() as u32,
+            token_type: SemanticTokenType::Property,
+        });
+        // Value token (if applicable and valid)
+        if let Some(tt) = value_token_type
+            && !hp.invalid()
+        {
+            let length = hp.value_end().saturating_sub(hp.value_start());
+            if length > 0 {
                 tokens.push(HydraSemanticToken {
-                    line: param_line as u32,
-                    start_char: key_pos as u32,
-                    length: param_key.len() as u32,
-                    token_type: SemanticTokenType::Parameter,
+                    line: hp.line(),
+                    start_char: hp.value_start(),
+                    length,
+                    token_type: tt,
                 });
-
-                // Try to tokenize the value after the colon
-                if let Some(colon_pos) = line[key_pos + param_key.len()..].find(':') {
-                    let value_start = key_pos + param_key.len() + colon_pos + 1;
-                    let value_part = &line[value_start..];
-
-                    // Skip whitespace to find the actual value
-                    if let Some(val_offset) = value_part.find(|c: char| !c.is_whitespace()) {
-                        let val_start = value_start + val_offset;
-                        Self::tokenize_value(
-                            &param.value,
-                            line,
-                            val_start,
-                            param_line as u32,
-                            false,
-                            tokens,
-                        );
-                    }
-                }
             }
         }
     }
+}
 
-    /// Tokenize a single YAML value at the given position.
-    /// Returns the length of the tokenized value (for position tracking in sequences).
-    /// `in_array` controls delimiter detection: arrays use `,`/`]`, top-level uses `#`/whitespace.
-    fn tokenize_value(
-        value: &YamlValue,
-        line: &str,
-        pos: usize,
-        line_num: u32,
-        in_array: bool,
-        tokens: &mut Vec<HydraSemanticToken>,
-    ) -> usize {
-        if pos >= line.len() {
-            return 0;
-        }
-
-        let remaining = &line[pos..];
-
-        match value {
-            YamlValue::Integer(_) | YamlValue::Float(_) => {
-                let num_len = remaining
-                    .find(|c: char| {
-                        !c.is_numeric() && c != '.' && c != '-' && c != 'e' && c != 'E' && c != '+'
-                    })
-                    .unwrap_or(remaining.len());
-                if num_len > 0 {
-                    tokens.push(HydraSemanticToken {
-                        line: line_num,
-                        start_char: pos as u32,
-                        length: num_len as u32,
-                        token_type: SemanticTokenType::Number,
-                    });
-                }
-                num_len
-            }
-            YamlValue::String(_) => {
-                if remaining.starts_with('"') || remaining.starts_with('\'') {
-                    // Quoted string - find closing quote
-                    let quote = remaining.chars().next().unwrap();
-                    if let Some(end_pos) = remaining[1..].find(quote) {
-                        let str_len = end_pos + 2; // Include both quotes
-                        tokens.push(HydraSemanticToken {
-                            line: line_num,
-                            start_char: pos as u32,
-                            length: str_len as u32,
-                            token_type: SemanticTokenType::String,
-                        });
-                        str_len
-                    } else {
-                        remaining.len()
-                    }
-                } else {
-                    // Unquoted string - delimiter depends on context
-                    let str_len = if in_array {
-                        let len = remaining.find([',', ']']).unwrap_or(remaining.len());
-                        remaining[..len].trim_end().len()
-                    } else {
-                        remaining
-                            .find('#')
-                            .unwrap_or(remaining.len())
-                            .min(remaining.trim_end().len())
-                    };
-                    if str_len > 0 {
-                        tokens.push(HydraSemanticToken {
-                            line: line_num,
-                            start_char: pos as u32,
-                            length: str_len as u32,
-                            token_type: SemanticTokenType::String,
-                        });
-                    }
-                    str_len
-                }
-            }
-            YamlValue::Bool(_) => {
-                let bool_len = remaining
-                    .find(|c: char| c.is_whitespace() || c == '#' || c == ',' || c == ']')
-                    .unwrap_or(remaining.len());
-                if bool_len > 0 {
-                    tokens.push(HydraSemanticToken {
-                        line: line_num,
-                        start_char: pos as u32,
-                        length: bool_len as u32,
-                        token_type: SemanticTokenType::Property,
-                    });
-                }
-                bool_len
-            }
-            YamlValue::Sequence(seq) => {
-                // Tokenize array elements individually
-                Self::tokenize_sequence_values(seq, line, pos, line_num, tokens)
-            }
-            _ => {
-                // Other value types (null, etc.) - treat as property
-                let val_len = remaining
-                    .find(|c: char| c.is_whitespace() || c == '#' || c == ',' || c == ']')
-                    .unwrap_or(remaining.len());
-                if val_len > 0 {
-                    tokens.push(HydraSemanticToken {
-                        line: line_num,
-                        start_char: pos as u32,
-                        length: val_len as u32,
-                        token_type: SemanticTokenType::Property,
-                    });
-                }
-                val_len
-            }
-        }
-    }
-
-    /// Tokenize values inside a YAML sequence (array) on a single line.
-    /// Handles inline arrays like [0.9, 0.999] or ["hello", "world"].
-    /// Returns the total length consumed including brackets.
-    fn tokenize_sequence_values(
-        seq: &[YamlValue],
-        line: &str,
-        start_pos: usize,
-        line_num: u32,
-        tokens: &mut Vec<HydraSemanticToken>,
-    ) -> usize {
-        // Only handle inline arrays (single line)
-        let remaining = &line[start_pos..];
-        if !remaining.starts_with('[') {
-            return 0;
-        }
-
-        let mut pos = start_pos + 1; // Skip opening bracket
-
-        for value in seq {
-            // Skip whitespace and commas
-            while pos < line.len() {
-                let c = line[pos..].chars().next().unwrap_or(' ');
-                if c.is_whitespace() || c == ',' {
-                    pos += 1;
-                } else {
-                    break;
-                }
-            }
-
-            if pos >= line.len() {
-                break;
-            }
-
-            // Tokenize the value and advance position
-            let consumed = Self::tokenize_value(value, line, pos, line_num, true, tokens);
-            pos += consumed;
-        }
-
-        // Find closing bracket to return total length
-        if let Some(close_pos) = line[start_pos..].find(']') {
-            close_pos + 1
-        } else {
-            pos - start_pos
-        }
-    }
+/// Identifies which parameter the cursor is on, for signature help.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParameterContext {
+    /// A keyword argument with the given key name.
+    Keyword(String),
+    /// A positional argument at the given index within `_args_`.
+    Positional(u32),
 }
 
 /// Represents the context for code completion in a YAML file. The context can be
@@ -1028,14 +1258,14 @@ model:
   num_layers: 12
 "#;
         let parsed_content = YamlParser::parse(content).unwrap();
-        assert_eq!(parsed_content.targets.len(), 1);
-        assert_eq!(parsed_content.line_map.len(), 1);
-        let target = parsed_content.targets.first().unwrap();
-        assert_eq!(target.value, "myproject.Model");
-        assert_eq!(target.parameters.len(), 2);
-        assert_eq!(target.line, 2);
-        assert_eq!(parsed_content.line_map.get(&2).unwrap(), &0);
-        assert_eq!(target.key_start, 2);
+        assert_eq!(parsed_content.hydra_objects.len(), 1);
+        assert_eq!(parsed_content.target_line_map.len(), 1);
+        let hydra_object = parsed_content.hydra_objects.first().unwrap();
+        assert_eq!(hydra_object.target.value, "myproject.Model");
+        assert_eq!(hydra_object.parameters.len(), 2);
+        assert_eq!(hydra_object.target.line, 2);
+        assert_eq!(parsed_content.target_line_map.get(&2).unwrap(), &0);
+        assert_eq!(hydra_object.target.key_start, 2);
     }
 
     #[test]
@@ -1052,30 +1282,30 @@ model:
 "#;
         let parsed_content = YamlParser::parse(content).unwrap();
         assert_eq!(
-            parsed_content.targets.len(),
+            parsed_content.hydra_objects.len(),
             3,
             "Should have 3 targets total"
         );
         assert_eq!(
-            parsed_content.line_map.len(),
+            parsed_content.target_line_map.len(),
             3,
             "Line map should have 3 entries"
         );
 
-        let model = parsed_content.targets.first().unwrap();
+        let model = parsed_content.hydra_objects.first().unwrap();
         assert_eq!(model.parameters.len(), 2);
-        assert_eq!(model.line, 2);
-        assert_eq!(parsed_content.line_map.get(&2).unwrap(), &0);
+        assert_eq!(model.target.line, 2);
+        assert_eq!(parsed_content.target_line_map.get(&2).unwrap(), &0);
 
-        let encoder = parsed_content.targets.get(1).unwrap();
+        let encoder = parsed_content.hydra_objects.get(1).unwrap();
         assert_eq!(encoder.parameters.len(), 1);
-        assert_eq!(encoder.line, 4);
-        assert_eq!(parsed_content.line_map.get(&4).unwrap(), &1);
+        assert_eq!(encoder.target.line, 4);
+        assert_eq!(parsed_content.target_line_map.get(&4).unwrap(), &1);
 
-        let decoder = parsed_content.targets.get(2).unwrap();
+        let decoder = parsed_content.hydra_objects.get(2).unwrap();
         assert_eq!(decoder.parameters.len(), 1);
-        assert_eq!(decoder.line, 7);
-        assert_eq!(parsed_content.line_map.get(&7).unwrap(), &2);
+        assert_eq!(decoder.target.line, 7);
+        assert_eq!(parsed_content.target_line_map.get(&7).unwrap(), &2);
     }
 
     #[test]
@@ -1087,12 +1317,12 @@ model:
   num_layers: 12
 "#;
         let position = Position::new(2, 15);
-        let target_info = YamlParser::find_target_at_position(content, position)
+        let hydra_object = YamlParser::find_target_at_position(content, position)
             .unwrap()
             .unwrap();
-        assert_eq!(target_info.value, "myproject.Model");
-        assert_eq!(target_info.line, 2);
-        assert_eq!(target_info.key_start, 2);
+        assert_eq!(hydra_object.target.value, "myproject.Model");
+        assert_eq!(hydra_object.target.line, 2);
+        assert_eq!(hydra_object.target.key_start, 2);
     }
 
     #[test]
@@ -1104,8 +1334,8 @@ model:
   num_layers: 12
 "#;
         let position = Position::new(1, 2); // Line without _target_
-        let target_info = YamlParser::find_target_at_position(content, position).unwrap();
-        assert!(target_info.is_none());
+        let hydra_object = YamlParser::find_target_at_position(content, position).unwrap();
+        assert!(hydra_object.is_none());
     }
 
     #[test]
@@ -1117,8 +1347,8 @@ model:
   num_layers: 12
 "#;
         let position = Position::new(2, 11); // Column before _target_ value
-        let target_info = YamlParser::find_target_at_position(content, position).unwrap();
-        assert!(target_info.is_none());
+        let hydra_object = YamlParser::find_target_at_position(content, position).unwrap();
+        assert!(hydra_object.is_none());
     }
 
     #[test]
@@ -1130,8 +1360,8 @@ model:
   num_layers: 12
 "#;
         let position = Position::new(2, 27); // Column after _target_
-        let target_info = YamlParser::find_target_at_position(content, position).unwrap();
-        assert!(target_info.is_none());
+        let hydra_object = YamlParser::find_target_at_position(content, position).unwrap();
+        assert!(hydra_object.is_none());
     }
 
     #[test]
@@ -1204,39 +1434,43 @@ config:
     size: 256
 "#;
         let parsed_content = YamlParser::parse(content).unwrap();
-        assert_eq!(parsed_content.targets.len(), 2, "Should have 2 targets");
         assert_eq!(
-            parsed_content.line_map.len(),
+            parsed_content.hydra_objects.len(),
+            2,
+            "Should have 2 targets"
+        );
+        assert_eq!(
+            parsed_content.target_line_map.len(),
             2,
             "Line map should have 2 entries"
         );
 
         // First occurrence (line 3)
-        let first_model = parsed_content.targets.first().unwrap();
-        assert_eq!(first_model.value, "myproject.Model");
-        assert_eq!(first_model.line, 3);
-        assert_eq!(parsed_content.line_map.get(&3).unwrap(), &0);
-        assert_eq!(first_model.key_start, 4);
+        let first_model = parsed_content.hydra_objects.first().unwrap();
+        assert_eq!(first_model.target.value, "myproject.Model");
+        assert_eq!(first_model.target.line, 3);
+        assert_eq!(parsed_content.target_line_map.get(&3).unwrap(), &0);
+        assert_eq!(first_model.target.key_start, 4);
         assert_eq!(first_model.parameters.len(), 1);
 
         // Check the size value
-        if let YamlValue::Integer(val) = &first_model.parameters.first().unwrap().value {
-            assert_eq!(val, &128);
+        if let YamlValue::Integer(val) = &first_model.parameters.first().unwrap().value() {
+            assert_eq!(*val, 128);
         } else {
             panic!("Expected Integer value");
         }
 
         // Second occurrence (line 6)
-        let second_model = parsed_content.targets.get(1).unwrap();
-        assert_eq!(second_model.value, "myproject.Model");
-        assert_eq!(second_model.line, 6);
-        assert_eq!(parsed_content.line_map.get(&6).unwrap(), &1);
-        assert_eq!(second_model.key_start, 4);
+        let second_model = parsed_content.hydra_objects.get(1).unwrap();
+        assert_eq!(second_model.target.value, "myproject.Model");
+        assert_eq!(second_model.target.line, 6);
+        assert_eq!(parsed_content.target_line_map.get(&6).unwrap(), &1);
+        assert_eq!(second_model.target.key_start, 4);
         assert_eq!(second_model.parameters.len(), 1);
 
         // Check the size value
-        if let YamlValue::Integer(val) = &second_model.parameters.first().unwrap().value {
-            assert_eq!(val, &256);
+        if let YamlValue::Integer(val) = &second_model.parameters.first().unwrap().value() {
+            assert_eq!(*val, 256);
         } else {
             panic!("Expected Integer value");
         }
@@ -1255,24 +1489,28 @@ config:
     size: 256
 "#;
         let parsed_content = YamlParser::parse(content).unwrap();
-        assert_eq!(parsed_content.targets.len(), 2, "Should have 2 targets");
         assert_eq!(
-            parsed_content.line_map.len(),
+            parsed_content.hydra_objects.len(),
+            2,
+            "Should have 2 targets"
+        );
+        assert_eq!(
+            parsed_content.target_line_map.len(),
             2,
             "Line map should have 2 entries"
         );
-        assert_eq!(parsed_content.line_map.get(&3).unwrap(), &0);
-        assert_eq!(parsed_content.line_map.get(&6).unwrap(), &1);
+        assert_eq!(parsed_content.target_line_map.get(&3).unwrap(), &0);
+        assert_eq!(parsed_content.target_line_map.get(&6).unwrap(), &1);
 
-        let target_at_line_3 = parsed_content.targets.first().unwrap();
-        let target_at_line_6 = parsed_content.targets.get(1).unwrap();
+        let target_at_line_3 = parsed_content.hydra_objects.first().unwrap();
+        let target_at_line_6 = parsed_content.hydra_objects.get(1).unwrap();
 
         // Verify both targets are correct
-        if let YamlValue::Integer(val) = &target_at_line_3.parameters.first().unwrap().value {
+        if let YamlValue::Integer(val) = &target_at_line_3.parameters.first().unwrap().value() {
             assert_eq!(val, &128, "Line 3's target should have size: 128");
         }
 
-        if let YamlValue::Integer(val) = &target_at_line_6.parameters.first().unwrap().value {
+        if let YamlValue::Integer(val) = &target_at_line_6.parameters.first().unwrap().value() {
             assert_eq!(val, &256, "Line 6's target should have size: 256");
         }
     }
@@ -1289,25 +1527,29 @@ another:
   param: value
 "#;
         let parsed_content = YamlParser::parse(content).unwrap();
-        assert_eq!(parsed_content.targets.len(), 2, "Should have 2 targets");
         assert_eq!(
-            parsed_content.line_map.len(),
+            parsed_content.hydra_objects.len(),
+            2,
+            "Should have 2 targets"
+        );
+        assert_eq!(
+            parsed_content.target_line_map.len(),
             2,
             "Line map should have 2 entries"
         );
 
         // First target with spaces before colon
-        let first = parsed_content.targets.first().unwrap();
-        assert_eq!(first.value, "myproject.Model");
-        assert_eq!(first.line, 2);
-        assert_eq!(first.key_start, 2);
+        let first = parsed_content.hydra_objects.first().unwrap();
+        assert_eq!(first.target.value, "myproject.Model");
+        assert_eq!(first.target.line, 2);
+        assert_eq!(first.target.key_start, 2);
         assert_eq!(first.parameters.len(), 1);
 
         // Second target with tab before colon
-        let second = parsed_content.targets.get(1).unwrap();
-        assert_eq!(second.value, "another.Model");
-        assert_eq!(second.line, 5);
-        assert_eq!(second.key_start, 2);
+        let second = parsed_content.hydra_objects.get(1).unwrap();
+        assert_eq!(second.target.value, "another.Model");
+        assert_eq!(second.target.line, 5);
+        assert_eq!(second.target.key_start, 2);
         assert_eq!(second.parameters.len(), 1);
     }
 
@@ -1320,18 +1562,22 @@ model:
   hidden_size: 256
 "#;
         let parsed_content = YamlParser::parse(content).unwrap();
-        assert_eq!(parsed_content.targets.len(), 1, "Should have 1 target");
         assert_eq!(
-            parsed_content.line_map.len(),
+            parsed_content.hydra_objects.len(),
+            1,
+            "Should have 1 target"
+        );
+        assert_eq!(
+            parsed_content.target_line_map.len(),
             1,
             "Line map should have 1 entry"
         );
 
-        let target = parsed_content.targets.first().unwrap();
-        assert_eq!(target.value, "myproject.Model");
-        assert_eq!(target.line, 2);
-        assert_eq!(target.key_start, 2); // Position of opening quote
-        assert_eq!(target.parameters.len(), 1);
+        let hydra_object = parsed_content.hydra_objects.first().unwrap();
+        assert_eq!(hydra_object.target.value, "myproject.Model");
+        assert_eq!(hydra_object.target.line, 2);
+        assert_eq!(hydra_object.target.key_start, 2); // Position of opening quote
+        assert_eq!(hydra_object.parameters.len(), 1);
     }
 
     #[test]
@@ -1343,18 +1589,22 @@ model:
   hidden_size: 256
 "#;
         let parsed_content = YamlParser::parse(content).unwrap();
-        assert_eq!(parsed_content.targets.len(), 1, "Should have 1 target");
         assert_eq!(
-            parsed_content.line_map.len(),
+            parsed_content.hydra_objects.len(),
+            1,
+            "Should have 1 target"
+        );
+        assert_eq!(
+            parsed_content.target_line_map.len(),
             1,
             "Line map should have 1 entry"
         );
 
-        let target = parsed_content.targets.first().unwrap();
-        assert_eq!(target.value, "myproject.Model");
-        assert_eq!(target.line, 2);
-        assert_eq!(target.key_start, 2); // Position of opening quote
-        assert_eq!(target.parameters.len(), 1);
+        let hydra_object = parsed_content.hydra_objects.first().unwrap();
+        assert_eq!(hydra_object.target.value, "myproject.Model");
+        assert_eq!(hydra_object.target.line, 2);
+        assert_eq!(hydra_object.target.key_start, 2); // Position of opening quote
+        assert_eq!(hydra_object.parameters.len(), 1);
     }
 
     #[test]
@@ -1369,22 +1619,26 @@ another:
   param: value
 "#;
         let parsed_content = YamlParser::parse(content).unwrap();
-        assert_eq!(parsed_content.targets.len(), 2, "Should have 2 targets");
         assert_eq!(
-            parsed_content.line_map.len(),
+            parsed_content.hydra_objects.len(),
+            2,
+            "Should have 2 targets"
+        );
+        assert_eq!(
+            parsed_content.target_line_map.len(),
             2,
             "Line map should have 2 entries"
         );
 
-        let first = parsed_content.targets.first().unwrap();
-        assert_eq!(first.value, "myproject.Model");
-        assert_eq!(first.line, 2);
-        assert_eq!(first.key_start, 2);
+        let first = parsed_content.hydra_objects.first().unwrap();
+        assert_eq!(first.target.value, "myproject.Model");
+        assert_eq!(first.target.line, 2);
+        assert_eq!(first.target.key_start, 2);
 
-        let second = parsed_content.targets.get(1).unwrap();
-        assert_eq!(second.value, "another.Model");
-        assert_eq!(second.line, 5);
-        assert_eq!(second.key_start, 2);
+        let second = parsed_content.hydra_objects.get(1).unwrap();
+        assert_eq!(second.target.value, "another.Model");
+        assert_eq!(second.target.line, 5);
+        assert_eq!(second.target.key_start, 2);
     }
 
     #[test]
@@ -1399,17 +1653,21 @@ training:
         project_name: my_project
 "#;
         let parsed_content = YamlParser::parse(content).unwrap();
-        assert_eq!(parsed_content.targets.len(), 1, "Should have 1 target");
         assert_eq!(
-            parsed_content.line_map.len(),
+            parsed_content.hydra_objects.len(),
+            1,
+            "Should have 1 target"
+        );
+        assert_eq!(
+            parsed_content.target_line_map.len(),
             1,
             "Line map should have 1 entry"
         );
 
-        let target = parsed_content.targets.first().unwrap();
-        assert_eq!(target.value, "package.debug.Logger");
-        assert_eq!(target.line, 5);
-        assert_eq!(target.key_start, 8);
+        let hydra_object = parsed_content.hydra_objects.first().unwrap();
+        assert_eq!(hydra_object.target.value, "package.debug.Logger");
+        assert_eq!(hydra_object.target.line, 5);
+        assert_eq!(hydra_object.target.key_start, 8);
     }
 
     #[test]
@@ -1421,7 +1679,11 @@ model:
   hidden_size: 256
 "#;
         let parsed_content = YamlParser::parse(content).unwrap();
-        assert_eq!(parsed_content.targets.len(), 0, "Should have 0 targets");
+        assert_eq!(
+            parsed_content.hydra_objects.len(),
+            0,
+            "Should have 0 targets"
+        );
     }
 
     #[test]
@@ -1436,11 +1698,15 @@ another:
   param: value
 "#;
         let parsed_content = YamlParser::parse(content).unwrap();
-        assert_eq!(parsed_content.targets.len(), 1, "Should have 1 target");
-        let target = parsed_content.targets.first().unwrap();
-        assert_eq!(target.value, "myproject.Model");
-        assert_eq!(target.line, 5);
-        assert_eq!(target.key_start, 2);
+        assert_eq!(
+            parsed_content.hydra_objects.len(),
+            1,
+            "Should have 1 target"
+        );
+        let hydra_object = parsed_content.hydra_objects.first().unwrap();
+        assert_eq!(hydra_object.target.value, "myproject.Model");
+        assert_eq!(hydra_object.target.line, 5);
+        assert_eq!(hydra_object.target.key_start, 2);
     }
 
     #[test]
@@ -1452,7 +1718,11 @@ model:
   hidden_size: 256
 "#;
         let parsed_content = YamlParser::parse(content).unwrap();
-        assert_eq!(parsed_content.targets.len(), 0, "Should have 0 targets");
+        assert_eq!(
+            parsed_content.hydra_objects.len(),
+            0,
+            "Should have 0 targets"
+        );
     }
 
     #[test]
@@ -1467,11 +1737,15 @@ another:
   param: value
 "#;
         let parsed_content = YamlParser::parse(content).unwrap();
-        assert_eq!(parsed_content.targets.len(), 1, "Should have 1 target");
-        let target = parsed_content.targets.first().unwrap();
-        assert_eq!(target.value, "myproject.Model");
-        assert_eq!(target.line, 5);
-        assert_eq!(target.key_start, 2);
+        assert_eq!(
+            parsed_content.hydra_objects.len(),
+            1,
+            "Should have 1 target"
+        );
+        let hydra_object = parsed_content.hydra_objects.first().unwrap();
+        assert_eq!(hydra_object.target.value, "myproject.Model");
+        assert_eq!(hydra_object.target.line, 5);
+        assert_eq!(hydra_object.target.key_start, 2);
     }
 
     #[test]
@@ -1491,12 +1765,12 @@ model:
   hidden_size: 256
 "#;
         let position = Position::new(2, 20); // In the value part
-        let target_info = YamlParser::find_target_at_position(content, position)
+        let hydra_object = YamlParser::find_target_at_position(content, position)
             .unwrap()
             .unwrap();
-        assert_eq!(target_info.value, "myproject.Model");
-        assert_eq!(target_info.line, 2);
-        assert_eq!(target_info.key_start, 2); // Position of opening quote
+        assert_eq!(hydra_object.target.value, "myproject.Model");
+        assert_eq!(hydra_object.target.line, 2);
+        assert_eq!(hydra_object.target.key_start, 2); // Position of opening quote
     }
 
     #[test]
@@ -1513,12 +1787,12 @@ model:
   hidden_size: 256
 "#;
         let position = Position::new(2, 20); // In the value part
-        let target_info = YamlParser::find_target_at_position(content, position)
+        let hydra_object = YamlParser::find_target_at_position(content, position)
             .unwrap()
             .unwrap();
-        assert_eq!(target_info.value, "myproject.Model");
-        assert_eq!(target_info.line, 2);
-        assert_eq!(target_info.key_start, 2);
+        assert_eq!(hydra_object.target.value, "myproject.Model");
+        assert_eq!(hydra_object.target.line, 2);
+        assert_eq!(hydra_object.target.key_start, 2);
     }
 
     #[test]
@@ -1547,7 +1821,7 @@ model:
         let parsed_content = YamlParser::parse(content).unwrap();
         // Should not find the target because there's an unexpected quote
         assert_eq!(
-            parsed_content.targets.len(),
+            parsed_content.hydra_objects.len(),
             0,
             "Should not find target with invalid closing quote"
         );
@@ -1594,13 +1868,13 @@ model:
   hidden_size: 256
 "#;
         let parsed_content = YamlParser::parse(content).unwrap();
-        assert_eq!(parsed_content.targets.len(), 1);
+        assert_eq!(parsed_content.hydra_objects.len(), 1);
 
-        let target = parsed_content.targets.first().unwrap();
-        assert_eq!(target.value, "myproject.Model");
-        assert_eq!(target.line, 2);
+        let hydra_object = parsed_content.hydra_objects.first().unwrap();
+        assert_eq!(hydra_object.target.value, "myproject.Model");
+        assert_eq!(hydra_object.target.line, 2);
         // value_start should point to the first character of the actual value (after the quote)
-        assert_eq!(target.value_start, 13); // Position after opening quote
+        assert_eq!(hydra_object.target.value_start, 13); // Position after opening quote
     }
 
     #[test]
@@ -1612,13 +1886,13 @@ model:
   hidden_size: 256
 "#;
         let parsed_content = YamlParser::parse(content).unwrap();
-        assert_eq!(parsed_content.targets.len(), 1);
+        assert_eq!(parsed_content.hydra_objects.len(), 1);
 
-        let target = parsed_content.targets.first().unwrap();
-        assert_eq!(target.value, "myproject.Model");
-        assert_eq!(target.line, 2);
+        let hydra_object = parsed_content.hydra_objects.first().unwrap();
+        assert_eq!(hydra_object.target.value, "myproject.Model");
+        assert_eq!(hydra_object.target.line, 2);
         // value_start should point to the first character of the actual value (after the quote)
-        assert_eq!(target.value_start, 13); // Position after opening quote
+        assert_eq!(hydra_object.target.value_start, 13); // Position after opening quote
     }
 
     #[test]
@@ -1630,14 +1904,14 @@ model:
   hidden_size: 256
 "#;
         let parsed_content = YamlParser::parse(content).unwrap();
-        assert_eq!(parsed_content.targets.len(), 1);
+        assert_eq!(parsed_content.hydra_objects.len(), 1);
 
-        let target = parsed_content.targets.first().unwrap();
-        assert_eq!(target.value, "myproject.Model");
-        assert_eq!(target.line, 2);
-        assert_eq!(target.key_start, 2); // Position of opening quote of key
+        let hydra_object = parsed_content.hydra_objects.first().unwrap();
+        assert_eq!(hydra_object.target.value, "myproject.Model");
+        assert_eq!(hydra_object.target.line, 2);
+        assert_eq!(hydra_object.target.key_start, 2); // Position of opening quote of key
         // value_start should point to after the opening quote of the value
-        assert_eq!(target.value_start, 15); // Position after opening quote of value
+        assert_eq!(hydra_object.target.value_start, 15); // Position after opening quote of value
     }
 
     #[test]
@@ -1649,11 +1923,11 @@ model:
 "#;
         // Position in the middle of the value (inside quotes)
         let position = Position::new(2, 20);
-        let target_info = YamlParser::find_target_at_position(content, position)
+        let hydra_object = YamlParser::find_target_at_position(content, position)
             .unwrap()
             .unwrap();
-        assert_eq!(target_info.value, "myproject.Model");
-        assert_eq!(target_info.line, 2);
+        assert_eq!(hydra_object.target.value, "myproject.Model");
+        assert_eq!(hydra_object.target.line, 2);
     }
 
     #[test]
@@ -1912,7 +2186,7 @@ items:
         let result = YamlParser::parse(yaml);
         assert!(result.is_ok());
         let parsed_content = result.unwrap();
-        assert_eq!(parsed_content.targets.len(), 3); // config._target_, items[0]._target_, items[1]._target_
+        assert_eq!(parsed_content.hydra_objects.len(), 3); // config._target_, items[0]._target_, items[1]._target_
     }
 
     #[test]
@@ -1944,8 +2218,11 @@ invalid_target_key: this is not a target
         assert!(result.is_ok());
         let parsed_content = result.unwrap();
         // Should only find the one valid target
-        assert_eq!(parsed_content.targets.len(), 1);
-        assert_eq!(parsed_content.targets[0].value, "some.module.Class");
+        assert_eq!(parsed_content.hydra_objects.len(), 1);
+        assert_eq!(
+            parsed_content.hydra_objects[0].target.value,
+            "some.module.Class"
+        );
     }
 
     #[test]
@@ -1957,8 +2234,11 @@ invalid_target_key: this is not a target
         let result = YamlParser::parse(yaml);
         assert!(result.is_ok());
         let parsed_content = result.unwrap();
-        assert_eq!(parsed_content.targets.len(), 1);
-        assert_eq!(parsed_content.targets[0].value, "some.module.Class");
+        assert_eq!(parsed_content.hydra_objects.len(), 1);
+        assert_eq!(
+            parsed_content.hydra_objects[0].target.value,
+            "some.module.Class"
+        );
     }
 
     #[test]
@@ -1970,8 +2250,11 @@ invalid_target_key: this is not a target
         let result = YamlParser::parse(yaml);
         assert!(result.is_ok());
         let parsed_content = result.unwrap();
-        assert_eq!(parsed_content.targets.len(), 1);
-        assert_eq!(parsed_content.targets[0].value, "some.module.Class");
+        assert_eq!(parsed_content.hydra_objects.len(), 1);
+        assert_eq!(
+            parsed_content.hydra_objects[0].target.value,
+            "some.module.Class"
+        );
     }
 
     #[test]
@@ -1992,36 +2275,36 @@ training:
         let parsed_content = YamlParser::parse(content).unwrap();
 
         assert_eq!(
-            parsed_content.targets.len(),
+            parsed_content.hydra_objects.len(),
             3,
             "Should have 3 targets total"
         );
 
         // Expected order based on document line order
         assert_eq!(
-            parsed_content.targets[0].value, "made.up.Module",
+            parsed_content.hydra_objects[0].target.value, "made.up.Module",
             "First target should be made.up.Module"
         );
         assert_eq!(
-            parsed_content.targets[0].line, 3,
+            parsed_content.hydra_objects[0].target.line, 3,
             "First target should be on line 3"
         );
 
         assert_eq!(
-            parsed_content.targets[1].value, "DataLoader",
+            parsed_content.hydra_objects[1].target.value, "DataLoader",
             "Second target should be DataLoader"
         );
         assert_eq!(
-            parsed_content.targets[1].line, 7,
+            parsed_content.hydra_objects[1].target.line, 7,
             "Second target should be on line 7"
         );
 
         assert_eq!(
-            parsed_content.targets[2].value, "made.up.mod",
+            parsed_content.hydra_objects[2].target.value, "made.up.mod",
             "Third target should be made.up.mod"
         );
         assert_eq!(
-            parsed_content.targets[2].line, 11,
+            parsed_content.hydra_objects[2].target.line, 11,
             "Third target should be on line 11"
         );
     }
@@ -2040,16 +2323,26 @@ my_module:
   # comment
 "#;
         let parsed_content = YamlParser::parse(content).unwrap();
-        assert_eq!(parsed_content.targets.len(), 1);
-        let target = &parsed_content.targets[0];
-        assert_eq!(target.line, 5);
+        assert_eq!(parsed_content.hydra_objects.len(), 1);
+        let hydra_object = &parsed_content.hydra_objects[0];
+        assert_eq!(hydra_object.target.line, 5);
 
         // Verify each parameter has the correct line
-        let find_param = |key: &str| target.parameters.iter().find(|p| p.key == key).unwrap();
-        assert_eq!(find_param("bap").line, 2, "bap should be on line 2");
-        assert_eq!(find_param("boop").line, 4, "boop should be on line 4");
-        assert_eq!(find_param("beep").line, 6, "beep should be on line 6");
-        assert_eq!(find_param("another").line, 8, "another should be on line 8");
+        let find_param = |key: &str| {
+            hydra_object
+                .parameters
+                .iter()
+                .find(|p| matches!(p, Parameter::Keyword { key: k, .. } if k == key))
+                .unwrap()
+        };
+        assert_eq!(find_param("bap").line(), 2, "bap should be on line 2");
+        assert_eq!(find_param("boop").line(), 4, "boop should be on line 4");
+        assert_eq!(find_param("beep").line(), 6, "beep should be on line 6");
+        assert_eq!(
+            find_param("another").line(),
+            8,
+            "another should be on line 8"
+        );
     }
 
     #[test]
@@ -2061,13 +2354,23 @@ my_module:
   _target_: myproject.Model
 "#;
         let parsed_content = YamlParser::parse(content).unwrap();
-        assert_eq!(parsed_content.targets.len(), 1);
-        let target = &parsed_content.targets[0];
+        assert_eq!(parsed_content.hydra_objects.len(), 1);
+        let hydra_object = &parsed_content.hydra_objects[0];
 
-        let find_param = |key: &str| target.parameters.iter().find(|p| p.key == key).unwrap();
-        assert_eq!(find_param("shuffle").line, 2, "shuffle should be on line 2");
+        let find_param = |key: &str| {
+            hydra_object
+                .parameters
+                .iter()
+                .find(|p| matches!(p, Parameter::Keyword { key: k, .. } if k == key))
+                .unwrap()
+        };
         assert_eq!(
-            find_param("batch_size").line,
+            find_param("shuffle").line(),
+            2,
+            "shuffle should be on line 2"
+        );
+        assert_eq!(
+            find_param("batch_size").line(),
             3,
             "batch_size should be on line 3"
         );
@@ -2083,27 +2386,33 @@ model:
   hidden_size: 256
 "#;
         let parsed_content = YamlParser::parse(content).unwrap();
-        assert_eq!(parsed_content.targets.len(), 1);
+        assert_eq!(parsed_content.hydra_objects.len(), 1);
 
-        let target = &parsed_content.targets[0];
-        assert_eq!(target.value, "myproject.Model");
+        let hydra_object = &parsed_content.hydra_objects[0];
+        assert_eq!(hydra_object.target.value, "myproject.Model");
         assert!(
-            target.is_partial,
-            "Expected is_partial=true when _partial_: true"
+            hydra_object
+                .partial
+                .as_ref()
+                .is_some_and(|p| !p.invalid && p.value),
+            "Expected partial=true when _partial_: true"
         );
         assert!(
-            target.parameters.iter().all(|p| p.key != PARTIAL_KEY),
+            hydra_object
+                .parameters
+                .iter()
+                .all(|p| p.key() != Some(PARTIAL_KEY)),
             "_partial_ should not be included in parameters"
         );
 
-        let hidden = target
+        let hidden = hydra_object
             .parameters
             .iter()
-            .find(|p| p.key == "hidden_size")
+            .find(|p| p.key() == Some("hidden_size"))
             .expect("Expected hidden_size parameter");
-        assert_eq!(hidden.line, 4);
-        match hidden.value {
-            YamlValue::Integer(v) => assert_eq!(v, 256),
+        assert_eq!(hidden.line(), 4);
+        match hidden.value() {
+            YamlValue::Integer(v) => assert_eq!(*v, 256),
             _ => panic!("Expected Integer value for hidden_size"),
         }
     }
@@ -2117,17 +2426,23 @@ model:
   hidden_size: 256
 "#;
         let parsed_content = YamlParser::parse(content).unwrap();
-        assert_eq!(parsed_content.targets.len(), 1);
+        assert_eq!(parsed_content.hydra_objects.len(), 1);
 
-        let target = &parsed_content.targets[0];
-        assert_eq!(target.value, "myproject.Model");
-        assert_eq!(target.line, 3, "_target_ should be on line 3");
+        let hydra_object = &parsed_content.hydra_objects[0];
+        assert_eq!(hydra_object.target.value, "myproject.Model");
+        assert_eq!(hydra_object.target.line, 3, "_target_ should be on line 3");
         assert!(
-            target.is_partial,
-            "Expected is_partial=true when _partial_ precedes _target_"
+            hydra_object
+                .partial
+                .as_ref()
+                .is_some_and(|p| !p.invalid && p.value),
+            "Expected partial=true when _partial_ precedes _target_"
         );
         assert!(
-            target.parameters.iter().all(|p| p.key != PARTIAL_KEY),
+            hydra_object
+                .parameters
+                .iter()
+                .all(|p| p.key() != Some(PARTIAL_KEY)),
             "_partial_ should not be included in parameters"
         );
     }
@@ -2141,10 +2456,10 @@ model:
   hidden_size: 256
 "#;
         let parsed_missing = YamlParser::parse(content_missing).unwrap();
-        assert_eq!(parsed_missing.targets.len(), 1);
+        assert_eq!(parsed_missing.hydra_objects.len(), 1);
         assert!(
-            !parsed_missing.targets[0].is_partial,
-            "Expected is_partial=false when _partial_ is absent"
+            parsed_missing.hydra_objects[0].partial.is_none(),
+            "Expected partial=None when _partial_ is absent"
         );
 
         // Explicit _partial_: false
@@ -2155,10 +2470,13 @@ model:
   hidden_size: 256
 "#;
         let parsed_false = YamlParser::parse(content_false).unwrap();
-        assert_eq!(parsed_false.targets.len(), 1);
+        assert_eq!(parsed_false.hydra_objects.len(), 1);
         assert!(
-            !parsed_false.targets[0].is_partial,
-            "Expected is_partial=false when _partial_: false"
+            parsed_false.hydra_objects[0]
+                .partial
+                .as_ref()
+                .is_some_and(|p| !p.value),
+            "Expected partial.value=false when _partial_: false"
         );
     }
 
@@ -2172,13 +2490,13 @@ model:
   hidden_size: 256
 "#;
         let parsed_content = YamlParser::parse(content).unwrap();
-        assert_eq!(parsed_content.targets.len(), 1);
+        assert_eq!(parsed_content.hydra_objects.len(), 1);
 
-        let target = &parsed_content.targets[0];
-        assert_eq!(target.value, "myproject.Model");
+        let hydra_object = &parsed_content.hydra_objects[0];
+        assert_eq!(hydra_object.target.value, "myproject.Model");
         assert!(
-            !target.is_partial,
-            "Expected is_partial=false when _partial_ is a string"
+            hydra_object.partial.as_ref().is_some_and(|p| p.invalid),
+            "Expected partial.invalid=true when _partial_ is a string"
         );
     }
 
@@ -2191,7 +2509,7 @@ model:
 "#;
         let parsed_content = YamlParser::parse(content).unwrap();
         assert_eq!(
-            parsed_content.targets.len(),
+            parsed_content.hydra_objects.len(),
             0,
             "Should not create a target when _target_ is missing"
         );
@@ -2208,25 +2526,35 @@ items:
 "#;
         let parsed_content = YamlParser::parse(content).unwrap();
         assert_eq!(
-            parsed_content.targets.len(),
+            parsed_content.hydra_objects.len(),
             2,
             "Should find two list item targets"
         );
 
-        let first = &parsed_content.targets[0];
-        assert_eq!(first.value, "a.b.C");
-        assert_eq!(first.line, 2);
-        assert_eq!(first.key_start, 4, "Key should start after `  - `");
-        assert!(first.is_partial);
+        let first = &parsed_content.hydra_objects[0];
+        assert_eq!(first.target.value, "a.b.C");
+        assert_eq!(first.target.line, 2);
+        assert_eq!(first.target.key_start, 4, "Key should start after `  - `");
+        assert!(
+            first
+                .partial
+                .as_ref()
+                .is_some_and(|p| !p.invalid && p.value)
+        );
 
-        let second = &parsed_content.targets[1];
-        assert_eq!(second.value, "a.b.D");
-        assert_eq!(second.line, 5);
+        let second = &parsed_content.hydra_objects[1];
+        assert_eq!(second.target.value, "a.b.D");
+        assert_eq!(second.target.line, 5);
         assert_eq!(
-            second.key_start, 4,
+            second.target.key_start, 4,
             "Key should start after indentation for list item mapping"
         );
-        assert!(second.is_partial);
+        assert!(
+            second
+                .partial
+                .as_ref()
+                .is_some_and(|p| !p.invalid && p.value)
+        );
     }
 
     #[test]
@@ -2240,15 +2568,20 @@ outer:
     _partial_: false
 "#;
         let parsed_content = YamlParser::parse(content).unwrap();
-        assert_eq!(parsed_content.targets.len(), 2);
+        assert_eq!(parsed_content.hydra_objects.len(), 2);
 
-        let outer = &parsed_content.targets[0];
-        assert_eq!(outer.value, "pkg.Outer");
-        assert!(outer.is_partial);
+        let outer = &parsed_content.hydra_objects[0];
+        assert_eq!(outer.target.value, "pkg.Outer");
+        assert!(
+            outer
+                .partial
+                .as_ref()
+                .is_some_and(|p| !p.invalid && p.value)
+        );
 
-        let inner = &parsed_content.targets[1];
-        assert_eq!(inner.value, "pkg.Inner");
-        assert!(!inner.is_partial);
+        let inner = &parsed_content.hydra_objects[1];
+        assert_eq!(inner.target.value, "pkg.Inner");
+        assert!(inner.partial.as_ref().is_some_and(|p| !p.value));
     }
 
     // ==================== suppression comment tests ====================
@@ -2263,7 +2596,7 @@ db:
   host: localhost
 ";
         let parsed_content = YamlParser::parse(content).unwrap();
-        assert_eq!(parsed_content.targets.len(), 1);
+        assert_eq!(parsed_content.hydra_objects.len(), 1);
         assert!(
             parsed_content
                 .file_suppressions
@@ -2274,7 +2607,7 @@ db:
                 .file_suppressions
                 .contains(&DiagnosticRule::UnknownArgument)
         );
-        assert!(parsed_content.targets[0].suppressed_rules.is_empty());
+        assert!(parsed_content.hydra_objects[0].suppressed_rules.is_empty());
     }
 
     #[test]
@@ -2288,7 +2621,7 @@ db:
   _target_: my_module.DB
 ";
         let parsed_content = YamlParser::parse(content).unwrap();
-        assert_eq!(parsed_content.targets.len(), 1);
+        assert_eq!(parsed_content.hydra_objects.len(), 1);
         assert!(
             parsed_content
                 .file_suppressions
@@ -2300,15 +2633,15 @@ db:
     fn test_inline_suppression_on_target_line() {
         let content = "\
 db:
-  _target_: my_module.DB # hydrust: ignore[invalid-target]
+  _target_: my_module.DB # hydrust: ignore[invalid-hydra-parameter]
   host: localhost
 ";
         let parsed_content = YamlParser::parse(content).unwrap();
-        assert_eq!(parsed_content.targets.len(), 1);
+        assert_eq!(parsed_content.hydra_objects.len(), 1);
         assert!(
-            parsed_content.targets[0]
+            parsed_content.hydra_objects[0]
                 .suppressed_rules
-                .contains(&DiagnosticRule::InvalidTarget)
+                .contains(&DiagnosticRule::InvalidHydraParameter)
         );
         assert!(parsed_content.file_suppressions.is_empty());
     }
@@ -2321,15 +2654,15 @@ db:
   host: localhost # hydrust: ignore[unknown-argument]
 ";
         let parsed_content = YamlParser::parse(content).unwrap();
-        assert_eq!(parsed_content.targets.len(), 1);
-        let param = parsed_content.targets[0]
+        assert_eq!(parsed_content.hydra_objects.len(), 1);
+        let param = parsed_content.hydra_objects[0]
             .parameters
             .iter()
-            .find(|p| p.key == "host")
+            .find(|p| p.key() == Some("host"))
             .unwrap();
         assert!(
             param
-                .suppressed_rules
+                .suppressed_rules()
                 .contains(&DiagnosticRule::UnknownArgument)
         );
     }
@@ -2345,7 +2678,7 @@ db:
   host: localhost
 ";
         let parsed_content = YamlParser::parse(content).unwrap();
-        assert_eq!(parsed_content.targets.len(), 1);
+        assert_eq!(parsed_content.hydra_objects.len(), 1);
         assert!(parsed_content.file_suppressions.is_empty());
     }
 
@@ -2357,7 +2690,7 @@ db:
   _target_: my_module.DB
 ";
         let parsed_content = YamlParser::parse(content).unwrap();
-        assert_eq!(parsed_content.targets.len(), 1);
+        assert_eq!(parsed_content.hydra_objects.len(), 1);
         assert!(parsed_content.file_suppressions.is_empty());
     }
     #[test]
@@ -2393,12 +2726,15 @@ model:
   num_layers: 12
 "#;
         let position = Position::new(3, 5); // on hidden_size line
-        let (target_value, param_key) =
+        let (target_value, param_ctx) =
             YamlParser::find_target_for_parameter_line(content, position)
                 .unwrap()
                 .unwrap();
         assert_eq!(target_value, "myproject.Model");
-        assert_eq!(param_key, "hidden_size");
+        assert_eq!(
+            param_ctx,
+            ParameterContext::Keyword("hidden_size".to_string())
+        );
     }
 
     #[test]
@@ -2424,12 +2760,12 @@ optimizer:
   lr: 0.001
 "#;
         // Cursor on lr line (parameter of second target)
-        let (target_value, param_key) =
+        let (target_value, param_ctx) =
             YamlParser::find_target_for_parameter_line(content, Position::new(6, 5))
                 .unwrap()
                 .unwrap();
         assert_eq!(target_value, "myproject.Optimizer");
-        assert_eq!(param_key, "lr");
+        assert_eq!(param_ctx, ParameterContext::Keyword("lr".to_string()));
     }
 
     #[test]
@@ -2442,5 +2778,261 @@ model:
         let position = Position::new(1, 2); // on "model:" line
         let result = YamlParser::find_target_for_parameter_line(content, position).unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_find_target_for_parameter_line_positional_arg() {
+        let content = r#"
+model:
+  _target_: myproject.Model
+  _args_:
+    - 10
+    - 20
+    - 30
+  param: value
+"#;
+        // Cursor on first positional arg (line 4: "    - 10")
+        let (target_value, param_ctx) =
+            YamlParser::find_target_for_parameter_line(content, Position::new(4, 5))
+                .unwrap()
+                .unwrap();
+        assert_eq!(target_value, "myproject.Model");
+        assert_eq!(param_ctx, ParameterContext::Positional(0));
+
+        // Cursor on second positional arg (line 5: "    - 20")
+        let (_, param_ctx) =
+            YamlParser::find_target_for_parameter_line(content, Position::new(5, 5))
+                .unwrap()
+                .unwrap();
+        assert_eq!(param_ctx, ParameterContext::Positional(1));
+
+        // Cursor on third positional arg (line 6: "    - 30")
+        let (_, param_ctx) =
+            YamlParser::find_target_for_parameter_line(content, Position::new(6, 5))
+                .unwrap()
+                .unwrap();
+        assert_eq!(param_ctx, ParameterContext::Positional(2));
+
+        // Cursor on keyword param (line 7: "  param: value")
+        let (_, param_ctx) =
+            YamlParser::find_target_for_parameter_line(content, Position::new(7, 5))
+                .unwrap()
+                .unwrap();
+        assert_eq!(param_ctx, ParameterContext::Keyword("param".to_string()));
+    }
+
+    // ==================== Hydra Keyword Tests ====================
+
+    #[test]
+    fn test_recursive_true_parsed() {
+        let content = r#"
+model:
+  _target_: myproject.Model
+  _recursive_: true
+  param: 1
+"#;
+        let parsed = YamlParser::parse(content).unwrap();
+        assert_eq!(parsed.hydra_objects.len(), 1);
+        let hydra_object = &parsed.hydra_objects[0];
+        let rec = hydra_object
+            .recursive
+            .as_ref()
+            .expect("recursive should be present");
+        assert!(rec.value);
+        assert!(!rec.invalid);
+        // _recursive_ should not appear as a parameter
+        assert!(
+            hydra_object
+                .parameters
+                .iter()
+                .all(|p| p.key() != Some("_recursive_"))
+        );
+        assert_eq!(hydra_object.parameters.len(), 1);
+    }
+
+    #[test]
+    fn test_recursive_false_parsed() {
+        let content = r#"
+model:
+  _target_: myproject.Model
+  _recursive_: false
+"#;
+        let parsed = YamlParser::parse(content).unwrap();
+        let hydra_object = &parsed.hydra_objects[0];
+        let rec = hydra_object
+            .recursive
+            .as_ref()
+            .expect("recursive should be present");
+        assert!(!rec.value);
+        assert!(!rec.invalid);
+    }
+
+    #[test]
+    fn test_recursive_invalid_value() {
+        let content = r#"
+model:
+  _target_: myproject.Model
+  _recursive_: "yes"
+"#;
+        let parsed = YamlParser::parse(content).unwrap();
+        let hydra_object = &parsed.hydra_objects[0];
+        let rec = hydra_object
+            .recursive
+            .as_ref()
+            .expect("recursive should be present");
+        assert!(rec.invalid);
+    }
+
+    #[test]
+    fn test_convert_valid_values() {
+        for mode_str in ConvertMode::variants() {
+            let content = format!(
+                "\nmodel:\n  _target_: myproject.Model\n  _convert_: {}\n",
+                mode_str
+            );
+            let parsed = YamlParser::parse(&content).unwrap();
+            let hydra_object = &parsed.hydra_objects[0];
+            let conv = hydra_object
+                .convert
+                .as_ref()
+                .unwrap_or_else(|| panic!("Should parse _convert_: {}", mode_str));
+            assert!(!conv.invalid);
+        }
+    }
+
+    #[test]
+    fn test_convert_invalid_value() {
+        let content = r#"
+model:
+  _target_: myproject.Model
+  _convert_: invalid
+"#;
+        let parsed = YamlParser::parse(content).unwrap();
+        let hydra_object = &parsed.hydra_objects[0];
+        let conv = hydra_object
+            .convert
+            .as_ref()
+            .expect("convert should be present");
+        assert!(conv.invalid);
+    }
+
+    #[test]
+    fn test_args_valid_list() {
+        let content = r#"
+model:
+  _target_: myproject.Model
+  _args_: [1, 2, 3]
+"#;
+        let parsed = YamlParser::parse(content).unwrap();
+        let hydra_object = &parsed.hydra_objects[0];
+        let args = hydra_object.args.as_ref().expect("args should be present");
+        assert!(!args.invalid);
+        // _args_ should not appear as a parameter key
+        assert!(
+            hydra_object
+                .parameters
+                .iter()
+                .all(|p| p.key() != Some("_args_"))
+        );
+    }
+
+    #[test]
+    fn test_args_invalid_not_list() {
+        let content = r#"
+model:
+  _target_: myproject.Model
+  _args_: "not a list"
+"#;
+        let parsed = YamlParser::parse(content).unwrap();
+        let hydra_object = &parsed.hydra_objects[0];
+        let args = hydra_object.args.as_ref().expect("args should be present");
+        assert!(args.invalid);
+    }
+
+    #[test]
+    fn test_all_hydra_keywords_excluded_from_parameters() {
+        let content = r#"
+model:
+  _target_: myproject.Model
+  _partial_: true
+  _recursive_: false
+  _convert_: all
+  _args_: [1]
+  real_param: 42
+"#;
+        let parsed = YamlParser::parse(content).unwrap();
+        let hydra_object = &parsed.hydra_objects[0];
+        // 1 positional arg from _args_ + 1 real_param
+        assert_eq!(hydra_object.parameters.len(), 2);
+        assert!(
+            hydra_object
+                .parameters
+                .iter()
+                .any(|p| matches!(p, Parameter::Keyword { key, .. } if key == "real_param"))
+        );
+        assert!(
+            hydra_object
+                .parameters
+                .iter()
+                .any(|p| matches!(p, Parameter::Positional { .. }))
+        );
+        // No hydra keyword keys in parameters
+        for kw in HYDRA_KEYWORDS {
+            assert!(hydra_object.parameters.iter().all(|p| p.key() != Some(*kw)));
+        }
+    }
+
+    #[test]
+    fn test_hydra_keywords_not_present_defaults() {
+        let content = r#"
+model:
+  _target_: myproject.Model
+  param: 1
+"#;
+        let parsed = YamlParser::parse(content).unwrap();
+        let hydra_object = &parsed.hydra_objects[0];
+        assert!(hydra_object.recursive.is_none());
+        assert!(hydra_object.convert.is_none());
+        assert!(hydra_object.args.is_none());
+    }
+
+    #[test]
+    fn test_completion_context_recursive_value() {
+        let content = r#"
+model:
+  _target_: myproject.Model
+  _recursive_: t
+"#;
+        let position = Position::new(3, 16);
+        let context = YamlParser::get_completion_context(content, position).unwrap();
+        match context {
+            CompletionContext::ParameterValue {
+                parameter, partial, ..
+            } => {
+                assert_eq!(parameter, "_recursive_");
+                assert_eq!(partial, "t");
+            }
+            _ => panic!("Expected ParameterValue context"),
+        }
+    }
+
+    #[test]
+    fn test_completion_context_convert_value() {
+        let content = r#"
+model:
+  _target_: myproject.Model
+  _convert_: par
+"#;
+        let position = Position::new(3, 17);
+        let context = YamlParser::get_completion_context(content, position).unwrap();
+        match context {
+            CompletionContext::ParameterValue {
+                parameter, partial, ..
+            } => {
+                assert_eq!(parameter, "_convert_");
+                assert_eq!(partial, "par");
+            }
+            _ => panic!("Expected ParameterValue context"),
+        }
     }
 }

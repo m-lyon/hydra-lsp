@@ -189,3 +189,15 @@ class ChildWithOwnInit(ParentWithInit):
         """
         super().__init__(name)
         self.extra = extra
+
+
+def my_func(arg1, arg2, *args, **kwargs):
+    pass
+
+
+def strict_func(arg1, arg2):
+    pass
+
+
+def mixed_func(arg1, *args, kw_only):
+    pass
