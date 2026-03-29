@@ -10,7 +10,7 @@ use crate::document::DocumentStore;
 use crate::python_analyzer::{DefinitionInfo, ParameterInfo, PythonAnalyzer};
 use crate::yaml_parser::{
     ARGS_KEY, CONVERT_KEY, CompletionContext, ConvertMode, HydraSemanticToken, PARTIAL_KEY,
-    ParameterContext, RECURSIVE_KEY, YamlParser,
+    RECURSIVE_KEY, ResolvedParameterContext, YamlParser,
 };
 
 /// Format a parameter as a string for signature labels (e.g., "*args", "name: str")
@@ -41,11 +41,13 @@ fn to_parameter_information(p: &ParameterInfo) -> ParameterInformation {
     }
 }
 
-/// Build signature label and parameter information from a list of parameters
-fn build_signature_params(
-    params: &[ParameterInfo],
+/// Build signature label and parameter information from a list of parameters.
+/// Returns the label string, the LSP parameter info list, and the filtered
+/// `ParameterInfo` references (needed for active-parameter resolution).
+fn build_signature_params<'a>(
+    params: &'a [ParameterInfo],
     filter_param: Option<&str>,
-) -> (String, Vec<ParameterInformation>) {
+) -> (String, Vec<ParameterInformation>, Vec<&'a ParameterInfo>) {
     let filtered: Vec<_> = params
         .iter()
         .filter(|p| filter_param.is_none_or(|f| p.name != f))
@@ -55,7 +57,7 @@ fn build_signature_params(
         .iter()
         .map(|p| to_parameter_information(p))
         .collect();
-    (param_strs.join(", "), param_infos)
+    (param_strs.join(", "), param_infos, filtered)
 }
 
 /// Feature toggle settings for individual LSP capabilities.
@@ -631,61 +633,95 @@ impl LanguageServer for HydraLspBackend {
         match extract_result {
             Ok((definition_info, _file_path, _module_path, _symbol_name)) => {
                 let implicit_param = definition_info.implicit_param();
-                let (signature_label, parameters) = match &definition_info {
+                let (signature_label, parameters, param_infos) = match &definition_info {
                     DefinitionInfo::Function(sig) => {
-                        let (params_str, params) =
+                        let (params_str, params, infos) =
                             build_signature_params(&sig.parameters, implicit_param);
                         let label = format!("{}({})", sig.name, params_str);
-                        (label, params)
+                        (label, params, infos)
                     }
                     DefinitionInfo::Class(class_info) => {
                         if let Some(init_sig) = &class_info.init_signature {
-                            let (params_str, params) =
+                            let (params_str, params, infos) =
                                 build_signature_params(&init_sig.parameters, implicit_param);
                             let label = format!("{}({})", class_info.name, params_str);
-                            (label, params)
+                            (label, params, infos)
                         } else {
                             let label = format!("{}()", class_info.name);
-                            (label, vec![])
+                            (label, vec![], vec![])
                         }
                     }
                     DefinitionInfo::Method(method_info) => {
                         let sig = &method_info.signature;
-                        let (params_str, params) =
+                        let (params_str, params, infos) =
                             build_signature_params(&sig.parameters, implicit_param);
                         let label =
                             format!("{}.{}({})", method_info.class_name, sig.name, params_str);
-                        (label, params)
+                        (label, params, infos)
                     }
                 };
 
                 // Use an out-of-bounds index when the YAML key doesn't match any
                 // parameter, so the client doesn't default to highlighting index 0.
                 let active_parameter = Some(match &param_context {
-                    ParameterContext::Keyword(key) => parameters
-                        .iter()
-                        .position(|p| match &p.label {
-                            ParameterLabel::Simple(name) => {
-                                // Extract just the param name (before ':')
-                                let param_name = name.split(':').next().unwrap_or(name).trim();
-                                param_name == key
-                            }
-                            ParameterLabel::LabelOffsets(_) => false,
-                        })
-                        .unwrap_or(parameters.len())
-                        as u32,
-                    ParameterContext::Positional(_) => {
-                        // For positional args, highlight the *args parameter
+                    ResolvedParameterContext::Keyword(key) => {
+                        // Try exact match first, then fall back to **kwargs
                         parameters
                             .iter()
                             .position(|p| match &p.label {
                                 ParameterLabel::Simple(name) => {
-                                    let param_name = name.split(':').next().unwrap_or(name).trim();
-                                    param_name.starts_with('*') && !param_name.starts_with("**")
+                                    let param_name =
+                                        name.split(':').next().unwrap_or(name).trim();
+                                    param_name == key.as_str()
                                 }
                                 ParameterLabel::LabelOffsets(_) => false,
                             })
+                            .or_else(|| {
+                                // Unknown keyword: highlight **kwargs if present
+                                param_infos
+                                    .iter()
+                                    .position(|p| p.is_variadic_keyword)
+                            })
                             .unwrap_or(parameters.len()) as u32
+                    }
+                    ResolvedParameterContext::Positional(index) => {
+                        // _args_ entries map to positional parameters in order.
+                        // Count regular (non-keyword-only, non-variadic) params
+                        // that can be passed positionally.
+                        let positional_count = param_infos
+                            .iter()
+                            .filter(|p| {
+                                !p.is_variadic
+                                    && !p.is_variadic_keyword
+                                    && !p.is_keyword_only
+                            })
+                            .count();
+                        let idx = *index as usize;
+                        (if idx < positional_count {
+                            // Map to the idx-th positional parameter
+                            let mut seen = 0usize;
+                            param_infos
+                                .iter()
+                                .position(|p| {
+                                    if !p.is_variadic
+                                        && !p.is_variadic_keyword
+                                        && !p.is_keyword_only
+                                    {
+                                        if seen == idx {
+                                            return true;
+                                        }
+                                        seen += 1;
+                                    }
+                                    false
+                                })
+                                .unwrap_or(parameters.len())
+                        } else {
+                            // Overflow into *args if present
+                            param_infos
+                                .iter()
+                                .position(|p| p.is_variadic)
+                                .unwrap_or(parameters.len())
+                        }) as u32
                     }
                 });
 

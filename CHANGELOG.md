@@ -4,6 +4,7 @@
 
 - Added class name for `__init__` diagnostics
 - Implemented `signature_help` for parameters
+- Added support for `_args_`, `_convert_`, and `_recursive_`
 
 ## [0.2.0]
 

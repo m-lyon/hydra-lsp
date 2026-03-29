@@ -406,18 +406,7 @@ impl YamlParser {
         let mut param_line_map = HashMap::new();
         for (target_idx, hydra_obj) in hydra_objects.iter().enumerate() {
             target_line_map.insert(hydra_obj.target.line, target_idx);
-            let mut param_index = 0u32;
-            for param in &hydra_obj.parameters {
-                let context = match param {
-                    Parameter::Keyword { key, .. } => ParameterContext::Keyword(key.clone()),
-                    Parameter::Positional { .. } => {
-                        let ctx = ParameterContext::Positional(param_index);
-                        param_index += 1;
-                        ctx
-                    }
-                };
-                param_line_map.insert(param.line(), (target_idx, context));
-            }
+            Self::build_param_line_map(hydra_obj, target_idx, &mut param_line_map);
         }
 
         // Attach suppression comments from the raw content to targets/parameters
@@ -672,6 +661,67 @@ impl YamlParser {
         }
     }
 
+    /// Populate `param_line_map` entries for a single `HydraObject`.
+    ///
+    /// Keyword parameters get a `Keyword` context. Block-style positional
+    /// parameters (each on its own line) get `Positional(index)`. Inline
+    /// positional parameters sharing the `_args_` key line are collected
+    /// into an `InlinePositional` context so the cursor column can later
+    /// select the right item.
+    fn build_param_line_map(
+        hydra_obj: &HydraObject,
+        target_idx: usize,
+        param_line_map: &mut HashMap<u32, (usize, ParameterContext)>,
+    ) {
+        let args_line = hydra_obj.args.as_ref().map(|hp| hp.line);
+        let mut inline_args: Vec<InlinePositionalArg> = Vec::new();
+        let mut param_index = 0u32;
+
+        for param in &hydra_obj.parameters {
+            match param {
+                Parameter::Keyword { key, .. } => {
+                    param_line_map.insert(
+                        param.line(),
+                        (target_idx, ParameterContext::Keyword(key.clone())),
+                    );
+                }
+                Parameter::Positional {
+                    line,
+                    value_start,
+                    value_end,
+                    ..
+                } => {
+                    if Some(*line) == args_line {
+                        inline_args.push(InlinePositionalArg {
+                            index: param_index,
+                            col_start: *value_start,
+                            col_end: *value_end,
+                        });
+                    } else {
+                        param_line_map.insert(
+                            *line,
+                            (target_idx, ParameterContext::Positional(param_index)),
+                        );
+                    }
+                    param_index += 1;
+                }
+            }
+        }
+
+        // Map the _args_ key line for inline sequences (or empty _args_: [])
+        if let Some(line) = args_line {
+            if !inline_args.is_empty() {
+                param_line_map.insert(
+                    line,
+                    (target_idx, ParameterContext::InlinePositional(inline_args)),
+                );
+            } else {
+                param_line_map
+                    .insert(line, (target_idx, ParameterContext::Positional(0)));
+            }
+        }
+    }
+
     /// Extract the `_args_` Hydra keyword from a mapping.
     /// Returns the HydraParameter and any positional parameters parsed from the list.
     fn extract_args_keyword(
@@ -873,7 +923,7 @@ impl YamlParser {
     pub fn find_target_for_parameter_line(
         content: &str,
         position: Position,
-    ) -> Result<Option<(String, ParameterContext)>, YamlParseError> {
+    ) -> Result<Option<(String, ResolvedParameterContext)>, YamlParseError> {
         let parsed_content = Self::parse(content)?;
         // If cursor is on a _target_ line, return None
         if parsed_content.target_line_map.contains_key(&position.line) {
@@ -882,7 +932,28 @@ impl YamlParser {
         // Look up the parameter line in the precomputed map
         if let Some((idx, context)) = parsed_content.param_line_map.get(&position.line) {
             let hydra_object = &parsed_content.hydra_objects[*idx];
-            return Ok(Some((hydra_object.target.value.clone(), context.clone())));
+            let resolved = match context {
+                ParameterContext::Keyword(key) => {
+                    ResolvedParameterContext::Keyword(key.clone())
+                }
+                ParameterContext::Positional(index) => {
+                    ResolvedParameterContext::Positional(*index)
+                }
+                ParameterContext::InlinePositional(args) => {
+                    // Resolve to the specific positional arg based on cursor column.
+                    // Find the last arg whose col_start <= cursor position, or
+                    // default to the first arg (index 0).
+                    let col = position.character;
+                    let index = args
+                        .iter()
+                        .rev()
+                        .find(|a| col >= a.col_start)
+                        .map(|a| a.index)
+                        .unwrap_or(0);
+                    ResolvedParameterContext::Positional(index)
+                }
+            };
+            return Ok(Some((hydra_object.target.value.clone(), resolved)));
         }
         Ok(None)
     }
@@ -1205,12 +1276,34 @@ impl YamlParser {
     }
 }
 
+/// A single positional argument within an inline `_args_` sequence,
+/// carrying its column span so the cursor position can select the right one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InlinePositionalArg {
+    pub index: u32,
+    pub col_start: u32,
+    pub col_end: u32,
+}
+
 /// Identifies which parameter the cursor is on, for signature help.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParameterContext {
     /// A keyword argument with the given key name.
     Keyword(String),
-    /// A positional argument at the given index within `_args_`.
+    /// A positional argument at the given index within `_args_` (block style).
+    Positional(u32),
+    /// Multiple positional arguments on a single line (inline `_args_: [a, b, c]`).
+    /// Requires the cursor column to resolve to a specific index.
+    InlinePositional(Vec<InlinePositionalArg>),
+}
+
+/// Resolved parameter context returned by [`YamlParser::find_target_for_parameter_line`].
+///
+/// Unlike [`ParameterContext`] this has no `InlinePositional` variant — inline
+/// sequences are resolved to a concrete `Positional` index using the cursor column.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedParameterContext {
+    Keyword(String),
     Positional(u32),
 }
 
@@ -2733,7 +2826,7 @@ model:
         assert_eq!(target_value, "myproject.Model");
         assert_eq!(
             param_ctx,
-            ParameterContext::Keyword("hidden_size".to_string())
+            ResolvedParameterContext::Keyword("hidden_size".to_string())
         );
     }
 
@@ -2765,7 +2858,7 @@ optimizer:
                 .unwrap()
                 .unwrap();
         assert_eq!(target_value, "myproject.Optimizer");
-        assert_eq!(param_ctx, ParameterContext::Keyword("lr".to_string()));
+        assert_eq!(param_ctx, ResolvedParameterContext::Keyword("lr".to_string()));
     }
 
     #[test]
@@ -2797,28 +2890,28 @@ model:
                 .unwrap()
                 .unwrap();
         assert_eq!(target_value, "myproject.Model");
-        assert_eq!(param_ctx, ParameterContext::Positional(0));
+        assert_eq!(param_ctx, ResolvedParameterContext::Positional(0));
 
         // Cursor on second positional arg (line 5: "    - 20")
         let (_, param_ctx) =
             YamlParser::find_target_for_parameter_line(content, Position::new(5, 5))
                 .unwrap()
                 .unwrap();
-        assert_eq!(param_ctx, ParameterContext::Positional(1));
+        assert_eq!(param_ctx, ResolvedParameterContext::Positional(1));
 
         // Cursor on third positional arg (line 6: "    - 30")
         let (_, param_ctx) =
             YamlParser::find_target_for_parameter_line(content, Position::new(6, 5))
                 .unwrap()
                 .unwrap();
-        assert_eq!(param_ctx, ParameterContext::Positional(2));
+        assert_eq!(param_ctx, ResolvedParameterContext::Positional(2));
 
         // Cursor on keyword param (line 7: "  param: value")
         let (_, param_ctx) =
             YamlParser::find_target_for_parameter_line(content, Position::new(7, 5))
                 .unwrap()
                 .unwrap();
-        assert_eq!(param_ctx, ParameterContext::Keyword("param".to_string()));
+        assert_eq!(param_ctx, ResolvedParameterContext::Keyword("param".to_string()));
     }
 
     // ==================== Hydra Keyword Tests ====================

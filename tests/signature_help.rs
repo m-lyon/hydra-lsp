@@ -297,26 +297,14 @@ test:
     let sig_help = res.expect("Expected signature help for positional arg");
     assert!(!sig_help.signatures.is_empty(), "Should have signatures");
 
-    // Find which parameter index corresponds to *args
-    let params = sig_help.signatures[0]
-        .parameters
-        .as_ref()
-        .expect("Should have parameters");
-    let args_index = params
-        .iter()
-        .position(|p| match &p.label {
-            ParameterLabel::Simple(name) => name.starts_with('*') && !name.starts_with("**"),
-            _ => false,
-        })
-        .expect("Should have *args parameter");
-
+    // _args_[0] should highlight the first positional param (pos_only, index 0)
     assert_eq!(
         sig_help.active_parameter,
-        Some(args_index as u32),
-        "Positional arg should highlight *args parameter"
+        Some(0),
+        "First positional arg should highlight pos_only (index 0)"
     );
 
-    // Cursor on second positional arg (line 5: "    - 20") — should also highlight *args
+    // Cursor on second positional arg (line 5: "    - 20") — should highlight regular (index 1)
     let res2 = ctx
         .request::<request::SignatureHelpRequest>(SignatureHelpParams {
             context: None,
@@ -338,8 +326,8 @@ test:
     let sig_help2 = res2.expect("Expected signature help for second positional arg");
     assert_eq!(
         sig_help2.active_parameter,
-        Some(args_index as u32),
-        "Second positional arg should also highlight *args"
+        Some(1),
+        "Second positional arg should highlight regular (index 1)"
     );
 }
 
@@ -437,7 +425,7 @@ test:
         "Positional arg should highlight *args (index 0)"
     );
 
-    // Cursor on keyword arg — should not highlight any parameter (unknown kwarg)
+    // Cursor on keyword arg — should highlight **kwargs since it's an unknown kwarg
     let res2 = ctx
         .request::<request::SignatureHelpRequest>(SignatureHelpParams {
             context: None,
@@ -458,14 +446,21 @@ test:
 
     let sig_help2 = res2.expect("Expected signature help for kwarg");
     assert!(!sig_help2.signatures.is_empty());
-    let param_count = sig_help2.signatures[0]
+    // Unknown kwarg should highlight **kwargs (index 1)
+    let kwargs_index = sig_help2.signatures[0]
         .parameters
         .as_ref()
-        .map_or(0, |p| p.len()) as u32;
+        .unwrap()
+        .iter()
+        .position(|p| match &p.label {
+            ParameterLabel::Simple(name) => name.starts_with("**"),
+            _ => false,
+        })
+        .expect("Should have **kwargs parameter");
     assert_eq!(
         sig_help2.active_parameter,
-        Some(param_count),
-        "Unknown kwarg should not highlight any parameter"
+        Some(kwargs_index as u32),
+        "Unknown kwarg should highlight **kwargs"
     );
 }
 
@@ -505,24 +500,71 @@ test:
     let sig_help = res.expect("Expected signature help for inline positional args");
     assert!(!sig_help.signatures.is_empty(), "Should have signatures");
 
-    // Find which parameter index corresponds to *args
-    let params = sig_help.signatures[0]
-        .parameters
-        .as_ref()
-        .expect("Should have parameters");
-    let args_index = params
-        .iter()
-        .position(|p| match &p.label {
-            ParameterLabel::Simple(name) => name.starts_with('*') && !name.starts_with("**"),
-            _ => false,
-        })
-        .expect("Should have *args parameter");
-
+    // Inline _args_ line maps to Positional(0), which should highlight
+    // the first positional param (pos_only at index 0, since regular params
+    // come before *args).
+    // Note: for inline _args_ the _args_ key line maps to Positional(0).
     assert_eq!(
         sig_help.active_parameter,
-        Some(args_index as u32),
-        "Inline positional args should highlight *args parameter"
+        Some(0),
+        "Inline positional args should highlight first positional parameter"
     );
+}
+
+#[tokio::test]
+async fn test_signature_help_inline_args_cursor_per_item() {
+    let mut ctx = TestContext::new(TestWorkspace::Simple);
+    ctx.initialize().await;
+
+    // complex_function(pos_only, /, regular, *args, keyword_only, another_kw=None, **kwargs)
+    // Signature params (after filtering): pos_only, regular, *args, keyword_only, another_kw, **kwargs
+    //                                     idx 0     idx 1    idx 2
+    let content = r#"# @hydra
+test:
+  _target_: my_module.complex_function
+  _args_: [10, 20, 30]
+  keyword_only: value
+"#;
+    //  line 3: "  _args_: [10, 20, 30]"
+    //  columns: 0123456789012345678901
+    //                      ^10 ^20 ^30
+    ctx.open_document("test.yaml", content.to_string()).await;
+
+    // Helper to request signature help at a given column on line 3
+    async fn sig_help_at_col(ctx: &mut TestContext, col: u32) -> Option<SignatureHelp> {
+        ctx.request::<request::SignatureHelpRequest>(SignatureHelpParams {
+            context: None,
+            text_document_position_params: TextDocumentPositionParams {
+                position: Position {
+                    line: 3,
+                    character: col,
+                },
+                text_document: TextDocumentIdentifier {
+                    uri: ctx.doc_uri("test.yaml"),
+                },
+            },
+            work_done_progress_params: WorkDoneProgressParams {
+                work_done_token: None,
+            },
+        })
+        .await
+    }
+
+    // Cursor before any item (on the _args_ key or '[') → first positional (pos_only, idx 0)
+    let sh = sig_help_at_col(&mut ctx, 5).await.expect("should trigger");
+    assert_eq!(sh.active_parameter, Some(0), "before items → pos_only (idx 0)");
+
+    // Cursor on first item '10' (col 11) → pos_only (idx 0)
+    let sh = sig_help_at_col(&mut ctx, 11).await.expect("should trigger");
+    assert_eq!(sh.active_parameter, Some(0), "on first item → pos_only (idx 0)");
+
+    // Cursor after first comma (col 14, on ' 20') → regular (idx 1)
+    let sh = sig_help_at_col(&mut ctx, 15).await.expect("should trigger");
+    assert_eq!(sh.active_parameter, Some(1), "on second item → regular (idx 1)");
+
+    // Cursor on third item '30' (col 19) → *args (idx 2), since there are only 2 regular params
+    let sh = sig_help_at_col(&mut ctx, 19).await.expect("should trigger");
+    assert_eq!(sh.active_parameter, Some(2), "on third item → *args (idx 2)");
 }
 
 #[tokio::test]
@@ -565,22 +607,11 @@ test:
     let sig_help = res.expect("Signature help should trigger on '-' for _args_ items");
     assert!(!sig_help.signatures.is_empty(), "Should have signatures");
 
-    // Should highlight *args parameter
-    let params = sig_help.signatures[0]
-        .parameters
-        .as_ref()
-        .expect("Should have parameters");
-    let args_index = params
-        .iter()
-        .position(|p| match &p.label {
-            ParameterLabel::Simple(name) => name.starts_with('*') && !name.starts_with("**"),
-            _ => false,
-        })
-        .expect("Should have *args parameter");
+    // _args_[0] with dash trigger should highlight the first positional param (pos_only, index 0)
     assert_eq!(
         sig_help.active_parameter,
-        Some(args_index as u32),
-        "Dash-triggered signature help should highlight *args"
+        Some(0),
+        "Dash-triggered signature help should highlight first positional parameter"
     );
 }
 
@@ -699,13 +730,21 @@ test:
         .await;
 
     let sig_help = res.expect("Should still return signature help");
-    let param_count = sig_help.signatures[0]
+    // YAML key 'args' should NOT match '*args'. Since variadic_function has
+    // **kwargs, the unknown keyword should highlight **kwargs.
+    let kwargs_index = sig_help.signatures[0]
         .parameters
         .as_ref()
-        .map_or(0, |p| p.len()) as u32;
+        .unwrap()
+        .iter()
+        .position(|p| match &p.label {
+            ParameterLabel::Simple(name) => name.starts_with("**"),
+            _ => false,
+        })
+        .expect("Should have **kwargs parameter");
     assert_eq!(
         sig_help.active_parameter,
-        Some(param_count),
-        "YAML key 'args' should NOT match '*args' — active_parameter should be out-of-bounds"
+        Some(kwargs_index as u32),
+        "YAML key 'args' should NOT match '*args' — should highlight **kwargs instead"
     );
 }
