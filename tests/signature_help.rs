@@ -841,3 +841,52 @@ test:
         "After comma, highlight should advance to the next positional parameter"
     );
 }
+
+#[tokio::test]
+async fn test_signature_help_empty_args_list() {
+    let mut ctx = TestContext::new(TestWorkspace::Simple);
+    ctx.initialize().await;
+
+    // _args_: [] — empty inline flow sequence
+    let content = r#"# @hydra
+test:
+  _target_: my_module.complex_function
+  _args_: []
+"#;
+    ctx.open_document("test.yaml", content.to_string()).await;
+
+    // Cursor inside the empty brackets (col 11, between [ and ])
+    // line 3: "  _args_: []"
+    // columns: 0123456789012
+    let res = ctx
+        .request::<request::SignatureHelpRequest>(SignatureHelpParams {
+            context: Some(SignatureHelpContext {
+                trigger_kind: SignatureHelpTriggerKind::TRIGGER_CHARACTER,
+                trigger_character: Some("[".to_string()),
+                is_retrigger: false,
+                active_signature_help: None,
+            }),
+            text_document_position_params: TextDocumentPositionParams {
+                position: Position {
+                    line: 3,
+                    character: 11,
+                },
+                text_document: TextDocumentIdentifier {
+                    uri: ctx.doc_uri("test.yaml"),
+                },
+            },
+            work_done_progress_params: WorkDoneProgressParams {
+                work_done_token: None,
+            },
+        })
+        .await;
+
+    let sig_help = res.expect("Signature help should trigger inside empty _args_: []");
+    assert!(!sig_help.signatures.is_empty(), "Should have signatures");
+    // No commas → positional index 0 → should highlight first positional param
+    assert_eq!(
+        sig_help.active_parameter,
+        Some(0),
+        "Empty _args_: [] should highlight the first positional parameter"
+    );
+}

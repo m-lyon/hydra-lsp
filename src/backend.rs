@@ -602,7 +602,7 @@ impl LanguageServer for HydraLspBackend {
         }
 
         // Find target info for the parameter line at cursor position
-        let (target_value, param_context) =
+        let (target_value, param_context, keyword_keys) =
             match YamlParser::find_target_for_parameter_line(&document.content, position) {
                 Ok(Some(result)) => result,
                 Ok(None) => return Ok(None),
@@ -697,7 +697,7 @@ impl LanguageServer for HydraLspBackend {
                             })
                             .count();
                         let idx = *index as usize;
-                        (if idx < positional_count {
+                        let pos = if idx < positional_count {
                             // Map to the idx-th positional parameter
                             let mut seen = 0usize;
                             param_infos
@@ -721,6 +721,16 @@ impl LanguageServer for HydraLspBackend {
                                 .iter()
                                 .position(|p| p.is_variadic)
                                 .unwrap_or(parameters.len())
+                        };
+                        // If the positional parameter is also specified as a
+                        // keyword argument, use out-of-bounds to avoid
+                        // highlighting a conflicting parameter.
+                        (if pos < param_infos.len()
+                            && keyword_keys.contains(&param_infos[pos].name)
+                        {
+                            parameters.len()
+                        } else {
+                            pos
                         }) as u32
                     }
                 });

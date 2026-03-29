@@ -112,6 +112,17 @@ pub enum ConvertMode {
     Object,
 }
 
+impl fmt::Display for ConvertMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ConvertMode::None => write!(f, "none"),
+            ConvertMode::Partial => write!(f, "partial"),
+            ConvertMode::All => write!(f, "all"),
+            ConvertMode::Object => write!(f, "object"),
+        }
+    }
+}
+
 impl ConvertMode {
     pub fn variants() -> &'static [&'static str] {
         &["none", "partial", "all", "object"]
@@ -758,8 +769,9 @@ impl YamlParser {
                 let key_byte_idx = key_n.span.start.index();
                 content[key_byte_idx..].find('[').map(|i| {
                     let abs = key_byte_idx + i;
+                    let chars_before_bracket = content[key_byte_idx..abs].chars().count() as u32;
                     InlineArgsText {
-                        bracket_col: key_start + i as u32,
+                        bracket_col: key_start + chars_before_bracket,
                         text_after_bracket: content[abs + 1..]
                             .lines()
                             .next()
@@ -939,13 +951,21 @@ impl YamlParser {
 
     /// Count top-level commas in a slice of a YAML flow sequence.
     ///
-    /// Tracks `[]` / `{}` nesting depth so commas inside nested structures
-    /// are not counted.
+    /// Tracks `[]` / `{}` nesting depth and quoted strings so commas inside
+    /// nested structures or string literals are not counted.
     fn count_flow_commas(line: &str, start: usize, end: usize) -> u32 {
         let mut depth = 0u32;
         let mut count = 0u32;
+        let mut in_quote: Option<char> = None;
         for ch in line[start..end].chars() {
+            if let Some(q) = in_quote {
+                if ch == q {
+                    in_quote = None;
+                }
+                continue;
+            }
             match ch {
+                '"' | '\'' => in_quote = Some(ch),
                 '[' | '{' => depth += 1,
                 ']' | '}' => depth = depth.saturating_sub(1),
                 ',' if depth == 0 => count += 1,
@@ -959,10 +979,13 @@ impl YamlParser {
     /// position.
     ///
     /// Returns `None` if the cursor is on a `_target_` line or an unrelated line.
+    /// The returned tuple includes the keyword parameter names already specified
+    /// in the same Hydra object, which callers can use to detect conflicts
+    /// between positional (`_args_`) and keyword assignments.
     pub fn find_target_for_parameter_line(
         content: &str,
         position: Position,
-    ) -> Result<Option<(String, ResolvedParameterContext)>, YamlParseError> {
+    ) -> Result<Option<(String, ResolvedParameterContext, Vec<String>)>, YamlParseError> {
         let parsed_content = Self::parse(content)?;
         // If cursor is on a _target_ line, return None
         if parsed_content.target_line_map.contains_key(&position.line) {
@@ -980,14 +1003,29 @@ impl YamlParser {
                 } => {
                     // Resolve to a positional index by counting commas
                     // in the pre-extracted text between '[' and the cursor.
-                    let cursor_offset =
+                    // position.character is UTF-16 offset; bracket_col is a char
+                    // offset. For chars in the BMP these coincide; for non-BMP
+                    // chars they may differ, but Hydra configs are typically ASCII.
+                    let cursor_chars =
                         (position.character as usize).saturating_sub(*bracket_col as usize + 1);
-                    let end = cursor_offset.min(text_after_bracket.len());
+                    // Convert char count to byte offset for slicing
+                    let end: usize = text_after_bracket
+                        .char_indices()
+                        .nth(cursor_chars)
+                        .map_or(text_after_bracket.len(), |(i, _)| i);
                     let index = Self::count_flow_commas(text_after_bracket, 0, end);
                     ResolvedParameterContext::Positional(index)
                 }
             };
-            return Ok(Some((hydra_object.target.value.clone(), resolved)));
+            let keyword_keys: Vec<String> = hydra_object
+                .parameters
+                .iter()
+                .filter_map(|p| match p {
+                    Parameter::Keyword { key, .. } => Some(key.clone()),
+                    _ => None,
+                })
+                .collect();
+            return Ok(Some((hydra_object.target.value.clone(), resolved, keyword_keys)));
         }
         Ok(None)
     }
@@ -2859,7 +2897,7 @@ model:
   num_layers: 12
 "#;
         let position = Position::new(3, 5); // on hidden_size line
-        let (target_value, param_ctx) =
+        let (target_value, param_ctx, _) =
             YamlParser::find_target_for_parameter_line(content, position)
                 .unwrap()
                 .unwrap();
@@ -2893,7 +2931,7 @@ optimizer:
   lr: 0.001
 "#;
         // Cursor on lr line (parameter of second target)
-        let (target_value, param_ctx) =
+        let (target_value, param_ctx, _) =
             YamlParser::find_target_for_parameter_line(content, Position::new(6, 5))
                 .unwrap()
                 .unwrap();
@@ -2928,7 +2966,7 @@ model:
   param: value
 "#;
         // Cursor on first positional arg (line 4: "    - 10")
-        let (target_value, param_ctx) =
+        let (target_value, param_ctx, _) =
             YamlParser::find_target_for_parameter_line(content, Position::new(4, 5))
                 .unwrap()
                 .unwrap();
@@ -2936,21 +2974,21 @@ model:
         assert_eq!(param_ctx, ResolvedParameterContext::Positional(0));
 
         // Cursor on second positional arg (line 5: "    - 20")
-        let (_, param_ctx) =
+        let (_, param_ctx, _) =
             YamlParser::find_target_for_parameter_line(content, Position::new(5, 5))
                 .unwrap()
                 .unwrap();
         assert_eq!(param_ctx, ResolvedParameterContext::Positional(1));
 
         // Cursor on third positional arg (line 6: "    - 30")
-        let (_, param_ctx) =
+        let (_, param_ctx, _) =
             YamlParser::find_target_for_parameter_line(content, Position::new(6, 5))
                 .unwrap()
                 .unwrap();
         assert_eq!(param_ctx, ResolvedParameterContext::Positional(2));
 
         // Cursor on keyword param (line 7: "  param: value")
-        let (_, param_ctx) =
+        let (_, param_ctx, _) =
             YamlParser::find_target_for_parameter_line(content, Position::new(7, 5))
                 .unwrap()
                 .unwrap();
@@ -3179,5 +3217,51 @@ model:
             }
             _ => panic!("Expected ParameterValue context"),
         }
+    }
+
+    #[test]
+    fn test_count_flow_commas_ignores_commas_in_quotes() {
+        // "a,b" contains a comma but it should not be counted
+        let line = r#""a,b", "c", d"#;
+        assert_eq!(YamlParser::count_flow_commas(line, 0, line.len()), 2);
+    }
+
+    #[test]
+    fn test_count_flow_commas_single_quotes() {
+        let line = "'a,b', c";
+        assert_eq!(YamlParser::count_flow_commas(line, 0, line.len()), 1);
+    }
+
+    #[test]
+    fn test_count_flow_commas_nested_brackets_with_quotes() {
+        let line = r#"["a,b", [1,2]], c"#;
+        assert_eq!(YamlParser::count_flow_commas(line, 0, line.len()), 1);
+    }
+
+    #[test]
+    fn test_find_target_for_parameter_line_empty_args() {
+        let content = r#"
+model:
+  _target_: myproject.Model
+  _args_: []
+  param: value
+"#;
+        // Cursor on _args_ line (line 3), inside the empty brackets
+        let (target, param_ctx, _) =
+            YamlParser::find_target_for_parameter_line(content, Position::new(3, 11))
+                .unwrap()
+                .unwrap();
+        assert_eq!(target, "myproject.Model");
+        assert_eq!(param_ctx, ResolvedParameterContext::Positional(0));
+
+        // Cursor on keyword param (line 4: "  param: value")
+        let (_, param_ctx, _) =
+            YamlParser::find_target_for_parameter_line(content, Position::new(4, 5))
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            param_ctx,
+            ResolvedParameterContext::Keyword("param".to_string())
+        );
     }
 }

@@ -1182,3 +1182,32 @@ func:
         missing_diags[0].message
     );
 }
+
+#[tokio::test]
+async fn test_args_empty_list_does_not_satisfy_required() {
+    let mut ctx = TestContext::new(TestWorkspace::Simple);
+    ctx.initialize().await;
+
+    let content = r#"
+func:
+  _target_: my_module.strict_func
+  _args_: []
+"#;
+    ctx.open_document("args_empty.yaml", content.to_string())
+        .await;
+
+    let dp = ctx.recv::<PublishDiagnosticsParams>().await;
+    let diagnostics = dp.diagnostics;
+
+    let missing_diags: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.message.contains("Missing required parameter"))
+        .collect();
+
+    assert_eq!(
+        missing_diags.len(),
+        2,
+        "Empty _args_ should not satisfy any positional parameters, got: {:?}",
+        missing_diags
+    );
+}
