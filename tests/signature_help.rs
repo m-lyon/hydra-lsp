@@ -748,3 +748,96 @@ test:
         "YAML key 'args' should NOT match '*args' — should highlight **kwargs instead"
     );
 }
+
+#[tokio::test]
+async fn test_signature_help_no_trigger_on_args_colon() {
+    let mut ctx = TestContext::new(TestWorkspace::Simple);
+    ctx.initialize().await;
+
+    // Document state when user has just typed "_args_:" (no bracket yet)
+    let content = r#"# @hydra
+test:
+  _target_: my_module.complex_function
+  _args_:
+"#;
+    ctx.open_document("test.yaml", content.to_string()).await;
+
+    // Simulate the ":" trigger on the _args_ key line
+    let res = ctx
+        .request::<request::SignatureHelpRequest>(SignatureHelpParams {
+            context: Some(SignatureHelpContext {
+                trigger_kind: SignatureHelpTriggerKind::TRIGGER_CHARACTER,
+                trigger_character: Some(":".to_string()),
+                is_retrigger: false,
+                active_signature_help: None,
+            }),
+            text_document_position_params: TextDocumentPositionParams {
+                position: Position {
+                    line: 3,
+                    character: 9,
+                },
+                text_document: TextDocumentIdentifier {
+                    uri: ctx.doc_uri("test.yaml"),
+                },
+            },
+            work_done_progress_params: WorkDoneProgressParams {
+                work_done_token: None,
+            },
+        })
+        .await;
+
+    assert!(
+        res.is_none(),
+        "Signature help should NOT trigger on ':' for bare _args_: (no bracket)"
+    );
+}
+
+#[tokio::test]
+async fn test_signature_help_inline_args_comma_advances_highlight() {
+    let mut ctx = TestContext::new(TestWorkspace::Simple);
+    ctx.initialize().await;
+
+    // Simulate the state after the user types a comma: _args_: [1,]
+    // (editor auto-closes the bracket)
+    let content = r#"# @hydra
+test:
+  _target_: my_module.complex_function
+  _args_: [1,]
+"#;
+    //  line 3: "  _args_: [1,]"
+    //  columns: 01234567890123
+    ctx.open_document("test.yaml", content.to_string()).await;
+
+    // Cursor right after the comma (col 13), before the closing ']'
+    let res = ctx
+        .request::<request::SignatureHelpRequest>(SignatureHelpParams {
+            context: Some(SignatureHelpContext {
+                trigger_kind: SignatureHelpTriggerKind::TRIGGER_CHARACTER,
+                trigger_character: Some(",".to_string()),
+                is_retrigger: false,
+                active_signature_help: None,
+            }),
+            text_document_position_params: TextDocumentPositionParams {
+                position: Position {
+                    line: 3,
+                    character: 13,
+                },
+                text_document: TextDocumentIdentifier {
+                    uri: ctx.doc_uri("test.yaml"),
+                },
+            },
+            work_done_progress_params: WorkDoneProgressParams {
+                work_done_token: None,
+            },
+        })
+        .await;
+
+    let sig_help = res.expect("Signature help should trigger on ',' in inline _args_");
+    // One comma seen → positional index 1 → should highlight "regular" (the second
+    // positional param of complex_function)
+    assert_eq!(
+        sig_help.active_parameter,
+        Some(1),
+        "After comma, highlight should advance to the next positional parameter"
+    );
+}

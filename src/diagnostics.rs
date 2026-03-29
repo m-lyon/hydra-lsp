@@ -1519,7 +1519,7 @@ mod tests {
     fn test_invalid_args_value_diagnostic() {
         let mut hydra_object = build_hydra_object("InvalidTarget", Vec::new(), 0, 0, 0, false);
         hydra_object.args = Some(HydraParameter {
-            value: (),
+            value: None,
             line: 1,
             invalid: true,
             key_start: 0,
@@ -1562,7 +1562,7 @@ mod tests {
             value_end: 0,
         });
         hydra_object.args = Some(HydraParameter {
-            value: (),
+            value: None,
             line: 3,
             invalid: false,
             key_start: 0,

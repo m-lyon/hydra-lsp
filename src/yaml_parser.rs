@@ -307,8 +307,10 @@ pub struct HydraObject {
     pub recursive: Option<HydraParameter<bool>>,
     /// The `_convert_` keyword (if present)
     pub convert: Option<HydraParameter<ConvertMode>>,
-    /// The `_args_` keyword (if present)
-    pub args: Option<HydraParameter<()>>,
+    /// The `_args_` keyword (if present).
+    /// The value is `Some(InlineArgsText)` for inline flow sequences,
+    /// `None` for block sequences or invalid values.
+    pub args: Option<HydraParameter<Option<InlineArgsText>>>,
 }
 
 impl HydraObject {
@@ -665,16 +667,15 @@ impl YamlParser {
     ///
     /// Keyword parameters get a `Keyword` context. Block-style positional
     /// parameters (each on its own line) get `Positional(index)`. Inline
-    /// positional parameters sharing the `_args_` key line are collected
-    /// into an `InlinePositional` context so the cursor column can later
-    /// select the right item.
+    /// `_args_` sequences get an `InlinePositional` context using the
+    /// [`InlineArgsText`] captured during parsing.
     fn build_param_line_map(
         hydra_obj: &HydraObject,
         target_idx: usize,
         param_line_map: &mut HashMap<u32, (usize, ParameterContext)>,
     ) {
-        let args_line = hydra_obj.args.as_ref().map(|hp| hp.line);
-        let mut inline_args: Vec<InlinePositionalArg> = Vec::new();
+        let args_hp = hydra_obj.args.as_ref();
+        let args_line = args_hp.map(|hp| hp.line);
         let mut param_index = 0u32;
 
         for param in &hydra_obj.parameters {
@@ -685,19 +686,9 @@ impl YamlParser {
                         (target_idx, ParameterContext::Keyword(key.clone())),
                     );
                 }
-                Parameter::Positional {
-                    line,
-                    value_start,
-                    value_end,
-                    ..
-                } => {
-                    if Some(*line) == args_line {
-                        inline_args.push(InlinePositionalArg {
-                            index: param_index,
-                            col_start: *value_start,
-                            col_end: *value_end,
-                        });
-                    } else {
+                Parameter::Positional { line, .. } => {
+                    if Some(*line) != args_line {
+                        // Block-style positional: each on its own line
                         param_line_map.insert(
                             *line,
                             (target_idx, ParameterContext::Positional(param_index)),
@@ -708,25 +699,32 @@ impl YamlParser {
             }
         }
 
-        // Map the _args_ key line for inline sequences (or empty _args_: [])
-        if let Some(line) = args_line {
-            if !inline_args.is_empty() {
-                param_line_map.insert(
-                    line,
-                    (target_idx, ParameterContext::InlinePositional(inline_args)),
-                );
-            } else {
-                param_line_map
-                    .insert(line, (target_idx, ParameterContext::Positional(0)));
-            }
+        // Map the _args_ key line for inline sequences only.
+        // The InlineArgsText is only present for valid flow sequences.
+        if let Some(hp) = args_hp
+            && let Some(inline) = &hp.value
+        {
+            param_line_map.insert(
+                hp.line,
+                (
+                    target_idx,
+                    ParameterContext::InlinePositional {
+                        bracket_col: inline.bracket_col,
+                        text_after_bracket: inline.text_after_bracket.clone(),
+                    },
+                ),
+            );
         }
     }
 
     /// Extract the `_args_` Hydra keyword from a mapping.
     /// Returns the HydraParameter and any positional parameters parsed from the list.
+    /// For inline flow sequences (`[a, b]`), the HydraParameter value carries
+    /// an [`InlineArgsText`] with the bracket column and trailing text.
     fn extract_args_keyword(
         map: &LinkedHashMap<MarkedYamlOwned, MarkedYamlOwned>,
-    ) -> Option<(HydraParameter<()>, Vec<Parameter>)> {
+        content: &str,
+    ) -> Option<(HydraParameter<Option<InlineArgsText>>, Vec<Parameter>)> {
         let (key_n, val_node) = map
             .iter()
             .find(|(k, _)| k.data.as_str() == Some(ARGS_KEY))?;
@@ -750,9 +748,32 @@ impl YamlParser {
                     }
                 })
                 .collect();
+
+            // Detect inline flow sequence: items share the key line, or the
+            // sequence is empty and valid. For inline sequences, find '['
+            // on the line and capture the text after it.
+            let is_inline =
+                positional_params.is_empty() || positional_params.iter().all(|p| p.line() == line);
+            let inline_info = if is_inline {
+                let key_byte_idx = key_n.span.start.index();
+                content[key_byte_idx..].find('[').map(|i| {
+                    let abs = key_byte_idx + i;
+                    InlineArgsText {
+                        bracket_col: key_start + i as u32,
+                        text_after_bracket: content[abs + 1..]
+                            .lines()
+                            .next()
+                            .unwrap_or("")
+                            .to_string(),
+                    }
+                })
+            } else {
+                None
+            };
+
             Some((
                 HydraParameter {
-                    value: (),
+                    value: inline_info,
                     line,
                     invalid: false,
                     key_start,
@@ -764,7 +785,7 @@ impl YamlParser {
         } else {
             Some((
                 HydraParameter {
-                    value: (),
+                    value: None,
                     line,
                     invalid: true,
                     key_start,
@@ -794,7 +815,7 @@ impl YamlParser {
             let partial = Self::extract_bool_keyword(map, PARTIAL_KEY);
             let recursive = Self::extract_bool_keyword(map, RECURSIVE_KEY);
             let convert = Self::extract_convert_keyword(map);
-            let args_result = Self::extract_args_keyword(map);
+            let args_result = Self::extract_args_keyword(map, content);
 
             if let Some(target_str) = value_node.data.as_str() {
                 // Saphyr lines are 1-indexed, LSP is 0-indexed
@@ -916,6 +937,24 @@ impl YamlParser {
         Ok(None)
     }
 
+    /// Count top-level commas in a slice of a YAML flow sequence.
+    ///
+    /// Tracks `[]` / `{}` nesting depth so commas inside nested structures
+    /// are not counted.
+    fn count_flow_commas(line: &str, start: usize, end: usize) -> u32 {
+        let mut depth = 0u32;
+        let mut count = 0u32;
+        for ch in line[start..end].chars() {
+            match ch {
+                '[' | '{' => depth += 1,
+                ']' | '}' => depth = depth.saturating_sub(1),
+                ',' if depth == 0 => count += 1,
+                _ => {}
+            }
+        }
+        count
+    }
+
     /// Find the target value and parameter context for a parameter line at the given
     /// position.
     ///
@@ -933,23 +972,18 @@ impl YamlParser {
         if let Some((idx, context)) = parsed_content.param_line_map.get(&position.line) {
             let hydra_object = &parsed_content.hydra_objects[*idx];
             let resolved = match context {
-                ParameterContext::Keyword(key) => {
-                    ResolvedParameterContext::Keyword(key.clone())
-                }
-                ParameterContext::Positional(index) => {
-                    ResolvedParameterContext::Positional(*index)
-                }
-                ParameterContext::InlinePositional(args) => {
-                    // Resolve to the specific positional arg based on cursor column.
-                    // Find the last arg whose col_start <= cursor position, or
-                    // default to the first arg (index 0).
-                    let col = position.character;
-                    let index = args
-                        .iter()
-                        .rev()
-                        .find(|a| col >= a.col_start)
-                        .map(|a| a.index)
-                        .unwrap_or(0);
+                ParameterContext::Keyword(key) => ResolvedParameterContext::Keyword(key.clone()),
+                ParameterContext::Positional(index) => ResolvedParameterContext::Positional(*index),
+                ParameterContext::InlinePositional {
+                    bracket_col,
+                    text_after_bracket,
+                } => {
+                    // Resolve to a positional index by counting commas
+                    // in the pre-extracted text between '[' and the cursor.
+                    let cursor_offset =
+                        (position.character as usize).saturating_sub(*bracket_col as usize + 1);
+                    let end = cursor_offset.min(text_after_bracket.len());
+                    let index = Self::count_flow_commas(text_after_bracket, 0, end);
                     ResolvedParameterContext::Positional(index)
                 }
             };
@@ -1276,13 +1310,13 @@ impl YamlParser {
     }
 }
 
-/// A single positional argument within an inline `_args_` sequence,
-/// carrying its column span so the cursor position can select the right one.
+/// Pre-extracted text from an inline `_args_: [...]` flow sequence.
+/// Captured during parsing so that signature-help resolution can count
+/// commas without re-reading source content.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InlinePositionalArg {
-    pub index: u32,
-    pub col_start: u32,
-    pub col_end: u32,
+pub struct InlineArgsText {
+    pub bracket_col: u32,
+    pub text_after_bracket: String,
 }
 
 /// Identifies which parameter the cursor is on, for signature help.
@@ -1292,9 +1326,15 @@ pub enum ParameterContext {
     Keyword(String),
     /// A positional argument at the given index within `_args_` (block style).
     Positional(u32),
-    /// Multiple positional arguments on a single line (inline `_args_: [a, b, c]`).
-    /// Requires the cursor column to resolve to a specific index.
-    InlinePositional(Vec<InlinePositionalArg>),
+    /// An inline `_args_` sequence (e.g. `_args_: [a, b, c]`).
+    /// Stores the column of the opening `[` and the text that follows it
+    /// so the cursor column can be resolved to a positional index by
+    /// counting commas, without re-reading the source content.
+    InlinePositional {
+        bracket_col: u32,
+        /// Text after the `[` up to end-of-line (e.g. `"a, b, c]"`).
+        text_after_bracket: String,
+    },
 }
 
 /// Resolved parameter context returned by [`YamlParser::find_target_for_parameter_line`].
@@ -2858,7 +2898,10 @@ optimizer:
                 .unwrap()
                 .unwrap();
         assert_eq!(target_value, "myproject.Optimizer");
-        assert_eq!(param_ctx, ResolvedParameterContext::Keyword("lr".to_string()));
+        assert_eq!(
+            param_ctx,
+            ResolvedParameterContext::Keyword("lr".to_string())
+        );
     }
 
     #[test]
@@ -2911,7 +2954,10 @@ model:
             YamlParser::find_target_for_parameter_line(content, Position::new(7, 5))
                 .unwrap()
                 .unwrap();
-        assert_eq!(param_ctx, ResolvedParameterContext::Keyword("param".to_string()));
+        assert_eq!(
+            param_ctx,
+            ResolvedParameterContext::Keyword("param".to_string())
+        );
     }
 
     // ==================== Hydra Keyword Tests ====================
@@ -3020,6 +3066,12 @@ model:
         let hydra_object = &parsed.hydra_objects[0];
         let args = hydra_object.args.as_ref().expect("args should be present");
         assert!(!args.invalid);
+        // Inline flow sequence should have InlineArgsText
+        let inline = args
+            .value
+            .as_ref()
+            .expect("should have InlineArgsText for flow sequence");
+        assert_eq!(inline.text_after_bracket, "1, 2, 3]");
         // _args_ should not appear as a parameter key
         assert!(
             hydra_object
