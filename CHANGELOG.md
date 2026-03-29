@@ -1,10 +1,11 @@
 # Changelog
 
-## [0.2.1]
+## [0.3.0]
 
 - Added class name for `__init__` diagnostics
 - Implemented `signature_help` for parameters
 - Added support for `_args_`, `_convert_`, and `_recursive_`
+- Renamed `invalid-target` diagnostic to `invalid-hydra-parameter` and included other checks within that rule
 
 ## [0.2.0]
 
