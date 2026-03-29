@@ -684,7 +684,7 @@ impl LanguageServer for HydraLspBackend {
                             })
                             .unwrap_or(parameters.len()) as u32
                     }
-                    ResolvedParameterContext::Positional(index) => {
+                    ResolvedParameterContext::Positional(index, num_args_in_yaml) => {
                         // _args_ entries map to positional parameters in order.
                         // Count regular (non-keyword-only, non-variadic) params
                         // that can be passed positionally.
@@ -722,11 +722,13 @@ impl LanguageServer for HydraLspBackend {
                                 .position(|p| p.is_variadic)
                                 .unwrap_or(parameters.len())
                         };
-                        // If the positional parameter is also specified as a
-                        // keyword argument, use out-of-bounds to avoid
-                        // highlighting a conflicting parameter.
-                        (if pos < param_infos.len()
-                            && keyword_keys.contains(&param_infos[pos].name)
+                        // Don't highlight any parameter when the _args_ list
+                        // is empty — there are no actual arguments being passed.
+                        // Also suppress when the positional parameter is already
+                        // specified as a keyword argument.
+                        (if *num_args_in_yaml == 0
+                            || (pos < param_infos.len()
+                                && keyword_keys.contains(&param_infos[pos].name))
                         {
                             parameters.len()
                         } else {

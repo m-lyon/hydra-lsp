@@ -883,10 +883,15 @@ test:
 
     let sig_help = res.expect("Signature help should trigger inside empty _args_: []");
     assert!(!sig_help.signatures.is_empty(), "Should have signatures");
-    // No commas → positional index 0 → should highlight first positional param
-    assert_eq!(
-        sig_help.active_parameter,
-        Some(0),
-        "Empty _args_: [] should highlight the first positional parameter"
+    let param_count = sig_help.signatures[0]
+        .parameters
+        .as_ref()
+        .map_or(0, |p| p.len()) as u32;
+    // Empty _args_ list — no arguments are actually being passed, so no
+    // parameter should be highlighted (active_parameter is out-of-bounds).
+    assert!(
+        sig_help.active_parameter.unwrap() >= param_count,
+        "Empty _args_: [] should not highlight any parameter, got active_parameter={:?}",
+        sig_help.active_parameter
     );
 }
