@@ -336,6 +336,7 @@ impl HydraObject {
     }
 }
 
+#[derive(Clone)]
 pub struct ParsedContent {
     /// All hydra objects found in the document, in the order they appear
     pub hydra_objects: Vec<HydraObject>,

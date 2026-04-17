@@ -1,3 +1,4 @@
+use dashmap::DashMap;
 use parking_lot::RwLock;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -5,9 +6,13 @@ use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
 
+use salsa::Setter;
+
+use crate::database::HydraDatabase;
 use crate::diagnostics::{self, DiagnosticRule};
 use crate::document::DocumentStore;
 use crate::python_analyzer::{DefinitionInfo, ParameterInfo, PythonAnalyzer};
+use crate::yaml_cache::{self, DocumentInput};
 use crate::yaml_parser::{
     ARGS_KEY, CONVERT_KEY, CompletionContext, ConvertMode, HydraSemanticToken, PARTIAL_KEY,
     RECURSIVE_KEY, ResolvedParameterContext, YamlParser,
@@ -125,19 +130,59 @@ pub struct Settings {
     pub features: FeatureToggles,
 }
 
-#[derive(Debug)]
 pub struct HydraLspBackend {
     pub client: Client,
     pub documents: Arc<DocumentStore>,
     pub settings: Arc<RwLock<Settings>>,
+    /// Salsa database for incremental caching.
+    /// Uses `Mutex` because salsa's Storage is `Send` but not `Sync`.
+    db: Arc<parking_lot::Mutex<HydraDatabase>>,
+    /// Map from document URI to its salsa input handle.
+    document_inputs: DashMap<Url, DocumentInput>,
+}
+
+impl std::fmt::Debug for HydraLspBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HydraLspBackend")
+            .field("documents", &self.documents)
+            .field("settings", &self.settings)
+            .finish_non_exhaustive()
+    }
 }
 
 impl HydraLspBackend {
     pub fn new(client: Client) -> Self {
+        // Use the current directory as the database root.
+        let cwd = std::env::current_dir()
+            .ok()
+            .and_then(|p| p.to_str().map(|s| s.to_string()))
+            .unwrap_or_else(|| "/".to_string());
+        let cwd = ruff_db::system::SystemPath::new(&cwd);
         Self {
             client,
             documents: Arc::new(DocumentStore::new()),
             settings: Arc::new(RwLock::new(Settings::default())),
+            db: Arc::new(parking_lot::Mutex::new(HydraDatabase::new(cwd))),
+            document_inputs: DashMap::new(),
+        }
+    }
+
+    /// Get or create a `DocumentInput` for a given URI.
+    fn get_or_create_input(&self, uri: &Url, text: &str, version: i32) -> DocumentInput {
+        if let Some(existing) = self.document_inputs.get(uri) {
+            let input = *existing;
+            drop(existing);
+            // Update the existing input
+            let mut db = self.db.lock();
+            input.set_text(&mut *db).to(text.to_string());
+            input.set_version(&mut *db).to(version);
+            input
+        } else {
+            let db = self.db.lock();
+            let input = DocumentInput::new(&*db, text.to_string(), version);
+            drop(db);
+            self.document_inputs.insert(uri.clone(), input);
+            input
         }
     }
 }
@@ -294,8 +339,15 @@ impl LanguageServer for HydraLspBackend {
 
         self.documents.insert(uri.clone(), text.clone(), version);
 
-        // Publish diagnostics if this is a Hydra file
-        if YamlParser::is_hydra_file(&text) && self.settings.read().features.diagnostics {
+        // Create a salsa input for this document
+        let input = self.get_or_create_input(&uri, &text, version);
+
+        // Publish diagnostics if this is a Hydra file (using cached check)
+        let is_hydra = {
+            let db = self.db.lock();
+            yaml_cache::is_hydra_file(&*db, input)
+        };
+        if is_hydra && self.settings.read().features.diagnostics {
             self.publish_diagnostics_for_document(&uri, &text).await;
         }
 
@@ -313,9 +365,15 @@ impl LanguageServer for HydraLspBackend {
             self.documents
                 .update(uri.clone(), change.text.clone(), version);
 
-            // Re-publish diagnostics if this is a Hydra file
-            if YamlParser::is_hydra_file(&change.text) && self.settings.read().features.diagnostics
-            {
+            // Update the salsa input (invalidates cached queries)
+            let input = self.get_or_create_input(&uri, &change.text, version);
+
+            // Re-publish diagnostics if this is a Hydra file (using cached check)
+            let is_hydra = {
+                let db = self.db.lock();
+                yaml_cache::is_hydra_file(&*db, input)
+            };
+            if is_hydra && self.settings.read().features.diagnostics {
                 self.publish_diagnostics_for_document(&uri, &change.text)
                     .await;
             }
@@ -338,6 +396,7 @@ impl LanguageServer for HydraLspBackend {
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = params.text_document.uri;
         self.documents.remove(&uri);
+        self.document_inputs.remove(&uri);
 
         self.client
             .log_message(MessageType::INFO, format!("Document closed: {}", uri))
@@ -670,17 +729,14 @@ impl LanguageServer for HydraLspBackend {
                             .iter()
                             .position(|p| match &p.label {
                                 ParameterLabel::Simple(name) => {
-                                    let param_name =
-                                        name.split(':').next().unwrap_or(name).trim();
+                                    let param_name = name.split(':').next().unwrap_or(name).trim();
                                     param_name == key.as_str()
                                 }
                                 ParameterLabel::LabelOffsets(_) => false,
                             })
                             .or_else(|| {
                                 // Unknown keyword: highlight **kwargs if present
-                                param_infos
-                                    .iter()
-                                    .position(|p| p.is_variadic_keyword)
+                                param_infos.iter().position(|p| p.is_variadic_keyword)
                             })
                             .unwrap_or(parameters.len()) as u32
                     }
@@ -691,9 +747,7 @@ impl LanguageServer for HydraLspBackend {
                         let positional_count = param_infos
                             .iter()
                             .filter(|p| {
-                                !p.is_variadic
-                                    && !p.is_variadic_keyword
-                                    && !p.is_keyword_only
+                                !p.is_variadic && !p.is_variadic_keyword && !p.is_keyword_only
                             })
                             .count();
                         let idx = *index as usize;
@@ -909,14 +963,35 @@ impl LanguageServer for HydraLspBackend {
 }
 
 impl HydraLspBackend {
-    /// Publish diagnostics for a document
+    /// Publish diagnostics for a document.
+    ///
+    /// Uses the cached `parsed_yaml` query when a `DocumentInput` exists
+    /// for this URI. Falls back to direct parsing otherwise.
     async fn publish_diagnostics_for_document(&self, uri: &Url, content: &str) {
         let workspace_root = uri
             .to_file_path()
             .ok()
             .and_then(|path| path.parent().map(|p| p.to_path_buf()));
 
-        match YamlParser::parse(content) {
+        // Get parsed content from cache or direct parse
+        let parse_result = if let Some(input_ref) = self.document_inputs.get(uri) {
+            let input = *input_ref;
+            drop(input_ref);
+
+            // Get the cached parse result and extract data before releasing the lock.
+            // The lock must be released before any `.await` point.
+            let db = self.db.lock();
+            let cached = yaml_cache::parsed_yaml(&*db, input);
+            match cached.result() {
+                Ok(parsed_content) => Ok(parsed_content.clone()),
+                Err(e) => Err(e.to_string()),
+            }
+        } else {
+            YamlParser::parse(content).map_err(|e| e.to_string())
+        };
+
+        // Handle the parse result
+        match parse_result {
             Ok(mut parsed_content) => {
                 let diagnostics = {
                     let settings = self.settings.read();
@@ -934,7 +1009,6 @@ impl HydraLspBackend {
                     .await;
             }
             Err(e) => {
-                // Publish YAML syntax error as diagnostic
                 let diagnostic = Diagnostic {
                     range: Range {
                         start: Position {
