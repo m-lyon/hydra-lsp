@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use tracing::debug;
+
 use crate::yaml_parser::{ParsedContent, YamlParseError, YamlParser};
 
 /// A salsa input representing a document's source text.
@@ -60,6 +62,7 @@ impl Eq for ParsedYaml {}
 /// when the document content changes.
 #[salsa::tracked]
 pub fn is_hydra_file(db: &dyn salsa::Database, input: DocumentInput) -> bool {
+    debug!("is_hydra_file: executing (cache miss)");
     let text = input.text(db);
     YamlParser::is_hydra_file(text)
 }
@@ -74,6 +77,149 @@ pub fn is_hydra_file(db: &dyn salsa::Database, input: DocumentInput) -> bool {
 /// Uses `lru=100` to bound memory usage for large workspaces.
 #[salsa::tracked(no_eq, lru = 100)]
 pub fn parsed_yaml(db: &dyn salsa::Database, input: DocumentInput) -> ParsedYaml {
+    debug!("parsed_yaml: executing (cache miss)");
     let text = input.text(db);
     ParsedYaml::new(YamlParser::parse(text))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::database::tests::TestDb;
+    use salsa::Setter;
+
+    fn hydra_yaml() -> &'static str {
+        "# @hydra\nmodel:\n  _target_: my.Module\n  param: 42\n"
+    }
+
+    fn non_hydra_yaml() -> &'static str {
+        "server:\n  host: localhost\n  port: 8080\n"
+    }
+
+    #[test]
+    fn test_document_input_fields() {
+        let db = TestDb::new();
+        let input = DocumentInput::new(&db, "hello".to_string(), 1);
+        assert_eq!(input.text(&db), "hello");
+        assert_eq!(input.version(&db), 1);
+    }
+
+    #[test]
+    fn test_document_input_update() {
+        let mut db = TestDb::new();
+        let input = DocumentInput::new(&db, "v1".to_string(), 1);
+        assert_eq!(input.text(&db), "v1");
+
+        input.set_text(&mut db).to("v2".to_string());
+        input.set_version(&mut db).to(2);
+        assert_eq!(input.text(&db), "v2");
+        assert_eq!(input.version(&db), 2);
+    }
+
+    #[test]
+    fn test_is_hydra_file_true() {
+        let db = TestDb::new();
+        let input = DocumentInput::new(&db, hydra_yaml().to_string(), 1);
+        assert!(is_hydra_file(&db, input));
+    }
+
+    #[test]
+    fn test_is_hydra_file_false() {
+        let db = TestDb::new();
+        let input = DocumentInput::new(&db, non_hydra_yaml().to_string(), 1);
+        assert!(!is_hydra_file(&db, input));
+    }
+
+    #[test]
+    fn test_is_hydra_file_invalidation() {
+        let mut db = TestDb::new();
+        let input = DocumentInput::new(&db, non_hydra_yaml().to_string(), 1);
+        assert!(!is_hydra_file(&db, input));
+
+        // Change content to a Hydra file — cached result should invalidate
+        input.set_text(&mut db).to(hydra_yaml().to_string());
+        input.set_version(&mut db).to(2);
+        assert!(is_hydra_file(&db, input));
+    }
+
+    #[test]
+    fn test_parsed_yaml_success() {
+        let db = TestDb::new();
+        let input = DocumentInput::new(&db, hydra_yaml().to_string(), 1);
+        let parsed = parsed_yaml(&db, input);
+        assert!(parsed.is_ok());
+
+        let content = parsed.result().unwrap();
+        assert!(!content.hydra_objects.is_empty());
+        assert_eq!(content.hydra_objects[0].target.value, "my.Module");
+    }
+
+    #[test]
+    fn test_parsed_yaml_invalid() {
+        let db = TestDb::new();
+        let input = DocumentInput::new(&db, ":\n  - :\n  bad yaml [[[".to_string(), 1);
+        let parsed = parsed_yaml(&db, input);
+        assert!(!parsed.is_ok());
+        assert!(parsed.result().is_err());
+    }
+
+    #[test]
+    fn test_parsed_yaml_non_hydra() {
+        let db = TestDb::new();
+        let input = DocumentInput::new(&db, non_hydra_yaml().to_string(), 1);
+        let parsed = parsed_yaml(&db, input);
+        // Non-hydra YAML still parses successfully — just no targets
+        assert!(parsed.is_ok());
+        let content = parsed.result().unwrap();
+        assert!(content.hydra_objects.is_empty());
+    }
+
+    #[test]
+    fn test_parsed_yaml_invalidation() {
+        let mut db = TestDb::new();
+        let input = DocumentInput::new(&db, hydra_yaml().to_string(), 1);
+
+        let parsed1 = parsed_yaml(&db, input);
+        assert_eq!(parsed1.result().unwrap().hydra_objects[0].target.value, "my.Module");
+
+        // Update text — should reparse
+        input
+            .set_text(&mut db)
+            .to("# @hydra\nother:\n  _target_: other.Class\n".to_string());
+        input.set_version(&mut db).to(2);
+
+        let parsed2 = parsed_yaml(&db, input);
+        assert_eq!(
+            parsed2.result().unwrap().hydra_objects[0].target.value,
+            "other.Class"
+        );
+    }
+
+    #[test]
+    fn test_parsed_yaml_cache_returns_same_arc() {
+        let db = TestDb::new();
+        let input = DocumentInput::new(&db, hydra_yaml().to_string(), 1);
+
+        let parsed1 = parsed_yaml(&db, input);
+        let parsed2 = parsed_yaml(&db, input);
+        // Same input, no changes — should be pointer-equal (same Arc)
+        assert!(parsed1 == parsed2);
+    }
+
+    #[test]
+    fn test_parsed_yaml_multiple_targets() {
+        let db = TestDb::new();
+        let yaml = r#"# @hydra
+model:
+  _target_: my.Model
+  size: 10
+optimizer:
+  _target_: torch.optim.Adam
+  lr: 0.001
+"#;
+        let input = DocumentInput::new(&db, yaml.to_string(), 1);
+        let parsed = parsed_yaml(&db, input);
+        let content = parsed.result().unwrap();
+        assert_eq!(content.hydra_objects.len(), 2);
+    }
 }

@@ -2,16 +2,18 @@ use dashmap::DashMap;
 use parking_lot::RwLock;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Instant;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
 
-use salsa::Setter;
+use salsa::{Database as _, Setter};
 
 use crate::database::HydraDatabase;
 use crate::diagnostics::{self, DiagnosticRule};
 use crate::document::DocumentStore;
 use crate::python_analyzer::{DefinitionInfo, ParameterInfo, PythonAnalyzer};
+use crate::python_cache::{self, PythonConfig, TargetString};
 use crate::yaml_cache::{self, DocumentInput};
 use crate::yaml_parser::{
     ARGS_KEY, CONVERT_KEY, CompletionContext, ConvertMode, HydraSemanticToken, PARTIAL_KEY,
@@ -139,6 +141,9 @@ pub struct HydraLspBackend {
     db: Arc<parking_lot::Mutex<HydraDatabase>>,
     /// Map from document URI to its salsa input handle.
     document_inputs: DashMap<Url, DocumentInput>,
+    /// Salsa input for Python environment config (workspace root, interpreter).
+    /// Updated when LSP settings change; invalidates all cached definition lookups.
+    python_config: PythonConfig,
 }
 
 impl std::fmt::Debug for HydraLspBackend {
@@ -153,18 +158,61 @@ impl std::fmt::Debug for HydraLspBackend {
 impl HydraLspBackend {
     pub fn new(client: Client) -> Self {
         // Use the current directory as the database root.
-        let cwd = std::env::current_dir()
+        let cwd_string = std::env::current_dir()
             .ok()
             .and_then(|p| p.to_str().map(|s| s.to_string()))
             .unwrap_or_else(|| "/".to_string());
-        let cwd = ruff_db::system::SystemPath::new(&cwd);
+        let cwd = ruff_db::system::SystemPath::new(&cwd_string);
+        let db = HydraDatabase::new(cwd);
+        let python_config = PythonConfig::new(&db, Some(cwd_string), None);
         Self {
             client,
             documents: Arc::new(DocumentStore::new()),
             settings: Arc::new(RwLock::new(Settings::default())),
-            db: Arc::new(parking_lot::Mutex::new(HydraDatabase::new(cwd))),
+            db: Arc::new(parking_lot::Mutex::new(db)),
             document_inputs: DashMap::new(),
+            python_config,
         }
+    }
+
+    /// Run Python definition lookup on a blocking thread using a database snapshot.
+    ///
+    /// Clones the database (cheap — salsa shares cached data via Arc) and moves
+    /// the clone to `tokio::task::spawn_blocking` so that expensive Python
+    /// analysis (module resolution, file parsing) doesn't block the async runtime.
+    ///
+    /// On cache hits the blocking thread returns almost immediately; on misses
+    /// it performs the full analysis without holding any locks.
+    async fn spawn_definition_lookup(
+        &self,
+        target_value: String,
+    ) -> anyhow::Result<(DefinitionInfo, std::path::PathBuf, String, String)> {
+        let db = self.db.lock().clone();
+        let python_config = self.python_config;
+
+        tokio::task::spawn_blocking(move || {
+            let start = Instant::now();
+            let target = TargetString::new(&db, target_value);
+            let cached = python_cache::cached_definition_info(&db, python_config, target);
+            let result = match cached.get() {
+                Ok(def) => Ok((
+                    def.definition_info.clone(),
+                    def.file_path.clone(),
+                    def.module_path.clone(),
+                    def.symbol_name.clone(),
+                )),
+                Err(e) => Err(anyhow::anyhow!("{}", e)),
+            };
+            tracing::debug!(
+                elapsed_us = start.elapsed().as_micros() as u64,
+                target = target.value(&db),
+                ok = result.is_ok(),
+                "definition lookup"
+            );
+            result
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Task failed: {}", e))?
     }
 
     /// Get or create a `DocumentInput` for a given URI.
@@ -236,6 +284,14 @@ impl LanguageServer for HydraLspBackend {
                 s.features = toggles;
             }
 
+            // Update the salsa PythonConfig so cached lookups invalidate
+            if interpreter_path.is_some() {
+                let mut db = self.db.lock();
+                self.python_config
+                    .set_interpreter(&mut *db)
+                    .to(interpreter_path.clone());
+            }
+
             // Log after releasing the lock
             if let Some(ref path) = interpreter_path {
                 self.client
@@ -266,6 +322,17 @@ impl LanguageServer for HydraLspBackend {
                     .await;
             }
         }
+
+        // Capture workspace root from init params for Python environment discovery
+        if let Some(root_uri) = params.root_uri
+            && let Ok(root_path) = root_uri.to_file_path()
+        {
+            let mut db = self.db.lock();
+            self.python_config
+                .set_workspace_root(&mut *db)
+                .to(Some(root_path.to_string_lossy().to_string()));
+        }
+
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
@@ -398,12 +465,20 @@ impl LanguageServer for HydraLspBackend {
         self.documents.remove(&uri);
         self.document_inputs.remove(&uri);
 
+        // Enforce LRU limits after removing a document — evicts stale
+        // cache entries and keeps memory bounded.
+        {
+            let mut db = self.db.lock();
+            db.trigger_lru_eviction();
+        }
+
         self.client
             .log_message(MessageType::INFO, format!("Document closed: {}", uri))
             .await;
     }
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
+        let start = Instant::now();
         if !self.settings.read().features.hover {
             return Ok(None);
         }
@@ -440,23 +515,12 @@ impl LanguageServer for HydraLspBackend {
             )
             .await;
 
-        // Try to get the workspace root from the URI
-        let workspace_root = uri
-            .to_file_path()
-            .ok()
-            .and_then(|path| path.parent().map(|p| p.to_path_buf()));
+        // Extract Python definition info on a blocking thread (cached + non-blocking)
+        let extract_result = self
+            .spawn_definition_lookup(hydra_object.target.value.clone())
+            .await;
 
-        // Try to extract Python definition information (avoid cloning settings)
-        let extract_result = {
-            let settings = self.settings.read();
-            PythonAnalyzer::extract_definition_info(
-                &hydra_object.target.value,
-                workspace_root.as_deref(),
-                settings.python_interpreter.as_deref(),
-            )
-        };
-
-        match extract_result {
+        let result = match extract_result {
             Ok((definition_info, _file_path, _module_path, _symbol_name)) => {
                 let hover_content = match definition_info {
                     DefinitionInfo::Function(sig) => PythonAnalyzer::format_function(&sig),
@@ -494,7 +558,9 @@ impl LanguageServer for HydraLspBackend {
                 }
                 Ok(None)
             }
-        }
+        };
+        tracing::info!(elapsed_ms = start.elapsed().as_millis() as u64, "hover");
+        result
     }
 
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
@@ -643,6 +709,7 @@ impl LanguageServer for HydraLspBackend {
     }
 
     async fn signature_help(&self, params: SignatureHelpParams) -> Result<Option<SignatureHelp>> {
+        let start = Instant::now();
         if !self.settings.read().features.signature_help {
             return Ok(None);
         }
@@ -673,23 +740,10 @@ impl LanguageServer for HydraLspBackend {
                 }
             };
 
-        // Try to get the workspace root from the URI
-        let workspace_root = uri
-            .to_file_path()
-            .ok()
-            .and_then(|path| path.parent().map(|p| p.to_path_buf()));
+        // Extract Python definition info on a blocking thread (cached + non-blocking)
+        let extract_result = self.spawn_definition_lookup(target_value.clone()).await;
 
-        // Try to extract Python definition information (avoid cloning settings)
-        let extract_result = {
-            let settings = self.settings.read();
-            PythonAnalyzer::extract_definition_info(
-                &target_value,
-                workspace_root.as_deref(),
-                settings.python_interpreter.as_deref(),
-            )
-        };
-
-        match extract_result {
+        let result = match extract_result {
             Ok((definition_info, _file_path, _module_path, _symbol_name)) => {
                 let implicit_param = definition_info.implicit_param();
                 let (signature_label, parameters, param_infos) = match &definition_info {
@@ -820,13 +874,19 @@ impl LanguageServer for HydraLspBackend {
                 }
                 Ok(None)
             }
-        }
+        };
+        tracing::info!(
+            elapsed_ms = start.elapsed().as_millis() as u64,
+            "signature_help"
+        );
+        result
     }
 
     async fn goto_definition(
         &self,
         params: GotoDefinitionParams,
     ) -> Result<Option<GotoDefinitionResponse>> {
+        let start = Instant::now();
         if !self.settings.read().features.goto_definition {
             return Ok(None);
         }
@@ -856,21 +916,10 @@ impl LanguageServer for HydraLspBackend {
             }
         };
 
-        // Try to get the workspace root from the URI
-        let workspace_root = uri
-            .to_file_path()
-            .ok()
-            .and_then(|path| path.parent().map(|p| p.to_path_buf()));
-
-        // Extract definition info to get the line number
-        let extract_result = {
-            let settings = self.settings.read();
-            PythonAnalyzer::extract_definition_info(
-                &target_info.target.value,
-                workspace_root.as_deref(),
-                settings.python_interpreter.as_deref(),
-            )
-        };
+        // Extract definition info on a blocking thread (cached + non-blocking)
+        let extract_result = self
+            .spawn_definition_lookup(target_info.target.value.clone())
+            .await;
         let (file_path, start_line, start_col, end_line, end_col) = match extract_result {
             Ok((definition_info, file_path, _module_path, _symbol_name)) => {
                 let (start_line, start_col, end_line, end_col) = definition_info.position();
@@ -903,7 +952,7 @@ impl LanguageServer for HydraLspBackend {
             }
         };
 
-        Ok(Some(GotoDefinitionResponse::Scalar(Location {
+        let result = Ok(Some(GotoDefinitionResponse::Scalar(Location {
             uri: target_uri,
             range: Range {
                 start: Position {
@@ -915,7 +964,12 @@ impl LanguageServer for HydraLspBackend {
                     character: end_col,
                 },
             },
-        })))
+        })));
+        tracing::info!(
+            elapsed_ms = start.elapsed().as_millis() as u64,
+            "goto_definition"
+        );
+        result
     }
 
     async fn semantic_tokens_full(
@@ -993,17 +1047,27 @@ impl HydraLspBackend {
         // Handle the parse result
         match parse_result {
             Ok(mut parsed_content) => {
-                let diagnostics = {
+                // Clone settings needed for validation, then drop the read lock
+                let (disabled_rules, python_interpreter) = {
                     let settings = self.settings.read();
-                    parsed_content
-                        .file_suppressions
-                        .extend(&settings.disabled_rules);
+                    (
+                        settings.disabled_rules.clone(),
+                        settings.python_interpreter.clone(),
+                    )
+                };
+                parsed_content.file_suppressions.extend(&disabled_rules);
+
+                // Move expensive validation (Python analysis per target) to blocking thread
+                let diagnostics = tokio::task::spawn_blocking(move || {
                     diagnostics::validate_document(
                         parsed_content,
                         workspace_root.as_deref(),
-                        settings.python_interpreter.as_deref(),
+                        python_interpreter.as_deref(),
                     )
-                };
+                })
+                .await
+                .unwrap_or_default();
+
                 self.client
                     .publish_diagnostics(uri.clone(), diagnostics, None)
                     .await;

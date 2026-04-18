@@ -348,7 +348,7 @@ pub struct ParsedContent {
     pub file_suppressions: HashSet<DiagnosticRule>,
 }
 
-/// Convert a saphyr MarkedYamlOwned node to YamlValue
+/// Convert a saphyr `MarkedYamlOwned` node to `YamlValue`
 fn node_to_yaml_value(node: &MarkedYamlOwned) -> YamlValue {
     let data = &node.data;
     if data.is_null() {
@@ -391,7 +391,7 @@ pub struct YamlParser;
 
 impl YamlParser {
     /// Parse YAML content and extract all `_target_` references with their parameters
-    /// Returns a vector of TargetInfo and a line-to-index lookup map
+    /// Returns a vector of `TargetInfo` and a line-to-index lookup map
     pub fn parse(content: &str) -> Result<ParsedContent, YamlParseError> {
         let docs = MarkedYamlOwned::load_from_str(content)?;
         if content.trim().is_empty() {

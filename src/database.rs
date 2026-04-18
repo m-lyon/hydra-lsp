@@ -57,6 +57,41 @@ impl ruff_db::Db for HydraDatabase {
 #[salsa::db]
 impl salsa::Database for HydraDatabase {}
 
+impl HydraDatabase {
+    /// Log memory usage statistics for all salsa ingredients.
+    ///
+    /// Reports struct counts, field sizes, and query memo counts.
+    /// Useful for tuning LRU cache sizes and diagnosing memory issues.
+    pub fn log_memory_usage(&self) {
+        let db: &dyn salsa::Database = self;
+        let info = db.memory_usage();
+
+        for s in &info.structs {
+            if s.count() > 0 {
+                tracing::info!(
+                    name = s.debug_name(),
+                    count = s.count(),
+                    fields_bytes = s.size_of_fields(),
+                    metadata_bytes = s.size_of_metadata(),
+                    "salsa struct"
+                );
+            }
+        }
+
+        for (name, q) in &info.queries {
+            if q.count() > 0 {
+                tracing::info!(
+                    query = *name,
+                    memos = q.count(),
+                    fields_bytes = q.size_of_fields(),
+                    metadata_bytes = q.size_of_metadata(),
+                    "salsa query"
+                );
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 pub mod tests {
     use ruff_db::files::Files;
@@ -111,4 +146,63 @@ pub mod tests {
 
     #[salsa::db]
     impl salsa::Database for TestDb {}
+
+    #[test]
+    fn test_hydra_database_creation() {
+        use ruff_db::Db;
+        let db = super::HydraDatabase::new(ruff_db::system::SystemPath::new("/tmp"));
+        // Verify the database is functional
+        let _files = db.files();
+    }
+
+    #[test]
+    fn test_hydra_database_memory_usage() {
+        let db = super::HydraDatabase::new(ruff_db::system::SystemPath::new("/tmp"));
+        // Should not panic — verifies salsa_unstable feature works
+        db.log_memory_usage();
+    }
+
+    #[test]
+    fn test_hydra_database_memory_usage_after_queries() {
+        use crate::yaml_cache::{DocumentInput, is_hydra_file, parsed_yaml};
+
+        let db = TestDb::new();
+        let input = DocumentInput::new(
+            &db,
+            "# @hydra\nmodel:\n  _target_: my.Mod\n".to_string(),
+            1,
+        );
+        // Run some queries to populate the memo table
+        let _ = is_hydra_file(&db, input);
+        let _ = parsed_yaml(&db, input);
+
+        // memory_usage should reflect the cached queries
+        let db_ref: &dyn salsa::Database = &db;
+        let info = db_ref.memory_usage();
+        let total_memos: usize = info.queries.values().map(|q| q.count()).sum();
+        assert!(total_memos > 0, "should have cached query memos");
+    }
+
+    #[test]
+    fn test_testdb_new() {
+        let db = TestDb::new();
+        // Verify basic salsa operations work
+        let input = crate::yaml_cache::DocumentInput::new(&db, "test".to_string(), 0);
+        assert_eq!(input.text(&db), "test");
+    }
+
+    #[test]
+    fn test_hydra_database_clone() {
+        use crate::yaml_cache::{DocumentInput, is_hydra_file};
+
+        let db = super::HydraDatabase::new(ruff_db::system::SystemPath::new("/tmp"));
+        let input = DocumentInput::new(&db, "# @hydra\n_target_: a.B\n".to_string(), 1);
+        let _ = is_hydra_file(&db, input);
+
+        // Clone should work (used for snapshot-based concurrency)
+        let db2 = db.clone();
+        // Snapshot should see the same cached result
+        let result = is_hydra_file(&db2, input);
+        assert!(result);
+    }
 }
