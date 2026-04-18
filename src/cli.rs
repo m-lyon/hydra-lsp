@@ -14,8 +14,10 @@ use colored::Colorize;
 use tower_lsp::lsp_types::DiagnosticSeverity;
 use tracing::{Level, debug, error, info, warn};
 
+use hydra_lsp::database::HydraDatabase;
 use hydra_lsp::diagnostics::{DiagnosticRule, validate_document};
 use hydra_lsp::python_analyzer::PythonAnalyzer;
+use hydra_lsp::python_cache::PythonConfig;
 use hydra_lsp::yaml_parser::YamlParser;
 
 use std::collections::HashSet;
@@ -239,11 +241,23 @@ fn run(args: &Args) -> anyhow::Result<i32> {
     // Run diagnostics
     info!("Running diagnostics...");
     parsed_content.file_suppressions.extend(disabled_rules);
-    let diagnostics = validate_document(
-        parsed_content,
-        workspace_root.as_deref(),
-        python_interpreter.as_deref(),
+
+    // Build an ephemeral salsa db + PythonConfig so validate_document can
+    // route lookups through cached_definition_info (cache benefit is moot
+    // for a single CLI run, but the signature is shared with the LSP).
+    let db_root = workspace_root
+        .as_deref()
+        .and_then(|p| p.to_str())
+        .unwrap_or(".");
+    let db = HydraDatabase::new(ruff_db::system::SystemPath::new(db_root));
+    let python_config = PythonConfig::new(
+        &db,
+        workspace_root
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string()),
+        python_interpreter.clone(),
     );
+    let diagnostics = validate_document(parsed_content, &db, python_config);
 
     // Output results
     match args.format {

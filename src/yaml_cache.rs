@@ -74,8 +74,10 @@ pub fn is_hydra_file(db: &dyn salsa::Database, input: DocumentInput) -> bool {
 ///
 /// Uses `no_eq` to always propagate changes to dependents (avoids
 /// expensive structural comparison of parsed YAML).
-/// Uses `lru=100` to bound memory usage for large workspaces.
-#[salsa::tracked(no_eq, lru = 100)]
+/// Uses `lru=512` to bound memory usage for large workspaces while
+/// comfortably exceeding the number of YAML files an editor typically
+/// has open at once.
+#[salsa::tracked(no_eq, lru = 512)]
 pub fn parsed_yaml(db: &dyn salsa::Database, input: DocumentInput) -> ParsedYaml {
     debug!("parsed_yaml: executing (cache miss)");
     let text = input.text(db);

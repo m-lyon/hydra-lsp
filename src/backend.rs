@@ -216,21 +216,28 @@ impl HydraLspBackend {
     }
 
     /// Get or create a `DocumentInput` for a given URI.
+    ///
+    /// Holds the DashMap shard's write guard for `uri` across the salsa
+    /// update so that concurrent callers for the same URI cannot both
+    /// observe a vacant entry and create distinct inputs (which would
+    /// orphan one in salsa storage and let stale text leak through).
+    /// Lock order is shard-guard → `self.db`, matching every other code
+    /// path in this module.
     fn get_or_create_input(&self, uri: &Url, text: &str, version: i32) -> DocumentInput {
-        if let Some(existing) = self.document_inputs.get(uri) {
-            let input = *existing;
-            drop(existing);
-            // Update the existing input
-            let mut db = self.db.lock();
-            input.set_text(&mut *db).to(text.to_string());
-            input.set_version(&mut *db).to(version);
-            input
-        } else {
-            let db = self.db.lock();
-            let input = DocumentInput::new(&*db, text.to_string(), version);
-            drop(db);
-            self.document_inputs.insert(uri.clone(), input);
-            input
+        match self.document_inputs.entry(uri.clone()) {
+            dashmap::Entry::Occupied(occ) => {
+                let input = *occ.get();
+                let mut db = self.db.lock();
+                input.set_text(&mut *db).to(text.to_string());
+                input.set_version(&mut *db).to(version);
+                input
+            }
+            dashmap::Entry::Vacant(vac) => {
+                let db = self.db.lock();
+                let input = DocumentInput::new(&*db, text.to_string(), version);
+                vac.insert(input);
+                input
+            }
         }
     }
 }
@@ -463,7 +470,11 @@ impl LanguageServer for HydraLspBackend {
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = params.text_document.uri;
         self.documents.remove(&uri);
-        self.document_inputs.remove(&uri);
+        // Keep the URI -> DocumentInput entry so a subsequent did_open reuses
+        // the same salsa input. Salsa inputs cannot be removed from storage,
+        // so dropping the mapping here would leak a fresh input on every
+        // close/open cycle. Bounding by unique URIs (rather than open count)
+        // is the best we can do until salsa supports input GC.
 
         // Enforce LRU limits after removing a document — evicts stale
         // cache entries and keeps memory bounded.
@@ -559,7 +570,7 @@ impl LanguageServer for HydraLspBackend {
                 Ok(None)
             }
         };
-        tracing::info!(elapsed_ms = start.elapsed().as_millis() as u64, "hover");
+        tracing::debug!(elapsed_ms = start.elapsed().as_millis() as u64, "hover");
         result
     }
 
@@ -875,7 +886,7 @@ impl LanguageServer for HydraLspBackend {
                 Ok(None)
             }
         };
-        tracing::info!(
+        tracing::debug!(
             elapsed_ms = start.elapsed().as_millis() as u64,
             "signature_help"
         );
@@ -965,7 +976,7 @@ impl LanguageServer for HydraLspBackend {
                 },
             },
         })));
-        tracing::info!(
+        tracing::debug!(
             elapsed_ms = start.elapsed().as_millis() as u64,
             "goto_definition"
         );
@@ -1022,13 +1033,9 @@ impl HydraLspBackend {
     /// Uses the cached `parsed_yaml` query when a `DocumentInput` exists
     /// for this URI. Falls back to direct parsing otherwise.
     async fn publish_diagnostics_for_document(&self, uri: &Url, content: &str) {
-        let workspace_root = uri
-            .to_file_path()
-            .ok()
-            .and_then(|path| path.parent().map(|p| p.to_path_buf()));
-
-        // Get parsed content from cache or direct parse
-        let parse_result = if let Some(input_ref) = self.document_inputs.get(uri) {
+        // Get parsed content from cache or direct parse, and snapshot the db
+        // for use by validate_document inside spawn_blocking.
+        let (parse_result, db_snapshot) = if let Some(input_ref) = self.document_inputs.get(uri) {
             let input = *input_ref;
             drop(input_ref);
 
@@ -1036,37 +1043,45 @@ impl HydraLspBackend {
             // The lock must be released before any `.await` point.
             let db = self.db.lock();
             let cached = yaml_cache::parsed_yaml(&*db, input);
-            match cached.result() {
+            let result = match cached.result() {
                 Ok(parsed_content) => Ok(parsed_content.clone()),
                 Err(e) => Err(e.to_string()),
-            }
+            };
+            let snapshot = db.clone();
+            (result, snapshot)
         } else {
-            YamlParser::parse(content).map_err(|e| e.to_string())
+            let result = YamlParser::parse(content).map_err(|e| e.to_string());
+            let snapshot = self.db.lock().clone();
+            (result, snapshot)
         };
+
+        let python_config = self.python_config;
 
         // Handle the parse result
         match parse_result {
             Ok(mut parsed_content) => {
-                // Clone settings needed for validation, then drop the read lock
-                let (disabled_rules, python_interpreter) = {
-                    let settings = self.settings.read();
-                    (
-                        settings.disabled_rules.clone(),
-                        settings.python_interpreter.clone(),
-                    )
-                };
+                // Clone disabled_rules (other settings live in salsa via python_config)
+                let disabled_rules = self.settings.read().disabled_rules.clone();
                 parsed_content.file_suppressions.extend(&disabled_rules);
 
-                // Move expensive validation (Python analysis per target) to blocking thread
-                let diagnostics = tokio::task::spawn_blocking(move || {
+                // Move expensive validation (Python analysis per target) to blocking thread.
+                // The snapshot lets the cached_definition_info salsa query share results
+                // with hover/signature_help/goto on the main db.
+                let join_result = tokio::task::spawn_blocking(move || {
                     diagnostics::validate_document(
                         parsed_content,
-                        workspace_root.as_deref(),
-                        python_interpreter.as_deref(),
+                        &db_snapshot,
+                        python_config,
                     )
                 })
-                .await
-                .unwrap_or_default();
+                .await;
+                let diagnostics = match join_result {
+                    Ok(d) => d,
+                    Err(e) => {
+                        tracing::error!(error = %e, "validate_document task failed");
+                        Vec::new()
+                    }
+                };
 
                 self.client
                     .publish_diagnostics(uri.clone(), diagnostics, None)

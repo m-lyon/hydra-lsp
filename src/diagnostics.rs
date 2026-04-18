@@ -1,11 +1,11 @@
-use crate::python_analyzer::{DefinitionInfo, FunctionSignature, ParameterInfo, PythonAnalyzer};
+use crate::python_analyzer::{DefinitionInfo, FunctionSignature, ParameterInfo};
+use crate::python_cache::{PythonConfig, TargetString, cached_definition_info};
 use crate::yaml_parser::{
     ARGS_KEY, CONVERT_KEY, ConvertMode, HydraObject, PARTIAL_KEY, Parameter, ParsedContent,
     RECURSIVE_KEY,
 };
 use std::collections::HashSet;
 use std::fmt;
-use std::path::Path;
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 
 /// Diagnostic rule codes for Hydrust diagnostics.
@@ -97,24 +97,22 @@ fn create_diagnostic(
 
 /// Validate a Hydra `_target_` entry. Returns diagnostics and optionally the resolved
 /// DefinitionInfo.
+///
+/// Routes through `cached_definition_info`.
 fn validate_target(
     hydra_obj: &HydraObject,
-    workspace_root: Option<&Path>,
-    python_interpreter: Option<&str>,
+    db: &dyn salsa::Database,
+    python_config: PythonConfig,
     file_suppressions: &HashSet<DiagnosticRule>,
 ) -> (Vec<Diagnostic>, Option<DefinitionInfo>) {
     let mut diagnostics = Vec::new();
 
-    match PythonAnalyzer::extract_definition_info(
-        &hydra_obj.target.value,
-        workspace_root,
-        python_interpreter,
-    ) {
-        Ok((definition_info, _file_path, _module_path, _symbol_name)) => {
-            (diagnostics, Some(definition_info))
-        }
-        Err(err) => {
-            let error_msg = err.to_string();
+    let target = TargetString::new(db, hydra_obj.target.value.clone());
+    let cached = cached_definition_info(db, python_config, target);
+    match cached.get() {
+        Ok(def) => (diagnostics, Some(def.definition_info.clone())),
+        Err(error_msg) => {
+            let error_msg = error_msg.to_string();
             let (rule, msg) = if error_msg.starts_with("Could not resolve module:") {
                 (DiagnosticRule::UnresolvedImport, error_msg)
             } else if error_msg.starts_with("Invalid _target_ format:") {
@@ -414,21 +412,20 @@ fn validate_hydra_keywords(
     diagnostics
 }
 
-/// Validate all targets in a document
+/// Validate all targets in a document.
+///
+/// Takes a salsa database and `PythonConfig` so target resolution shares the
+/// cached_definition_info LRU with the rest of the LSP.
 pub fn validate_document(
     parsed_content: ParsedContent,
-    workspace_root: Option<&Path>,
-    python_interpreter: Option<&str>,
+    db: &dyn salsa::Database,
+    python_config: PythonConfig,
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
 
     for target in &parsed_content.hydra_objects {
-        let (target_diagnostics, definition_info) = validate_target(
-            target,
-            workspace_root,
-            python_interpreter,
-            &parsed_content.file_suppressions,
-        );
+        let (target_diagnostics, definition_info) =
+            validate_target(target, db, python_config, &parsed_content.file_suppressions);
         diagnostics.extend(target_diagnostics);
 
         // Try to resolve the target and validate parameters
@@ -482,17 +479,26 @@ pub fn validate_document(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::database::tests::TestDb;
     use crate::python_analyzer::ParameterInfo;
     use crate::yaml_parser::{HydraParameter, Parameter, YamlValue};
     use hashlink::LinkedHashMap;
     use std::collections::HashMap;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     fn get_simple_test_dir() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests")
             .join("workspace")
             .join("simple")
+    }
+
+    /// Build a fresh salsa db + PythonConfig for tests.
+    fn test_env(workspace_root: Option<&Path>) -> (TestDb, PythonConfig) {
+        let db = TestDb::new();
+        let workspace = workspace_root.map(|p| p.to_string_lossy().to_string());
+        let config = PythonConfig::new(&db, workspace, None);
+        (db, config)
     }
 
     /// Helper to create a HydraObject with default suppression fields.
@@ -981,8 +987,9 @@ mod tests {
             false,
         );
 
+        let (db, config) = test_env(None);
         let (diagnostics, _definition_info) =
-            validate_target(&hydra_obj, None, None, &HashSet::new());
+            validate_target(&hydra_obj, &db, config, &HashSet::new());
         assert_eq!(diagnostics.len(), 1);
         assert!(diagnostics[0].message.contains("Invalid _target_ format"));
         assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
@@ -1005,12 +1012,10 @@ mod tests {
             false,
         );
 
-        let (diagnostics, _definition_info) = validate_target(
-            &hydra_obj,
-            Some(&get_simple_test_dir()),
-            None,
-            &HashSet::new(),
-        );
+        let resources_dir = get_simple_test_dir();
+        let (db, config) = test_env(Some(&resources_dir));
+        let (diagnostics, _definition_info) =
+            validate_target(&hydra_obj, &db, config, &HashSet::new());
         assert_eq!(diagnostics.len(), 1);
         assert!(
             diagnostics[0].message.contains("Could not resolve module"),
@@ -1038,8 +1043,9 @@ mod tests {
         );
 
         let resources_dir = get_simple_test_dir();
+        let (db, config) = test_env(Some(&resources_dir));
         let (diagnostics, _definition_info) =
-            validate_target(&hydra_obj, Some(&resources_dir), None, &HashSet::new());
+            validate_target(&hydra_obj, &db, config, &HashSet::new());
         assert_eq!(diagnostics.len(), 1);
         assert!(diagnostics[0].message.contains("Symbol"));
         assert!(diagnostics[0].message.contains("not found"));
@@ -1064,8 +1070,9 @@ mod tests {
         );
 
         let resources_dir = get_simple_test_dir();
+        let (db, config) = test_env(Some(&resources_dir));
         let (diagnostics, _definition_info) =
-            validate_target(&hydra_obj, Some(&resources_dir), None, &HashSet::new());
+            validate_target(&hydra_obj, &db, config, &HashSet::new());
 
         assert!(
             !diagnostics
@@ -1093,8 +1100,9 @@ mod tests {
         );
 
         let resources_dir = get_simple_test_dir();
+        let (db, config) = test_env(Some(&resources_dir));
         let (diagnostics, _definition_info) =
-            validate_target(&hydra_obj, Some(&resources_dir), None, &HashSet::new());
+            validate_target(&hydra_obj, &db, config, &HashSet::new());
 
         assert!(
             !diagnostics
@@ -1128,7 +1136,8 @@ mod tests {
         };
 
         let resources_dir = get_simple_test_dir();
-        let diagnostics = validate_document(parsed_content, Some(&resources_dir), None);
+        let (db, config) = test_env(Some(&resources_dir));
+        let diagnostics = validate_document(parsed_content, &db, config);
 
         // Should have at least 2 errors (invalid format and module not found)
         let errors: Vec<_> = diagnostics
@@ -1166,7 +1175,8 @@ mod tests {
         };
 
         let resources_dir = get_simple_test_dir();
-        let diagnostics = validate_document(parsed_content, Some(&resources_dir), None);
+        let (db, config) = test_env(Some(&resources_dir));
+        let diagnostics = validate_document(parsed_content, &db, config);
 
         let missing_param_diag = diagnostics.iter().find(|d| {
             d.message.contains("Missing required parameter") && d.message.contains("name")
@@ -1204,7 +1214,8 @@ mod tests {
             file_suppressions: HashSet::new(),
         };
 
-        let diagnostics = validate_document(parsed_content, Some(&resources_dir), None);
+        let (db, config) = test_env(Some(&resources_dir));
+        let diagnostics = validate_document(parsed_content, &db, config);
 
         assert!(
             !diagnostics
@@ -1410,7 +1421,8 @@ mod tests {
             file_suppressions,
         };
 
-        let diagnostics = validate_document(parsed_content, None, None);
+        let (db, config) = test_env(None);
+        let diagnostics = validate_document(parsed_content, &db, config);
 
         assert!(
             diagnostics.is_empty(),
@@ -1434,7 +1446,8 @@ mod tests {
             file_suppressions: HashSet::new(),
         };
 
-        let diagnostics = validate_document(parsed_content, None, None);
+        let (db, config) = test_env(None);
+        let diagnostics = validate_document(parsed_content, &db, config);
 
         assert!(
             diagnostics.is_empty(),
@@ -1463,7 +1476,8 @@ mod tests {
             file_suppressions: HashSet::new(),
         };
 
-        let diagnostics = validate_document(parsed_content, None, None);
+        let (db, config) = test_env(None);
+        let diagnostics = validate_document(parsed_content, &db, config);
         let keyword_diags: Vec<_> = diagnostics
             .iter()
             .filter(|d| d.message.contains("_recursive_"))
@@ -1496,7 +1510,8 @@ mod tests {
             file_suppressions: HashSet::new(),
         };
 
-        let diagnostics = validate_document(parsed_content, None, None);
+        let (db, config) = test_env(None);
+        let diagnostics = validate_document(parsed_content, &db, config);
         let keyword_diags: Vec<_> = diagnostics
             .iter()
             .filter(|d| d.message.contains("_convert_"))
@@ -1533,7 +1548,8 @@ mod tests {
             file_suppressions: HashSet::new(),
         };
 
-        let diagnostics = validate_document(parsed_content, None, None);
+        let (db, config) = test_env(None);
+        let diagnostics = validate_document(parsed_content, &db, config);
         let keyword_diags: Vec<_> = diagnostics
             .iter()
             .filter(|d| d.message.contains("_args_"))
@@ -1576,7 +1592,8 @@ mod tests {
             file_suppressions: HashSet::new(),
         };
 
-        let diagnostics = validate_document(parsed_content, None, None);
+        let (db, config) = test_env(None);
+        let diagnostics = validate_document(parsed_content, &db, config);
         let keyword_diags: Vec<_> = diagnostics
             .iter()
             .filter(|d| {

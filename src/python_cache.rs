@@ -90,8 +90,10 @@ impl Eq for CachedDefinitionResult {}
 /// - The target string changes (different `_target_` value)
 /// - The Python configuration changes (interpreter or workspace root)
 ///
-/// Uses `lru=200` to bound memory for workspaces with many distinct targets.
-#[salsa::tracked(no_eq, lru = 200)]
+/// Uses `lru=1024` to bound memory for workspaces with many distinct targets.
+/// Hydra projects often reference many `_target_` strings (e.g. one per config),
+/// so the bound is set well above typical workspace sizes to avoid thrashing.
+#[salsa::tracked(no_eq, lru = 1024)]
 pub fn cached_definition_info<'db>(
     db: &'db dyn salsa::Database,
     config: PythonConfig,
