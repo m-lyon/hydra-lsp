@@ -210,7 +210,7 @@ fn run(args: &Args) -> anyhow::Result<i32> {
 
     // Parse YAML and extract targets
     info!("Parsing YAML content...");
-    let mut parsed_content = match YamlParser::parse(&content) {
+    let parsed_content = match YamlParser::parse(&content) {
         Ok(result) => result,
         Err(e) => {
             error!("Failed to parse YAML: {}", e);
@@ -240,7 +240,6 @@ fn run(args: &Args) -> anyhow::Result<i32> {
 
     // Run diagnostics
     info!("Running diagnostics...");
-    parsed_content.file_suppressions.extend(disabled_rules);
 
     // Build an ephemeral salsa db + PythonConfig so validate_document can
     // route lookups through cached_definition_info (cache benefit is moot
@@ -258,7 +257,7 @@ fn run(args: &Args) -> anyhow::Result<i32> {
         python_interpreter.clone(),
         vec![],
     );
-    let diagnostics = validate_document(parsed_content, &db, python_config);
+    let diagnostics = validate_document(&parsed_content, &disabled_rules, &db, python_config);
 
     // Output results
     match args.format {

@@ -37,6 +37,27 @@ pub fn read_source(db: &dyn ruff_db::Db, path: &Path) -> Result<SourceText> {
     Ok(source)
 }
 
+/// Normalize a directory path for use as a `PthInventory` key.
+///
+/// `discover_python_environment` returns site-packages paths via
+/// `SystemPathBuf::as_std_path()` (no symlink resolution, no case
+/// folding), while `did_change_watched_files` derives the inventory key
+/// from `change.uri.to_file_path()?.parent()`. The two sources can
+/// disagree on trailing separators, symlink targets, and (on
+/// case-insensitive filesystems) case, which would make the inventory
+/// lookup miss and silently lose `.pth` invalidation.
+///
+/// Canonicalize when possible so both sources produce the same key.
+/// Falls back to the original path string if canonicalization fails
+/// (e.g. the directory was just deleted) — better to risk a stale
+/// memo for one event than to panic on a missing path.
+pub(crate) fn normalize_pth_inventory_key(directory: &Path) -> String {
+    match std::fs::canonicalize(directory) {
+        Ok(canonical) => canonical.to_string_lossy().into_owned(),
+        Err(_) => directory.to_string_lossy().into_owned(),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FunctionSignature {
     pub name: String,
@@ -650,13 +671,15 @@ impl PythonAnalyzer {
         let mut paths = Vec::new();
 
         // Depend on the tracked inventory for this directory so `.pth`
-        // create/delete events invalidate the directory scan.
+        // create/delete events invalidate the directory scan. Both the
+        // inventory key and this lookup go through `normalize_pth_inventory_key`
+        // so symlink/case/separator differences don't cause a miss.
         if let Some(inventory) = pth_inventories.and_then(|inventories| {
-            let site_packages = site_packages.to_string_lossy();
+            let site_packages_key = normalize_pth_inventory_key(site_packages);
             inventories
                 .iter()
                 .copied()
-                .find(|inventory| inventory.directory(db).as_str() == site_packages.as_ref())
+                .find(|inventory| inventory.directory(db).as_str() == site_packages_key)
         }) {
             let _ = inventory.revision(db);
         }
@@ -3709,6 +3732,49 @@ mod tests {
         let db = test_db();
         let paths = PythonAnalyzer::parse_pth_files(&db, &nonexistent, None);
         assert!(paths.is_empty(), "Should return empty for nonexistent dir");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_normalize_pth_inventory_key_resolves_symlink() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().expect("tempdir");
+        let real_dir = tmp.path().join("real-site-packages");
+        std::fs::create_dir(&real_dir).expect("create real dir");
+        let symlink_dir = tmp.path().join("link-site-packages");
+        std::os::unix::fs::symlink(&real_dir, &symlink_dir).expect("create symlink");
+
+        // The watched-event side and the discovery side can arrive via either
+        // path; normalization must collapse them to the same key.
+        assert_eq!(
+            normalize_pth_inventory_key(&real_dir),
+            normalize_pth_inventory_key(&symlink_dir),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_parse_pth_files_inventory_lookup_via_symlink() {
+        use crate::python_cache::PthInventory;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let real_dir = tmp.path().join("real-site-packages");
+        std::fs::create_dir(&real_dir).expect("create real dir");
+        let symlink_dir = tmp.path().join("link-site-packages");
+        std::os::unix::fs::symlink(&real_dir, &symlink_dir).expect("create symlink");
+
+        let db = test_db();
+        // Inventory keyed off the symlinked path (as a watched-event might
+        // arrive). `parse_pth_files` is then called with the real path
+        // (as `discover_python_environment` would return it).
+        let key = normalize_pth_inventory_key(&symlink_dir);
+        let inventory = PthInventory::new(&db, key, 0);
+        let inventories = vec![inventory];
+
+        // Should not panic and should still register the salsa dep on the
+        // inventory revision via the normalized lookup.
+        let _ = PythonAnalyzer::parse_pth_files(&db, &real_dir, Some(&inventories));
     }
 
     #[test]

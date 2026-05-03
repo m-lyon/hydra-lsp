@@ -14,7 +14,9 @@ use salsa::{Database as _, Setter};
 use crate::database::HydraDatabase;
 use crate::diagnostics::{self, DiagnosticRule};
 use crate::document::DocumentStore;
-use crate::python_analyzer::{DefinitionInfo, ParameterInfo, PythonAnalyzer};
+use crate::python_analyzer::{
+    DefinitionInfo, ParameterInfo, PythonAnalyzer, normalize_pth_inventory_key,
+};
 use crate::python_cache::{self, PthInventory, PythonConfig, TargetString};
 use crate::yaml_cache::{self, DocumentInput};
 use crate::yaml_parser::{
@@ -143,7 +145,10 @@ struct AnalysisState {
 
 impl AnalysisState {
     fn ensure_pth_inventory(&mut self, directory: &std::path::Path) -> PthInventory {
-        let key = directory.to_string_lossy().to_string();
+        // Normalized so the watched-event side and the discovery side agree
+        // even when the path differs by symlink, case, or trailing separator.
+        // See `python_analyzer::normalize_pth_inventory_key`.
+        let key = normalize_pth_inventory_key(directory);
         if let Some(inventory) = self.pth_inventories.get(&key) {
             return *inventory;
         }
@@ -151,7 +156,9 @@ impl AnalysisState {
         let inventory = PthInventory::new(&self.db, key.clone(), 0);
         let mut inventories = self.python_config.pth_inventories(&self.db).clone();
         inventories.push(inventory);
-        self.python_config.set_pth_inventories(&mut self.db).to(inventories);
+        self.python_config
+            .set_pth_inventories(&mut self.db)
+            .to(inventories);
         self.pth_inventories.insert(key, inventory);
         inventory
     }
@@ -263,13 +270,15 @@ impl HydraLspBackend {
         f: impl FnOnce(&AnalysisState) -> T,
     ) -> Option<T> {
         let analysis = self.analysis.lock();
-        match analysis.as_ref() {
-            Some(state) => Some(f(state)),
-            None => {
-                tracing::warn!(context, "analysis state not initialized; ignoring");
-                None
-            }
+        if analysis.is_none() {
+            // Drop the guard before logging so a slow tracing subscriber
+            // (file write, stderr lock contention) does not stall every
+            // other handler that needs the analysis mutex.
+            drop(analysis);
+            tracing::warn!(context, "analysis state not initialized; ignoring");
+            return None;
         }
+        Some(f(analysis.as_ref().expect("checked Some above")))
     }
 
     fn with_analysis_mut<T>(
@@ -278,13 +287,12 @@ impl HydraLspBackend {
         f: impl FnOnce(&mut AnalysisState) -> T,
     ) -> Option<T> {
         let mut analysis = self.analysis.lock();
-        match analysis.as_mut() {
-            Some(state) => Some(f(state)),
-            None => {
-                tracing::warn!(context, "analysis state not initialized; ignoring");
-                None
-            }
+        if analysis.is_none() {
+            drop(analysis);
+            tracing::warn!(context, "analysis state not initialized; ignoring");
+            return None;
         }
+        Some(f(analysis.as_mut().expect("checked Some above")))
     }
 
     /// Run Python definition lookup on a blocking thread using a database snapshot.
@@ -303,9 +311,7 @@ impl HydraLspBackend {
             anyhow::bail!("analysis state not initialized")
         };
         let AnalysisState {
-            db,
-            python_config,
-            ..
+            db, python_config, ..
         } = analysis;
 
         tokio::task::spawn_blocking(move || {
@@ -611,8 +617,10 @@ impl LanguageServer for HydraLspBackend {
                 match path.extension().and_then(|ext| ext.to_str()) {
                     Some("py") | Some("pyi") => Some(path),
                     Some("pth") => {
-                        if matches!(change.typ, FileChangeType::CREATED | FileChangeType::DELETED)
-                            && let Some(parent) = path.parent()
+                        if matches!(
+                            change.typ,
+                            FileChangeType::CREATED | FileChangeType::DELETED
+                        ) && let Some(parent) = path.parent()
                         {
                             pth_inventory_dirs.insert(parent.to_path_buf());
                         }
@@ -1238,73 +1246,76 @@ impl HydraLspBackend {
         let input = *input_ref;
         drop(input_ref);
 
-        let Some((parse_result, db_snapshot, python_config)) =
+        let Some((parsed_yaml, db_snapshot, python_config)) =
             self.with_analysis("publishing diagnostics", |analysis| {
-                // Get the cached parse result and extract data before releasing the lock.
-                // The lock must be released before any `.await` point.
+                // Clone the cheap Arc-wrapped ParsedYaml; the deep
+                // ParsedContent stays inside the salsa cache.
                 let cached = yaml_cache::parsed_yaml(&analysis.db, input);
-                let result = match cached.result() {
-                    Ok(parsed_content) => Ok(parsed_content.clone()),
-                    Err(e) => Err(e.to_string()),
-                };
                 let snapshot = analysis.db.clone();
-                (result, snapshot, analysis.python_config)
+                (cached, snapshot, analysis.python_config)
             })
         else {
             return;
         };
 
         // Handle the parse result
-        match parse_result {
-            Ok(mut parsed_content) => {
-                // Clone disabled_rules (other settings live in salsa via python_config)
-                let disabled_rules = self.settings.read().disabled_rules.clone();
-                parsed_content.file_suppressions.extend(&disabled_rules);
+        if parsed_yaml.is_ok() {
+            // Clone disabled_rules (other settings live in salsa via python_config)
+            let disabled_rules = self.settings.read().disabled_rules.clone();
 
-                // Move expensive validation (Python analysis per target) to blocking thread.
-                // The snapshot lets the cached_definition_info salsa query share results
-                // with hover/signature_help/goto on the main db.
-                let join_result = tokio::task::spawn_blocking(move || {
-                    diagnostics::validate_document(parsed_content, &db_snapshot, python_config)
-                })
+            // Move expensive validation (Python analysis per target) to blocking thread.
+            // The snapshot lets the cached_definition_info salsa query share results
+            // with hover/signature_help/goto on the main db. The ParsedYaml clone
+            // moves a single Arc, not the full HydraObject vec / line index.
+            let join_result = tokio::task::spawn_blocking(move || {
+                let parsed_content = match parsed_yaml.result() {
+                    Ok(content) => content,
+                    Err(_) => return Vec::new(),
+                };
+                diagnostics::validate_document(
+                    parsed_content,
+                    &disabled_rules,
+                    &db_snapshot,
+                    python_config,
+                )
+            })
+            .await;
+            let diagnostics = match join_result {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::error!(error = %e, "validate_document task failed");
+                    Vec::new()
+                }
+            };
+
+            self.client
+                .publish_diagnostics(uri.clone(), diagnostics, None)
                 .await;
-                let diagnostics = match join_result {
-                    Ok(d) => d,
-                    Err(e) => {
-                        tracing::error!(error = %e, "validate_document task failed");
-                        Vec::new()
-                    }
-                };
-
-                self.client
-                    .publish_diagnostics(uri.clone(), diagnostics, None)
-                    .await;
-            }
-            Err(e) => {
-                let diagnostic = Diagnostic {
-                    range: Range {
-                        start: Position {
-                            line: 0,
-                            character: 0,
-                        },
-                        end: Position {
-                            line: 0,
-                            character: 0,
-                        },
+        } else {
+            let e = parsed_yaml.result().err().unwrap_or("").to_string();
+            let diagnostic = Diagnostic {
+                range: Range {
+                    start: Position {
+                        line: 0,
+                        character: 0,
                     },
-                    severity: Some(DiagnosticSeverity::ERROR),
-                    code: Some(tower_lsp::lsp_types::NumberOrString::String(
-                        "yaml-syntax-error".to_string(),
-                    )),
-                    source: Some("hydra-lsp".to_string()),
-                    message: format!("YAML syntax error: {}", e),
-                    ..Default::default()
-                };
+                    end: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                },
+                severity: Some(DiagnosticSeverity::ERROR),
+                code: Some(tower_lsp::lsp_types::NumberOrString::String(
+                    "yaml-syntax-error".to_string(),
+                )),
+                source: Some("hydra-lsp".to_string()),
+                message: format!("YAML syntax error: {}", e),
+                ..Default::default()
+            };
 
-                self.client
-                    .publish_diagnostics(uri.clone(), vec![diagnostic], None)
-                    .await;
-            }
+            self.client
+                .publish_diagnostics(uri.clone(), vec![diagnostic], None)
+                .await;
         }
     }
 }

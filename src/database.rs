@@ -49,6 +49,12 @@ impl ruff_db::Db for HydraDatabase {
         &self.files
     }
 
+    /// **Limitation:** the configured interpreter's actual version is not yet
+    /// plumbed through to the database. We always report `latest_ty()`, which
+    /// affects ruff_db queries that branch on `db.python_version()` (parser
+    /// dialect, semantic resolution rules in third-party crates). Pointing the
+    /// LSP at a Python 3.10 interpreter still gets the latest dialect's
+    /// behavior. Tracked as a follow-up in `CACHING_IMPLEMENTATION_PLAN.md`.
     fn python_version(&self) -> PythonVersion {
         PythonVersion::latest_ty()
     }
@@ -129,6 +135,9 @@ pub mod tests {
             &self.files
         }
 
+        /// Mirrors the production `HydraDatabase::python_version` limitation:
+        /// always returns `latest_ty()` regardless of the configured
+        /// interpreter version.
         fn python_version(&self) -> PythonVersion {
             PythonVersion::latest_ty()
         }

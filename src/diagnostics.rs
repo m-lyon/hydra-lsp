@@ -416,16 +416,32 @@ fn validate_hydra_keywords(
 ///
 /// Takes a salsa database and `PythonConfig` so target resolution shares the
 /// cached_definition_info LRU with the rest of the LSP.
+///
+/// `extra_suppressions` is unioned with the file's own suppressions so the
+/// caller can inject globally-disabled rules (e.g. from user settings) without
+/// mutating the cached `ParsedContent`.
 pub fn validate_document(
-    parsed_content: ParsedContent,
+    parsed_content: &ParsedContent,
+    extra_suppressions: &HashSet<DiagnosticRule>,
     db: &dyn ruff_db::Db,
     python_config: PythonConfig,
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
 
+    let suppressions: HashSet<DiagnosticRule> = if extra_suppressions.is_empty() {
+        parsed_content.file_suppressions.clone()
+    } else {
+        parsed_content
+            .file_suppressions
+            .iter()
+            .copied()
+            .chain(extra_suppressions.iter().copied())
+            .collect()
+    };
+
     for target in &parsed_content.hydra_objects {
         let (target_diagnostics, definition_info) =
-            validate_target(target, db, python_config, &parsed_content.file_suppressions);
+            validate_target(target, db, python_config, &suppressions);
         diagnostics.extend(target_diagnostics);
 
         // Try to resolve the target and validate parameters
@@ -452,15 +468,14 @@ pub fn validate_document(
                 signature,
                 &display_name,
                 implicit_param,
-                &parsed_content.file_suppressions,
+                &suppressions,
             );
             diagnostics.extend(parameter_diagnostics);
         }
         // If Python analysis fails, we've already added a basic validation diagnostic above
 
         // Validate Hydra keyword values
-        let keyword_diagnostics =
-            validate_hydra_keywords(target, &parsed_content.file_suppressions);
+        let keyword_diagnostics = validate_hydra_keywords(target, &suppressions);
         diagnostics.extend(keyword_diagnostics);
     }
 
@@ -1139,7 +1154,7 @@ mod tests {
 
         let resources_dir = get_simple_test_dir();
         let (db, config) = test_env(Some(&resources_dir));
-        let diagnostics = validate_document(parsed_content, &db, config);
+        let diagnostics = validate_document(&parsed_content, &HashSet::new(), &db, config);
 
         // Should have at least 2 errors (invalid format and module not found)
         let errors: Vec<_> = diagnostics
@@ -1178,7 +1193,7 @@ mod tests {
 
         let resources_dir = get_simple_test_dir();
         let (db, config) = test_env(Some(&resources_dir));
-        let diagnostics = validate_document(parsed_content, &db, config);
+        let diagnostics = validate_document(&parsed_content, &HashSet::new(), &db, config);
 
         let missing_param_diag = diagnostics.iter().find(|d| {
             d.message.contains("Missing required parameter") && d.message.contains("name")
@@ -1217,7 +1232,7 @@ mod tests {
         };
 
         let (db, config) = test_env(Some(&resources_dir));
-        let diagnostics = validate_document(parsed_content, &db, config);
+        let diagnostics = validate_document(&parsed_content, &HashSet::new(), &db, config);
 
         assert!(
             !diagnostics
@@ -1424,7 +1439,7 @@ mod tests {
         };
 
         let (db, config) = test_env(None);
-        let diagnostics = validate_document(parsed_content, &db, config);
+        let diagnostics = validate_document(&parsed_content, &HashSet::new(), &db, config);
 
         assert!(
             diagnostics.is_empty(),
@@ -1449,7 +1464,7 @@ mod tests {
         };
 
         let (db, config) = test_env(None);
-        let diagnostics = validate_document(parsed_content, &db, config);
+        let diagnostics = validate_document(&parsed_content, &HashSet::new(), &db, config);
 
         assert!(
             diagnostics.is_empty(),
@@ -1479,7 +1494,7 @@ mod tests {
         };
 
         let (db, config) = test_env(None);
-        let diagnostics = validate_document(parsed_content, &db, config);
+        let diagnostics = validate_document(&parsed_content, &HashSet::new(), &db, config);
         let keyword_diags: Vec<_> = diagnostics
             .iter()
             .filter(|d| d.message.contains("_recursive_"))
@@ -1513,7 +1528,7 @@ mod tests {
         };
 
         let (db, config) = test_env(None);
-        let diagnostics = validate_document(parsed_content, &db, config);
+        let diagnostics = validate_document(&parsed_content, &HashSet::new(), &db, config);
         let keyword_diags: Vec<_> = diagnostics
             .iter()
             .filter(|d| d.message.contains("_convert_"))
@@ -1551,7 +1566,7 @@ mod tests {
         };
 
         let (db, config) = test_env(None);
-        let diagnostics = validate_document(parsed_content, &db, config);
+        let diagnostics = validate_document(&parsed_content, &HashSet::new(), &db, config);
         let keyword_diags: Vec<_> = diagnostics
             .iter()
             .filter(|d| d.message.contains("_args_"))
@@ -1595,7 +1610,7 @@ mod tests {
         };
 
         let (db, config) = test_env(None);
-        let diagnostics = validate_document(parsed_content, &db, config);
+        let diagnostics = validate_document(&parsed_content, &HashSet::new(), &db, config);
         let keyword_diags: Vec<_> = diagnostics
             .iter()
             .filter(|d| {

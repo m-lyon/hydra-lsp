@@ -422,6 +422,7 @@ mod tests {
 
     #[test]
     fn test_pth_inventory_invalidation_on_file_create() {
+        use crate::python_analyzer::normalize_pth_inventory_key;
         use filetime::{FileTime, set_file_mtime};
         use ruff_db::files::File;
         use std::fs;
@@ -434,7 +435,11 @@ mod tests {
         fs::create_dir_all(&editable_src).expect("create editable src dir");
 
         let mut db = real_fs_db();
-        let inventory = PthInventory::new(&db, site_packages.to_string_lossy().to_string(), 0);
+        // Inventory key must go through the same normalization that
+        // `parse_pth_files` applies to its lookup side; otherwise the lookup
+        // misses and the salsa dep on `inventory.revision` is never registered.
+        let inventory_key = normalize_pth_inventory_key(&site_packages);
+        let inventory = PthInventory::new(&db, inventory_key, 0);
         let config = PythonConfig::new(&db, None, None, vec![inventory]);
         let site_packages_str = site_packages.to_string_lossy().to_string();
         let result1 = {
