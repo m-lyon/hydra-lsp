@@ -1,11 +1,13 @@
 use crate::import_resolver::ImportResolver;
-use anyhow::Result;
+use anyhow::{Context, Result};
+use ruff_db::files::system_path_to_file;
+use ruff_db::source::{SourceText, source_text};
 use ruff_db::system::{OsSystem, SystemPath, SystemPathBuf};
 use ruff_python_ast::{self as ast, Expr, Stmt, visitor::Visitor};
 use ruff_python_parser::parse_module;
 use ruff_source_file::{LineIndex, PositionEncoding};
 use ruff_text_size::TextRange;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use ty_python_semantic::{PythonEnvironment, SysPrefixPathOrigin};
@@ -13,39 +15,25 @@ use ty_python_semantic::{PythonEnvironment, SysPrefixPathOrigin};
 /// Maximum depth for parent class resolution to prevent infinite loops
 const MAX_PARENT_DEPTH: usize = 1000;
 
-/// Cache for file contents to minimize disk reads during analysis.
-/// Files are read once and stored in memory for the duration of an analysis operation.
-pub struct FileCache {
-    cache: HashMap<PathBuf, String>,
-}
-
-impl FileCache {
-    pub fn new() -> Self {
-        Self {
-            cache: HashMap::new(),
-        }
+/// Read a Python source file through ruff_db's salsa-tracked `source_text`.
+///
+/// File reads go through `source_text` (not `std::fs`) so that the lookup
+/// participates in salsa's dependency graph — when the file's revision is
+/// bumped (via `File::sync_path`), every memo that called this function for
+/// that path is invalidated.
+///
+/// The returned `SourceText` is `Arc`-backed; callers should bind it to a
+/// local and call `.as_str()` to get a borrowed `&str`.
+pub fn read_source(db: &dyn ruff_db::Db, path: &Path) -> Result<SourceText> {
+    let sys_path = SystemPath::from_std_path(path)
+        .with_context(|| format!("non-utf8 path: {}", path.display()))?;
+    let file = system_path_to_file(db, sys_path)
+        .with_context(|| format!("could not resolve file: {}", path.display()))?;
+    let source = source_text(db, file);
+    if let Some(err) = source.read_error() {
+        anyhow::bail!("failed to read {}: {}", path.display(), err);
     }
-
-    /// Get file contents, reading from disk if not already cached
-    pub fn get(&mut self, path: &Path) -> Result<&str> {
-        // Use entry API to avoid double lookup
-        if !self.cache.contains_key(path) {
-            let content = fs::read_to_string(path)?;
-            self.cache.insert(path.to_path_buf(), content);
-        }
-        Ok(self.cache.get(path).unwrap())
-    }
-
-    /// Check if a file is already cached
-    pub fn contains(&self, path: &Path) -> bool {
-        self.cache.contains_key(path)
-    }
-}
-
-impl Default for FileCache {
-    fn default() -> Self {
-        Self::new()
-    }
+    Ok(source)
 }
 
 #[derive(Debug, Clone)]
@@ -420,11 +408,11 @@ impl PythonAnalyzer {
     ///
     /// Returns (ClassAttributeInfo, file_path, class_name) where the attribute was found.
     fn extract_class_attribute_with_inheritance(
+        db: &dyn ruff_db::Db,
         file_path: &Path,
         class_name: &str,
         attribute_name: &str,
         search_paths: &[PathBuf],
-        file_cache: &mut FileCache,
         visited: &mut HashSet<String>,
     ) -> Result<(ClassAttributeInfo, PathBuf, String)> {
         // Limit recursion depth
@@ -442,8 +430,8 @@ impl PythonAnalyzer {
         }
         visited.insert(visit_key);
 
-        // Read the source file
-        let source = file_cache.get(file_path)?;
+        let source_text = read_source(db, file_path)?;
+        let source = source_text.as_str();
 
         // Try to find the attribute directly on this class
         if let Ok(attr_info) = Self::extract_class_attribute(source, class_name, attribute_name) {
@@ -462,18 +450,18 @@ impl PythonAnalyzer {
 
             // Resolve the parent class to a file and name
             let Some((parent_file, parent_class_name)) =
-                Self::resolve_base_class(base_class, file_path, search_paths)
+                Self::resolve_base_class(db, base_class, file_path, search_paths)
             else {
                 continue;
             };
 
             // Recursively search in parent class
             if let Ok(result) = Self::extract_class_attribute_with_inheritance(
+                db,
                 &parent_file,
                 &parent_class_name,
                 attribute_name,
                 search_paths,
-                file_cache,
                 visited,
             ) {
                 return Ok(result);
@@ -494,11 +482,11 @@ impl PythonAnalyzer {
     ///
     /// Returns the final resolved class name and the remaining method name (if any).
     fn resolve_attribute_chain(
+        db: &dyn ruff_db::Db,
         file_path: &Path,
         starting_class: &str,
         attribute_chain: &[&str],
         search_paths: &[PathBuf],
-        file_cache: &mut FileCache,
     ) -> Result<(PathBuf, String, Option<String>)> {
         if attribute_chain.is_empty() {
             anyhow::bail!("Empty attribute chain");
@@ -506,7 +494,7 @@ impl PythonAnalyzer {
 
         let mut current_file = file_path.to_path_buf();
         let mut current_class = starting_class.to_string();
-        let mut resolver = ImportResolver::new(search_paths.to_vec());
+        let mut resolver = ImportResolver::new(db, search_paths.to_vec());
 
         // Process all but the last attribute (which might be a method)
         for (i, attr) in attribute_chain.iter().enumerate() {
@@ -514,8 +502,8 @@ impl PythonAnalyzer {
 
             // First, check if this is a method on the current class
             {
-                // Read current file source in its own scope to release borrow
-                let source = file_cache.get(&current_file)?;
+                let source_text = read_source(db, &current_file)?;
+                let source = source_text.as_str();
                 if is_last && Self::extract_method_info(source, &current_class, attr).is_ok() {
                     // It's a method - return the class and method name
                     return Ok((current_file, current_class, Some(attr.to_string())));
@@ -525,11 +513,11 @@ impl PythonAnalyzer {
             // Try to get the attribute as a class attribute (with inheritance support)
             let mut visited = HashSet::new();
             match Self::extract_class_attribute_with_inheritance(
+                db,
                 &current_file,
                 &current_class,
                 attr,
                 search_paths,
-                file_cache,
                 &mut visited,
             ) {
                 Ok((attr_info, _attr_file, _attr_class)) => {
@@ -541,7 +529,8 @@ impl PythonAnalyzer {
                         let new_class_name = value_parts[0];
 
                         // Try direct lookup in current file
-                        let source = file_cache.get(&current_file)?;
+                        let source_text = read_source(db, &current_file)?;
+                        let source = source_text.as_str();
                         if Self::extract_class_info(source, new_class_name).is_ok() {
                             current_class = new_class_name.to_string();
                             continue;
@@ -691,6 +680,7 @@ impl PythonAnalyzer {
     /// - Simple names: `ParentClass` - looks up in the current file's imports
     /// - Qualified names: `module.ClassName` - resolves the module path
     fn resolve_base_class(
+        db: &dyn ruff_db::Db,
         base_class_expr: &str,
         current_file: &Path,
         search_paths: &[PathBuf],
@@ -709,7 +699,7 @@ impl PythonAnalyzer {
         }
 
         // Simple name - try to resolve through imports in the current file
-        let mut resolver = ImportResolver::new(search_paths.to_vec());
+        let mut resolver = ImportResolver::new(db, search_paths.to_vec());
         if let Some((resolved_file, resolved_name)) =
             resolver.resolve_symbol(current_file, base_class_expr)
         {
@@ -722,13 +712,15 @@ impl PythonAnalyzer {
         }
 
         // Check if the class is defined in the same file
-        if let Ok(source) = fs::read_to_string(current_file)
-            && let Ok(parsed) = parse_module(&source)
-        {
-            let mut visitor = ClassExtractor::new(base_class_expr.to_string(), source);
-            visitor.visit_body(parsed.suite());
-            if visitor.get_result().is_some() {
-                return Some((current_file.to_path_buf(), base_class_expr.to_string()));
+        if let Ok(source_text) = read_source(db, current_file) {
+            let source = source_text.as_str();
+            if let Ok(parsed) = parse_module(source) {
+                let mut visitor =
+                    ClassExtractor::new(base_class_expr.to_string(), source.to_string());
+                visitor.visit_body(parsed.suite());
+                if visitor.get_result().is_some() {
+                    return Some((current_file.to_path_buf(), base_class_expr.to_string()));
+                }
             }
         }
 
@@ -740,10 +732,10 @@ impl PythonAnalyzer {
     /// This follows Python's MRO (left-to-right for simple cases) and searches
     /// parent classes recursively when properties are not found in the child.
     fn resolve_from_parents(
+        db: &dyn ruff_db::Db,
         base_classes: &[String],
         current_file: &Path,
         search_paths: &[PathBuf],
-        file_cache: &mut FileCache,
         visited: &mut HashSet<String>,
         needs_docstring: bool,
         needs_init: bool,
@@ -770,7 +762,7 @@ impl PythonAnalyzer {
 
             // Resolve the base class to a file and name
             let Some((parent_file, parent_class_name)) =
-                Self::resolve_base_class(base_class, current_file, search_paths)
+                Self::resolve_base_class(db, base_class, current_file, search_paths)
             else {
                 continue;
             };
@@ -787,14 +779,15 @@ impl PythonAnalyzer {
             visited.insert(visit_key);
 
             // Extract the parent class info using cache
-            let source = match file_cache.get(&parent_file) {
+            let source_text = match read_source(db, &parent_file) {
                 Ok(s) => s,
                 Err(_) => continue,
             };
-            let parent_info = match Self::extract_class_info(source, &parent_class_name) {
-                Ok(info) => info,
-                Err(_) => continue,
-            };
+            let parent_info =
+                match Self::extract_class_info(source_text.as_str(), &parent_class_name) {
+                    Ok(info) => info,
+                    Err(_) => continue,
+                };
 
             // Check if the parent has what we need
             if needs_docstring && found_docstring.is_none() && parent_info.docstring.is_some() {
@@ -811,10 +804,10 @@ impl PythonAnalyzer {
 
             if still_needs_docstring || still_needs_init {
                 let (grandparent_docstring, grandparent_init) = Self::resolve_from_parents(
+                    db,
                     &parent_info.base_classes,
                     &parent_file,
                     search_paths,
-                    file_cache,
                     visited,
                     still_needs_docstring,
                     still_needs_init,
@@ -845,19 +838,20 @@ impl PythonAnalyzer {
     /// This also resolves missing properties (docstring, __init__) from parent classes
     /// when they are not defined in the child class.
     pub fn extract_class_info_with_imports(
+        db: &dyn ruff_db::Db,
         file_path: &Path,
         class_name: &str,
         search_paths: Vec<PathBuf>,
-        file_cache: &mut FileCache,
     ) -> Result<(ClassInfo, PathBuf)> {
-        // First try direct lookup using cache
-        let (mut class_info, resolved_file) = if let Ok(source) = file_cache.get(file_path)
-            && let Ok(class_info) = Self::extract_class_info(source, class_name)
-        {
+        // First try direct lookup
+        let direct = read_source(db, file_path)
+            .ok()
+            .and_then(|s| Self::extract_class_info(s.as_str(), class_name).ok());
+        let (mut class_info, resolved_file) = if let Some(class_info) = direct {
             (class_info, file_path.to_path_buf())
         } else {
             // Try to resolve through imports
-            let mut resolver = ImportResolver::new(search_paths.clone());
+            let mut resolver = ImportResolver::new(db, search_paths.clone());
             if let Some((resolved_file, resolved_name)) =
                 resolver.resolve_symbol(file_path, class_name)
             {
@@ -866,9 +860,8 @@ impl PythonAnalyzer {
                 } else {
                     resolved_name
                 };
-                // Use cache for the resolved file
-                let source = file_cache.get(&resolved_file)?;
-                let class_info = Self::extract_class_info(source, &actual_name)?;
+                let source_text = read_source(db, &resolved_file)?;
+                let class_info = Self::extract_class_info(source_text.as_str(), &actual_name)?;
                 (class_info, resolved_file)
             } else {
                 anyhow::bail!(
@@ -890,10 +883,10 @@ impl PythonAnalyzer {
             visited.insert(visit_key);
 
             let (parent_docstring, parent_init) = Self::resolve_from_parents(
+                db,
                 &class_info.base_classes,
                 &resolved_file,
                 &search_paths,
-                file_cache,
                 &mut visited,
                 class_info.docstring.is_none(),
                 class_info.init_signature.is_none(),
@@ -913,20 +906,21 @@ impl PythonAnalyzer {
     /// Extract function signature, following re-exports if necessary.
     /// Returns the FunctionSignature and the file path where it was found.
     pub fn extract_function_signature_with_imports(
+        db: &dyn ruff_db::Db,
         file_path: &Path,
         function_name: &str,
         search_paths: Vec<PathBuf>,
-        file_cache: &mut FileCache,
     ) -> Result<(FunctionSignature, PathBuf)> {
-        // First try direct lookup using cache
-        if let Ok(source) = file_cache.get(file_path)
-            && let Ok(func_sig) = Self::extract_function_signature(source, function_name)
+        // First try direct lookup
+        if let Ok(source_text) = read_source(db, file_path)
+            && let Ok(func_sig) =
+                Self::extract_function_signature(source_text.as_str(), function_name)
         {
             return Ok((func_sig, file_path.to_path_buf()));
         }
 
         // Try to resolve through imports
-        let mut resolver = ImportResolver::new(search_paths);
+        let mut resolver = ImportResolver::new(db, search_paths);
         if let Some((resolved_file, resolved_name)) =
             resolver.resolve_symbol(file_path, function_name)
         {
@@ -935,9 +929,8 @@ impl PythonAnalyzer {
             } else {
                 resolved_name
             };
-            // Use cache for the resolved file
-            let source = file_cache.get(&resolved_file)?;
-            let func_sig = Self::extract_function_signature(source, &actual_name)?;
+            let source_text = read_source(db, &resolved_file)?;
+            let func_sig = Self::extract_function_signature(source_text.as_str(), &actual_name)?;
             return Ok((func_sig, resolved_file));
         }
 
@@ -955,14 +948,12 @@ impl PythonAnalyzer {
     /// - Module path
     /// - Symbol name
     pub fn extract_definition_info(
+        db: &dyn ruff_db::Db,
         target: &str,
         workspace_root: Option<&Path>,
         python_interpreter: Option<&str>,
     ) -> Result<(DefinitionInfo, PathBuf, String, String)> {
         let (module_path, symbol_name) = Self::split_target(target)?;
-
-        // Create a shared file cache for all operations
-        let mut file_cache = FileCache::new();
 
         // Track whether we found the module but not the symbol
         let mut module_found = false;
@@ -975,10 +966,10 @@ impl PythonAnalyzer {
 
             // Try to extract as function first (with import resolution)
             if let Ok((func_sig, resolved_file)) = Self::extract_function_signature_with_imports(
+                db,
                 &file_path,
                 &symbol_name,
                 search_paths.clone(),
-                &mut file_cache,
             ) {
                 return Ok((
                     DefinitionInfo::Function(func_sig),
@@ -989,12 +980,9 @@ impl PythonAnalyzer {
             }
 
             // Try to extract as class (with import resolution)
-            if let Ok((class_info, resolved_file)) = Self::extract_class_info_with_imports(
-                &file_path,
-                &symbol_name,
-                search_paths,
-                &mut file_cache,
-            ) {
+            if let Ok((class_info, resolved_file)) =
+                Self::extract_class_info_with_imports(db, &file_path, &symbol_name, search_paths)
+            {
                 return Ok((
                     DefinitionInfo::Class(class_info),
                     resolved_file,
@@ -1007,12 +995,9 @@ impl PythonAnalyzer {
         // Try to interpret as Class.method pattern (e.g., "my_module.MyClass.from_config")
         // or nested pattern (e.g., "my_module.OuterClass.nested.nested_class.method")
         // or nested class pattern (e.g., "my_module.OuterClass.nested.nested_class")
-        if let Some(result) = Self::resolve_class_attribute_chain(
-            target,
-            workspace_root,
-            python_interpreter,
-            &mut file_cache,
-        ) {
+        if let Some(result) =
+            Self::resolve_class_attribute_chain(db, target, workspace_root, python_interpreter)
+        {
             match result {
                 ClassAttributeChainResult::Method {
                     file_path: resolved_file,
@@ -1021,11 +1006,11 @@ impl PythonAnalyzer {
                     search_paths,
                 } => {
                     if let Ok((method_info, final_file)) = Self::extract_method_info_with_imports(
+                        db,
                         &resolved_file,
                         &class_name,
                         &method_name,
                         search_paths,
-                        &mut file_cache,
                     ) {
                         return Ok((
                             DefinitionInfo::Method(method_info),
@@ -1041,10 +1026,10 @@ impl PythonAnalyzer {
                     search_paths,
                 } => {
                     if let Ok((class_info, final_file)) = Self::extract_class_info_with_imports(
+                        db,
                         &resolved_file,
                         &class_name,
                         search_paths,
-                        &mut file_cache,
                     ) {
                         return Ok((
                             DefinitionInfo::Class(class_info),
@@ -1078,10 +1063,10 @@ impl PythonAnalyzer {
     ///
     /// Returns either a Method or Class result depending on what the chain resolves to.
     fn resolve_class_attribute_chain(
+        db: &dyn ruff_db::Db,
         target: &str,
         workspace_root: Option<&Path>,
         python_interpreter: Option<&str>,
-        file_cache: &mut FileCache,
     ) -> Option<ClassAttributeChainResult> {
         let parts: Vec<&str> = target.split('.').collect();
         if parts.len() < 3 {
@@ -1112,17 +1097,22 @@ impl PythonAnalyzer {
 
             // Check if this is a class
             if let Ok((class_info, resolved_file)) = Self::extract_class_info_with_imports(
+                db,
                 &file_path,
                 first_symbol,
                 search_paths.clone(),
-                file_cache,
             ) {
                 if remaining_parts.len() == 2 {
                     // Simple case: Class.method
                     let method_name = remaining_parts[1];
                     // Read the resolved file source and check if method exists
-                    if let Ok(source) = file_cache.get(&resolved_file)
-                        && Self::extract_method_info(source, &class_info.name, method_name).is_ok()
+                    if let Ok(source_text) = read_source(db, &resolved_file)
+                        && Self::extract_method_info(
+                            source_text.as_str(),
+                            &class_info.name,
+                            method_name,
+                        )
+                        .is_ok()
                     {
                         return Some(ClassAttributeChainResult::Method {
                             file_path: resolved_file,
@@ -1137,11 +1127,11 @@ impl PythonAnalyzer {
                     let attribute_chain = &remaining_parts[1..];
                     if let Ok((final_file, final_class, method_name_opt)) =
                         Self::resolve_attribute_chain(
+                            db,
                             &resolved_file,
                             &class_info.name,
                             attribute_chain,
                             &search_paths,
-                            file_cache,
                         )
                     {
                         if let Some(method_name) = method_name_opt {
@@ -1169,21 +1159,22 @@ impl PythonAnalyzer {
     /// Extract method info, following re-exports if necessary.
     /// Returns the MethodInfo and the file path where it was found.
     pub fn extract_method_info_with_imports(
+        db: &dyn ruff_db::Db,
         file_path: &Path,
         class_name: &str,
         method_name: &str,
         search_paths: Vec<PathBuf>,
-        file_cache: &mut FileCache,
     ) -> Result<(MethodInfo, PathBuf)> {
-        // First try direct lookup using cache
-        if let Ok(source) = file_cache.get(file_path)
-            && let Ok(method_info) = Self::extract_method_info(source, class_name, method_name)
+        // First try direct lookup
+        if let Ok(source_text) = read_source(db, file_path)
+            && let Ok(method_info) =
+                Self::extract_method_info(source_text.as_str(), class_name, method_name)
         {
             return Ok((method_info, file_path.to_path_buf()));
         }
 
         // Try to resolve class through imports, then find the method
-        let mut resolver = ImportResolver::new(search_paths);
+        let mut resolver = ImportResolver::new(db, search_paths);
         if let Some((resolved_file, resolved_name)) = resolver.resolve_symbol(file_path, class_name)
         {
             let actual_class_name = if resolved_name.is_empty() {
@@ -1191,8 +1182,9 @@ impl PythonAnalyzer {
             } else {
                 resolved_name
             };
-            let source = file_cache.get(&resolved_file)?;
-            let method_info = Self::extract_method_info(source, &actual_class_name, method_name)?;
+            let source_text = read_source(db, &resolved_file)?;
+            let method_info =
+                Self::extract_method_info(source_text.as_str(), &actual_class_name, method_name)?;
             return Ok((method_info, resolved_file));
         }
 
@@ -1780,6 +1772,7 @@ fn expr_to_string(expr: &Expr) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::database::HydraDatabase;
     use std::env;
     use std::fs;
 
@@ -1788,6 +1781,12 @@ mod tests {
             .join("tests")
             .join("workspace")
             .join("simple")
+    }
+
+    /// Build a fresh `HydraDatabase` for tests. Each call is a clean db so
+    /// tests don't share salsa caches.
+    fn test_db() -> HydraDatabase {
+        HydraDatabase::new(SystemPath::new("/"))
     }
 
     // ==================== split_target tests ====================
@@ -2062,12 +2061,11 @@ mod tests {
 
         // Now verify that extract_class_info_with_imports gives us inherited __init__
         let search_paths = vec![examples_dir.clone()];
-        let mut file_cache = FileCache::new();
         let (class_info, _) = PythonAnalyzer::extract_class_info_with_imports(
+            &test_db(),
             &test_file,
             "ChildWithoutInit",
             search_paths,
-            &mut file_cache,
         )
         .unwrap();
 
@@ -2102,12 +2100,11 @@ mod tests {
         let test_file = examples_dir.join("my_module.py");
 
         let search_paths = vec![examples_dir.clone()];
-        let mut file_cache = FileCache::new();
         let (class_info, _) = PythonAnalyzer::extract_class_info_with_imports(
+            &test_db(),
             &test_file,
             "GrandchildWithoutInit",
             search_paths,
-            &mut file_cache,
         )
         .unwrap();
 
@@ -2130,12 +2127,11 @@ mod tests {
         let test_file = examples_dir.join("my_module.py");
 
         let search_paths = vec![examples_dir.clone()];
-        let mut file_cache = FileCache::new();
         let (class_info, _) = PythonAnalyzer::extract_class_info_with_imports(
+            &test_db(),
             &test_file,
             "ChildWithOwnInit",
             search_paths,
-            &mut file_cache,
         )
         .unwrap();
 
@@ -2160,6 +2156,7 @@ mod tests {
         let examples_dir = get_simple_test_dir();
 
         let result = PythonAnalyzer::extract_definition_info(
+            &test_db(),
             "my_module.ChildWithoutInit",
             Some(&examples_dir),
             None,
@@ -2189,6 +2186,7 @@ mod tests {
         let examples_dir = get_simple_test_dir();
 
         let result = PythonAnalyzer::extract_definition_info(
+            &test_db(),
             "class_methods.InheritedNested.nested.nested_class.from_config",
             Some(&examples_dir),
             None,
@@ -2220,6 +2218,7 @@ mod tests {
         let workspace_dir = get_simple_test_dir();
 
         let result = PythonAnalyzer::extract_definition_info(
+            &test_db(),
             "class_methods.InheritedNested.nested.nested_class.compute_size",
             Some(&workspace_dir),
             None,
@@ -2252,6 +2251,7 @@ mod tests {
         let examples_dir = get_simple_test_dir();
 
         let result = PythonAnalyzer::extract_definition_info(
+            &test_db(),
             "class_methods.NestedTwice.nested.inherited_nested_class",
             Some(&examples_dir),
             None,
@@ -2288,6 +2288,7 @@ mod tests {
         let examples_dir = get_simple_test_dir();
 
         let result = PythonAnalyzer::extract_definition_info(
+            &test_db(),
             "my_module.simple_function",
             Some(&examples_dir),
             None,
@@ -2308,6 +2309,7 @@ mod tests {
         let examples_dir = get_simple_test_dir();
 
         let result = PythonAnalyzer::extract_definition_info(
+            &test_db(),
             "my_module.SimpleClass",
             Some(&examples_dir),
             None,
@@ -2328,6 +2330,7 @@ mod tests {
         let examples_dir = get_simple_test_dir();
 
         let result = PythonAnalyzer::extract_definition_info(
+            &test_db(),
             "test_package.submodule.SubmoduleClass",
             Some(&examples_dir),
             None,
@@ -2348,6 +2351,7 @@ mod tests {
         let examples_dir = get_simple_test_dir();
 
         let result = PythonAnalyzer::extract_definition_info(
+            &test_db(),
             "my_module.NonexistentSymbol",
             Some(&examples_dir),
             None,
@@ -3086,6 +3090,7 @@ mod tests {
 
         // Extract definition with configured interpreter
         let result = PythonAnalyzer::extract_definition_info(
+            &test_db(),
             "my_module.simple_function",
             Some(&examples_dir),
             system_python_str,
@@ -3105,6 +3110,7 @@ mod tests {
 
         // Extract definition without configured interpreter
         let result = PythonAnalyzer::extract_definition_info(
+            &test_db(),
             "my_module.simple_function",
             Some(&examples_dir),
             None,
@@ -3160,8 +3166,12 @@ mod tests {
         //       mylib/modules/linear.py defines Linear
         let workspace_dir = get_reexport_test_dir();
 
-        let result =
-            PythonAnalyzer::extract_definition_info("mylib.Linear", Some(&workspace_dir), None);
+        let result = PythonAnalyzer::extract_definition_info(
+            &test_db(),
+            "mylib.Linear",
+            Some(&workspace_dir),
+            None,
+        );
 
         assert!(
             result.is_ok(),
@@ -3192,6 +3202,7 @@ mod tests {
         let workspace_dir = get_reexport_test_dir();
 
         let result = PythonAnalyzer::extract_definition_info(
+            &test_db(),
             "mylib.AliasedClass",
             Some(&workspace_dir),
             None,
@@ -3221,6 +3232,7 @@ mod tests {
         let workspace_dir = get_reexport_test_dir();
 
         let result = PythonAnalyzer::extract_definition_info(
+            &test_db(),
             "mylib.StarExportedClass",
             Some(&workspace_dir),
             None,
@@ -3247,6 +3259,7 @@ mod tests {
         let workspace_dir = get_reexport_test_dir();
 
         let result = PythonAnalyzer::extract_definition_info(
+            &test_db(),
             "mylib.modules.linear.DirectClass",
             Some(&workspace_dir),
             None,
@@ -3274,6 +3287,7 @@ mod tests {
         let workspace_dir = get_reexport_test_dir();
 
         let result = PythonAnalyzer::extract_definition_info(
+            &test_db(),
             "mylib._PrivateClass",
             Some(&workspace_dir),
             None,
@@ -3293,6 +3307,7 @@ mod tests {
         let workspace_dir = get_simple_test_dir();
 
         let result = PythonAnalyzer::extract_definition_info(
+            &test_db(),
             "class_methods.ModelFactory.from_config",
             Some(&workspace_dir),
             None,
@@ -3327,6 +3342,7 @@ mod tests {
         let workspace_dir = get_simple_test_dir();
 
         let result = PythonAnalyzer::extract_definition_info(
+            &test_db(),
             "class_methods.ModelFactory.compute_size",
             Some(&workspace_dir),
             None,
@@ -3361,6 +3377,7 @@ mod tests {
         let workspace_dir = get_simple_test_dir();
 
         let result = PythonAnalyzer::extract_definition_info(
+            &test_db(),
             "class_methods.ModelFactory.with_defaults",
             Some(&workspace_dir),
             None,
@@ -3393,6 +3410,7 @@ mod tests {
         let workspace_dir = get_simple_test_dir();
 
         let result = PythonAnalyzer::extract_definition_info(
+            &test_db(),
             "class_methods.DataProcessor.create",
             Some(&workspace_dir),
             None,
@@ -3503,6 +3521,7 @@ mod tests {
         let workspace_dir = get_simple_test_dir();
 
         let result = PythonAnalyzer::extract_definition_info(
+            &test_db(),
             "class_methods.NestedTwice.nested.nested_class.from_config",
             Some(&workspace_dir),
             None,
@@ -3538,6 +3557,7 @@ mod tests {
         let workspace_dir = get_simple_test_dir();
 
         let result = PythonAnalyzer::extract_definition_info(
+            &test_db(),
             "class_methods.NestedTwice.nested.nested_class.compute_size",
             Some(&workspace_dir),
             None,

@@ -295,8 +295,15 @@ fn trace_target_resolution(
         hydra_object.target.line + 1
     );
 
+    // Ephemeral salsa db so analyzer file reads go through ruff_db's
+    // tracked source_text. The cache vanishes when this function returns;
+    // for a one-shot CLI trace that's fine.
+    let db_root = workspace_root.and_then(|p| p.to_str()).unwrap_or(".");
+    let db = HydraDatabase::new(ruff_db::system::SystemPath::new(db_root));
+
     // Try to extract definition info
     match PythonAnalyzer::extract_definition_info(
+        &db,
         &hydra_object.target.value,
         workspace_root,
         python_interpreter,

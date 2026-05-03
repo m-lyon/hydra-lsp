@@ -7,12 +7,14 @@ use crate::python_analyzer::{DefinitionInfo, PythonAnalyzer};
 
 /// Salsa input for Python environment configuration.
 ///
-/// Created once when the LSP backend starts. Updated when:
-/// - Python interpreter setting changes (via initialization options)
-/// - Workspace root is determined (from LSP init params or cwd)
+/// In the LSP backend, this is created during `initialize()` alongside the
+/// analysis database, using the workspace root from LSP init params (or a
+/// current-directory fallback) plus any configured Python interpreter.
 ///
-/// Changes to this input invalidate all cached definition lookups,
-/// triggering re-resolution of modules on the next request.
+/// This input participates in the cache key for Python definition lookups, so
+/// changing its values invalidates cached module-resolution results. Per-file
+/// invalidation for watched Python source changes is handled separately via
+/// `ruff_db::files::File::sync_path` in the LSP backend.
 #[salsa::input]
 pub struct PythonConfig {
     /// Workspace root directory path.
@@ -95,20 +97,21 @@ impl Eq for CachedDefinitionResult {}
 /// so the bound is set well above typical workspace sizes to avoid thrashing.
 #[salsa::tracked(no_eq, lru = 1024)]
 pub fn cached_definition_info<'db>(
-    db: &'db dyn salsa::Database,
+    db: &'db dyn ruff_db::Db,
     config: PythonConfig,
     target: TargetString<'db>,
 ) -> CachedDefinitionResult {
     let target_str = target.value(db);
-    debug!(target = target_str, "cached_definition_info: executing (cache miss)");
+    debug!(
+        target = target_str,
+        "cached_definition_info: executing (cache miss)"
+    );
 
-    let workspace_root = config
-        .workspace_root(db)
-        .as_deref()
-        .map(PathBuf::from);
+    let workspace_root = config.workspace_root(db).as_deref().map(PathBuf::from);
     let interpreter = config.interpreter(db);
 
     CachedDefinitionResult::from_result(PythonAnalyzer::extract_definition_info(
+        db,
         target_str,
         workspace_root.as_deref().map(std::path::Path::new),
         interpreter.as_deref(),
@@ -118,11 +121,19 @@ pub fn cached_definition_info<'db>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::database::HydraDatabase;
     use crate::database::tests::TestDb;
+    use ruff_db::system::SystemPath;
     use salsa::Setter;
 
     fn examples_dir() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/workspace/simple")
+    }
+
+    /// Build a HydraDatabase for tests that read real on-disk Python files.
+    /// `TestDb` uses an in-memory `TestSystem` and can't see workspace files.
+    fn real_fs_db() -> HydraDatabase {
+        HydraDatabase::new(SystemPath::new("/"))
     }
 
     #[test]
@@ -142,10 +153,7 @@ mod tests {
         config
             .set_interpreter(&mut db)
             .to(Some("/usr/bin/python3".to_string()));
-        assert_eq!(
-            config.interpreter(&db).as_deref(),
-            Some("/usr/bin/python3")
-        );
+        assert_eq!(config.interpreter(&db).as_deref(), Some("/usr/bin/python3"));
     }
 
     #[test]
@@ -165,13 +173,9 @@ mod tests {
 
     #[test]
     fn test_cached_definition_info_valid_target() {
-        let db = TestDb::new();
+        let db = real_fs_db();
         let workspace = examples_dir();
-        let config = PythonConfig::new(
-            &db,
-            Some(workspace.to_string_lossy().to_string()),
-            None,
-        );
+        let config = PythonConfig::new(&db, Some(workspace.to_string_lossy().to_string()), None);
         let target = TargetString::new(&db, "my_module.DataLoader".to_string());
         let result = cached_definition_info(&db, config, target);
 
@@ -184,11 +188,7 @@ mod tests {
     fn test_cached_definition_info_invalid_target() {
         let db = TestDb::new();
         let workspace = examples_dir();
-        let config = PythonConfig::new(
-            &db,
-            Some(workspace.to_string_lossy().to_string()),
-            None,
-        );
+        let config = PythonConfig::new(&db, Some(workspace.to_string_lossy().to_string()), None);
         let target = TargetString::new(&db, "nonexistent.Module".to_string());
         let result = cached_definition_info(&db, config, target);
         assert!(result.get().is_err());
@@ -196,13 +196,9 @@ mod tests {
 
     #[test]
     fn test_cached_definition_info_cache_hit() {
-        let db = TestDb::new();
+        let db = real_fs_db();
         let workspace = examples_dir();
-        let config = PythonConfig::new(
-            &db,
-            Some(workspace.to_string_lossy().to_string()),
-            None,
-        );
+        let config = PythonConfig::new(&db, Some(workspace.to_string_lossy().to_string()), None);
         let target = TargetString::new(&db, "my_module.DataLoader".to_string());
 
         let result1 = cached_definition_info(&db, config, target);
@@ -214,13 +210,9 @@ mod tests {
 
     #[test]
     fn test_cached_definition_info_function_target() {
-        let db = TestDb::new();
+        let db = real_fs_db();
         let workspace = examples_dir();
-        let config = PythonConfig::new(
-            &db,
-            Some(workspace.to_string_lossy().to_string()),
-            None,
-        );
+        let config = PythonConfig::new(&db, Some(workspace.to_string_lossy().to_string()), None);
         let target = TargetString::new(&db, "my_module.create_model".to_string());
         let result = cached_definition_info(&db, config, target);
 
@@ -231,13 +223,9 @@ mod tests {
 
     #[test]
     fn test_cached_definition_info_invalidation_on_config_change() {
-        let mut db = TestDb::new();
+        let mut db = real_fs_db();
         let workspace = examples_dir();
-        let config = PythonConfig::new(
-            &db,
-            Some(workspace.to_string_lossy().to_string()),
-            None,
-        );
+        let config = PythonConfig::new(&db, Some(workspace.to_string_lossy().to_string()), None);
 
         let result1 = {
             let target = TargetString::new(&db, "my_module.DataLoader".to_string());
@@ -256,6 +244,57 @@ mod tests {
         };
         // Result pointer should differ (recomputed, not from cache)
         assert!(result1 != result2);
+    }
+
+    #[test]
+    fn test_cached_definition_info_invalidation_on_file_sync() {
+        use ruff_db::files::File;
+        use std::fs;
+        use tempfile::TempDir;
+
+        // Build a temporary workspace so we can actually modify the file
+        // backing the resolved target. `File::sync_path` is intentionally a
+        // no-op when on-disk metadata has not changed (matches the LSP path:
+        // the file watcher only fires for real changes).
+        let tmp = TempDir::new().expect("tempdir");
+        let workspace = tmp.path();
+        let py_file = workspace.join("watched_module.py");
+        fs::write(
+            &py_file,
+            "class WatchedClass:\n    \"\"\"v1\"\"\"\n    pass\n",
+        )
+        .expect("write v1");
+
+        let mut db = real_fs_db();
+        let config = PythonConfig::new(&db, Some(workspace.to_string_lossy().to_string()), None);
+        let result1 = {
+            let target = TargetString::new(&db, "watched_module.WatchedClass".to_string());
+            cached_definition_info(&db, config, target)
+        };
+        assert!(result1.get().is_ok(), "should resolve WatchedClass");
+
+        // Modify the file on disk, then sync — this models what the LSP does
+        // when did_change_watched_files notifies us of a real change.
+        // Sleep briefly to ensure the mtime changes on filesystems with
+        // coarse-grained timestamps.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        fs::write(
+            &py_file,
+            "class WatchedClass:\n    \"\"\"v2\"\"\"\n    pass\n",
+        )
+        .expect("write v2");
+
+        let sys_path = SystemPath::from_std_path(&py_file).unwrap();
+        File::sync_path(&mut db, sys_path);
+
+        let result2 = {
+            let target = TargetString::new(&db, "watched_module.WatchedClass".to_string());
+            cached_definition_info(&db, config, target)
+        };
+        assert!(
+            result1 != result2,
+            "memo should be invalidated after sync_path picks up the disk change"
+        );
     }
 
     #[test]

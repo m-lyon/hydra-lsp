@@ -167,11 +167,8 @@ pub mod tests {
         use crate::yaml_cache::{DocumentInput, is_hydra_file, parsed_yaml};
 
         let db = TestDb::new();
-        let input = DocumentInput::new(
-            &db,
-            "# @hydra\nmodel:\n  _target_: my.Mod\n".to_string(),
-            1,
-        );
+        let input =
+            DocumentInput::new(&db, "# @hydra\nmodel:\n  _target_: my.Mod\n".to_string(), 1);
         // Run some queries to populate the memo table
         let _ = is_hydra_file(&db, input);
         let _ = parsed_yaml(&db, input);

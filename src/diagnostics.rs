@@ -101,7 +101,7 @@ fn create_diagnostic(
 /// Routes through `cached_definition_info`.
 fn validate_target(
     hydra_obj: &HydraObject,
-    db: &dyn salsa::Database,
+    db: &dyn ruff_db::Db,
     python_config: PythonConfig,
     file_suppressions: &HashSet<DiagnosticRule>,
 ) -> (Vec<Diagnostic>, Option<DefinitionInfo>) {
@@ -418,7 +418,7 @@ fn validate_hydra_keywords(
 /// cached_definition_info LRU with the rest of the LSP.
 pub fn validate_document(
     parsed_content: ParsedContent,
-    db: &dyn salsa::Database,
+    db: &dyn ruff_db::Db,
     python_config: PythonConfig,
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
@@ -479,10 +479,11 @@ pub fn validate_document(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::database::tests::TestDb;
+    use crate::database::HydraDatabase;
     use crate::python_analyzer::ParameterInfo;
     use crate::yaml_parser::{HydraParameter, Parameter, YamlValue};
     use hashlink::LinkedHashMap;
+    use ruff_db::system::SystemPath;
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
 
@@ -493,9 +494,10 @@ mod tests {
             .join("simple")
     }
 
-    /// Build a fresh salsa db + PythonConfig for tests.
-    fn test_env(workspace_root: Option<&Path>) -> (TestDb, PythonConfig) {
-        let db = TestDb::new();
+    /// Build a fresh salsa db + PythonConfig for tests. Uses `HydraDatabase`
+    /// (not `TestDb`) so analyzer file reads can hit the real workspace files.
+    fn test_env(workspace_root: Option<&Path>) -> (HydraDatabase, PythonConfig) {
+        let db = HydraDatabase::new(SystemPath::new("/"));
         let workspace = workspace_root.map(|p| p.to_string_lossy().to_string());
         let config = PythonConfig::new(&db, workspace, None);
         (db, config)

@@ -224,7 +224,9 @@ model:
         assert_eq!(diag.severity, Some(DiagnosticSeverity::ERROR));
         assert_eq!(
             diag.code,
-            Some(NumberOrString::String("invalid-hydra-parameter".to_string()))
+            Some(NumberOrString::String(
+                "invalid-hydra-parameter".to_string()
+            ))
         );
         insta::assert_snapshot!(
             "diagnostic_invalid_format",
@@ -878,7 +880,9 @@ model:
         assert_eq!(diag.severity, Some(DiagnosticSeverity::ERROR));
         assert_eq!(
             diag.code,
-            Some(NumberOrString::String("invalid-hydra-parameter".to_string()))
+            Some(NumberOrString::String(
+                "invalid-hydra-parameter".to_string()
+            ))
         );
     }
 }
@@ -914,7 +918,9 @@ model:
         assert_eq!(diag.severity, Some(DiagnosticSeverity::ERROR));
         assert_eq!(
             diag.code,
-            Some(NumberOrString::String("invalid-hydra-parameter".to_string()))
+            Some(NumberOrString::String(
+                "invalid-hydra-parameter".to_string()
+            ))
         );
     }
 }
@@ -950,7 +956,9 @@ model:
         assert_eq!(diag.severity, Some(DiagnosticSeverity::ERROR));
         assert_eq!(
             diag.code,
-            Some(NumberOrString::String("invalid-hydra-parameter".to_string()))
+            Some(NumberOrString::String(
+                "invalid-hydra-parameter".to_string()
+            ))
         );
     }
 }
@@ -977,7 +985,10 @@ model:
     let keyword_diags: Vec<_> = diagnostics
         .iter()
         .filter(|d| {
-            d.code == Some(NumberOrString::String("invalid-hydra-parameter".to_string()))
+            d.code
+                == Some(NumberOrString::String(
+                    "invalid-hydra-parameter".to_string(),
+                ))
         })
         .collect();
 
@@ -1070,7 +1081,10 @@ func:
     let already_assigned: Vec<_> = diagnostics
         .iter()
         .filter(|d| {
-            d.code == Some(NumberOrString::String("parameter-already-assigned".to_string()))
+            d.code
+                == Some(NumberOrString::String(
+                    "parameter-already-assigned".to_string(),
+                ))
         })
         .collect();
 

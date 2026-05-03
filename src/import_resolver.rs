@@ -1,5 +1,5 @@
 use crate::python_analyzer::{
-    ClassExtractor, ClassInfo, FileCache, FunctionExtractor, FunctionSignature,
+    ClassExtractor, ClassInfo, FunctionExtractor, FunctionSignature, read_source,
 };
 use ruff_python_ast::{self as ast, Expr, Stmt, visitor::Visitor};
 use ruff_python_parser::parse_module;
@@ -29,20 +29,20 @@ enum ImportInfo {
 }
 
 /// Context for import resolution operations
-pub struct ImportResolver {
+pub struct ImportResolver<'db> {
+    db: &'db dyn ruff_db::Db,
     search_paths: Vec<PathBuf>,
     visited_files: HashSet<PathBuf>,
     depth: usize,
-    file_cache: FileCache,
 }
 
-impl ImportResolver {
-    pub fn new(search_paths: Vec<PathBuf>) -> Self {
+impl<'db> ImportResolver<'db> {
+    pub fn new(db: &'db dyn ruff_db::Db, search_paths: Vec<PathBuf>) -> Self {
         Self {
+            db,
             search_paths,
             visited_files: HashSet::new(),
             depth: 0,
-            file_cache: FileCache::new(),
         }
     }
 
@@ -146,8 +146,8 @@ impl ImportResolver {
 
     /// Extract __all__ from a module
     fn extract_dunder_all(&mut self, file_path: &Path) -> Option<FxHashSet<String>> {
-        let source = self.file_cache.get(file_path).ok()?;
-        let parsed = parse_module(source).ok()?;
+        let source_text = read_source(self.db, file_path).ok()?;
+        let parsed = parse_module(source_text.as_str()).ok()?;
 
         let mut dunder_all_finder = DunderAllFinder::default();
         dunder_all_finder.visit_body(parsed.suite());
@@ -160,8 +160,8 @@ impl ImportResolver {
         file_path: &Path,
         symbol_name: &str,
     ) -> Option<ImportInfo> {
-        let source = self.file_cache.get(file_path).ok()?;
-        let parsed = parse_module(source).ok()?;
+        let source_text = read_source(self.db, file_path).ok()?;
+        let parsed = parse_module(source_text.as_str()).ok()?;
 
         let mut finder = ImportFinder {
             target_symbol: symbol_name.to_string(),
@@ -173,11 +173,11 @@ impl ImportResolver {
 
     /// Extract all star imports from a module
     fn find_star_imports(&mut self, file_path: &Path) -> Vec<ImportInfo> {
-        let source = match self.file_cache.get(file_path) {
+        let source_text = match read_source(self.db, file_path) {
             Ok(s) => s,
             Err(_) => return Vec::new(),
         };
-        let parsed = match parse_module(source) {
+        let parsed = match parse_module(source_text.as_str()) {
             Ok(p) => p,
             Err(_) => return Vec::new(),
         };
@@ -189,7 +189,8 @@ impl ImportResolver {
 
     /// Check if a class is directly defined in the file
     fn find_class_direct(&mut self, file_path: &Path, class_name: &str) -> Option<ClassInfo> {
-        let source = self.file_cache.get(file_path).ok()?;
+        let source_text = read_source(self.db, file_path).ok()?;
+        let source = source_text.as_str();
         let parsed = parse_module(source).ok()?;
 
         let mut visitor = ClassExtractor::new(class_name.to_string(), source.to_string());
@@ -203,7 +204,8 @@ impl ImportResolver {
         file_path: &Path,
         function_name: &str,
     ) -> Option<FunctionSignature> {
-        let source = self.file_cache.get(file_path).ok()?;
+        let source_text = read_source(self.db, file_path).ok()?;
+        let source = source_text.as_str();
         let parsed = parse_module(source).ok()?;
 
         let mut visitor = FunctionExtractor::new(function_name.to_string(), source.to_string());

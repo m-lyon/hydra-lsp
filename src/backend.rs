@@ -3,10 +3,12 @@ use parking_lot::RwLock;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
-use tower_lsp::jsonrpc::Result;
+use tower_lsp::jsonrpc::{Error, Result};
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
 
+use ruff_db::files::File;
+use ruff_db::system::SystemPath;
 use salsa::{Database as _, Setter};
 
 use crate::database::HydraDatabase;
@@ -132,18 +134,35 @@ pub struct Settings {
     pub features: FeatureToggles,
 }
 
+#[derive(Clone)]
+struct AnalysisState {
+    db: HydraDatabase,
+    python_config: PythonConfig,
+}
+
 pub struct HydraLspBackend {
     pub client: Client,
     pub documents: Arc<DocumentStore>,
     pub settings: Arc<RwLock<Settings>>,
     /// Salsa database for incremental caching.
     /// Uses `Mutex` because salsa's Storage is `Send` but not `Sync`.
-    db: Arc<parking_lot::Mutex<HydraDatabase>>,
+    analysis: Arc<parking_lot::Mutex<Option<AnalysisState>>>,
     /// Map from document URI to its salsa input handle.
+    ///
+    /// Lock order: `document_inputs` shard guard MUST be acquired before
+    /// `self.analysis`. The reverse order would deadlock against
+    /// `get_or_create_input`, which holds the shard guard while taking
+    /// the analysis lock to keep concurrent `did_open` calls for the same
+    /// URI from creating distinct inputs.
+    ///
+    /// This map grows unbounded over the lifetime of the server (one entry
+    /// per unique URI ever opened). Salsa inputs cannot be removed from
+    /// storage, so we keep the URI→input mapping even after `did_close`
+    /// to let a subsequent `did_open` reuse the same input. Bounding by
+    /// unique URIs is the best available approximation; a long-lived
+    /// session that opens thousands of distinct files will accumulate
+    /// entries here. Per-query LRUs cap actual cached computation memory.
     document_inputs: DashMap<Url, DocumentInput>,
-    /// Salsa input for Python environment config (workspace root, interpreter).
-    /// Updated when LSP settings change; invalidates all cached definition lookups.
-    python_config: PythonConfig,
 }
 
 impl std::fmt::Debug for HydraLspBackend {
@@ -156,23 +175,84 @@ impl std::fmt::Debug for HydraLspBackend {
 }
 
 impl HydraLspBackend {
+    const ANALYSIS_STATE_PREFIX: &str = "analysis state must be initialized before ";
+
     pub fn new(client: Client) -> Self {
-        // Use the current directory as the database root.
-        let cwd_string = std::env::current_dir()
-            .ok()
-            .and_then(|p| p.to_str().map(|s| s.to_string()))
-            .unwrap_or_else(|| "/".to_string());
-        let cwd = ruff_db::system::SystemPath::new(&cwd_string);
-        let db = HydraDatabase::new(cwd);
-        let python_config = PythonConfig::new(&db, Some(cwd_string), None);
         Self {
             client,
             documents: Arc::new(DocumentStore::new()),
             settings: Arc::new(RwLock::new(Settings::default())),
-            db: Arc::new(parking_lot::Mutex::new(db)),
+            analysis: Arc::new(parking_lot::Mutex::new(None)),
             document_inputs: DashMap::new(),
-            python_config,
         }
+    }
+
+    fn fallback_workspace_root() -> Result<String> {
+        std::env::current_dir()
+            .map_err(|error| Error {
+                code: Error::internal_error().code,
+                message: format!(
+                    "failed to determine workspace root from current directory: {}",
+                    error
+                )
+                .into(),
+                data: None,
+            })?
+            .into_os_string()
+            .into_string()
+            .map_err(|path| Error {
+                code: Error::internal_error().code,
+                message: format!(
+                    "failed to determine workspace root from current directory: non-utf8 path {}",
+                    std::path::PathBuf::from(path).display()
+                )
+                .into(),
+                data: None,
+            })
+    }
+
+    fn initialize_analysis_state(
+        &self,
+        workspace_root: Option<String>,
+        interpreter: Option<String>,
+    ) -> Result<()> {
+        let workspace_root = match workspace_root {
+            Some(workspace_root) => workspace_root,
+            None => Self::fallback_workspace_root()?,
+        };
+        let cwd = SystemPath::new(&workspace_root);
+        let db = HydraDatabase::new(cwd);
+        let python_config = PythonConfig::new(&db, Some(workspace_root), interpreter);
+        *self.analysis.lock() = Some(AnalysisState { db, python_config });
+        Ok(())
+    }
+
+    fn snapshot_analysis(&self) -> Option<AnalysisState> {
+        self.analysis.lock().as_ref().cloned()
+    }
+
+    fn with_analysis<T>(
+        &self,
+        context_suffix: &'static str,
+        f: impl FnOnce(&AnalysisState) -> T,
+    ) -> T {
+        let analysis = self.analysis.lock();
+        let analysis = analysis
+            .as_ref()
+            .unwrap_or_else(|| panic!("{}{}", Self::ANALYSIS_STATE_PREFIX, context_suffix));
+        f(analysis)
+    }
+
+    fn with_analysis_mut<T>(
+        &self,
+        context_suffix: &'static str,
+        f: impl FnOnce(&mut AnalysisState) -> T,
+    ) -> T {
+        let mut analysis = self.analysis.lock();
+        let analysis = analysis
+            .as_mut()
+            .unwrap_or_else(|| panic!("{}{}", Self::ANALYSIS_STATE_PREFIX, context_suffix));
+        f(analysis)
     }
 
     /// Run Python definition lookup on a blocking thread using a database snapshot.
@@ -187,8 +267,10 @@ impl HydraLspBackend {
         &self,
         target_value: String,
     ) -> anyhow::Result<(DefinitionInfo, std::path::PathBuf, String, String)> {
-        let db = self.db.lock().clone();
-        let python_config = self.python_config;
+        let Some(analysis) = self.snapshot_analysis() else {
+            anyhow::bail!("analysis state not initialized")
+        };
+        let AnalysisState { db, python_config } = analysis;
 
         tokio::task::spawn_blocking(move || {
             let start = Instant::now();
@@ -221,30 +303,36 @@ impl HydraLspBackend {
     /// update so that concurrent callers for the same URI cannot both
     /// observe a vacant entry and create distinct inputs (which would
     /// orphan one in salsa storage and let stale text leak through).
-    /// Lock order is shard-guard → `self.db`, matching every other code
+    /// Lock order is shard-guard → `self.analysis`, matching every other code
     /// path in this module.
     fn get_or_create_input(&self, uri: &Url, text: &str, version: i32) -> DocumentInput {
-        match self.document_inputs.entry(uri.clone()) {
-            dashmap::Entry::Occupied(occ) => {
-                let input = *occ.get();
-                let mut db = self.db.lock();
-                input.set_text(&mut *db).to(text.to_string());
-                input.set_version(&mut *db).to(version);
-                input
+        self.with_analysis_mut("opening documents", |analysis| {
+            match self.document_inputs.entry(uri.clone()) {
+                dashmap::Entry::Occupied(occ) => {
+                    let input = *occ.get();
+                    input.set_text(&mut analysis.db).to(text.to_string());
+                    input.set_version(&mut analysis.db).to(version);
+                    input
+                }
+                dashmap::Entry::Vacant(vac) => {
+                    let input = DocumentInput::new(&analysis.db, text.to_string(), version);
+                    vac.insert(input);
+                    input
+                }
             }
-            dashmap::Entry::Vacant(vac) => {
-                let db = self.db.lock();
-                let input = DocumentInput::new(&*db, text.to_string(), version);
-                vac.insert(input);
-                input
-            }
-        }
+        })
     }
 }
 
 #[tower_lsp::async_trait]
 impl LanguageServer for HydraLspBackend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
+        let workspace_root = params
+            .root_uri
+            .as_ref()
+            .and_then(|root_uri| root_uri.to_file_path().ok())
+            .map(|path| path.to_string_lossy().to_string());
+
         self.client
             .log_message(
                 MessageType::INFO,
@@ -291,14 +379,6 @@ impl LanguageServer for HydraLspBackend {
                 s.features = toggles;
             }
 
-            // Update the salsa PythonConfig so cached lookups invalidate
-            if interpreter_path.is_some() {
-                let mut db = self.db.lock();
-                self.python_config
-                    .set_interpreter(&mut *db)
-                    .to(interpreter_path.clone());
-            }
-
             // Log after releasing the lock
             if let Some(ref path) = interpreter_path {
                 self.client
@@ -330,15 +410,8 @@ impl LanguageServer for HydraLspBackend {
             }
         }
 
-        // Capture workspace root from init params for Python environment discovery
-        if let Some(root_uri) = params.root_uri
-            && let Ok(root_path) = root_uri.to_file_path()
-        {
-            let mut db = self.db.lock();
-            self.python_config
-                .set_workspace_root(&mut *db)
-                .to(Some(root_path.to_string_lossy().to_string()));
-        }
+        let interpreter_path = self.settings.read().python_interpreter.clone();
+        self.initialize_analysis_state(workspace_root, interpreter_path)?;
 
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
@@ -417,12 +490,11 @@ impl LanguageServer for HydraLspBackend {
         let input = self.get_or_create_input(&uri, &text, version);
 
         // Publish diagnostics if this is a Hydra file (using cached check)
-        let is_hydra = {
-            let db = self.db.lock();
-            yaml_cache::is_hydra_file(&*db, input)
-        };
+        let is_hydra = self.with_analysis("opening documents", |analysis| {
+            yaml_cache::is_hydra_file(&analysis.db, input)
+        });
         if is_hydra && self.settings.read().features.diagnostics {
-            self.publish_diagnostics_for_document(&uri, &text).await;
+            self.publish_diagnostics_for_document(&uri).await;
         }
 
         self.client
@@ -443,13 +515,11 @@ impl LanguageServer for HydraLspBackend {
             let input = self.get_or_create_input(&uri, &change.text, version);
 
             // Re-publish diagnostics if this is a Hydra file (using cached check)
-            let is_hydra = {
-                let db = self.db.lock();
-                yaml_cache::is_hydra_file(&*db, input)
-            };
+            let is_hydra = self.with_analysis("changing documents", |analysis| {
+                yaml_cache::is_hydra_file(&analysis.db, input)
+            });
             if is_hydra && self.settings.read().features.diagnostics {
-                self.publish_diagnostics_for_document(&uri, &change.text)
-                    .await;
+                self.publish_diagnostics_for_document(&uri).await;
             }
 
             self.client
@@ -467,6 +537,36 @@ impl LanguageServer for HydraLspBackend {
             .await;
     }
 
+    async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
+        // The client tells us when files in the workspace change on disk
+        // (typically Python sources outside the editor). For each changed
+        // path we call `File::sync_path`, which bumps the per-file revision
+        // inside ruff_db so that any salsa query reading that file's
+        // `source_text` is invalidated on the next request.
+        if params.changes.is_empty() {
+            return;
+        }
+        let synced = self.with_analysis_mut("watching files", |analysis| {
+            let mut synced = 0usize;
+            for change in &params.changes {
+                let Ok(std_path) = change.uri.to_file_path() else {
+                    continue;
+                };
+                let Some(sys_path) = SystemPath::from_std_path(&std_path) else {
+                    continue;
+                };
+                File::sync_path(&mut analysis.db, sys_path);
+                synced += 1;
+            }
+            synced
+        });
+        tracing::debug!(
+            changed = params.changes.len(),
+            synced,
+            "watched files changed; synced file revisions"
+        );
+    }
+
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = params.text_document.uri;
         self.documents.remove(&uri);
@@ -478,10 +578,9 @@ impl LanguageServer for HydraLspBackend {
 
         // Enforce LRU limits after removing a document — evicts stale
         // cache entries and keeps memory bounded.
-        {
-            let mut db = self.db.lock();
-            db.trigger_lru_eviction();
-        }
+        self.with_analysis_mut("closing documents", |analysis| {
+            analysis.db.trigger_lru_eviction()
+        });
 
         self.client
             .log_message(MessageType::INFO, format!("Document closed: {}", uri))
@@ -1030,32 +1129,38 @@ impl LanguageServer for HydraLspBackend {
 impl HydraLspBackend {
     /// Publish diagnostics for a document.
     ///
-    /// Uses the cached `parsed_yaml` query when a `DocumentInput` exists
-    /// for this URI. Falls back to direct parsing otherwise.
-    async fn publish_diagnostics_for_document(&self, uri: &Url, content: &str) {
-        // Get parsed content from cache or direct parse, and snapshot the db
-        // for use by validate_document inside spawn_blocking.
-        let (parse_result, db_snapshot) = if let Some(input_ref) = self.document_inputs.get(uri) {
-            let input = *input_ref;
-            drop(input_ref);
-
-            // Get the cached parse result and extract data before releasing the lock.
-            // The lock must be released before any `.await` point.
-            let db = self.db.lock();
-            let cached = yaml_cache::parsed_yaml(&*db, input);
-            let result = match cached.result() {
-                Ok(parsed_content) => Ok(parsed_content.clone()),
-                Err(e) => Err(e.to_string()),
-            };
-            let snapshot = db.clone();
-            (result, snapshot)
-        } else {
-            let result = YamlParser::parse(content).map_err(|e| e.to_string());
-            let snapshot = self.db.lock().clone();
-            (result, snapshot)
+    /// Uses the cached `parsed_yaml` query for the document's `DocumentInput`.
+    /// Callers (`did_open`, `did_change`) always create the input first, so
+    /// the absence of an entry is a programmer error rather than a runtime
+    /// concern — we skip publishing rather than silently parsing uncached.
+    async fn publish_diagnostics_for_document(&self, uri: &Url) {
+        // Get parsed content from cache and snapshot the db for use by
+        // validate_document inside spawn_blocking.
+        let Some(input_ref) = self.document_inputs.get(uri) else {
+            debug_assert!(
+                false,
+                "publish_diagnostics_for_document called for {} with no DocumentInput; \
+                 did_open/did_change should always create one first",
+                uri
+            );
+            tracing::warn!(%uri, "no DocumentInput for diagnostics; skipping");
+            return;
         };
+        let input = *input_ref;
+        drop(input_ref);
 
-        let python_config = self.python_config;
+        let (parse_result, db_snapshot, python_config) =
+            self.with_analysis("publishing diagnostics", |analysis| {
+                // Get the cached parse result and extract data before releasing the lock.
+                // The lock must be released before any `.await` point.
+                let cached = yaml_cache::parsed_yaml(&analysis.db, input);
+                let result = match cached.result() {
+                    Ok(parsed_content) => Ok(parsed_content.clone()),
+                    Err(e) => Err(e.to_string()),
+                };
+                let snapshot = analysis.db.clone();
+                (result, snapshot, analysis.python_config)
+            });
 
         // Handle the parse result
         match parse_result {
@@ -1068,11 +1173,7 @@ impl HydraLspBackend {
                 // The snapshot lets the cached_definition_info salsa query share results
                 // with hover/signature_help/goto on the main db.
                 let join_result = tokio::task::spawn_blocking(move || {
-                    diagnostics::validate_document(
-                        parsed_content,
-                        &db_snapshot,
-                        python_config,
-                    )
+                    diagnostics::validate_document(parsed_content, &db_snapshot, python_config)
                 })
                 .await;
                 let diagnostics = match join_result {

@@ -1,4 +1,6 @@
+use hydra_lsp::database::HydraDatabase;
 use hydra_lsp::python_analyzer::{DefinitionInfo, PythonAnalyzer};
+use ruff_db::system::SystemPath;
 use std::fs;
 use std::io::Write;
 use tempfile::{NamedTempFile, TempDir};
@@ -194,8 +196,10 @@ def test_function(x: int) -> int:
     let test_file = workspace_dir.join("test_module.py");
     fs::write(&test_file, source).unwrap();
 
+    let db = HydraDatabase::new(SystemPath::new("/"));
     let (def_info, _file_path, _module_path, _symbol_name) =
         PythonAnalyzer::extract_definition_info(
+            &db,
             "workspace.test_module.test_function",
             Some(workspace_root),
             None,
@@ -234,8 +238,10 @@ class TestClass:
     let test_file = workspace_dir.join("test_class_module.py");
     fs::write(&test_file, source).unwrap();
 
+    let db = HydraDatabase::new(SystemPath::new("/"));
     let (def_info, _file_path, _module_path, _symbol_name) =
         PythonAnalyzer::extract_definition_info(
+            &db,
             "workspace.test_class_module.TestClass",
             Some(workspace_root),
             None,

@@ -59,8 +59,8 @@ impl Eq for ParsedYaml {}
 /// Cached check for whether a file is a Hydra configuration file.
 ///
 /// Depends on `DocumentInput::text`, so it automatically invalidates
-/// when the document content changes.
-#[salsa::tracked]
+/// when the document content changes. Bounded with `lru=512`.
+#[salsa::tracked(lru = 512)]
 pub fn is_hydra_file(db: &dyn salsa::Database, input: DocumentInput) -> bool {
     debug!("is_hydra_file: executing (cache miss)");
     let text = input.text(db);
@@ -182,7 +182,10 @@ mod tests {
         let input = DocumentInput::new(&db, hydra_yaml().to_string(), 1);
 
         let parsed1 = parsed_yaml(&db, input);
-        assert_eq!(parsed1.result().unwrap().hydra_objects[0].target.value, "my.Module");
+        assert_eq!(
+            parsed1.result().unwrap().hydra_objects[0].target.value,
+            "my.Module"
+        );
 
         // Update text — should reparse
         input
