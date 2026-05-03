@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.4.0]
+
+- Routed Python source reads through `ruff_db::source_text` so resolved Python definitions participate in salsa's dependency graph
+- Replaced the `PythonConfig::cache_revision` global counter with per-file `ruff_db::files::File::sync_path` invalidation in `did_change_watched_files`, so editing one Python file no longer evicts every cached resolution
+- Removed the `FileCache` wrapper from `PythonAnalyzer` and `ImportResolver` in favour of a single `read_source` helper backed by salsa
+- TODO: check later versions of ruff_db and salsa for input GC - see obsidian note
+- TODO: Assess gaps in cache usage & tokio threading and implement where possible. Possible to put functions that should first and foremost be cached in `hydra_db` and then have the backend call those functions instead of implementing caching logic within the backend itself?
+- TODO: Check code for clone usage and refactor where possible
+- TODO: refactor into smaller files
+- TODO: Do manual check whether python file updates trigger diagnostics to update, same for hydra files
+- TODO: `impl ruff_db::Db for HydraDatabase` should `python_version` be hard coded like that?
+- TODO: go through `clippy -- -W clippy::pedantic`
+
 ## [0.3.0]
 
 - Added class name for `__init__` diagnostics

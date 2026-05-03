@@ -1,4 +1,5 @@
 use crate::import_resolver::ImportResolver;
+use crate::python_cache::{PthInventory, PythonConfig};
 use anyhow::{Context, Result};
 use ruff_db::files::system_path_to_file;
 use ruff_db::source::{SourceText, source_text};
@@ -251,14 +252,26 @@ impl PythonAnalyzer {
     ///
     /// Returns the resolved file path and the search paths used
     pub fn resolve_module(
+        db: &dyn ruff_db::Db,
         module_path: &str,
         workspace_root: Option<&Path>,
         python_interpreter: Option<&str>,
     ) -> Result<(PathBuf, Vec<PathBuf>)> {
+        Self::resolve_module_impl(db, module_path, workspace_root, python_interpreter, None)
+    }
+
+    fn resolve_module_impl(
+        db: &dyn ruff_db::Db,
+        module_path: &str,
+        workspace_root: Option<&Path>,
+        python_interpreter: Option<&str>,
+        pth_inventories: Option<&[PthInventory]>,
+    ) -> Result<(PathBuf, Vec<PathBuf>)> {
         let site_packages_paths =
             Self::discover_python_environment(workspace_root, python_interpreter)
                 .unwrap_or_default();
-        let search_paths = Self::build_search_paths(workspace_root, site_packages_paths.to_vec());
+        let search_paths =
+            Self::build_search_paths(db, workspace_root, site_packages_paths, pth_inventories);
         let file_path = Self::resolve_module_with_search_paths(module_path, &search_paths)?;
         Ok((file_path, search_paths))
     }
@@ -592,8 +605,10 @@ impl PythonAnalyzer {
 
     /// Build search paths from discovered site-packages
     fn build_search_paths(
+        db: &dyn ruff_db::Db,
         workspace_root: Option<&Path>,
         site_packages_paths: Vec<SystemPathBuf>,
+        pth_inventories: Option<&[PthInventory]>,
     ) -> Vec<PathBuf> {
         let mut search_paths = Vec::new();
 
@@ -610,7 +625,7 @@ impl PythonAnalyzer {
             let site_packages = sys_path.as_std_path().to_path_buf();
 
             // Process .pth files in this site-packages directory
-            let editable_paths = Self::parse_pth_files(&site_packages);
+            let editable_paths = Self::parse_pth_files(db, &site_packages, pth_inventories);
 
             search_paths.push(site_packages);
             search_paths.extend(editable_paths);
@@ -627,8 +642,24 @@ impl PythonAnalyzer {
     /// - All other lines are treated as directories to add to `sys.path`
     ///
     /// See: https://docs.python.org/3/library/site.html
-    fn parse_pth_files(site_packages: &Path) -> Vec<PathBuf> {
+    pub(crate) fn parse_pth_files(
+        db: &dyn ruff_db::Db,
+        site_packages: &Path,
+        pth_inventories: Option<&[PthInventory]>,
+    ) -> Vec<PathBuf> {
         let mut paths = Vec::new();
+
+        // Depend on the tracked inventory for this directory so `.pth`
+        // create/delete events invalidate the directory scan.
+        if let Some(inventory) = pth_inventories.and_then(|inventories| {
+            let site_packages = site_packages.to_string_lossy();
+            inventories
+                .iter()
+                .copied()
+                .find(|inventory| inventory.directory(db).as_str() == site_packages.as_ref())
+        }) {
+            let _ = inventory.revision(db);
+        }
 
         let Ok(entries) = fs::read_dir(site_packages) else {
             return paths;
@@ -643,30 +674,31 @@ impl PythonAnalyzer {
         pth_files.sort();
 
         for pth_file in pth_files {
-            if let Ok(contents) = fs::read_to_string(&pth_file) {
-                for line in contents.lines() {
-                    let line = line.trim_end();
+            let Ok(contents) = read_source(db, &pth_file) else {
+                continue;
+            };
+            for line in contents.as_str().lines() {
+                let line = line.trim_end();
 
-                    // Skip empty lines, comments, and import statements
-                    if line.is_empty()
-                        || line.starts_with('#')
-                        || line.starts_with("import ")
-                        || line.starts_with("import\t")
-                    {
-                        continue;
-                    }
+                // Skip empty lines, comments, and import statements
+                if line.is_empty()
+                    || line.starts_with('#')
+                    || line.starts_with("import ")
+                    || line.starts_with("import\t")
+                {
+                    continue;
+                }
 
-                    // Resolve relative paths relative to site-packages
-                    let path = if Path::new(line).is_absolute() {
-                        PathBuf::from(line)
-                    } else {
-                        site_packages.join(line)
-                    };
+                // Resolve relative paths relative to site-packages
+                let path = if Path::new(line).is_absolute() {
+                    PathBuf::from(line)
+                } else {
+                    site_packages.join(line)
+                };
 
-                    // Only add if the directory exists
-                    if path.is_dir() {
-                        paths.push(path);
-                    }
+                // Only add if the directory exists
+                if path.is_dir() {
+                    paths.push(path);
                 }
             }
         }
@@ -953,14 +985,46 @@ impl PythonAnalyzer {
         workspace_root: Option<&Path>,
         python_interpreter: Option<&str>,
     ) -> Result<(DefinitionInfo, PathBuf, String, String)> {
+        Self::extract_definition_info_impl(db, target, workspace_root, python_interpreter, None)
+    }
+
+    pub(crate) fn extract_definition_info_for_config(
+        db: &dyn ruff_db::Db,
+        target: &str,
+        config: PythonConfig,
+    ) -> Result<(DefinitionInfo, PathBuf, String, String)> {
+        let workspace_root = config.workspace_root(db).as_deref().map(PathBuf::from);
+        let interpreter = config.interpreter(db);
+        let pth_inventories = config.pth_inventories(db);
+        Self::extract_definition_info_impl(
+            db,
+            target,
+            workspace_root.as_deref().map(Path::new),
+            interpreter.as_deref(),
+            Some(pth_inventories.as_slice()),
+        )
+    }
+
+    fn extract_definition_info_impl(
+        db: &dyn ruff_db::Db,
+        target: &str,
+        workspace_root: Option<&Path>,
+        python_interpreter: Option<&str>,
+        pth_inventories: Option<&[PthInventory]>,
+    ) -> Result<(DefinitionInfo, PathBuf, String, String)> {
         let (module_path, symbol_name) = Self::split_target(target)?;
 
         // Track whether we found the module but not the symbol
         let mut module_found = false;
 
         // First try standard resolution: module.symbol where symbol is a function or class
-        if let Ok((file_path, search_paths)) =
-            Self::resolve_module(&module_path, workspace_root, python_interpreter)
+        if let Ok((file_path, search_paths)) = Self::resolve_module_impl(
+            db,
+            &module_path,
+            workspace_root,
+            python_interpreter,
+            pth_inventories,
+        )
         {
             module_found = true;
 
@@ -996,7 +1060,13 @@ impl PythonAnalyzer {
         // or nested pattern (e.g., "my_module.OuterClass.nested.nested_class.method")
         // or nested class pattern (e.g., "my_module.OuterClass.nested.nested_class")
         if let Some(result) =
-            Self::resolve_class_attribute_chain(db, target, workspace_root, python_interpreter)
+            Self::resolve_class_attribute_chain(
+                db,
+                target,
+                workspace_root,
+                python_interpreter,
+                pth_inventories,
+            )
         {
             match result {
                 ClassAttributeChainResult::Method {
@@ -1067,6 +1137,7 @@ impl PythonAnalyzer {
         target: &str,
         workspace_root: Option<&Path>,
         python_interpreter: Option<&str>,
+        pth_inventories: Option<&[PthInventory]>,
     ) -> Option<ClassAttributeChainResult> {
         let parts: Vec<&str> = target.split('.').collect();
         if parts.len() < 3 {
@@ -1086,8 +1157,13 @@ impl PythonAnalyzer {
             let remaining_parts = &parts[module_end_idx..];
 
             // Try to resolve the module
-            let Ok((file_path, search_paths)) =
-                Self::resolve_module(&module_path, workspace_root, python_interpreter)
+            let Ok((file_path, search_paths)) = Self::resolve_module_impl(
+                db,
+                &module_path,
+                workspace_root,
+                python_interpreter,
+                pth_inventories,
+            )
             else {
                 continue;
             };
@@ -1822,7 +1898,8 @@ mod tests {
     #[test]
     fn test_resolve_module_simple() {
         let examples_dir = get_simple_test_dir();
-        let result = PythonAnalyzer::resolve_module("my_module", Some(&examples_dir), None);
+        let db = test_db();
+        let result = PythonAnalyzer::resolve_module(&db, "my_module", Some(&examples_dir), None);
         assert!(result.is_ok());
         let (path, _) = result.unwrap();
         assert!(path.ends_with("my_module.py"));
@@ -1831,7 +1908,9 @@ mod tests {
     #[test]
     fn test_resolve_module_package() {
         let examples_dir = get_simple_test_dir();
-        let result = PythonAnalyzer::resolve_module("test_package", Some(&examples_dir), None);
+        let db = test_db();
+        let result =
+            PythonAnalyzer::resolve_module(&db, "test_package", Some(&examples_dir), None);
         assert!(result.is_ok());
         let (path, _) = result.unwrap();
         assert!(path.ends_with("__init__.py"));
@@ -1840,8 +1919,13 @@ mod tests {
     #[test]
     fn test_resolve_module_submodule() {
         let examples_dir = get_simple_test_dir();
-        let result =
-            PythonAnalyzer::resolve_module("test_package.submodule", Some(&examples_dir), None);
+        let db = test_db();
+        let result = PythonAnalyzer::resolve_module(
+            &db,
+            "test_package.submodule",
+            Some(&examples_dir),
+            None,
+        );
         assert!(result.is_ok());
         let (path, _) = result.unwrap();
         assert!(path.ends_with("submodule.py"));
@@ -1850,8 +1934,13 @@ mod tests {
     #[test]
     fn test_resolve_module_nonexistent() {
         let examples_dir = get_simple_test_dir();
-        let result =
-            PythonAnalyzer::resolve_module("nonexistent_module", Some(&examples_dir), None);
+        let db = test_db();
+        let result = PythonAnalyzer::resolve_module(
+            &db,
+            "nonexistent_module",
+            Some(&examples_dir),
+            None,
+        );
         assert!(result.is_err());
     }
 
@@ -3046,11 +3135,9 @@ mod tests {
         let system_python_str = system_python.to_str().unwrap();
 
         // Resolve a module with explicit interpreter configuration
-        let result_with_config = PythonAnalyzer::resolve_module(
-            "my_module",
-            Some(&examples_dir),
-            Some(system_python_str),
-        );
+        let db = test_db();
+        let result_with_config =
+            PythonAnalyzer::resolve_module(&db, "my_module", Some(&examples_dir), Some(system_python_str));
 
         // Should succeed using the configured interpreter
         assert!(
@@ -3066,7 +3153,8 @@ mod tests {
         let examples_dir = get_simple_test_dir();
 
         // Resolve a module without explicit interpreter configuration (None)
-        let result = PythonAnalyzer::resolve_module("my_module", Some(&examples_dir), None);
+        let db = test_db();
+        let result = PythonAnalyzer::resolve_module(&db, "my_module", Some(&examples_dir), None);
 
         // Should still succeed using auto-discovery
         assert!(
@@ -3133,7 +3221,9 @@ mod tests {
 
         // Test with configured interpreter (priority 1)
         if let Ok(python_path) = which::which("python3").or_else(|_| which::which("python")) {
+            let db = test_db();
             let result_configured = PythonAnalyzer::resolve_module(
+                &db,
                 "my_module",
                 Some(&examples_dir),
                 python_path.to_str(),
@@ -3145,7 +3235,8 @@ mod tests {
         }
 
         // Test with auto-discovery (priority 2)
-        let result_auto = PythonAnalyzer::resolve_module("my_module", Some(&examples_dir), None);
+        let db = test_db();
+        let result_auto = PythonAnalyzer::resolve_module(&db, "my_module", Some(&examples_dir), None);
         assert!(result_auto.is_ok(), "Should resolve with auto-discovery");
     }
 
@@ -3599,8 +3690,9 @@ mod tests {
         // Test parsing .pth files from the editable test workspace
         let workspace_dir = get_editable_test_dir();
         let site_packages = workspace_dir.join("site-packages");
+        let db = test_db();
 
-        let paths = PythonAnalyzer::parse_pth_files(&site_packages);
+        let paths = PythonAnalyzer::parse_pth_files(&db, &site_packages, None);
 
         // Should find the path from _editable_package.pth
         assert!(!paths.is_empty(), "Should find paths from .pth files");
@@ -3614,7 +3706,8 @@ mod tests {
     fn test_parse_pth_files_nonexistent_dir() {
         // Test that parsing .pth files from nonexistent directory returns empty
         let nonexistent = PathBuf::from("/nonexistent/path/site-packages");
-        let paths = PythonAnalyzer::parse_pth_files(&nonexistent);
+        let db = test_db();
+        let paths = PythonAnalyzer::parse_pth_files(&db, &nonexistent, None);
         assert!(paths.is_empty(), "Should return empty for nonexistent dir");
     }
 
@@ -3623,11 +3716,12 @@ mod tests {
         // Test resolving a module from an editable install via .pth file
         let workspace_dir = get_editable_test_dir();
         let site_packages = workspace_dir.join("site-packages");
+        let db = test_db();
 
         // Build search paths manually with site-packages that has .pth files
         let mut search_paths = vec![workspace_dir.clone()];
         search_paths.push(site_packages.clone());
-        search_paths.extend(PythonAnalyzer::parse_pth_files(&site_packages));
+        search_paths.extend(PythonAnalyzer::parse_pth_files(&db, &site_packages, None));
 
         // The editable_package should now be resolvable
         let result =
@@ -3651,11 +3745,12 @@ mod tests {
         // Test extracting class definition from an editable package via .pth resolution
         let workspace_dir = get_editable_test_dir();
         let site_packages = workspace_dir.join("site-packages");
+        let db = test_db();
 
         // Build search paths manually with site-packages that has .pth files
         let mut search_paths = vec![workspace_dir.clone()];
         search_paths.push(site_packages.clone());
-        search_paths.extend(PythonAnalyzer::parse_pth_files(&site_packages));
+        search_paths.extend(PythonAnalyzer::parse_pth_files(&db, &site_packages, None));
 
         // Resolve the module first
         let module_path =

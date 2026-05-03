@@ -13,8 +13,9 @@ use crate::python_analyzer::{DefinitionInfo, PythonAnalyzer};
 ///
 /// This input participates in the cache key for Python definition lookups, so
 /// changing its values invalidates cached module-resolution results. Per-file
-/// invalidation for watched Python source changes is handled separately via
-/// `ruff_db::files::File::sync_path` in the LSP backend.
+/// invalidation for watched Python source and existing `.pth` edits is handled
+/// separately via `ruff_db::files::File::sync_path` in the LSP backend, while
+/// `.pth` create/delete events update the per-directory inventories below.
 #[salsa::input]
 pub struct PythonConfig {
     /// Workspace root directory path.
@@ -24,6 +25,19 @@ pub struct PythonConfig {
     /// Configured Python interpreter path.
     #[returns(ref)]
     pub interpreter: Option<String>,
+
+    /// Tracked inventories for site-packages directories whose `.pth` members
+    /// can affect editable-install resolution.
+    #[returns(ref)]
+    pub pth_inventories: Vec<PthInventory>,
+}
+
+/// Tracked membership revision for `.pth` files under one site-packages directory.
+#[salsa::input]
+pub struct PthInventory {
+    #[returns(ref)]
+    pub directory: String,
+    pub revision: u64,
 }
 
 /// Interned target string for cache key deduplication.
@@ -90,7 +104,8 @@ impl Eq for CachedDefinitionResult {}
 /// Wraps `PythonAnalyzer::extract_definition_info` with salsa caching.
 /// The result is cached and only recomputed when:
 /// - The target string changes (different `_target_` value)
-/// - The Python configuration changes (interpreter or workspace root)
+/// - The Python configuration changes (interpreter, workspace root, or `.pth`
+///   inventory handles)
 ///
 /// Uses `lru=1024` to bound memory for workspaces with many distinct targets.
 /// Hydra projects often reference many `_target_` strings (e.g. one per config),
@@ -107,14 +122,8 @@ pub fn cached_definition_info<'db>(
         "cached_definition_info: executing (cache miss)"
     );
 
-    let workspace_root = config.workspace_root(db).as_deref().map(PathBuf::from);
-    let interpreter = config.interpreter(db);
-
-    CachedDefinitionResult::from_result(PythonAnalyzer::extract_definition_info(
-        db,
-        target_str,
-        workspace_root.as_deref().map(std::path::Path::new),
-        interpreter.as_deref(),
+    CachedDefinitionResult::from_result(PythonAnalyzer::extract_definition_info_for_config(
+        db, target_str, config,
     ))
 }
 
@@ -125,6 +134,35 @@ mod tests {
     use crate::database::tests::TestDb;
     use ruff_db::system::SystemPath;
     use salsa::Setter;
+    use std::path::Path;
+
+    #[salsa::interned]
+    struct SitePackagesPath {
+        #[returns(ref)]
+        path: String,
+    }
+
+    #[salsa::tracked(returns(ref))]
+    fn tracked_pth_paths<'db>(
+        db: &'db dyn ruff_db::Db,
+        site_packages: SitePackagesPath<'db>,
+    ) -> Vec<PathBuf> {
+        PythonAnalyzer::parse_pth_files(db, Path::new(site_packages.path(db)), None)
+    }
+
+    #[salsa::tracked(returns(ref))]
+    fn tracked_pth_paths_with_inventory<'db>(
+        db: &'db dyn ruff_db::Db,
+        config: PythonConfig,
+        site_packages: SitePackagesPath<'db>,
+    ) -> Vec<PathBuf> {
+        let inventories = config.pth_inventories(db);
+        PythonAnalyzer::parse_pth_files(
+            db,
+            Path::new(site_packages.path(db)),
+            Some(inventories.as_slice()),
+        )
+    }
 
     fn examples_dir() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/workspace/simple")
@@ -139,21 +177,26 @@ mod tests {
     #[test]
     fn test_python_config_fields() {
         let db = TestDb::new();
-        let config = PythonConfig::new(&db, Some("/workspace".to_string()), None);
+        let config = PythonConfig::new(&db, Some("/workspace".to_string()), None, vec![]);
         assert_eq!(config.workspace_root(&db).as_deref(), Some("/workspace"));
         assert_eq!(config.interpreter(&db).as_deref(), None);
+        assert!(config.pth_inventories(&db).is_empty());
     }
 
     #[test]
     fn test_python_config_update() {
         let mut db = TestDb::new();
-        let config = PythonConfig::new(&db, None, None);
+        let config = PythonConfig::new(&db, None, None, vec![]);
         assert!(config.interpreter(&db).is_none());
 
         config
             .set_interpreter(&mut db)
             .to(Some("/usr/bin/python3".to_string()));
         assert_eq!(config.interpreter(&db).as_deref(), Some("/usr/bin/python3"));
+
+        let inventory = PthInventory::new(&db, "/workspace/site-packages".to_string(), 0);
+        config.set_pth_inventories(&mut db).to(vec![inventory]);
+        assert!(config.pth_inventories(&db) == &[inventory]);
     }
 
     #[test]
@@ -175,7 +218,12 @@ mod tests {
     fn test_cached_definition_info_valid_target() {
         let db = real_fs_db();
         let workspace = examples_dir();
-        let config = PythonConfig::new(&db, Some(workspace.to_string_lossy().to_string()), None);
+        let config = PythonConfig::new(
+            &db,
+            Some(workspace.to_string_lossy().to_string()),
+            None,
+            vec![],
+        );
         let target = TargetString::new(&db, "my_module.DataLoader".to_string());
         let result = cached_definition_info(&db, config, target);
 
@@ -188,7 +236,12 @@ mod tests {
     fn test_cached_definition_info_invalid_target() {
         let db = TestDb::new();
         let workspace = examples_dir();
-        let config = PythonConfig::new(&db, Some(workspace.to_string_lossy().to_string()), None);
+        let config = PythonConfig::new(
+            &db,
+            Some(workspace.to_string_lossy().to_string()),
+            None,
+            vec![],
+        );
         let target = TargetString::new(&db, "nonexistent.Module".to_string());
         let result = cached_definition_info(&db, config, target);
         assert!(result.get().is_err());
@@ -198,7 +251,12 @@ mod tests {
     fn test_cached_definition_info_cache_hit() {
         let db = real_fs_db();
         let workspace = examples_dir();
-        let config = PythonConfig::new(&db, Some(workspace.to_string_lossy().to_string()), None);
+        let config = PythonConfig::new(
+            &db,
+            Some(workspace.to_string_lossy().to_string()),
+            None,
+            vec![],
+        );
         let target = TargetString::new(&db, "my_module.DataLoader".to_string());
 
         let result1 = cached_definition_info(&db, config, target);
@@ -212,7 +270,12 @@ mod tests {
     fn test_cached_definition_info_function_target() {
         let db = real_fs_db();
         let workspace = examples_dir();
-        let config = PythonConfig::new(&db, Some(workspace.to_string_lossy().to_string()), None);
+        let config = PythonConfig::new(
+            &db,
+            Some(workspace.to_string_lossy().to_string()),
+            None,
+            vec![],
+        );
         let target = TargetString::new(&db, "my_module.create_model".to_string());
         let result = cached_definition_info(&db, config, target);
 
@@ -225,7 +288,12 @@ mod tests {
     fn test_cached_definition_info_invalidation_on_config_change() {
         let mut db = real_fs_db();
         let workspace = examples_dir();
-        let config = PythonConfig::new(&db, Some(workspace.to_string_lossy().to_string()), None);
+        let config = PythonConfig::new(
+            &db,
+            Some(workspace.to_string_lossy().to_string()),
+            None,
+            vec![],
+        );
 
         let result1 = {
             let target = TargetString::new(&db, "my_module.DataLoader".to_string());
@@ -248,6 +316,7 @@ mod tests {
 
     #[test]
     fn test_cached_definition_info_invalidation_on_file_sync() {
+        use filetime::{FileTime, set_file_mtime};
         use ruff_db::files::File;
         use std::fs;
         use tempfile::TempDir;
@@ -264,25 +333,35 @@ mod tests {
             "class WatchedClass:\n    \"\"\"v1\"\"\"\n    pass\n",
         )
         .expect("write v1");
+        // Pin the initial mtime so the post-write bump below is unambiguous,
+        // even on filesystems with second-resolution mtimes (network mounts,
+        // older HFS+, ext3) where relying on the wall clock is flaky.
+        set_file_mtime(&py_file, FileTime::from_unix_time(1_000_000, 0))
+            .expect("set initial mtime");
 
         let mut db = real_fs_db();
-        let config = PythonConfig::new(&db, Some(workspace.to_string_lossy().to_string()), None);
+        let config = PythonConfig::new(
+            &db,
+            Some(workspace.to_string_lossy().to_string()),
+            None,
+            vec![],
+        );
         let result1 = {
             let target = TargetString::new(&db, "watched_module.WatchedClass".to_string());
             cached_definition_info(&db, config, target)
         };
         assert!(result1.get().is_ok(), "should resolve WatchedClass");
 
-        // Modify the file on disk, then sync — this models what the LSP does
-        // when did_change_watched_files notifies us of a real change.
-        // Sleep briefly to ensure the mtime changes on filesystems with
-        // coarse-grained timestamps.
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        // Modify the file on disk and force the mtime to a known-newer value
+        // so `sync_path` definitely sees a change. This models what the LSP
+        // does when did_change_watched_files notifies us of a real change.
         fs::write(
             &py_file,
             "class WatchedClass:\n    \"\"\"v2\"\"\"\n    pass\n",
         )
         .expect("write v2");
+        set_file_mtime(&py_file, FileTime::from_unix_time(2_000_000, 0))
+            .expect("set updated mtime");
 
         let sys_path = SystemPath::from_std_path(&py_file).unwrap();
         File::sync_path(&mut db, sys_path);
@@ -294,6 +373,92 @@ mod tests {
         assert!(
             result1 != result2,
             "memo should be invalidated after sync_path picks up the disk change"
+        );
+    }
+
+    #[test]
+    fn test_cached_definition_info_invalidation_on_pth_file_sync() {
+        use filetime::{FileTime, set_file_mtime};
+        use ruff_db::files::File;
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let site_packages = tmp.path().join("site-packages");
+        let editable_src = tmp.path().join("src");
+        fs::create_dir_all(&site_packages).expect("create site-packages dir");
+        fs::create_dir_all(&editable_src).expect("create editable src dir");
+
+        let pth_file = site_packages.join("editable_package.pth");
+        fs::write(&pth_file, "../src\n").expect("write initial pth");
+        set_file_mtime(&pth_file, FileTime::from_unix_time(1_000_000, 0))
+            .expect("set initial pth mtime");
+
+        let mut db = real_fs_db();
+        let site_packages_str = site_packages.to_string_lossy().to_string();
+        let result1 = {
+            let site_packages_key = SitePackagesPath::new(&db, site_packages_str.clone());
+            tracked_pth_paths(&db, site_packages_key).clone()
+        };
+        assert_eq!(result1.len(), 1);
+        assert_eq!(
+            std::fs::canonicalize(&result1[0]).expect("canonicalize returned editable path"),
+            std::fs::canonicalize(&editable_src).expect("canonicalize expected editable path"),
+        );
+
+        fs::write(&pth_file, "../missing\n").expect("write updated pth");
+        set_file_mtime(&pth_file, FileTime::from_unix_time(2_000_000, 0))
+            .expect("set updated pth mtime");
+
+        let sys_path = SystemPath::from_std_path(&pth_file).unwrap();
+        File::sync_path(&mut db, sys_path);
+
+        let result2 = {
+            let site_packages_key = SitePackagesPath::new(&db, site_packages_str);
+            tracked_pth_paths(&db, site_packages_key).clone()
+        };
+        assert!(result2.is_empty());
+    }
+
+    #[test]
+    fn test_pth_inventory_invalidation_on_file_create() {
+        use filetime::{FileTime, set_file_mtime};
+        use ruff_db::files::File;
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let site_packages = tmp.path().join("site-packages");
+        let editable_src = tmp.path().join("src");
+        fs::create_dir_all(&site_packages).expect("create site-packages dir");
+        fs::create_dir_all(&editable_src).expect("create editable src dir");
+
+        let mut db = real_fs_db();
+        let inventory = PthInventory::new(&db, site_packages.to_string_lossy().to_string(), 0);
+        let config = PythonConfig::new(&db, None, None, vec![inventory]);
+        let site_packages_str = site_packages.to_string_lossy().to_string();
+        let result1 = {
+            let site_packages_key = SitePackagesPath::new(&db, site_packages_str.clone());
+            tracked_pth_paths_with_inventory(&db, config, site_packages_key).clone()
+        };
+        assert!(result1.is_empty());
+
+        let pth_file = site_packages.join("editable_package.pth");
+        fs::write(&pth_file, "../src\n").expect("write pth");
+        set_file_mtime(&pth_file, FileTime::from_unix_time(1_000_000, 0)).expect("set pth mtime");
+
+        let sys_path = SystemPath::from_std_path(&pth_file).unwrap();
+        File::sync_path(&mut db, sys_path);
+        inventory.set_revision(&mut db).to(1);
+
+        let result2 = {
+            let site_packages_key = SitePackagesPath::new(&db, site_packages_str);
+            tracked_pth_paths_with_inventory(&db, config, site_packages_key).clone()
+        };
+        assert_eq!(result2.len(), 1);
+        assert_eq!(
+            std::fs::canonicalize(&result2[0]).expect("canonicalize returned editable path"),
+            std::fs::canonicalize(&editable_src).expect("canonicalize expected editable path"),
         );
     }
 

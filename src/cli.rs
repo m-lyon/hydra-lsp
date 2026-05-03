@@ -256,6 +256,7 @@ fn run(args: &Args) -> anyhow::Result<i32> {
             .as_ref()
             .map(|p| p.to_string_lossy().to_string()),
         python_interpreter.clone(),
+        vec![],
     );
     let diagnostics = validate_document(parsed_content, &db, python_config);
 

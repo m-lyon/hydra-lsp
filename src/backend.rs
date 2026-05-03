@@ -1,6 +1,6 @@
 use dashmap::DashMap;
 use parking_lot::RwLock;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 use tower_lsp::jsonrpc::{Error, Result};
@@ -15,7 +15,7 @@ use crate::database::HydraDatabase;
 use crate::diagnostics::{self, DiagnosticRule};
 use crate::document::DocumentStore;
 use crate::python_analyzer::{DefinitionInfo, ParameterInfo, PythonAnalyzer};
-use crate::python_cache::{self, PythonConfig, TargetString};
+use crate::python_cache::{self, PthInventory, PythonConfig, TargetString};
 use crate::yaml_cache::{self, DocumentInput};
 use crate::yaml_parser::{
     ARGS_KEY, CONVERT_KEY, CompletionContext, ConvertMode, HydraSemanticToken, PARTIAL_KEY,
@@ -138,6 +138,23 @@ pub struct Settings {
 struct AnalysisState {
     db: HydraDatabase,
     python_config: PythonConfig,
+    pth_inventories: HashMap<String, PthInventory>,
+}
+
+impl AnalysisState {
+    fn ensure_pth_inventory(&mut self, directory: &std::path::Path) -> PthInventory {
+        let key = directory.to_string_lossy().to_string();
+        if let Some(inventory) = self.pth_inventories.get(&key) {
+            return *inventory;
+        }
+
+        let inventory = PthInventory::new(&self.db, key.clone(), 0);
+        let mut inventories = self.python_config.pth_inventories(&self.db).clone();
+        inventories.push(inventory);
+        self.python_config.set_pth_inventories(&mut self.db).to(inventories);
+        self.pth_inventories.insert(key, inventory);
+        inventory
+    }
 }
 
 pub struct HydraLspBackend {
@@ -149,11 +166,12 @@ pub struct HydraLspBackend {
     analysis: Arc<parking_lot::Mutex<Option<AnalysisState>>>,
     /// Map from document URI to its salsa input handle.
     ///
-    /// Lock order: `document_inputs` shard guard MUST be acquired before
-    /// `self.analysis`. The reverse order would deadlock against
-    /// `get_or_create_input`, which holds the shard guard while taking
-    /// the analysis lock to keep concurrent `did_open` calls for the same
-    /// URI from creating distinct inputs.
+    /// Lock order: `self.analysis` MUST be acquired before any
+    /// `document_inputs` shard guard. `get_or_create_input` takes the
+    /// analysis lock first and then enters the shard inside the closure
+    /// to keep concurrent `did_open` calls for the same URI from creating
+    /// distinct inputs. Any code path that already holds a shard guard
+    /// must drop it before locking `analysis`.
     ///
     /// This map grows unbounded over the lifetime of the server (one entry
     /// per unique URI ever opened). Salsa inputs cannot be removed from
@@ -175,8 +193,6 @@ impl std::fmt::Debug for HydraLspBackend {
 }
 
 impl HydraLspBackend {
-    const ANALYSIS_STATE_PREFIX: &str = "analysis state must be initialized before ";
-
     pub fn new(client: Client) -> Self {
         Self {
             client,
@@ -222,8 +238,12 @@ impl HydraLspBackend {
         };
         let cwd = SystemPath::new(&workspace_root);
         let db = HydraDatabase::new(cwd);
-        let python_config = PythonConfig::new(&db, Some(workspace_root), interpreter);
-        *self.analysis.lock() = Some(AnalysisState { db, python_config });
+        let python_config = PythonConfig::new(&db, Some(workspace_root), interpreter, vec![]);
+        *self.analysis.lock() = Some(AnalysisState {
+            db,
+            python_config,
+            pth_inventories: HashMap::new(),
+        });
         Ok(())
     }
 
@@ -231,28 +251,40 @@ impl HydraLspBackend {
         self.analysis.lock().as_ref().cloned()
     }
 
+    /// Run `f` with a borrow of the initialized analysis state, returning
+    /// `None` (and logging a warning that names `context`) if the state has
+    /// not yet been built by `initialize`. The LSP protocol requires the
+    /// client to send `initialize` first, so reaching `None` means a
+    /// misbehaving client — notification handlers should ignore the event
+    /// rather than panic.
     fn with_analysis<T>(
         &self,
-        context_suffix: &'static str,
+        context: &'static str,
         f: impl FnOnce(&AnalysisState) -> T,
-    ) -> T {
+    ) -> Option<T> {
         let analysis = self.analysis.lock();
-        let analysis = analysis
-            .as_ref()
-            .unwrap_or_else(|| panic!("{}{}", Self::ANALYSIS_STATE_PREFIX, context_suffix));
-        f(analysis)
+        match analysis.as_ref() {
+            Some(state) => Some(f(state)),
+            None => {
+                tracing::warn!(context, "analysis state not initialized; ignoring");
+                None
+            }
+        }
     }
 
     fn with_analysis_mut<T>(
         &self,
-        context_suffix: &'static str,
+        context: &'static str,
         f: impl FnOnce(&mut AnalysisState) -> T,
-    ) -> T {
+    ) -> Option<T> {
         let mut analysis = self.analysis.lock();
-        let analysis = analysis
-            .as_mut()
-            .unwrap_or_else(|| panic!("{}{}", Self::ANALYSIS_STATE_PREFIX, context_suffix));
-        f(analysis)
+        match analysis.as_mut() {
+            Some(state) => Some(f(state)),
+            None => {
+                tracing::warn!(context, "analysis state not initialized; ignoring");
+                None
+            }
+        }
     }
 
     /// Run Python definition lookup on a blocking thread using a database snapshot.
@@ -270,7 +302,11 @@ impl HydraLspBackend {
         let Some(analysis) = self.snapshot_analysis() else {
             anyhow::bail!("analysis state not initialized")
         };
-        let AnalysisState { db, python_config } = analysis;
+        let AnalysisState {
+            db,
+            python_config,
+            ..
+        } = analysis;
 
         tokio::task::spawn_blocking(move || {
             let start = Instant::now();
@@ -299,13 +335,15 @@ impl HydraLspBackend {
 
     /// Get or create a `DocumentInput` for a given URI.
     ///
-    /// Holds the DashMap shard's write guard for `uri` across the salsa
-    /// update so that concurrent callers for the same URI cannot both
-    /// observe a vacant entry and create distinct inputs (which would
-    /// orphan one in salsa storage and let stale text leak through).
-    /// Lock order is shard-guard → `self.analysis`, matching every other code
-    /// path in this module.
-    fn get_or_create_input(&self, uri: &Url, text: &str, version: i32) -> DocumentInput {
+    /// Holds the analysis lock across the DashMap entry so that concurrent
+    /// callers for the same URI cannot both observe a vacant entry and
+    /// create distinct inputs (which would orphan one in salsa storage and
+    /// let stale text leak through). Lock order is `self.analysis` → shard
+    /// guard.
+    ///
+    /// Returns `None` when analysis state is not yet initialized; callers
+    /// (notification handlers) should treat that as a no-op.
+    fn get_or_create_input(&self, uri: &Url, text: &str, version: i32) -> Option<DocumentInput> {
         self.with_analysis_mut("opening documents", |analysis| {
             match self.document_inputs.entry(uri.clone()) {
                 dashmap::Entry::Occupied(occ) => {
@@ -486,13 +524,18 @@ impl LanguageServer for HydraLspBackend {
 
         self.documents.insert(uri.clone(), text.clone(), version);
 
-        // Create a salsa input for this document
-        let input = self.get_or_create_input(&uri, &text, version);
+        // Create a salsa input for this document. Returns None (and logs)
+        // when called before initialize.
+        let Some(input) = self.get_or_create_input(&uri, &text, version) else {
+            return;
+        };
 
         // Publish diagnostics if this is a Hydra file (using cached check)
-        let is_hydra = self.with_analysis("opening documents", |analysis| {
-            yaml_cache::is_hydra_file(&analysis.db, input)
-        });
+        let is_hydra = self
+            .with_analysis("opening documents", |analysis| {
+                yaml_cache::is_hydra_file(&analysis.db, input)
+            })
+            .unwrap_or(false);
         if is_hydra && self.settings.read().features.diagnostics {
             self.publish_diagnostics_for_document(&uri).await;
         }
@@ -511,13 +554,18 @@ impl LanguageServer for HydraLspBackend {
             self.documents
                 .update(uri.clone(), change.text.clone(), version);
 
-            // Update the salsa input (invalidates cached queries)
-            let input = self.get_or_create_input(&uri, &change.text, version);
+            // Update the salsa input (invalidates cached queries). Returns
+            // None (and logs) when called before initialize.
+            let Some(input) = self.get_or_create_input(&uri, &change.text, version) else {
+                return;
+            };
 
             // Re-publish diagnostics if this is a Hydra file (using cached check)
-            let is_hydra = self.with_analysis("changing documents", |analysis| {
-                yaml_cache::is_hydra_file(&analysis.db, input)
-            });
+            let is_hydra = self
+                .with_analysis("changing documents", |analysis| {
+                    yaml_cache::is_hydra_file(&analysis.db, input)
+                })
+                .unwrap_or(false);
             if is_hydra && self.settings.read().features.diagnostics {
                 self.publish_diagnostics_for_document(&uri).await;
             }
@@ -543,27 +591,67 @@ impl LanguageServer for HydraLspBackend {
         // path we call `File::sync_path`, which bumps the per-file revision
         // inside ruff_db so that any salsa query reading that file's
         // `source_text` is invalidated on the next request.
+        //
+        // We filter to Python analysis inputs before locking: `.py`, `.pyi`,
+        // and watched `.pth` files all participate in analysis. Syncing
+        // existing files bumps the per-file revision inside ruff_db so any
+        // query that read them through `source_text` is invalidated on the
+        // next request. For `.pth` create/delete events we also bump the
+        // tracked inventory for that site-packages directory so the directory
+        // scan is recomputed.
         if params.changes.is_empty() {
             return;
         }
-        let synced = self.with_analysis_mut("watching files", |analysis| {
-            let mut synced = 0usize;
-            for change in &params.changes {
-                let Ok(std_path) = change.uri.to_file_path() else {
-                    continue;
-                };
-                let Some(sys_path) = SystemPath::from_std_path(&std_path) else {
-                    continue;
-                };
-                File::sync_path(&mut analysis.db, sys_path);
-                synced += 1;
-            }
-            synced
-        });
+        let mut pth_inventory_dirs = HashSet::new();
+        let tracked_paths: Vec<std::path::PathBuf> = params
+            .changes
+            .iter()
+            .filter_map(|change| {
+                let path = change.uri.to_file_path().ok()?;
+                match path.extension().and_then(|ext| ext.to_str()) {
+                    Some("py") | Some("pyi") => Some(path),
+                    Some("pth") => {
+                        if matches!(change.typ, FileChangeType::CREATED | FileChangeType::DELETED)
+                            && let Some(parent) = path.parent()
+                        {
+                            pth_inventory_dirs.insert(parent.to_path_buf());
+                        }
+                        Some(path)
+                    }
+                    _ => None,
+                }
+            })
+            .collect();
+        if tracked_paths.is_empty() && pth_inventory_dirs.is_empty() {
+            tracing::debug!(
+                changed = params.changes.len(),
+                "watched files changed; no python analysis inputs to sync"
+            );
+            return;
+        }
+        let synced = self
+            .with_analysis_mut("watching files", |analysis| {
+                let mut synced = 0usize;
+                for std_path in &tracked_paths {
+                    let Some(sys_path) = SystemPath::from_std_path(std_path) else {
+                        continue;
+                    };
+                    File::sync_path(&mut analysis.db, sys_path);
+                    synced += 1;
+                }
+                for directory in &pth_inventory_dirs {
+                    let inventory = analysis.ensure_pth_inventory(directory);
+                    let next_revision = inventory.revision(&analysis.db) + 1;
+                    inventory.set_revision(&mut analysis.db).to(next_revision);
+                }
+                synced
+            })
+            .unwrap_or(0);
         tracing::debug!(
             changed = params.changes.len(),
             synced,
-            "watched files changed; synced file revisions"
+            pth_inventory_dirs = pth_inventory_dirs.len(),
+            "watched files changed; synced python analysis inputs"
         );
     }
 
@@ -577,7 +665,8 @@ impl LanguageServer for HydraLspBackend {
         // is the best we can do until salsa supports input GC.
 
         // Enforce LRU limits after removing a document — evicts stale
-        // cache entries and keeps memory bounded.
+        // cache entries and keeps memory bounded. Skips if analysis is not
+        // initialized (notification arrived before initialize).
         self.with_analysis_mut("closing documents", |analysis| {
             analysis.db.trigger_lru_eviction()
         });
@@ -1149,7 +1238,7 @@ impl HydraLspBackend {
         let input = *input_ref;
         drop(input_ref);
 
-        let (parse_result, db_snapshot, python_config) =
+        let Some((parse_result, db_snapshot, python_config)) =
             self.with_analysis("publishing diagnostics", |analysis| {
                 // Get the cached parse result and extract data before releasing the lock.
                 // The lock must be released before any `.await` point.
@@ -1160,7 +1249,10 @@ impl HydraLspBackend {
                 };
                 let snapshot = analysis.db.clone();
                 (result, snapshot, analysis.python_config)
-            });
+            })
+        else {
+            return;
+        };
 
         // Handle the parse result
         match parse_result {
