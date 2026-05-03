@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use salsa::Setter;
 use tracing::debug;
 
 use crate::yaml_parser::{ParsedContent, YamlParseError, YamlParser};
@@ -17,6 +18,31 @@ pub struct DocumentInput {
 
     /// The document version from the LSP protocol.
     pub version: i32,
+}
+
+impl DocumentInput {
+    /// Soft-close the document: drop the source text so salsa releases the
+    /// per-document `String` (the dominant cost) while keeping the input slot
+    /// alive for reuse on a future `did_open` for the same URI.
+    ///
+    /// Salsa exposes no API to remove an `#[salsa::input]` from storage
+    /// (verified against salsa v0.26.2). This method matches the soft-close
+    /// idiom used by `ruff_db::files::VirtualFile::close`, which sets a
+    /// status field rather than deleting the input.
+    ///
+    /// Reopening the same URI replays `set_text`/`set_version` on the same
+    /// input — that's the existing `did_change` code path, so dependent
+    /// queries (`is_hydra_file`, `parsed_yaml`) recompute against the new
+    /// text correctly.
+    pub fn close(self, db: &mut dyn salsa::Database) {
+        self.set_text(db).to(String::new());
+        // The version field isn't read by any tracked query, so this bump is
+        // purely defensive — it ensures any future code that does watch
+        // `version` observes the close. `wrapping_add` is safe; the next
+        // `did_open` overwrites this with the LSP-provided version anyway.
+        let next = self.version(db).wrapping_add(1);
+        self.set_version(db).to(next);
+    }
 }
 
 /// Cached result of parsing a YAML file.
@@ -88,7 +114,6 @@ pub fn parsed_yaml(db: &dyn salsa::Database, input: DocumentInput) -> ParsedYaml
 mod tests {
     use super::*;
     use crate::database::tests::TestDb;
-    use salsa::Setter;
 
     fn hydra_yaml() -> &'static str {
         "# @hydra\nmodel:\n  _target_: my.Module\n  param: 42\n"
@@ -209,6 +234,51 @@ mod tests {
         let parsed2 = parsed_yaml(&db, input);
         // Same input, no changes — should be pointer-equal (same Arc)
         assert!(parsed1 == parsed2);
+    }
+
+    #[test]
+    fn test_close_drops_text_and_bumps_version() {
+        let mut db = TestDb::new();
+        let input = DocumentInput::new(&db, hydra_yaml().to_string(), 7);
+
+        // Warm cache so we can verify invalidation downstream.
+        assert!(is_hydra_file(&db, input));
+
+        input.close(&mut db);
+
+        assert_eq!(input.text(&db), "");
+        assert_ne!(input.version(&db), 7);
+
+        // After close, the same input observed against empty text — no
+        // hydra markers, no targets — so `is_hydra_file` flips to false.
+        assert!(!is_hydra_file(&db, input));
+    }
+
+    #[test]
+    fn test_close_then_reopen_reuses_input_and_recomputes() {
+        let mut db = TestDb::new();
+        let input = DocumentInput::new(&db, hydra_yaml().to_string(), 1);
+        assert!(is_hydra_file(&db, input));
+        let original_id = input;
+
+        input.close(&mut db);
+        assert!(!is_hydra_file(&db, input));
+
+        // Simulate did_open on the same URI: the backend looks up the
+        // existing input via `document_inputs.get(...)` and re-applies
+        // set_text/set_version. The DocumentInput id is unchanged.
+        input
+            .set_text(&mut db)
+            .to("# @hydra\nother:\n  _target_: c.D\n".to_string());
+        input.set_version(&mut db).to(2);
+
+        assert!(input == original_id, "did_open should reuse the same input");
+        assert!(is_hydra_file(&db, input));
+        let parsed = parsed_yaml(&db, input);
+        assert_eq!(
+            parsed.result().unwrap().hydra_objects[0].target.value,
+            "c.D"
+        );
     }
 
     #[test]

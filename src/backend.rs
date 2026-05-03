@@ -180,13 +180,14 @@ pub struct HydraLspBackend {
     /// distinct inputs. Any code path that already holds a shard guard
     /// must drop it before locking `analysis`.
     ///
-    /// This map grows unbounded over the lifetime of the server (one entry
-    /// per unique URI ever opened). Salsa inputs cannot be removed from
-    /// storage, so we keep the URI→input mapping even after `did_close`
-    /// to let a subsequent `did_open` reuse the same input. Bounding by
-    /// unique URIs is the best available approximation; a long-lived
-    /// session that opens thousands of distinct files will accumulate
-    /// entries here. Per-query LRUs cap actual cached computation memory.
+    /// This map retains one entry per unique URI ever opened — salsa
+    /// exposes no API to remove an `#[salsa::input]` from storage
+    /// (verified against salsa v0.26.2). On `did_close` we soft-close
+    /// the input via `DocumentInput::close`, which clears the source
+    /// `String` (the dominant per-document cost); the input slot itself
+    /// remains so a subsequent `did_open` for the same URI reuses it.
+    /// Per-URI overhead is therefore O(slot header), independent of file
+    /// size. Per-query LRUs (`lru = 512`) bound cached computation memory.
     document_inputs: DashMap<Url, DocumentInput>,
 }
 
@@ -666,17 +667,25 @@ impl LanguageServer for HydraLspBackend {
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = params.text_document.uri;
         self.documents.remove(&uri);
-        // Keep the URI -> DocumentInput entry so a subsequent did_open reuses
-        // the same salsa input. Salsa inputs cannot be removed from storage,
-        // so dropping the mapping here would leak a fresh input on every
-        // close/open cycle. Bounding by unique URIs (rather than open count)
-        // is the best we can do until salsa supports input GC.
 
-        // Enforce LRU limits after removing a document — evicts stale
-        // cache entries and keeps memory bounded. Skips if analysis is not
+        // Soft-close the salsa input: clear the source text so salsa drops
+        // the per-document `String` while the input slot is retained for
+        // reuse on a subsequent `did_open` for the same URI. Salsa exposes
+        // no input-deletion API, so this is the minimum-footprint
+        // equivalent (matches `ruff_db::files::VirtualFile::close`).
+        //
+        // Lock order: take `analysis` before the `document_inputs` shard
+        // guard, per the comment on `document_inputs`. The shard is
+        // entered inside the closure.
+        //
+        // Then enforce LRU limits — evicts stale cache entries and keeps
+        // memory bounded. Skips entirely if analysis is not yet
         // initialized (notification arrived before initialize).
         self.with_analysis_mut("closing documents", |analysis| {
-            analysis.db.trigger_lru_eviction()
+            if let Some(input) = self.document_inputs.get(&uri).map(|e| *e) {
+                input.close(&mut analysis.db);
+            }
+            analysis.db.trigger_lru_eviction();
         });
 
         self.client
