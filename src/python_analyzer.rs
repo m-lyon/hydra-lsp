@@ -1,5 +1,5 @@
 use crate::import_resolver::ImportResolver;
-use crate::python_cache::{PthInventory, PythonConfig};
+use crate::python_cache::{PythonConfig, SitePackagesPthState};
 use anyhow::{Context, Result};
 use ruff_db::files::system_path_to_file;
 use ruff_db::source::{SourceText, source_text};
@@ -37,7 +37,7 @@ pub fn read_source(db: &dyn ruff_db::Db, path: &Path) -> Result<SourceText> {
     Ok(source)
 }
 
-/// Normalize a directory path for use as a `PthInventory` key.
+/// Normalize a directory path for use as a `SitePackagesPthState` key.
 ///
 /// `discover_python_environment` returns site-packages paths via
 /// `SystemPathBuf::as_std_path()` (no symlink resolution, no case
@@ -51,7 +51,7 @@ pub fn read_source(db: &dyn ruff_db::Db, path: &Path) -> Result<SourceText> {
 /// Falls back to the original path string if canonicalization fails
 /// (e.g. the directory was just deleted) — better to risk a stale
 /// memo for one event than to panic on a missing path.
-pub(crate) fn normalize_pth_inventory_key(directory: &Path) -> String {
+pub(crate) fn normalize_site_packages_pth_state_key(directory: &Path) -> String {
     match std::fs::canonicalize(directory) {
         Ok(canonical) => canonical.to_string_lossy().into_owned(),
         Err(_) => directory.to_string_lossy().into_owned(),
@@ -286,13 +286,17 @@ impl PythonAnalyzer {
         module_path: &str,
         workspace_root: Option<&Path>,
         python_interpreter: Option<&str>,
-        pth_inventories: Option<&[PthInventory]>,
+        site_packages_pth_states: Option<&[SitePackagesPthState]>,
     ) -> Result<(PathBuf, Vec<PathBuf>)> {
         let site_packages_paths =
             Self::discover_python_environment(workspace_root, python_interpreter)
                 .unwrap_or_default();
-        let search_paths =
-            Self::build_search_paths(db, workspace_root, site_packages_paths, pth_inventories);
+        let search_paths = Self::build_search_paths(
+            db,
+            workspace_root,
+            site_packages_paths,
+            site_packages_pth_states,
+        );
         let file_path = Self::resolve_module_with_search_paths(module_path, &search_paths)?;
         Ok((file_path, search_paths))
     }
@@ -629,7 +633,7 @@ impl PythonAnalyzer {
         db: &dyn ruff_db::Db,
         workspace_root: Option<&Path>,
         site_packages_paths: Vec<SystemPathBuf>,
-        pth_inventories: Option<&[PthInventory]>,
+        site_packages_pth_states: Option<&[SitePackagesPthState]>,
     ) -> Vec<PathBuf> {
         let mut search_paths = Vec::new();
 
@@ -646,7 +650,8 @@ impl PythonAnalyzer {
             let site_packages = sys_path.as_std_path().to_path_buf();
 
             // Process .pth files in this site-packages directory
-            let editable_paths = Self::parse_pth_files(db, &site_packages, pth_inventories);
+            let editable_paths =
+                Self::parse_pth_files(db, &site_packages, site_packages_pth_states);
 
             search_paths.push(site_packages);
             search_paths.extend(editable_paths);
@@ -666,22 +671,25 @@ impl PythonAnalyzer {
     pub(crate) fn parse_pth_files(
         db: &dyn ruff_db::Db,
         site_packages: &Path,
-        pth_inventories: Option<&[PthInventory]>,
+        site_packages_pth_states: Option<&[SitePackagesPthState]>,
     ) -> Vec<PathBuf> {
         let mut paths = Vec::new();
 
-        // Depend on the tracked inventory for this directory so `.pth`
+        // Depend on the tracked state for this directory so `.pth`
         // create/delete events invalidate the directory scan. Both the
-        // inventory key and this lookup go through `normalize_pth_inventory_key`
-        // so symlink/case/separator differences don't cause a miss.
-        if let Some(inventory) = pth_inventories.and_then(|inventories| {
-            let site_packages_key = normalize_pth_inventory_key(site_packages);
-            inventories
-                .iter()
-                .copied()
-                .find(|inventory| inventory.directory(db).as_str() == site_packages_key)
-        }) {
-            let _ = inventory.revision(db);
+        // state key and this lookup go through
+        // `normalize_site_packages_pth_state_key` so symlink/case/separator
+        // differences don't cause a miss.
+        if let Some(site_packages_pth_state) =
+            site_packages_pth_states.and_then(|site_packages_pth_states| {
+                let site_packages_key = normalize_site_packages_pth_state_key(site_packages);
+                site_packages_pth_states
+                    .iter()
+                    .copied()
+                    .find(|state| state.directory(db).as_str() == site_packages_key)
+            })
+        {
+            let _ = site_packages_pth_state.revision(db);
         }
 
         let Ok(entries) = fs::read_dir(site_packages) else {
@@ -1018,13 +1026,13 @@ impl PythonAnalyzer {
     ) -> Result<(DefinitionInfo, PathBuf, String, String)> {
         let workspace_root = config.workspace_root(db).as_deref().map(PathBuf::from);
         let interpreter = config.interpreter(db);
-        let pth_inventories = config.pth_inventories(db);
+        let site_packages_pth_states = config.site_packages_pth_states(db);
         Self::extract_definition_info_impl(
             db,
             target,
             workspace_root.as_deref().map(Path::new),
             interpreter.as_deref(),
-            Some(pth_inventories.as_slice()),
+            Some(site_packages_pth_states.as_slice()),
         )
     }
 
@@ -1033,7 +1041,7 @@ impl PythonAnalyzer {
         target: &str,
         workspace_root: Option<&Path>,
         python_interpreter: Option<&str>,
-        pth_inventories: Option<&[PthInventory]>,
+        site_packages_pth_states: Option<&[SitePackagesPthState]>,
     ) -> Result<(DefinitionInfo, PathBuf, String, String)> {
         let (module_path, symbol_name) = Self::split_target(target)?;
 
@@ -1046,9 +1054,8 @@ impl PythonAnalyzer {
             &module_path,
             workspace_root,
             python_interpreter,
-            pth_inventories,
-        )
-        {
+            site_packages_pth_states,
+        ) {
             module_found = true;
 
             // Try to extract as function first (with import resolution)
@@ -1082,15 +1089,13 @@ impl PythonAnalyzer {
         // Try to interpret as Class.method pattern (e.g., "my_module.MyClass.from_config")
         // or nested pattern (e.g., "my_module.OuterClass.nested.nested_class.method")
         // or nested class pattern (e.g., "my_module.OuterClass.nested.nested_class")
-        if let Some(result) =
-            Self::resolve_class_attribute_chain(
-                db,
-                target,
-                workspace_root,
-                python_interpreter,
-                pth_inventories,
-            )
-        {
+        if let Some(result) = Self::resolve_class_attribute_chain(
+            db,
+            target,
+            workspace_root,
+            python_interpreter,
+            site_packages_pth_states,
+        ) {
             match result {
                 ClassAttributeChainResult::Method {
                     file_path: resolved_file,
@@ -1160,7 +1165,7 @@ impl PythonAnalyzer {
         target: &str,
         workspace_root: Option<&Path>,
         python_interpreter: Option<&str>,
-        pth_inventories: Option<&[PthInventory]>,
+        site_packages_pth_states: Option<&[SitePackagesPthState]>,
     ) -> Option<ClassAttributeChainResult> {
         let parts: Vec<&str> = target.split('.').collect();
         if parts.len() < 3 {
@@ -1185,9 +1190,8 @@ impl PythonAnalyzer {
                 &module_path,
                 workspace_root,
                 python_interpreter,
-                pth_inventories,
-            )
-            else {
+                site_packages_pth_states,
+            ) else {
                 continue;
             };
 
@@ -1932,8 +1936,7 @@ mod tests {
     fn test_resolve_module_package() {
         let examples_dir = get_simple_test_dir();
         let db = test_db();
-        let result =
-            PythonAnalyzer::resolve_module(&db, "test_package", Some(&examples_dir), None);
+        let result = PythonAnalyzer::resolve_module(&db, "test_package", Some(&examples_dir), None);
         assert!(result.is_ok());
         let (path, _) = result.unwrap();
         assert!(path.ends_with("__init__.py"));
@@ -1958,12 +1961,8 @@ mod tests {
     fn test_resolve_module_nonexistent() {
         let examples_dir = get_simple_test_dir();
         let db = test_db();
-        let result = PythonAnalyzer::resolve_module(
-            &db,
-            "nonexistent_module",
-            Some(&examples_dir),
-            None,
-        );
+        let result =
+            PythonAnalyzer::resolve_module(&db, "nonexistent_module", Some(&examples_dir), None);
         assert!(result.is_err());
     }
 
@@ -3159,8 +3158,12 @@ mod tests {
 
         // Resolve a module with explicit interpreter configuration
         let db = test_db();
-        let result_with_config =
-            PythonAnalyzer::resolve_module(&db, "my_module", Some(&examples_dir), Some(system_python_str));
+        let result_with_config = PythonAnalyzer::resolve_module(
+            &db,
+            "my_module",
+            Some(&examples_dir),
+            Some(system_python_str),
+        );
 
         // Should succeed using the configured interpreter
         assert!(
@@ -3259,7 +3262,8 @@ mod tests {
 
         // Test with auto-discovery (priority 2)
         let db = test_db();
-        let result_auto = PythonAnalyzer::resolve_module(&db, "my_module", Some(&examples_dir), None);
+        let result_auto =
+            PythonAnalyzer::resolve_module(&db, "my_module", Some(&examples_dir), None);
         assert!(result_auto.is_ok(), "Should resolve with auto-discovery");
     }
 
@@ -3747,15 +3751,15 @@ mod tests {
         // The watched-event side and the discovery side can arrive via either
         // path; normalization must collapse them to the same key.
         assert_eq!(
-            normalize_pth_inventory_key(&real_dir),
-            normalize_pth_inventory_key(&symlink_dir),
+            normalize_site_packages_pth_state_key(&real_dir),
+            normalize_site_packages_pth_state_key(&symlink_dir),
         );
     }
 
     #[cfg(unix)]
     #[test]
-    fn test_parse_pth_files_inventory_lookup_via_symlink() {
-        use crate::python_cache::PthInventory;
+    fn test_parse_pth_files_site_packages_state_lookup_via_symlink() {
+        use crate::python_cache::SitePackagesPthState;
         use tempfile::TempDir;
 
         let tmp = TempDir::new().expect("tempdir");
@@ -3768,13 +3772,13 @@ mod tests {
         // Inventory keyed off the symlinked path (as a watched-event might
         // arrive). `parse_pth_files` is then called with the real path
         // (as `discover_python_environment` would return it).
-        let key = normalize_pth_inventory_key(&symlink_dir);
-        let inventory = PthInventory::new(&db, key, 0);
-        let inventories = vec![inventory];
+        let key = normalize_site_packages_pth_state_key(&symlink_dir);
+        let site_packages_pth_state = SitePackagesPthState::new(&db, key, 0);
+        let site_packages_pth_states = vec![site_packages_pth_state];
 
         // Should not panic and should still register the salsa dep on the
         // inventory revision via the normalized lookup.
-        let _ = PythonAnalyzer::parse_pth_files(&db, &real_dir, Some(&inventories));
+        let _ = PythonAnalyzer::parse_pth_files(&db, &real_dir, Some(&site_packages_pth_states));
     }
 
     #[test]

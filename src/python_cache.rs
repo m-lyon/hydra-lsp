@@ -15,7 +15,7 @@ use crate::python_analyzer::{DefinitionInfo, PythonAnalyzer};
 /// changing its values invalidates cached module-resolution results. Per-file
 /// invalidation for watched Python source and existing `.pth` edits is handled
 /// separately via `ruff_db::files::File::sync_path` in the LSP backend, while
-/// `.pth` create/delete events update the per-directory inventories below.
+/// `.pth` create/delete events update the per-directory state handles below.
 #[salsa::input]
 pub struct PythonConfig {
     /// Workspace root directory path.
@@ -26,15 +26,15 @@ pub struct PythonConfig {
     #[returns(ref)]
     pub interpreter: Option<String>,
 
-    /// Tracked inventories for site-packages directories whose `.pth` members
-    /// can affect editable-install resolution.
+    /// Tracked state for site-packages directories whose `.pth` members can
+    /// affect editable-install resolution.
     #[returns(ref)]
-    pub pth_inventories: Vec<PthInventory>,
+    pub site_packages_pth_states: Vec<SitePackagesPthState>,
 }
 
-/// Tracked membership revision for `.pth` files under one site-packages directory.
+/// Tracked revision for the `.pth` state of one site-packages directory.
 #[salsa::input]
-pub struct PthInventory {
+pub struct SitePackagesPthState {
     #[returns(ref)]
     pub directory: String,
     pub revision: u64,
@@ -104,8 +104,8 @@ impl Eq for CachedDefinitionResult {}
 /// Wraps `PythonAnalyzer::extract_definition_info` with salsa caching.
 /// The result is cached and only recomputed when:
 /// - The target string changes (different `_target_` value)
-/// - The Python configuration changes (interpreter, workspace root, or `.pth`
-///   inventory handles)
+/// - The Python configuration changes (interpreter, workspace root, or
+///   site-packages `.pth` state handles)
 ///
 /// Uses `lru=1024` to bound memory for workspaces with many distinct targets.
 /// Hydra projects often reference many `_target_` strings (e.g. one per config),
@@ -151,16 +151,16 @@ mod tests {
     }
 
     #[salsa::tracked(returns(ref))]
-    fn tracked_pth_paths_with_inventory<'db>(
+    fn tracked_pth_paths_with_site_packages_state<'db>(
         db: &'db dyn ruff_db::Db,
         config: PythonConfig,
         site_packages: SitePackagesPath<'db>,
     ) -> Vec<PathBuf> {
-        let inventories = config.pth_inventories(db);
+        let site_packages_pth_states = config.site_packages_pth_states(db);
         PythonAnalyzer::parse_pth_files(
             db,
             Path::new(site_packages.path(db)),
-            Some(inventories.as_slice()),
+            Some(site_packages_pth_states.as_slice()),
         )
     }
 
@@ -180,7 +180,7 @@ mod tests {
         let config = PythonConfig::new(&db, Some("/workspace".to_string()), None, vec![]);
         assert_eq!(config.workspace_root(&db).as_deref(), Some("/workspace"));
         assert_eq!(config.interpreter(&db).as_deref(), None);
-        assert!(config.pth_inventories(&db).is_empty());
+        assert!(config.site_packages_pth_states(&db).is_empty());
     }
 
     #[test]
@@ -194,9 +194,12 @@ mod tests {
             .to(Some("/usr/bin/python3".to_string()));
         assert_eq!(config.interpreter(&db).as_deref(), Some("/usr/bin/python3"));
 
-        let inventory = PthInventory::new(&db, "/workspace/site-packages".to_string(), 0);
-        config.set_pth_inventories(&mut db).to(vec![inventory]);
-        assert!(config.pth_inventories(&db) == &[inventory]);
+        let site_packages_pth_state =
+            SitePackagesPthState::new(&db, "/workspace/site-packages".to_string(), 0);
+        config
+            .set_site_packages_pth_states(&mut db)
+            .to(vec![site_packages_pth_state]);
+        assert!(config.site_packages_pth_states(&db) == &[site_packages_pth_state]);
     }
 
     #[test]
@@ -421,8 +424,8 @@ mod tests {
     }
 
     #[test]
-    fn test_pth_inventory_invalidation_on_file_create() {
-        use crate::python_analyzer::normalize_pth_inventory_key;
+    fn test_site_packages_pth_state_invalidation_on_file_create() {
+        use crate::python_analyzer::normalize_site_packages_pth_state_key;
         use filetime::{FileTime, set_file_mtime};
         use ruff_db::files::File;
         use std::fs;
@@ -438,13 +441,13 @@ mod tests {
         // Inventory key must go through the same normalization that
         // `parse_pth_files` applies to its lookup side; otherwise the lookup
         // misses and the salsa dep on `inventory.revision` is never registered.
-        let inventory_key = normalize_pth_inventory_key(&site_packages);
-        let inventory = PthInventory::new(&db, inventory_key, 0);
-        let config = PythonConfig::new(&db, None, None, vec![inventory]);
+        let inventory_key = normalize_site_packages_pth_state_key(&site_packages);
+        let site_packages_pth_state = SitePackagesPthState::new(&db, inventory_key, 0);
+        let config = PythonConfig::new(&db, None, None, vec![site_packages_pth_state]);
         let site_packages_str = site_packages.to_string_lossy().to_string();
         let result1 = {
             let site_packages_key = SitePackagesPath::new(&db, site_packages_str.clone());
-            tracked_pth_paths_with_inventory(&db, config, site_packages_key).clone()
+            tracked_pth_paths_with_site_packages_state(&db, config, site_packages_key).clone()
         };
         assert!(result1.is_empty());
 
@@ -454,11 +457,11 @@ mod tests {
 
         let sys_path = SystemPath::from_std_path(&pth_file).unwrap();
         File::sync_path(&mut db, sys_path);
-        inventory.set_revision(&mut db).to(1);
+        site_packages_pth_state.set_revision(&mut db).to(1);
 
         let result2 = {
             let site_packages_key = SitePackagesPath::new(&db, site_packages_str);
-            tracked_pth_paths_with_inventory(&db, config, site_packages_key).clone()
+            tracked_pth_paths_with_site_packages_state(&db, config, site_packages_key).clone()
         };
         assert_eq!(result2.len(), 1);
         assert_eq!(

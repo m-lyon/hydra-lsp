@@ -15,9 +15,9 @@ use crate::database::HydraDatabase;
 use crate::diagnostics::{self, DiagnosticRule};
 use crate::document::DocumentStore;
 use crate::python_analyzer::{
-    DefinitionInfo, ParameterInfo, PythonAnalyzer, normalize_pth_inventory_key,
+    DefinitionInfo, ParameterInfo, PythonAnalyzer, normalize_site_packages_pth_state_key,
 };
-use crate::python_cache::{self, PthInventory, PythonConfig, TargetString};
+use crate::python_cache::{self, PythonConfig, SitePackagesPthState, TargetString};
 use crate::yaml_cache::{self, DocumentInput};
 use crate::yaml_parser::{
     ARGS_KEY, CONVERT_KEY, CompletionContext, ConvertMode, HydraSemanticToken, PARTIAL_KEY,
@@ -136,49 +136,110 @@ pub struct Settings {
     pub features: FeatureToggles,
 }
 
-#[derive(Clone)]
-struct AnalysisState {
-    db: HydraDatabase,
+/// Initialized analysis state owned by `HydraLspBackend`.
+///
+/// `db` lives behind a `Mutex` rather than an `RwLock` because `HydraDatabase`
+/// (via `salsa::Storage`) is `Send` but not `Sync` — salsa's storage uses
+/// interior mutability that is not safe to share by `&T` across threads.
+/// The Mutex is taken only briefly: read handlers acquire it long enough to
+/// clone a snapshot (an Arc-share of cached data, microseconds), and writers
+/// acquire it long enough to mutate a salsa input. The expensive work runs
+/// on independent snapshots outside the lock — see `Session::snapshot`.
+///
+/// `site_packages_pth_states` is a runtime index from normalized directory
+/// path to the corresponding `SitePackagesPthState` Salsa handle. It exists
+/// for fast lookup and deduplication in `ensure_site_packages_pth_state`; the
+/// salsa-tracked list of states still lives on
+/// `python_config.site_packages_pth_states`. This map is guarded by a
+/// separate `RwLock` so that the read hot path never touches it.
+/// The only mutation site is `ensure_site_packages_pth_state`, called from
+/// `did_change_watched_files`.
+struct Session {
+    db: parking_lot::Mutex<HydraDatabase>,
     python_config: PythonConfig,
-    pth_inventories: HashMap<String, PthInventory>,
+    site_packages_pth_states: parking_lot::RwLock<HashMap<String, SitePackagesPthState>>,
 }
 
-impl AnalysisState {
-    fn ensure_pth_inventory(&mut self, directory: &std::path::Path) -> PthInventory {
+impl Session {
+    /// Cheap, read-only snapshot of the database for concurrent worker use.
+    ///
+    /// Holds the db lock only long enough to clone the salsa storage (an
+    /// Arc-share of cached data — `HydraDatabase: Clone` via
+    /// `salsa::Storage`). The returned `SessionSnapshot` is `Send` and
+    /// survives independently of the write side; if a writer modifies an
+    /// input after the snapshot is taken, salsa cancels in-flight reads on
+    /// the snapshot at the next query boundary.
+    fn snapshot(&self) -> SessionSnapshot {
+        SessionSnapshot {
+            db: self.db.lock().clone(),
+            python_config: self.python_config,
+        }
+    }
+
+    /// Look up or create a `SitePackagesPthState` for `directory`, returning the
+    /// salsa handle.
+    ///
+    /// Uses double-checked locking on `site_packages_pth_states` so the common
+    /// "already present" case takes only a read guard. Lock order when
+    /// inserting: `site_packages_pth_states` (write) → `db` (lock). No other code
+    /// path acquires both locks, so there is no cycle.
+    fn ensure_site_packages_pth_state(&self, directory: &std::path::Path) -> SitePackagesPthState {
         // Normalized so the watched-event side and the discovery side agree
         // even when the path differs by symlink, case, or trailing separator.
-        // See `python_analyzer::normalize_pth_inventory_key`.
-        let key = normalize_pth_inventory_key(directory);
-        if let Some(inventory) = self.pth_inventories.get(&key) {
-            return *inventory;
+        // See `python_analyzer::normalize_site_packages_pth_state_key`.
+        let key = normalize_site_packages_pth_state_key(directory);
+        if let Some(site_packages_pth_state) = self.site_packages_pth_states.read().get(&key) {
+            return *site_packages_pth_state;
         }
 
-        let inventory = PthInventory::new(&self.db, key.clone(), 0);
-        let mut inventories = self.python_config.pth_inventories(&self.db).clone();
-        inventories.push(inventory);
+        let mut site_packages_pth_states = self.site_packages_pth_states.write();
+        // Re-check after taking the write lock: another thread may have
+        // inserted between our read drop and write acquire.
+        if let Some(site_packages_pth_state) = site_packages_pth_states.get(&key) {
+            return *site_packages_pth_state;
+        }
+
+        let mut db = self.db.lock();
+        let site_packages_pth_state = SitePackagesPthState::new(&*db, key.clone(), 0);
+        let mut config_states = self.python_config.site_packages_pth_states(&*db).clone();
+        config_states.push(site_packages_pth_state);
         self.python_config
-            .set_pth_inventories(&mut self.db)
-            .to(inventories);
-        self.pth_inventories.insert(key, inventory);
-        inventory
+            .set_site_packages_pth_states(&mut *db)
+            .to(config_states);
+        site_packages_pth_states.insert(key, site_packages_pth_state);
+        site_packages_pth_state
     }
+}
+
+/// Cheap, send-safe view of the analysis state. Produced by
+/// `Session::snapshot`; consumed by handlers that hand the database to
+/// `tokio::task::spawn_blocking`.
+#[derive(Clone)]
+pub struct SessionSnapshot {
+    pub db: HydraDatabase,
+    pub python_config: PythonConfig,
 }
 
 pub struct HydraLspBackend {
     pub client: Client,
     pub documents: Arc<DocumentStore>,
     pub settings: Arc<RwLock<Settings>>,
-    /// Salsa database for incremental caching.
-    /// Uses `Mutex` because salsa's Storage is `Send` but not `Sync`.
-    analysis: Arc<parking_lot::Mutex<Option<AnalysisState>>>,
+    /// Initialized lazily on `initialize`. `None` means a notification
+    /// arrived before `initialize` (LSP protocol violation) — handlers log
+    /// a warning and ignore the event. The outer `RwLock` only guards the
+    /// `Option`; once set, concurrent reads share the inner `Session`'s
+    /// fine-grained locks (db, site_packages_pth_states) so unrelated operations do
+    /// not all have to proceed sequentially through a single backend-wide
+    /// mutex.
+    session: Arc<parking_lot::RwLock<Option<Session>>>,
     /// Map from document URI to its salsa input handle.
     ///
-    /// Lock order: `self.analysis` MUST be acquired before any
-    /// `document_inputs` shard guard. `get_or_create_input` takes the
-    /// analysis lock first and then enters the shard inside the closure
-    /// to keep concurrent `did_open` calls for the same URI from creating
-    /// distinct inputs. Any code path that already holds a shard guard
-    /// must drop it before locking `analysis`.
+    /// Lock order: code that mutates a `DocumentInput` enters the
+    /// `document_inputs` shard guard FIRST, then takes `Session::db.lock()`.
+    /// `get_or_create_input` and `did_close` both follow this order.
+    /// `get_or_create_input` additionally relies on the entry guard to make
+    /// the lookup-or-insert atomic, which keeps concurrent `did_open` calls
+    /// for the same URI from creating distinct inputs.
     ///
     /// This map retains one entry per unique URI ever opened — salsa
     /// exposes no API to remove an `#[salsa::input]` from storage
@@ -206,7 +267,7 @@ impl HydraLspBackend {
             client,
             documents: Arc::new(DocumentStore::new()),
             settings: Arc::new(RwLock::new(Settings::default())),
-            analysis: Arc::new(parking_lot::Mutex::new(None)),
+            session: Arc::new(parking_lot::RwLock::new(None)),
             document_inputs: DashMap::new(),
         }
     }
@@ -235,7 +296,7 @@ impl HydraLspBackend {
             })
     }
 
-    fn initialize_analysis_state(
+    fn initialize_session(
         &self,
         workspace_root: Option<String>,
         interpreter: Option<String>,
@@ -247,59 +308,53 @@ impl HydraLspBackend {
         let cwd = SystemPath::new(&workspace_root);
         let db = HydraDatabase::new(cwd);
         let python_config = PythonConfig::new(&db, Some(workspace_root), interpreter, vec![]);
-        *self.analysis.lock() = Some(AnalysisState {
-            db,
+        *self.session.write() = Some(Session {
+            db: parking_lot::Mutex::new(db),
             python_config,
-            pth_inventories: HashMap::new(),
+            site_packages_pth_states: parking_lot::RwLock::new(HashMap::new()),
         });
         Ok(())
     }
 
-    fn snapshot_analysis(&self) -> Option<AnalysisState> {
-        self.analysis.lock().as_ref().cloned()
+    /// Take a cheap snapshot of the analysis state for use on a worker thread.
+    ///
+    /// Returns `None` (and logs) when the session has not yet been built by
+    /// `initialize`. Holds the session read lock and the inner db lock only
+    /// long enough to clone the salsa storage; the returned snapshot is
+    /// `Send` and can be passed to `tokio::task::spawn_blocking` without
+    /// forcing other handlers to wait and run sequentially.
+    fn snapshot(&self) -> Option<SessionSnapshot> {
+        self.with_session("snapshot", Session::snapshot)
     }
 
-    /// Run `f` with a borrow of the initialized analysis state, returning
-    /// `None` (and logging a warning that names `context`) if the state has
+    /// Run `f` with a borrow of the initialized session, returning `None`
+    /// (and logging a warning that names `context`) when the session has
     /// not yet been built by `initialize`. The LSP protocol requires the
     /// client to send `initialize` first, so reaching `None` means a
     /// misbehaving client — notification handlers should ignore the event
     /// rather than panic.
-    fn with_analysis<T>(
-        &self,
-        context: &'static str,
-        f: impl FnOnce(&AnalysisState) -> T,
-    ) -> Option<T> {
-        let analysis = self.analysis.lock();
-        if analysis.is_none() {
+    ///
+    /// The outer `RwLock` guard is held for the duration of `f`, but `f`
+    /// only sees `&Session` — the inner db and site_packages_pth_states locks are
+    /// acquired by `f` itself, so concurrent callers with different access
+    /// patterns do not serialize on the outer lock.
+    fn with_session<T>(&self, context: &'static str, f: impl FnOnce(&Session) -> T) -> Option<T> {
+        let session = self.session.read();
+        if session.is_none() {
             // Drop the guard before logging so a slow tracing subscriber
             // (file write, stderr lock contention) does not stall every
-            // other handler that needs the analysis mutex.
-            drop(analysis);
-            tracing::warn!(context, "analysis state not initialized; ignoring");
+            // other handler that needs the session.
+            drop(session);
+            tracing::warn!(context, "session not initialized; ignoring");
             return None;
         }
-        Some(f(analysis.as_ref().expect("checked Some above")))
-    }
-
-    fn with_analysis_mut<T>(
-        &self,
-        context: &'static str,
-        f: impl FnOnce(&mut AnalysisState) -> T,
-    ) -> Option<T> {
-        let mut analysis = self.analysis.lock();
-        if analysis.is_none() {
-            drop(analysis);
-            tracing::warn!(context, "analysis state not initialized; ignoring");
-            return None;
-        }
-        Some(f(analysis.as_mut().expect("checked Some above")))
+        Some(f(session.as_ref().expect("checked Some above")))
     }
 
     /// Run Python definition lookup on a blocking thread using a database snapshot.
     ///
-    /// Clones the database (cheap — salsa shares cached data via Arc) and moves
-    /// the clone to `tokio::task::spawn_blocking` so that expensive Python
+    /// Takes a `SessionSnapshot` (cheap — salsa shares cached data via Arc) and
+    /// moves it to `tokio::task::spawn_blocking` so that expensive Python
     /// analysis (module resolution, file parsing) doesn't block the async runtime.
     ///
     /// On cache hits the blocking thread returns almost immediately; on misses
@@ -308,12 +363,10 @@ impl HydraLspBackend {
         &self,
         target_value: String,
     ) -> anyhow::Result<(DefinitionInfo, std::path::PathBuf, String, String)> {
-        let Some(analysis) = self.snapshot_analysis() else {
-            anyhow::bail!("analysis state not initialized")
+        let Some(snapshot) = self.snapshot() else {
+            anyhow::bail!("session not initialized")
         };
-        let AnalysisState {
-            db, python_config, ..
-        } = analysis;
+        let SessionSnapshot { db, python_config } = snapshot;
 
         tokio::task::spawn_blocking(move || {
             let start = Instant::now();
@@ -342,25 +395,26 @@ impl HydraLspBackend {
 
     /// Get or create a `DocumentInput` for a given URI.
     ///
-    /// Holds the analysis lock across the DashMap entry so that concurrent
-    /// callers for the same URI cannot both observe a vacant entry and
-    /// create distinct inputs (which would orphan one in salsa storage and
-    /// let stale text leak through). Lock order is `self.analysis` → shard
-    /// guard.
+    /// Holds the dashmap entry guard across the salsa write so that concurrent
+    /// callers for the same URI cannot both observe a vacant entry and create
+    /// distinct inputs (which would orphan one in salsa storage and let stale
+    /// text leak through). Lock order: dashmap shard → `Session::db.write()`.
     ///
-    /// Returns `None` when analysis state is not yet initialized; callers
+    /// Returns `None` when the session is not yet initialized; callers
     /// (notification handlers) should treat that as a no-op.
     fn get_or_create_input(&self, uri: &Url, text: &str, version: i32) -> Option<DocumentInput> {
-        self.with_analysis_mut("opening documents", |analysis| {
+        self.with_session("opening documents", |s| {
             match self.document_inputs.entry(uri.clone()) {
                 dashmap::Entry::Occupied(occ) => {
                     let input = *occ.get();
-                    input.set_text(&mut analysis.db).to(text.to_string());
-                    input.set_version(&mut analysis.db).to(version);
+                    let mut db = s.db.lock();
+                    input.set_text(&mut *db).to(text.to_string());
+                    input.set_version(&mut *db).to(version);
                     input
                 }
                 dashmap::Entry::Vacant(vac) => {
-                    let input = DocumentInput::new(&analysis.db, text.to_string(), version);
+                    let db = s.db.lock();
+                    let input = DocumentInput::new(&*db, text.to_string(), version);
                     vac.insert(input);
                     input
                 }
@@ -456,7 +510,7 @@ impl LanguageServer for HydraLspBackend {
         }
 
         let interpreter_path = self.settings.read().python_interpreter.clone();
-        self.initialize_analysis_state(workspace_root, interpreter_path)?;
+        self.initialize_session(workspace_root, interpreter_path)?;
 
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
@@ -539,8 +593,9 @@ impl LanguageServer for HydraLspBackend {
 
         // Publish diagnostics if this is a Hydra file (using cached check)
         let is_hydra = self
-            .with_analysis("opening documents", |analysis| {
-                yaml_cache::is_hydra_file(&analysis.db, input)
+            .with_session("opening documents", |s| {
+                let db = s.db.lock();
+                yaml_cache::is_hydra_file(&*db, input)
             })
             .unwrap_or(false);
         if is_hydra && self.settings.read().features.diagnostics {
@@ -569,8 +624,9 @@ impl LanguageServer for HydraLspBackend {
 
             // Re-publish diagnostics if this is a Hydra file (using cached check)
             let is_hydra = self
-                .with_analysis("changing documents", |analysis| {
-                    yaml_cache::is_hydra_file(&analysis.db, input)
+                .with_session("changing documents", |s| {
+                    let db = s.db.lock();
+                    yaml_cache::is_hydra_file(&*db, input)
                 })
                 .unwrap_or(false);
             if is_hydra && self.settings.read().features.diagnostics {
@@ -609,7 +665,7 @@ impl LanguageServer for HydraLspBackend {
         if params.changes.is_empty() {
             return;
         }
-        let mut pth_inventory_dirs = HashSet::new();
+        let mut site_packages_pth_state_dirs = HashSet::new();
         let tracked_paths: Vec<std::path::PathBuf> = params
             .changes
             .iter()
@@ -623,7 +679,7 @@ impl LanguageServer for HydraLspBackend {
                             FileChangeType::CREATED | FileChangeType::DELETED
                         ) && let Some(parent) = path.parent()
                         {
-                            pth_inventory_dirs.insert(parent.to_path_buf());
+                            site_packages_pth_state_dirs.insert(parent.to_path_buf());
                         }
                         Some(path)
                     }
@@ -631,7 +687,7 @@ impl LanguageServer for HydraLspBackend {
                 }
             })
             .collect();
-        if tracked_paths.is_empty() && pth_inventory_dirs.is_empty() {
+        if tracked_paths.is_empty() && site_packages_pth_state_dirs.is_empty() {
             tracing::debug!(
                 changed = params.changes.len(),
                 "watched files changed; no python analysis inputs to sync"
@@ -639,19 +695,28 @@ impl LanguageServer for HydraLspBackend {
             return;
         }
         let synced = self
-            .with_analysis_mut("watching files", |analysis| {
+            .with_session("watching files", |s| {
                 let mut synced = 0usize;
-                for std_path in &tracked_paths {
-                    let Some(sys_path) = SystemPath::from_std_path(std_path) else {
-                        continue;
-                    };
-                    File::sync_path(&mut analysis.db, sys_path);
-                    synced += 1;
+                {
+                    let mut db = s.db.lock();
+                    for std_path in &tracked_paths {
+                        let Some(sys_path) = SystemPath::from_std_path(std_path) else {
+                            continue;
+                        };
+                        File::sync_path(&mut *db, sys_path);
+                        synced += 1;
+                    }
                 }
-                for directory in &pth_inventory_dirs {
-                    let inventory = analysis.ensure_pth_inventory(directory);
-                    let next_revision = inventory.revision(&analysis.db) + 1;
-                    inventory.set_revision(&mut analysis.db).to(next_revision);
+                // `ensure_site_packages_pth_state` takes its own locks;
+                // release the db write lock above before calling so we don't
+                // deadlock.
+                for directory in &site_packages_pth_state_dirs {
+                    let site_packages_pth_state = s.ensure_site_packages_pth_state(directory);
+                    let mut db = s.db.lock();
+                    let next_revision = site_packages_pth_state.revision(&*db) + 1;
+                    site_packages_pth_state
+                        .set_revision(&mut *db)
+                        .to(next_revision);
                 }
                 synced
             })
@@ -659,7 +724,7 @@ impl LanguageServer for HydraLspBackend {
         tracing::debug!(
             changed = params.changes.len(),
             synced,
-            pth_inventory_dirs = pth_inventory_dirs.len(),
+            site_packages_pth_state_dirs = site_packages_pth_state_dirs.len(),
             "watched files changed; synced python analysis inputs"
         );
     }
@@ -674,18 +739,16 @@ impl LanguageServer for HydraLspBackend {
         // no input-deletion API, so this is the minimum-footprint
         // equivalent (matches `ruff_db::files::VirtualFile::close`).
         //
-        // Lock order: take `analysis` before the `document_inputs` shard
-        // guard, per the comment on `document_inputs`. The shard is
-        // entered inside the closure.
-        //
         // Then enforce LRU limits — evicts stale cache entries and keeps
-        // memory bounded. Skips entirely if analysis is not yet
+        // memory bounded. Skips entirely if the session is not yet
         // initialized (notification arrived before initialize).
-        self.with_analysis_mut("closing documents", |analysis| {
-            if let Some(input) = self.document_inputs.get(&uri).map(|e| *e) {
-                input.close(&mut analysis.db);
+        let input = self.document_inputs.get(&uri).map(|entry| *entry);
+        self.with_session("closing documents", |s| {
+            let mut db = s.db.lock();
+            if let Some(input) = input {
+                input.close(&mut *db);
             }
-            analysis.db.trigger_lru_eviction();
+            db.trigger_lru_eviction();
         });
 
         self.client
@@ -1255,17 +1318,16 @@ impl HydraLspBackend {
         let input = *input_ref;
         drop(input_ref);
 
-        let Some((parsed_yaml, db_snapshot, python_config)) =
-            self.with_analysis("publishing diagnostics", |analysis| {
-                // Clone the cheap Arc-wrapped ParsedYaml; the deep
-                // ParsedContent stays inside the salsa cache.
-                let cached = yaml_cache::parsed_yaml(&analysis.db, input);
-                let snapshot = analysis.db.clone();
-                (cached, snapshot, analysis.python_config)
-            })
+        let Some(SessionSnapshot {
+            db: db_snapshot,
+            python_config,
+        }) = self.snapshot()
         else {
             return;
         };
+        // Clone the cheap Arc-wrapped ParsedYaml off the snapshot; the deep
+        // ParsedContent stays inside the salsa cache.
+        let parsed_yaml = yaml_cache::parsed_yaml(&db_snapshot, input);
 
         // Handle the parse result
         if parsed_yaml.is_ok() {
