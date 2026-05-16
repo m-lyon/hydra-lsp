@@ -13,7 +13,6 @@ use salsa::{Database as _, Setter};
 
 use crate::database::HydraDatabase;
 use crate::diagnostics::{self, DiagnosticRule};
-use crate::document::DocumentStore;
 use crate::python_analyzer::{
     DefinitionInfo, ParameterInfo, PythonAnalyzer, normalize_site_packages_pth_state_key,
 };
@@ -222,7 +221,6 @@ pub struct SessionSnapshot {
 
 pub struct HydraLspBackend {
     pub client: Client,
-    pub documents: Arc<DocumentStore>,
     pub settings: Arc<RwLock<Settings>>,
     /// Initialized lazily on `initialize`. `None` means a notification
     /// arrived before `initialize` (LSP protocol violation) — handlers log
@@ -255,7 +253,6 @@ pub struct HydraLspBackend {
 impl std::fmt::Debug for HydraLspBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HydraLspBackend")
-            .field("documents", &self.documents)
             .field("settings", &self.settings)
             .finish_non_exhaustive()
     }
@@ -265,7 +262,6 @@ impl HydraLspBackend {
     pub fn new(client: Client) -> Self {
         Self {
             client,
-            documents: Arc::new(DocumentStore::new()),
             settings: Arc::new(RwLock::new(Settings::default())),
             session: Arc::new(parking_lot::RwLock::new(None)),
             document_inputs: DashMap::new(),
@@ -608,8 +604,6 @@ impl LanguageServer for HydraLspBackend {
         let text = params.text_document.text;
         let version = params.text_document.version;
 
-        self.documents.insert(uri.clone(), text.clone(), version);
-
         // Create a salsa input for this document. Returns None (and logs)
         // when called before initialize.
         let Some(input) = self.get_or_create_input(&uri, &text, version) else {
@@ -638,9 +632,6 @@ impl LanguageServer for HydraLspBackend {
 
         // Full sync: take the first change which is the entire document
         if let Some(change) = params.content_changes.into_iter().next() {
-            self.documents
-                .update(uri.clone(), change.text.clone(), version);
-
             // Update the salsa input (invalidates cached queries). Returns
             // None (and logs) when called before initialize.
             let Some(input) = self.get_or_create_input(&uri, &change.text, version) else {
@@ -756,7 +747,6 @@ impl LanguageServer for HydraLspBackend {
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = params.text_document.uri;
-        self.documents.remove(&uri);
 
         // Soft-close the salsa input: clear the source text so salsa drops
         // the per-document `String` while the input slot is retained for
