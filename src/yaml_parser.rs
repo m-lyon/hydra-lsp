@@ -348,6 +348,83 @@ pub struct ParsedContent {
     pub file_suppressions: HashSet<DiagnosticRule>,
 }
 
+impl ParsedContent {
+    /// Look up the [`HydraObject`] whose `_target_` value contains the cursor
+    /// position. Returns `None` when the cursor is on a non-target line or on
+    /// the column outside the value range. O(1) on the precomputed
+    /// `target_line_map`.
+    pub fn target_at_position(&self, position: Position) -> Option<&HydraObject> {
+        let line_index = *self.target_line_map.get(&position.line)?;
+        let hydra_object = &self.hydra_objects[line_index];
+        if position.character > hydra_object.target.value_start
+            && position.character < hydra_object.target_value_end()
+        {
+            Some(hydra_object)
+        } else {
+            None
+        }
+    }
+
+    /// Look up the target value and parameter context for a parameter line at
+    /// the given position. Returns `None` when the cursor is on a `_target_`
+    /// line or an unrelated line. The third element of the tuple is the list
+    /// of keyword parameter names already specified in the same Hydra object,
+    /// which callers use to detect conflicts between positional (`_args_`) and
+    /// keyword assignments. O(1) on the precomputed `param_line_map`.
+    pub fn target_for_parameter_line(
+        &self,
+        position: Position,
+    ) -> Option<(String, ResolvedParameterContext, Vec<String>)> {
+        if self.target_line_map.contains_key(&position.line) {
+            return None;
+        }
+        let (idx, context) = self.param_line_map.get(&position.line)?;
+        let hydra_object = &self.hydra_objects[*idx];
+        let (resolved, keyword_keys) = match context {
+            ParameterContext::Keyword(key) => {
+                (ResolvedParameterContext::Keyword(key.clone()), vec![])
+            }
+            ParameterContext::Positional(index) => {
+                let (num_args, kw_keys) = YamlParser::count_param_kinds(&hydra_object.parameters);
+                (
+                    ResolvedParameterContext::Positional(*index, num_args),
+                    kw_keys,
+                )
+            }
+            ParameterContext::InlinePositional {
+                bracket_col,
+                text_after_bracket,
+            } => {
+                let cursor_chars =
+                    (position.character as usize).saturating_sub(*bracket_col as usize + 1);
+                let end: usize = text_after_bracket
+                    .char_indices()
+                    .nth(cursor_chars)
+                    .map_or(text_after_bracket.len(), |(i, _)| i);
+                let index = YamlParser::count_flow_commas(text_after_bracket, 0, end);
+                let (num_args, kw_keys) = YamlParser::count_param_kinds(&hydra_object.parameters);
+                (
+                    ResolvedParameterContext::Positional(index, num_args),
+                    kw_keys,
+                )
+            }
+        };
+        Some((hydra_object.target.value.clone(), resolved, keyword_keys))
+    }
+
+    /// Generate semantic tokens for syntax highlighting from the already
+    /// parsed content. Returns tokens sorted by `(line, start_char)`.
+    pub fn extract_semantic_tokens(&self) -> Vec<HydraSemanticToken> {
+        let mut tokens = Vec::new();
+        for hydra_obj in &self.hydra_objects {
+            YamlParser::tokenize_hydra_keywords(hydra_obj, &mut tokens);
+            YamlParser::tokenize_parameters(hydra_obj, &mut tokens);
+        }
+        tokens.sort_by_key(|t| (t.line, t.start_char));
+        tokens
+    }
+}
+
 /// Convert a saphyr `MarkedYamlOwned` node to `YamlValue`
 fn node_to_yaml_value(node: &MarkedYamlOwned) -> YamlValue {
     let data = &node.data;
@@ -932,24 +1009,6 @@ impl YamlParser {
         parameters
     }
 
-    /// Find the target info at a specific position
-    pub fn find_target_at_position(
-        content: &str,
-        position: Position,
-    ) -> Result<Option<HydraObject>, YamlParseError> {
-        let parsed_content = Self::parse(content)?;
-        if let Some(&line_index) = parsed_content.target_line_map.get(&position.line) {
-            let hydra_object = &parsed_content.hydra_objects[line_index];
-            // Check if the column is within the function definition
-            if position.character > hydra_object.target.value_start
-                && position.character < hydra_object.target_value_end()
-            {
-                return Ok(Some(hydra_object.clone()));
-            }
-        }
-        Ok(None)
-    }
-
     /// Count positional args and collect keyword keys from a parameter list.
     fn count_param_kinds(parameters: &[Parameter]) -> (u32, Vec<String>) {
         let mut num_args = 0u32;
@@ -992,64 +1051,6 @@ impl YamlParser {
             }
         }
         count
-    }
-
-    /// Find the target value and parameter context for a parameter line at the given
-    /// position.
-    ///
-    /// Returns `None` if the cursor is on a `_target_` line or an unrelated line.
-    /// The returned tuple includes the keyword parameter names already specified
-    /// in the same Hydra object, which callers can use to detect conflicts
-    /// between positional (`_args_`) and keyword assignments.
-    pub fn find_target_for_parameter_line(
-        content: &str,
-        position: Position,
-    ) -> Result<Option<(String, ResolvedParameterContext, Vec<String>)>, YamlParseError> {
-        let parsed_content = Self::parse(content)?;
-        // If cursor is on a _target_ line, return None
-        if parsed_content.target_line_map.contains_key(&position.line) {
-            return Ok(None);
-        }
-        // Look up the parameter line in the precomputed map
-        if let Some((idx, context)) = parsed_content.param_line_map.get(&position.line) {
-            let hydra_object = &parsed_content.hydra_objects[*idx];
-            let (resolved, keyword_keys) = match context {
-                ParameterContext::Keyword(key) => {
-                    (ResolvedParameterContext::Keyword(key.clone()), vec![])
-                }
-                ParameterContext::Positional(index) => {
-                    let (num_args, kw_keys) = Self::count_param_kinds(&hydra_object.parameters);
-                    (
-                        ResolvedParameterContext::Positional(*index, num_args),
-                        kw_keys,
-                    )
-                }
-                ParameterContext::InlinePositional {
-                    bracket_col,
-                    text_after_bracket,
-                } => {
-                    let cursor_chars =
-                        (position.character as usize).saturating_sub(*bracket_col as usize + 1);
-                    // Convert char count to byte offset for slicing
-                    let end: usize = text_after_bracket
-                        .char_indices()
-                        .nth(cursor_chars)
-                        .map_or(text_after_bracket.len(), |(i, _)| i);
-                    let index = Self::count_flow_commas(text_after_bracket, 0, end);
-                    let (num_args, kw_keys) = Self::count_param_kinds(&hydra_object.parameters);
-                    (
-                        ResolvedParameterContext::Positional(index, num_args),
-                        kw_keys,
-                    )
-                }
-            };
-            return Ok(Some((
-                hydra_object.target.value.clone(),
-                resolved,
-                keyword_keys,
-            )));
-        }
-        Ok(None)
     }
 
     /// Get completion context at a position
@@ -1147,28 +1148,6 @@ impl YamlParser {
         }
 
         Ok(None)
-    }
-
-    /// Extract semantic tokens from the document for syntax highlighting
-    /// Returns tokens sorted by position (line, then character)
-    pub fn extract_semantic_tokens(content: &str) -> Vec<HydraSemanticToken> {
-        let mut tokens = Vec::new();
-
-        // Parse the YAML to get targets and their parameters
-        let Ok(parsed_content) = Self::parse(content) else {
-            return tokens;
-        };
-
-        // Generate tokens for each target
-        for hydra_obj in &parsed_content.hydra_objects {
-            Self::tokenize_hydra_keywords(hydra_obj, &mut tokens);
-            Self::tokenize_parameters(hydra_obj, &mut tokens);
-        }
-
-        // Sort tokens by position (line, then start character)
-        tokens.sort_by_key(|t| (t.line, t.start_char));
-
-        tokens
     }
 
     /// Tokenize a _target_ value, splitting it into namespace and class/function parts
@@ -1397,7 +1376,7 @@ pub enum ParameterContext {
     },
 }
 
-/// Resolved parameter context returned by [`YamlParser::find_target_for_parameter_line`].
+/// Resolved parameter context returned by [`ParsedContent::target_for_parameter_line`].
 ///
 /// Unlike [`ParameterContext`] this has no `InlinePositional` variant — inline
 /// sequences are resolved to a concrete `Positional` index using the cursor column.
@@ -1514,9 +1493,8 @@ model:
   num_layers: 12
 "#;
         let position = Position::new(2, 15);
-        let hydra_object = YamlParser::find_target_at_position(content, position)
-            .unwrap()
-            .unwrap();
+        let parsed = YamlParser::parse(content).unwrap();
+        let hydra_object = parsed.target_at_position(position).unwrap();
         assert_eq!(hydra_object.target.value, "myproject.Model");
         assert_eq!(hydra_object.target.line, 2);
         assert_eq!(hydra_object.target.key_start, 2);
@@ -1531,8 +1509,8 @@ model:
   num_layers: 12
 "#;
         let position = Position::new(1, 2); // Line without _target_
-        let hydra_object = YamlParser::find_target_at_position(content, position).unwrap();
-        assert!(hydra_object.is_none());
+        let parsed = YamlParser::parse(content).unwrap();
+        assert!(parsed.target_at_position(position).is_none());
     }
 
     #[test]
@@ -1544,8 +1522,8 @@ model:
   num_layers: 12
 "#;
         let position = Position::new(2, 11); // Column before _target_ value
-        let hydra_object = YamlParser::find_target_at_position(content, position).unwrap();
-        assert!(hydra_object.is_none());
+        let parsed = YamlParser::parse(content).unwrap();
+        assert!(parsed.target_at_position(position).is_none());
     }
 
     #[test]
@@ -1557,8 +1535,8 @@ model:
   num_layers: 12
 "#;
         let position = Position::new(2, 27); // Column after _target_
-        let hydra_object = YamlParser::find_target_at_position(content, position).unwrap();
-        assert!(hydra_object.is_none());
+        let parsed = YamlParser::parse(content).unwrap();
+        assert!(parsed.target_at_position(position).is_none());
     }
 
     #[test]
@@ -1962,9 +1940,8 @@ model:
   hidden_size: 256
 "#;
         let position = Position::new(2, 20); // In the value part
-        let hydra_object = YamlParser::find_target_at_position(content, position)
-            .unwrap()
-            .unwrap();
+        let parsed = YamlParser::parse(content).unwrap();
+        let hydra_object = parsed.target_at_position(position).unwrap();
         assert_eq!(hydra_object.target.value, "myproject.Model");
         assert_eq!(hydra_object.target.line, 2);
         assert_eq!(hydra_object.target.key_start, 2); // Position of opening quote
@@ -1984,9 +1961,8 @@ model:
   hidden_size: 256
 "#;
         let position = Position::new(2, 20); // In the value part
-        let hydra_object = YamlParser::find_target_at_position(content, position)
-            .unwrap()
-            .unwrap();
+        let parsed = YamlParser::parse(content).unwrap();
+        let hydra_object = parsed.target_at_position(position).unwrap();
         assert_eq!(hydra_object.target.value, "myproject.Model");
         assert_eq!(hydra_object.target.line, 2);
         assert_eq!(hydra_object.target.key_start, 2);
@@ -2120,9 +2096,8 @@ model:
 "#;
         // Position in the middle of the value (inside quotes)
         let position = Position::new(2, 20);
-        let hydra_object = YamlParser::find_target_at_position(content, position)
-            .unwrap()
-            .unwrap();
+        let parsed = YamlParser::parse(content).unwrap();
+        let hydra_object = parsed.target_at_position(position).unwrap();
         assert_eq!(hydra_object.target.value, "myproject.Model");
         assert_eq!(hydra_object.target.line, 2);
     }
@@ -2134,7 +2109,9 @@ model:
   _target_: myproject.Model
   hidden_size: 256
 "#;
-        let tokens = YamlParser::extract_semantic_tokens(content);
+        let tokens = YamlParser::parse(content)
+            .unwrap()
+            .extract_semantic_tokens();
 
         // Should have tokens for: "myproject" (namespace), "Model" (class),
         // "hidden_size" (parameter), "256" (number)
@@ -2176,7 +2153,9 @@ model:
   _target_: my.project.models.Transformer
   layers: 12
 "#;
-        let tokens = YamlParser::extract_semantic_tokens(content);
+        let tokens = YamlParser::parse(content)
+            .unwrap()
+            .extract_semantic_tokens();
 
         // Should have 3 namespace tokens (my, project, models) and 1 class token (Transformer)
         let namespace_tokens: Vec<_> = tokens
@@ -2199,7 +2178,9 @@ func:
   _target_: my.module.create_model
   config: test
 "#;
-        let tokens = YamlParser::extract_semantic_tokens(content);
+        let tokens = YamlParser::parse(content)
+            .unwrap()
+            .extract_semantic_tokens();
 
         // Function name (lowercase) should be tokenized as Function
         let function_tokens: Vec<_> = tokens
@@ -2217,7 +2198,9 @@ model:
   _target_: myproject.Model
   size: 100
 "#;
-        let tokens = YamlParser::extract_semantic_tokens(content);
+        let tokens = YamlParser::parse(content)
+            .unwrap()
+            .extract_semantic_tokens();
         let lsp_tokens = HydraSemanticToken::to_lsp_tokens(&tokens);
 
         // Should have tokens in LSP format
@@ -2255,7 +2238,9 @@ model:
   name: "test_model"
   path: '/tmp/model'
 "#;
-        let tokens = YamlParser::extract_semantic_tokens(content);
+        let tokens = YamlParser::parse(content)
+            .unwrap()
+            .extract_semantic_tokens();
 
         // Should have string tokens for both quoted strings
         let string_tokens: Vec<_> = tokens
@@ -2923,10 +2908,8 @@ model:
   num_layers: 12
 "#;
         let position = Position::new(3, 5); // on hidden_size line
-        let (target_value, param_ctx, _) =
-            YamlParser::find_target_for_parameter_line(content, position)
-                .unwrap()
-                .unwrap();
+        let parsed = YamlParser::parse(content).unwrap();
+        let (target_value, param_ctx, _) = parsed.target_for_parameter_line(position).unwrap();
         assert_eq!(target_value, "myproject.Model");
         assert_eq!(
             param_ctx,
@@ -2942,8 +2925,8 @@ model:
   hidden_size: 256
 "#;
         let position = Position::new(2, 10); // on _target_ line
-        let result = YamlParser::find_target_for_parameter_line(content, position).unwrap();
-        assert!(result.is_none());
+        let parsed = YamlParser::parse(content).unwrap();
+        assert!(parsed.target_for_parameter_line(position).is_none());
     }
 
     #[test]
@@ -2957,10 +2940,10 @@ optimizer:
   lr: 0.001
 "#;
         // Cursor on lr line (parameter of second target)
-        let (target_value, param_ctx, _) =
-            YamlParser::find_target_for_parameter_line(content, Position::new(6, 5))
-                .unwrap()
-                .unwrap();
+        let parsed = YamlParser::parse(content).unwrap();
+        let (target_value, param_ctx, _) = parsed
+            .target_for_parameter_line(Position::new(6, 5))
+            .unwrap();
         assert_eq!(target_value, "myproject.Optimizer");
         assert_eq!(
             param_ctx,
@@ -2976,8 +2959,8 @@ model:
   hidden_size: 256
 "#;
         let position = Position::new(1, 2); // on "model:" line
-        let result = YamlParser::find_target_for_parameter_line(content, position).unwrap();
-        assert!(result.is_none());
+        let parsed = YamlParser::parse(content).unwrap();
+        assert!(parsed.target_for_parameter_line(position).is_none());
     }
 
     #[test]
@@ -2991,33 +2974,30 @@ model:
     - 30
   param: value
 "#;
+        let parsed = YamlParser::parse(content).unwrap();
         // Cursor on first positional arg (line 4: "    - 10")
-        let (target_value, param_ctx, _) =
-            YamlParser::find_target_for_parameter_line(content, Position::new(4, 5))
-                .unwrap()
-                .unwrap();
+        let (target_value, param_ctx, _) = parsed
+            .target_for_parameter_line(Position::new(4, 5))
+            .unwrap();
         assert_eq!(target_value, "myproject.Model");
         assert_eq!(param_ctx, ResolvedParameterContext::Positional(0, 3));
 
         // Cursor on second positional arg (line 5: "    - 20")
-        let (_, param_ctx, _) =
-            YamlParser::find_target_for_parameter_line(content, Position::new(5, 5))
-                .unwrap()
-                .unwrap();
+        let (_, param_ctx, _) = parsed
+            .target_for_parameter_line(Position::new(5, 5))
+            .unwrap();
         assert_eq!(param_ctx, ResolvedParameterContext::Positional(1, 3));
 
         // Cursor on third positional arg (line 6: "    - 30")
-        let (_, param_ctx, _) =
-            YamlParser::find_target_for_parameter_line(content, Position::new(6, 5))
-                .unwrap()
-                .unwrap();
+        let (_, param_ctx, _) = parsed
+            .target_for_parameter_line(Position::new(6, 5))
+            .unwrap();
         assert_eq!(param_ctx, ResolvedParameterContext::Positional(2, 3));
 
         // Cursor on keyword param (line 7: "  param: value")
-        let (_, param_ctx, _) =
-            YamlParser::find_target_for_parameter_line(content, Position::new(7, 5))
-                .unwrap()
-                .unwrap();
+        let (_, param_ctx, _) = parsed
+            .target_for_parameter_line(Position::new(7, 5))
+            .unwrap();
         assert_eq!(
             param_ctx,
             ResolvedParameterContext::Keyword("param".to_string())
@@ -3279,19 +3259,18 @@ model:
   _args_: []
   param: value
 "#;
+        let parsed = YamlParser::parse(content).unwrap();
         // Cursor on _args_ line (line 3), inside the empty brackets
-        let (target, param_ctx, _) =
-            YamlParser::find_target_for_parameter_line(content, Position::new(3, 11))
-                .unwrap()
-                .unwrap();
+        let (target, param_ctx, _) = parsed
+            .target_for_parameter_line(Position::new(3, 11))
+            .unwrap();
         assert_eq!(target, "myproject.Model");
         assert_eq!(param_ctx, ResolvedParameterContext::Positional(0, 0));
 
         // Cursor on keyword param (line 4: "  param: value")
-        let (_, param_ctx, _) =
-            YamlParser::find_target_for_parameter_line(content, Position::new(4, 5))
-                .unwrap()
-                .unwrap();
+        let (_, param_ctx, _) = parsed
+            .target_for_parameter_line(Position::new(4, 5))
+            .unwrap();
         assert_eq!(
             param_ctx,
             ResolvedParameterContext::Keyword("param".to_string())

@@ -18,7 +18,7 @@ use crate::python_analyzer::{
     DefinitionInfo, ParameterInfo, PythonAnalyzer, normalize_site_packages_pth_state_key,
 };
 use crate::python_cache::{self, PythonConfig, SitePackagesPthState, TargetString};
-use crate::yaml_cache::{self, DocumentInput};
+use crate::yaml_cache::{self, DocumentInput, ParsedYaml};
 use crate::yaml_parser::{
     ARGS_KEY, CONVERT_KEY, CompletionContext, ConvertMode, HydraSemanticToken, PARTIAL_KEY,
     RECURSIVE_KEY, ResolvedParameterContext, YamlParser,
@@ -393,6 +393,31 @@ impl HydraLspBackend {
         .map_err(|e| anyhow::anyhow!("Task failed: {}", e))?
     }
 
+    /// Look up the cached `parsed_yaml` result for a URI, but only if the
+    /// document is a Hydra file.
+    ///
+    /// Checks the cheap `is_hydra_file` salsa query first; if the document
+    /// is not a Hydra file we skip the YAML parse entirely. Returns `None` when:
+    /// - The URI has no `DocumentInput` (notification not yet seen).
+    /// - The session is not initialized.
+    /// - The document is not a Hydra file.
+    ///
+    /// On the warm path for a Hydra file, both salsa calls are O(1) cache
+    /// hits. Used by every per-keystroke handler so a hover/etc. on an
+    /// already-parsed document does no YAML re-parsing.
+    fn cached_parsed_yaml(&self, uri: &Url, context: &'static str) -> Option<ParsedYaml> {
+        let input = *self.document_inputs.get(uri)?;
+        self.with_session(context, |s| {
+            let db = s.db.lock();
+            if yaml_cache::is_hydra_file(&*db, input) {
+                Some(yaml_cache::parsed_yaml(&*db, input))
+            } else {
+                None
+            }
+        })
+        .flatten()
+    }
+
     /// Get or create a `DocumentInput` for a given URI.
     ///
     /// Holds the dashmap entry guard across the salsa write so that concurrent
@@ -764,27 +789,16 @@ impl LanguageServer for HydraLspBackend {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
 
-        // Get document content
-        let document = match self.documents.get(&uri) {
-            Some(doc) => doc,
-            None => return Ok(None),
-        };
-
-        // Check if this is a Hydra file
-        if !YamlParser::is_hydra_file(&document.content) {
+        // Cached salsa lookups: skip if not a Hydra file. Both calls are O(1)
+        // hashmap probes on the warm path.
+        let Some(parsed) = self.cached_parsed_yaml(&uri, "hover") else {
             return Ok(None);
-        }
-
-        // Find _target_ at cursor position
-        let hydra_object = match YamlParser::find_target_at_position(&document.content, position) {
-            Ok(Some(info)) => info,
-            Ok(None) => return Ok(None),
-            Err(e) => {
-                self.client
-                    .log_message(MessageType::ERROR, format!("YAML parse error: {}", e))
-                    .await;
-                return Ok(None);
-            }
+        };
+        let Ok(content) = parsed.result() else {
+            return Ok(None);
+        };
+        let Some(hydra_object) = content.target_at_position(position) else {
+            return Ok(None);
         };
 
         self.client
@@ -849,19 +863,35 @@ impl LanguageServer for HydraLspBackend {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
 
-        // Get document content
-        let document = match self.documents.get(&uri) {
-            Some(doc) => doc,
-            None => return Ok(None),
+        // Use the cached `is_hydra_file` salsa query, then read the document
+        // text from the salsa input. `get_completion_context` still scans the
+        // raw text since the partial-syntax case can be unparseable —
+        // finding 7 in CACHING_AND_CONCURRENCY_AUDIT.md will refactor that
+        // to prefer the cached parse for valid lines.
+        let Some(input) = self.document_inputs.get(&uri).map(|e| *e) else {
+            return Ok(None);
         };
-
-        // Check if this is a Hydra file
-        if !YamlParser::is_hydra_file(&document.content) {
+        let Some((is_hydra, content_text)) = self.with_session("completion", |s| {
+            let db = s.db.lock();
+            let is_hydra = yaml_cache::is_hydra_file(&*db, input);
+            let text = if is_hydra {
+                Some(input.text(&*db).clone()) // TODO: check whether cloning whole text is still present after refactor to prefer cached parse - and optimize if so
+            } else {
+                None
+            };
+            (is_hydra, text)
+        }) else {
+            return Ok(None);
+        };
+        if !is_hydra {
             return Ok(None);
         }
+        let Some(content_text) = content_text else {
+            return Ok(None);
+        };
 
         // Get completion context
-        let context = match YamlParser::get_completion_context(&document.content, position) {
+        let context = match YamlParser::get_completion_context(&content_text, position) {
             Ok(ctx) => ctx,
             Err(e) => {
                 self.client
@@ -995,29 +1025,17 @@ impl LanguageServer for HydraLspBackend {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
 
-        // Get document content
-        let document = match self.documents.get(&uri) {
-            Some(doc) => doc,
-            None => return Ok(None),
-        };
-
-        // Check if this is a Hydra file
-        if !YamlParser::is_hydra_file(&document.content) {
+        let Some(parsed) = self.cached_parsed_yaml(&uri, "signature_help") else {
             return Ok(None);
-        }
-
-        // Find target info for the parameter line at cursor position
-        let (target_value, param_context, keyword_keys) =
-            match YamlParser::find_target_for_parameter_line(&document.content, position) {
-                Ok(Some(result)) => result,
-                Ok(None) => return Ok(None),
-                Err(e) => {
-                    self.client
-                        .log_message(MessageType::ERROR, format!("YAML parse error: {}", e))
-                        .await;
-                    return Ok(None);
-                }
-            };
+        };
+        let Ok(content) = parsed.result() else {
+            return Ok(None);
+        };
+        let Some((target_value, param_context, keyword_keys)) =
+            content.target_for_parameter_line(position)
+        else {
+            return Ok(None);
+        };
 
         // Extract Python definition info on a blocking thread (cached + non-blocking)
         let extract_result = self.spawn_definition_lookup(target_value.clone()).await;
@@ -1172,27 +1190,14 @@ impl LanguageServer for HydraLspBackend {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
 
-        // Get document content
-        let document = match self.documents.get(&uri) {
-            Some(doc) => doc,
-            None => return Ok(None),
-        };
-
-        // Check if this is a Hydra file
-        if !YamlParser::is_hydra_file(&document.content) {
+        let Some(parsed) = self.cached_parsed_yaml(&uri, "goto_definition") else {
             return Ok(None);
-        }
-
-        // Find _target_ at cursor position
-        let target_info = match YamlParser::find_target_at_position(&document.content, position) {
-            Ok(Some(info)) => info,
-            Ok(None) => return Ok(None),
-            Err(e) => {
-                self.client
-                    .log_message(MessageType::ERROR, format!("YAML parse error: {}", e))
-                    .await;
-                return Ok(None);
-            }
+        };
+        let Ok(content) = parsed.result() else {
+            return Ok(None);
+        };
+        let Some(target_info) = content.target_at_position(position).cloned() else {
+            return Ok(None);
         };
 
         // Extract definition info on a blocking thread (cached + non-blocking)
@@ -1260,23 +1265,22 @@ impl LanguageServer for HydraLspBackend {
         }
         let uri = params.text_document.uri;
 
-        // Get document content
-        let document = match self.documents.get(&uri) {
-            Some(doc) => doc,
-            None => return Ok(None),
-        };
-
-        // Check if this is a Hydra file
-        if !YamlParser::is_hydra_file(&document.content) {
+        let Some(parsed) = self.cached_parsed_yaml(&uri, "semantic_tokens") else {
             return Ok(None);
-        }
+        };
+        let Ok(content) = parsed.result() else {
+            return Ok(None);
+        };
 
         self.client
             .log_message(MessageType::INFO, "Generating semantic tokens".to_string())
             .await;
 
-        // Extract semantic tokens from the YAML content
-        let tokens = YamlParser::extract_semantic_tokens(&document.content);
+        // Extract semantic tokens from the cached parsed content. Finding 7
+        // will further cache the token list itself via a salsa-tracked query;
+        // for now this still re-tokenizes per request but skips the YAML
+        // re-parse, which is the dominant cost.
+        let tokens = content.extract_semantic_tokens();
 
         // Convert to LSP format
         let data = HydraSemanticToken::to_lsp_tokens(&tokens);
