@@ -282,10 +282,7 @@ impl PythonAnalyzer {
     }
 
     /// Resolve a Python module path to a file path using pre-built search paths
-    pub fn resolve_module(
-        module_path: &str,
-        search_paths: &[PathBuf],
-    ) -> Result<PathBuf> {
+    pub fn resolve_module(module_path: &str, search_paths: &[PathBuf]) -> Result<PathBuf> {
         let module_parts: Vec<&str> = module_path.split('.').collect();
         let search_path_count = search_paths.len();
 
@@ -348,9 +345,7 @@ impl PythonAnalyzer {
             result: None,
             source: source.as_str().to_string(),
         };
-
         visitor.visit_body(parsed.suite());
-
         visitor
             .result
             .ok_or_else(|| anyhow::anyhow!("Function '{}' not found", function_name))
@@ -370,9 +365,7 @@ impl PythonAnalyzer {
             result: None,
             source: source.as_str().to_string(),
         };
-
         visitor.visit_body(parsed.suite());
-
         visitor
             .result
             .ok_or_else(|| anyhow::anyhow!("Class '{}' not found", class_name))
@@ -394,9 +387,7 @@ impl PythonAnalyzer {
             result: None,
             source: source.as_str().to_string(),
         };
-
         visitor.visit_body(parsed.suite());
-
         visitor.result.ok_or_else(|| {
             anyhow::anyhow!(
                 "Method '{}' not found in class '{}'",
@@ -459,7 +450,9 @@ impl PythonAnalyzer {
         visited.insert(visit_key);
 
         // Try to find the attribute directly on this class
-        if let Ok(attr_info) = Self::extract_class_attribute(db, file_path, class_name, attribute_name) {
+        if let Ok(attr_info) =
+            Self::extract_class_attribute(db, file_path, class_name, attribute_name)
+        {
             return Ok((attr_info, file_path.to_path_buf(), class_name.to_string()));
         }
 
@@ -526,7 +519,8 @@ impl PythonAnalyzer {
             let is_last = i == attribute_chain.len() - 1;
 
             // First, check if this is a method on the current class
-            if is_last && Self::extract_method_info(db, &current_file, &current_class, attr).is_ok() {
+            if is_last && Self::extract_method_info(db, &current_file, &current_class, attr).is_ok()
+            {
                 return Ok((current_file, current_class, Some(attr.to_string())));
             }
 
@@ -735,8 +729,7 @@ impl PythonAnalyzer {
             let class_name = &base_class_expr[dot_pos + 1..];
 
             // Try to resolve the module
-            if let Ok(file_path) = Self::resolve_module(module_path, search_paths)
-            {
+            if let Ok(file_path) = Self::resolve_module(module_path, search_paths) {
                 return Some((file_path, class_name.to_string()));
             }
         }
@@ -873,7 +866,6 @@ impl PythonAnalyzer {
         class_name: &str,
         search_paths: Vec<PathBuf>,
     ) -> Result<(ClassInfo, PathBuf)> {
-        // First try direct lookup
         let (mut class_info, resolved_file) =
             if let Ok(class_info) = Self::extract_class_info(db, file_path, class_name) {
                 (class_info, file_path.to_path_buf())
@@ -902,7 +894,6 @@ impl PythonAnalyzer {
         // Resolve missing properties from parent classes
         if class_info.docstring.is_none() || class_info.init_signature.is_none() {
             let mut visited = HashSet::new();
-            // Use (file, class_name) as key to allow visiting multiple classes in same file
             let canonical_path = resolved_file
                 .canonicalize()
                 .unwrap_or_else(|_| resolved_file.clone());
@@ -938,7 +929,6 @@ impl PythonAnalyzer {
         function_name: &str,
         search_paths: Vec<PathBuf>,
     ) -> Result<(FunctionSignature, PathBuf)> {
-        // First try direct lookup
         if let Ok(func_sig) = Self::extract_function_signature(db, file_path, function_name) {
             return Ok((func_sig, file_path.to_path_buf()));
         }
@@ -981,9 +971,7 @@ impl PythonAnalyzer {
         let mut module_found = false;
 
         // First try standard resolution: module.symbol where symbol is a function or class
-        if let Ok(file_path) =
-            Self::resolve_module(&module_path, search_paths)
-        {
+        if let Ok(file_path) = Self::resolve_module(&module_path, search_paths) {
             module_found = true;
 
             // Try to extract as function first (with import resolution)
@@ -1108,8 +1096,7 @@ impl PythonAnalyzer {
             let remaining_parts = &parts[module_end_idx..];
 
             // Try to resolve the module
-            let Ok(file_path) = Self::resolve_module(&module_path, search_paths)
-            else {
+            let Ok(file_path) = Self::resolve_module(&module_path, search_paths) else {
                 continue;
             };
 
@@ -1127,7 +1114,9 @@ impl PythonAnalyzer {
                     // Simple case: Class.method
                     let method_name = remaining_parts[1];
                     // Check if method exists (salsa-cached)
-                    if Self::extract_method_info(db, &resolved_file, &class_info.name, method_name).is_ok() {
+                    if Self::extract_method_info(db, &resolved_file, &class_info.name, method_name)
+                        .is_ok()
+                    {
                         return Some(ClassAttributeChainResult::Method {
                             file_path: resolved_file,
                             class_name: class_info.name,
@@ -1179,7 +1168,6 @@ impl PythonAnalyzer {
         method_name: &str,
         search_paths: Vec<PathBuf>,
     ) -> Result<(MethodInfo, PathBuf)> {
-        // First try direct lookup
         if let Ok(method_info) = Self::extract_method_info(db, file_path, class_name, method_name) {
             return Ok((method_info, file_path.to_path_buf()));
         }
@@ -1831,7 +1819,10 @@ mod tests {
     #[test]
     fn test_resolve_module_simple() {
         let examples_dir = get_simple_test_dir();
-        let result = PythonAnalyzer::resolve_module("my_module", &[examples_dir.clone(), PathBuf::from(".")]);
+        let result = PythonAnalyzer::resolve_module(
+            "my_module",
+            &[examples_dir.clone(), PathBuf::from(".")],
+        );
         assert!(result.is_ok());
         let path = result.unwrap();
         assert!(path.ends_with("my_module.py"));
@@ -1840,7 +1831,10 @@ mod tests {
     #[test]
     fn test_resolve_module_package() {
         let examples_dir = get_simple_test_dir();
-        let result = PythonAnalyzer::resolve_module("test_package", &[examples_dir.clone(), PathBuf::from(".")]);
+        let result = PythonAnalyzer::resolve_module(
+            "test_package",
+            &[examples_dir.clone(), PathBuf::from(".")],
+        );
         assert!(result.is_ok());
         let path = result.unwrap();
         assert!(path.ends_with("__init__.py"));
@@ -1876,7 +1870,8 @@ mod tests {
         let test_file = examples_dir.join("my_module.py");
         let db = test_db();
 
-        let sig = PythonAnalyzer::extract_function_signature(&db, &test_file, "simple_function").unwrap();
+        let sig =
+            PythonAnalyzer::extract_function_signature(&db, &test_file, "simple_function").unwrap();
         assert_eq!(sig.name, "simple_function");
         assert_eq!(sig.parameters.len(), 0);
         assert!(sig.docstring.is_some());
@@ -1890,7 +1885,8 @@ mod tests {
         let db = test_db();
 
         let sig =
-            PythonAnalyzer::extract_function_signature(&db, &test_file, "function_with_params").unwrap();
+            PythonAnalyzer::extract_function_signature(&db, &test_file, "function_with_params")
+                .unwrap();
         assert_eq!(sig.name, "function_with_params");
         assert_eq!(sig.parameters.len(), 3);
 
@@ -1921,7 +1917,8 @@ mod tests {
         let db = test_db();
 
         let sig =
-            PythonAnalyzer::extract_function_signature(&db, &test_file, "function_with_return").unwrap();
+            PythonAnalyzer::extract_function_signature(&db, &test_file, "function_with_return")
+                .unwrap();
         assert_eq!(sig.name, "function_with_return");
         assert!(sig.return_type.is_some());
         assert_eq!(sig.return_type.as_ref().unwrap(), "int");
@@ -1933,7 +1930,8 @@ mod tests {
         let test_file = examples_dir.join("my_module.py");
         let db = test_db();
 
-        let sig = PythonAnalyzer::extract_function_signature(&db, &test_file, "variadic_function").unwrap();
+        let sig = PythonAnalyzer::extract_function_signature(&db, &test_file, "variadic_function")
+            .unwrap();
         assert_eq!(sig.name, "variadic_function");
         assert_eq!(sig.parameters.len(), 2);
 
@@ -1954,7 +1952,8 @@ mod tests {
         let test_file = examples_dir.join("my_module.py");
         let db = test_db();
 
-        let sig = PythonAnalyzer::extract_function_signature(&db, &test_file, "complex_function").unwrap();
+        let sig = PythonAnalyzer::extract_function_signature(&db, &test_file, "complex_function")
+            .unwrap();
         assert_eq!(sig.name, "complex_function");
 
         // Should have: pos_only, regular, *args, keyword_only, another_kw, **kwargs
@@ -1990,7 +1989,8 @@ mod tests {
         let test_file = examples_dir.join("my_module.py");
         let db = test_db();
 
-        let class_info = PythonAnalyzer::extract_class_info(&db, &test_file, "SimpleClass").unwrap();
+        let class_info =
+            PythonAnalyzer::extract_class_info(&db, &test_file, "SimpleClass").unwrap();
         assert_eq!(class_info.name, "SimpleClass");
         assert!(class_info.docstring.is_some());
         assert!(class_info.init_signature.is_none());
@@ -2002,7 +2002,8 @@ mod tests {
         let test_file = examples_dir.join("my_module.py");
         let db = test_db();
 
-        let class_info = PythonAnalyzer::extract_class_info(&db, &test_file, "ClassWithInit").unwrap();
+        let class_info =
+            PythonAnalyzer::extract_class_info(&db, &test_file, "ClassWithInit").unwrap();
         assert_eq!(class_info.name, "ClassWithInit");
         assert!(class_info.docstring.is_some());
         assert!(class_info.init_signature.is_some());
@@ -2036,7 +2037,8 @@ mod tests {
         let test_file = examples_dir.join("my_module.py");
         let db = test_db();
 
-        let class_info = PythonAnalyzer::extract_class_info(&db, &test_file, "ComplexClass").unwrap();
+        let class_info =
+            PythonAnalyzer::extract_class_info(&db, &test_file, "ComplexClass").unwrap();
         assert_eq!(class_info.name, "ComplexClass");
         assert!(class_info.init_signature.is_some());
 
@@ -2063,7 +2065,8 @@ mod tests {
         let test_file = examples_dir.join("my_module.py");
 
         // First verify that direct extraction does NOT give us __init__
-        let direct_info = PythonAnalyzer::extract_class_info(&test_db(), &test_file, "ChildWithoutInit").unwrap();
+        let direct_info =
+            PythonAnalyzer::extract_class_info(&test_db(), &test_file, "ChildWithoutInit").unwrap();
         assert_eq!(direct_info.name, "ChildWithoutInit");
         assert!(
             direct_info.init_signature.is_none(),
@@ -3056,8 +3059,12 @@ mod tests {
             Some(system_python_str),
         )
         .unwrap_or_default();
-        let search_paths =
-            PythonAnalyzer::build_search_paths(&db, Some(examples_dir.as_ref()), site_packages, None);
+        let search_paths = PythonAnalyzer::build_search_paths(
+            &db,
+            Some(examples_dir.as_ref()),
+            site_packages,
+            None,
+        );
         let result_with_config = PythonAnalyzer::resolve_module("my_module", &search_paths);
 
         // Should succeed using the configured interpreter
@@ -3106,8 +3113,12 @@ mod tests {
         )
         .unwrap_or_default();
         let db = test_db();
-        let search_paths =
-            PythonAnalyzer::build_search_paths(&db, Some(examples_dir.as_ref()), site_packages, None);
+        let search_paths = PythonAnalyzer::build_search_paths(
+            &db,
+            Some(examples_dir.as_ref()),
+            site_packages,
+            None,
+        );
         let result = PythonAnalyzer::extract_definition_info(
             &db,
             "my_module.simple_function",
@@ -3693,8 +3704,7 @@ mod tests {
         search_paths.extend(PythonAnalyzer::parse_pth_files(&db, &site_packages, None));
 
         // The editable_package should now be resolvable
-        let result =
-            PythonAnalyzer::resolve_module("editable_package.lib", &search_paths);
+        let result = PythonAnalyzer::resolve_module("editable_package.lib", &search_paths);
 
         assert!(
             result.is_ok(),
@@ -3722,9 +3732,8 @@ mod tests {
         search_paths.extend(PythonAnalyzer::parse_pth_files(&db, &site_packages, None));
 
         // Resolve the module first
-        let module_path =
-            PythonAnalyzer::resolve_module("editable_package.lib", &search_paths)
-                .expect("Should resolve module");
+        let module_path = PythonAnalyzer::resolve_module("editable_package.lib", &search_paths)
+            .expect("Should resolve module");
 
         // Extract the class info (salsa-cached)
         let class_info = PythonAnalyzer::extract_class_info(&db, &module_path, "EditableModel")
