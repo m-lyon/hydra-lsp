@@ -1,5 +1,5 @@
 use crate::import_resolver::ImportResolver;
-use crate::python_cache::{PythonConfig, SitePackagesPthState};
+use crate::python_cache::{self, PythonConfig, SitePackagesPthState};
 use anyhow::{Context, Result};
 use ruff_db::files::system_path_to_file;
 use ruff_db::source::{SourceText, source_text};
@@ -221,17 +221,24 @@ impl PythonAnalyzer {
     ///
     /// The configured interpreter is always preferred if provided, as it represents
     /// the user's explicit choice via LSP configuration.
-    fn discover_python_environment(
+    pub fn discover_python_environment(
         workspace_root: Option<&Path>,
         python_path: Option<&str>,
     ) -> Result<Vec<SystemPathBuf>> {
-        // Create the system - OsSystem needs a current working directory
-        let cwd = if let Some(root) = workspace_root {
+        // OsSystem requires an absolute CWD. Use workspace_root when provided;
+        // fall back to the process's current directory otherwise.
+        let cwd_buf = if let Some(root) = workspace_root {
             SystemPath::from_std_path(root)
                 .ok_or_else(|| anyhow::anyhow!("Invalid workspace root path"))?
+                .to_path_buf()
         } else {
-            SystemPath::new(".")
+            SystemPathBuf::from_path_buf(
+                std::env::current_dir()
+                    .map_err(|e| anyhow::anyhow!("Cannot determine current directory: {e}"))?,
+            )
+            .map_err(|p| anyhow::anyhow!("Current directory is not valid UTF-8: {}", p.display()))?
         };
+        let cwd = cwd_buf.as_path();
         let system = OsSystem::new(cwd);
 
         // Use the same path as project root for environment discovery
@@ -264,37 +271,22 @@ impl PythonAnalyzer {
     /// Resolve a Python module path to a file path using ty's module resolution
     ///
     /// This implementation:
-    /// - Discovers Python environment (venv, conda, system)
-    /// - Uses proper site-packages resolution
+    /// - Uses pre-computed site-packages (from the salsa-cached `site_packages_paths` query)
     /// - Handles package hierarchies correctly
     /// - Supports .pyi stub files
     ///
-    /// Resolve a Python module path to a file path using ty's module resolution
-    ///
-    /// Returns the resolved file path and the search paths used
+    /// Returns the resolved file path and the search paths used.
     pub fn resolve_module(
         db: &dyn ruff_db::Db,
         module_path: &str,
         workspace_root: Option<&Path>,
-        python_interpreter: Option<&str>,
-    ) -> Result<(PathBuf, Vec<PathBuf>)> {
-        Self::resolve_module_impl(db, module_path, workspace_root, python_interpreter, None)
-    }
-
-    fn resolve_module_impl(
-        db: &dyn ruff_db::Db,
-        module_path: &str,
-        workspace_root: Option<&Path>,
-        python_interpreter: Option<&str>,
+        precomputed_site_packages: &[SystemPathBuf],
         site_packages_pth_states: Option<&[SitePackagesPthState]>,
     ) -> Result<(PathBuf, Vec<PathBuf>)> {
-        let site_packages_paths =
-            Self::discover_python_environment(workspace_root, python_interpreter)
-                .unwrap_or_default();
         let search_paths = Self::build_search_paths(
             db,
             workspace_root,
-            site_packages_paths,
+            precomputed_site_packages.to_vec(),
             site_packages_pth_states,
         );
         let file_path = Self::resolve_module_with_search_paths(module_path, &search_paths)?;
@@ -1004,6 +996,23 @@ impl PythonAnalyzer {
         )
     }
 
+    pub(crate) fn extract_definition_info_for_config(
+        db: &dyn ruff_db::Db,
+        target: &str,
+        config: PythonConfig,
+    ) -> Result<(DefinitionInfo, PathBuf, String, String)> {
+        let workspace_root = config.workspace_root(db).as_deref().map(PathBuf::from);
+        let site_packages_pth_states = config.site_packages_pth_states(db);
+        let precomputed_site_packages = python_cache::site_packages_paths(db, config);
+        Self::extract_definition_info(
+            db,
+            target,
+            workspace_root.as_deref().map(Path::new),
+            precomputed_site_packages.as_slice(),
+            Some(site_packages_pth_states.as_slice()),
+        )
+    }
+
     /// Extract definition info (function or class) from a target string.
     /// Returns:
     /// - DefinitionInfo (Function or Class)
@@ -1014,33 +1023,7 @@ impl PythonAnalyzer {
         db: &dyn ruff_db::Db,
         target: &str,
         workspace_root: Option<&Path>,
-        python_interpreter: Option<&str>,
-    ) -> Result<(DefinitionInfo, PathBuf, String, String)> {
-        Self::extract_definition_info_impl(db, target, workspace_root, python_interpreter, None)
-    }
-
-    pub(crate) fn extract_definition_info_for_config(
-        db: &dyn ruff_db::Db,
-        target: &str,
-        config: PythonConfig,
-    ) -> Result<(DefinitionInfo, PathBuf, String, String)> {
-        let workspace_root = config.workspace_root(db).as_deref().map(PathBuf::from);
-        let interpreter = config.interpreter(db);
-        let site_packages_pth_states = config.site_packages_pth_states(db);
-        Self::extract_definition_info_impl(
-            db,
-            target,
-            workspace_root.as_deref().map(Path::new),
-            interpreter.as_deref(),
-            Some(site_packages_pth_states.as_slice()),
-        )
-    }
-
-    fn extract_definition_info_impl(
-        db: &dyn ruff_db::Db,
-        target: &str,
-        workspace_root: Option<&Path>,
-        python_interpreter: Option<&str>,
+        precomputed_site_packages: &[SystemPathBuf],
         site_packages_pth_states: Option<&[SitePackagesPthState]>,
     ) -> Result<(DefinitionInfo, PathBuf, String, String)> {
         let (module_path, symbol_name) = Self::split_target(target)?;
@@ -1049,11 +1032,11 @@ impl PythonAnalyzer {
         let mut module_found = false;
 
         // First try standard resolution: module.symbol where symbol is a function or class
-        if let Ok((file_path, search_paths)) = Self::resolve_module_impl(
+        if let Ok((file_path, search_paths)) = Self::resolve_module(
             db,
             &module_path,
             workspace_root,
-            python_interpreter,
+            precomputed_site_packages,
             site_packages_pth_states,
         ) {
             module_found = true;
@@ -1093,7 +1076,7 @@ impl PythonAnalyzer {
             db,
             target,
             workspace_root,
-            python_interpreter,
+            precomputed_site_packages,
             site_packages_pth_states,
         ) {
             match result {
@@ -1164,7 +1147,7 @@ impl PythonAnalyzer {
         db: &dyn ruff_db::Db,
         target: &str,
         workspace_root: Option<&Path>,
-        python_interpreter: Option<&str>,
+        precomputed_site_packages: &[SystemPathBuf],
         site_packages_pth_states: Option<&[SitePackagesPthState]>,
     ) -> Option<ClassAttributeChainResult> {
         let parts: Vec<&str> = target.split('.').collect();
@@ -1185,11 +1168,11 @@ impl PythonAnalyzer {
             let remaining_parts = &parts[module_end_idx..];
 
             // Try to resolve the module
-            let Ok((file_path, search_paths)) = Self::resolve_module_impl(
+            let Ok((file_path, search_paths)) = Self::resolve_module(
                 db,
                 &module_path,
                 workspace_root,
-                python_interpreter,
+                precomputed_site_packages,
                 site_packages_pth_states,
             ) else {
                 continue;
@@ -1926,7 +1909,7 @@ mod tests {
     fn test_resolve_module_simple() {
         let examples_dir = get_simple_test_dir();
         let db = test_db();
-        let result = PythonAnalyzer::resolve_module(&db, "my_module", Some(&examples_dir), None);
+        let result = PythonAnalyzer::resolve_module(&db, "my_module", Some(&examples_dir), &[], None);
         assert!(result.is_ok());
         let (path, _) = result.unwrap();
         assert!(path.ends_with("my_module.py"));
@@ -1936,7 +1919,7 @@ mod tests {
     fn test_resolve_module_package() {
         let examples_dir = get_simple_test_dir();
         let db = test_db();
-        let result = PythonAnalyzer::resolve_module(&db, "test_package", Some(&examples_dir), None);
+        let result = PythonAnalyzer::resolve_module(&db, "test_package", Some(&examples_dir), &[], None);
         assert!(result.is_ok());
         let (path, _) = result.unwrap();
         assert!(path.ends_with("__init__.py"));
@@ -1950,6 +1933,7 @@ mod tests {
             &db,
             "test_package.submodule",
             Some(&examples_dir),
+            &[],
             None,
         );
         assert!(result.is_ok());
@@ -1962,7 +1946,7 @@ mod tests {
         let examples_dir = get_simple_test_dir();
         let db = test_db();
         let result =
-            PythonAnalyzer::resolve_module(&db, "nonexistent_module", Some(&examples_dir), None);
+            PythonAnalyzer::resolve_module(&db, "nonexistent_module", Some(&examples_dir), &[], None);
         assert!(result.is_err());
     }
 
@@ -2270,6 +2254,7 @@ mod tests {
             &test_db(),
             "my_module.ChildWithoutInit",
             Some(&examples_dir),
+            &[],
             None,
         );
         assert!(result.is_ok());
@@ -2300,6 +2285,7 @@ mod tests {
             &test_db(),
             "class_methods.InheritedNested.nested.nested_class.from_config",
             Some(&examples_dir),
+            &[],
             None,
         );
         assert!(
@@ -2332,6 +2318,7 @@ mod tests {
             &test_db(),
             "class_methods.InheritedNested.nested.nested_class.compute_size",
             Some(&workspace_dir),
+            &[],
             None,
         );
 
@@ -2365,6 +2352,7 @@ mod tests {
             &test_db(),
             "class_methods.NestedTwice.nested.inherited_nested_class",
             Some(&examples_dir),
+            &[],
             None,
         );
         assert!(
@@ -2402,6 +2390,7 @@ mod tests {
             &test_db(),
             "my_module.simple_function",
             Some(&examples_dir),
+            &[],
             None,
         );
         assert!(result.is_ok());
@@ -2423,6 +2412,7 @@ mod tests {
             &test_db(),
             "my_module.SimpleClass",
             Some(&examples_dir),
+            &[],
             None,
         );
         assert!(result.is_ok());
@@ -2444,6 +2434,7 @@ mod tests {
             &test_db(),
             "test_package.submodule.SubmoduleClass",
             Some(&examples_dir),
+            &[],
             None,
         );
         assert!(result.is_ok());
@@ -2465,6 +2456,7 @@ mod tests {
             &test_db(),
             "my_module.NonexistentSymbol",
             Some(&examples_dir),
+            &[],
             None,
         );
         assert!(result.is_err());
@@ -3158,11 +3150,17 @@ mod tests {
 
         // Resolve a module with explicit interpreter configuration
         let db = test_db();
+        let site_packages = PythonAnalyzer::discover_python_environment(
+            Some(examples_dir.as_ref()),
+            Some(system_python_str),
+        )
+        .unwrap_or_default();
         let result_with_config = PythonAnalyzer::resolve_module(
             &db,
             "my_module",
             Some(&examples_dir),
-            Some(system_python_str),
+            &site_packages,
+            None,
         );
 
         // Should succeed using the configured interpreter
@@ -3180,7 +3178,7 @@ mod tests {
 
         // Resolve a module without explicit interpreter configuration (None)
         let db = test_db();
-        let result = PythonAnalyzer::resolve_module(&db, "my_module", Some(&examples_dir), None);
+        let result = PythonAnalyzer::resolve_module(&db, "my_module", Some(&examples_dir), &[], None);
 
         // Should still succeed using auto-discovery
         assert!(
@@ -3203,11 +3201,17 @@ mod tests {
         let system_python_str = system_python.as_ref().and_then(|p| p.to_str());
 
         // Extract definition with configured interpreter
+        let site_packages = PythonAnalyzer::discover_python_environment(
+            Some(examples_dir.as_ref()),
+            system_python_str,
+        )
+        .unwrap_or_default();
         let result = PythonAnalyzer::extract_definition_info(
             &test_db(),
             "my_module.simple_function",
             Some(&examples_dir),
-            system_python_str,
+            &site_packages,
+            None,
         );
 
         assert!(
@@ -3227,6 +3231,7 @@ mod tests {
             &test_db(),
             "my_module.simple_function",
             Some(&examples_dir),
+            &[],
             None,
         );
 
@@ -3248,11 +3253,17 @@ mod tests {
         // Test with configured interpreter (priority 1)
         if let Ok(python_path) = which::which("python3").or_else(|_| which::which("python")) {
             let db = test_db();
+            let site_packages = PythonAnalyzer::discover_python_environment(
+                Some(examples_dir.as_ref()),
+                python_path.to_str(),
+            )
+            .unwrap_or_default();
             let result_configured = PythonAnalyzer::resolve_module(
                 &db,
                 "my_module",
                 Some(&examples_dir),
-                python_path.to_str(),
+                &site_packages,
+                None,
             );
             assert!(
                 result_configured.is_ok(),
@@ -3263,7 +3274,7 @@ mod tests {
         // Test with auto-discovery (priority 2)
         let db = test_db();
         let result_auto =
-            PythonAnalyzer::resolve_module(&db, "my_module", Some(&examples_dir), None);
+            PythonAnalyzer::resolve_module(&db, "my_module", Some(&examples_dir), &[], None);
         assert!(result_auto.is_ok(), "Should resolve with auto-discovery");
     }
 
@@ -3288,6 +3299,7 @@ mod tests {
             &test_db(),
             "mylib.Linear",
             Some(&workspace_dir),
+            &[],
             None,
         );
 
@@ -3323,6 +3335,7 @@ mod tests {
             &test_db(),
             "mylib.AliasedClass",
             Some(&workspace_dir),
+            &[],
             None,
         );
 
@@ -3353,6 +3366,7 @@ mod tests {
             &test_db(),
             "mylib.StarExportedClass",
             Some(&workspace_dir),
+            &[],
             None,
         );
 
@@ -3380,6 +3394,7 @@ mod tests {
             &test_db(),
             "mylib.modules.linear.DirectClass",
             Some(&workspace_dir),
+            &[],
             None,
         );
 
@@ -3408,6 +3423,7 @@ mod tests {
             &test_db(),
             "mylib._PrivateClass",
             Some(&workspace_dir),
+            &[],
             None,
         );
 
@@ -3428,6 +3444,7 @@ mod tests {
             &test_db(),
             "class_methods.ModelFactory.from_config",
             Some(&workspace_dir),
+            &[],
             None,
         );
 
@@ -3463,6 +3480,7 @@ mod tests {
             &test_db(),
             "class_methods.ModelFactory.compute_size",
             Some(&workspace_dir),
+            &[],
             None,
         );
 
@@ -3498,6 +3516,7 @@ mod tests {
             &test_db(),
             "class_methods.ModelFactory.with_defaults",
             Some(&workspace_dir),
+            &[],
             None,
         );
 
@@ -3531,6 +3550,7 @@ mod tests {
             &test_db(),
             "class_methods.DataProcessor.create",
             Some(&workspace_dir),
+            &[],
             None,
         );
 
@@ -3642,6 +3662,7 @@ mod tests {
             &test_db(),
             "class_methods.NestedTwice.nested.nested_class.from_config",
             Some(&workspace_dir),
+            &[],
             None,
         );
 
@@ -3678,6 +3699,7 @@ mod tests {
             &test_db(),
             "class_methods.NestedTwice.nested.nested_class.compute_size",
             Some(&workspace_dir),
+            &[],
             None,
         );
 

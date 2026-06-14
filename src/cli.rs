@@ -302,11 +302,14 @@ fn trace_target_resolution(
     let db = HydraDatabase::new(ruff_db::system::SystemPath::new(db_root));
 
     // Try to extract definition info
+    let site_packages = PythonAnalyzer::discover_python_environment(workspace_root, python_interpreter)
+        .unwrap_or_default();
     match PythonAnalyzer::extract_definition_info(
         &db,
         &hydra_object.target.value,
         workspace_root,
-        python_interpreter,
+        &site_packages,
+        None,
     ) {
         Ok((def_info, file_path, module_path, symbol_name)) => {
             println!("  {} {}", "Module:".dimmed(), module_path);

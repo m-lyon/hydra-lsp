@@ -1,9 +1,11 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tracing::debug;
 
 use crate::python_analyzer::{DefinitionInfo, PythonAnalyzer};
+use ruff_db::files::FileRootKind;
+use ruff_db::system::SystemPathBuf;
 
 /// Salsa input for Python environment configuration.
 ///
@@ -99,6 +101,30 @@ impl PartialEq for CachedDefinitionResult {
 
 impl Eq for CachedDefinitionResult {}
 
+/// Cached site-packages discovery for a Python environment.
+///
+/// Wraps `PythonAnalyzer::discover_python_environment` with salsa caching.
+/// The result is cached and only recomputed when `PythonConfig`'s `workspace_root`
+/// or `interpreter` fields change — both are salsa inputs, so invalidation is
+/// automatic.
+///
+/// Also registers each discovered directory as a `LibrarySearchPath` file root
+/// so library files get `Durability::HIGH`: project-file edits don't invalidate
+/// library-derived memos.
+#[salsa::tracked(returns(ref))]
+pub fn site_packages_paths(db: &dyn ruff_db::Db, config: PythonConfig) -> Vec<SystemPathBuf> {
+    let workspace_root = config.workspace_root(db).as_deref().map(Path::new);
+    let interpreter = config.interpreter(db);
+    let paths =
+        PythonAnalyzer::discover_python_environment(workspace_root, interpreter.as_deref())
+            .unwrap_or_default();
+    for path in &paths {
+        db.files()
+            .try_add_root(db, path.as_path(), FileRootKind::LibrarySearchPath);
+    }
+    paths
+}
+
 /// Cached extraction of Python definition info for a `_target_` string.
 ///
 /// Wraps `PythonAnalyzer::extract_definition_info` with salsa caching.
@@ -172,6 +198,60 @@ mod tests {
     /// `TestDb` uses an in-memory `TestSystem` and can't see workspace files.
     fn real_fs_db() -> HydraDatabase {
         HydraDatabase::new(SystemPath::new("/"))
+    }
+
+    #[test]
+    fn test_site_packages_paths_no_config() {
+        let db = real_fs_db();
+        let config = PythonConfig::new(&db, None, None, vec![]);
+        // Should not panic; returns whatever the current-dir discovery finds (possibly empty).
+        let paths = site_packages_paths(&db, config);
+        // Result is a Vec<SystemPathBuf>; we can't assert a specific value since it
+        // depends on the active Python environment, but the call must succeed.
+        let _ = paths.len();
+    }
+
+    #[test]
+    fn test_site_packages_paths_cache_hit() {
+        let db = real_fs_db();
+        let examples = examples_dir();
+        let config = PythonConfig::new(
+            &db,
+            Some(examples.to_string_lossy().to_string()),
+            None,
+            vec![],
+        );
+        let result1 = site_packages_paths(&db, config);
+        let result2 = site_packages_paths(&db, config);
+        // Pointer equality: salsa returns the same Arc on a cache hit.
+        assert!(std::ptr::eq(result1 as *const _, result2 as *const _));
+    }
+
+    #[test]
+    fn test_site_packages_paths_invalidation_on_interpreter_change() {
+        let mut db = real_fs_db();
+        let examples = examples_dir();
+        let config = PythonConfig::new(
+            &db,
+            Some(examples.to_string_lossy().to_string()),
+            None,
+            vec![],
+        );
+        let result1 = site_packages_paths(&db, config).clone();
+
+        // Changing the interpreter invalidates the memo.
+        config
+            .set_interpreter(&mut db)
+            .to(Some("/nonexistent/python".to_string()));
+        let result2 = site_packages_paths(&db, config).clone();
+
+        // Results may differ (nonexistent interpreter → empty) — the important
+        // thing is that the query ran again rather than returning the cached value.
+        // We can't assert pointer inequality after a clone, but we can assert the
+        // new result is empty (nonexistent interpreter → discovery fails → empty).
+        assert!(result2.is_empty());
+        // Original result is unaffected (already cloned).
+        drop(result1);
     }
 
     #[test]

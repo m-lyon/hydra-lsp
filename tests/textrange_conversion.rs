@@ -202,6 +202,7 @@ def test_function(x: int) -> int:
             &db,
             "workspace.test_module.test_function",
             Some(workspace_root),
+            &[],
             None,
         )
         .unwrap();
@@ -244,6 +245,7 @@ class TestClass:
             &db,
             "workspace.test_class_module.TestClass",
             Some(workspace_root),
+            &[],
             None,
         )
         .unwrap();
