@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use tracing::debug;
 
-use crate::python_analyzer::{DefinitionInfo, PythonAnalyzer};
+use crate::python_analyzer::{normalize_site_packages_pth_state_key, DefinitionInfo, PythonAnalyzer};
 use ruff_db::files::FileRootKind;
 use ruff_db::system::SystemPathBuf;
 
@@ -125,6 +125,37 @@ pub fn site_packages_paths(db: &dyn ruff_db::Db, config: PythonConfig) -> Vec<Sy
     paths
 }
 
+/// Cached module-resolution search-path list for a Python environment config.
+///
+/// Builds the ordered search-path list that module resolution walks:
+/// `[workspace_root, ".", site_packages_0, pth_paths_0…, site_packages_1, …]`.
+///
+/// Recomputes only when `PythonConfig`'s `workspace_root`, `interpreter`, or
+/// `site_packages_pth_states` fields change, not on every module resolution call.
+#[salsa::tracked(returns(ref))]
+pub fn search_paths_for_config(db: &dyn ruff_db::Db, config: PythonConfig) -> Vec<PathBuf> {
+    let workspace_root = config.workspace_root(db).as_deref().map(Path::new);
+    let site_packages = site_packages_paths(db, config);
+    let pth_states = config.site_packages_pth_states(db);
+
+    let mut paths = Vec::new();
+    if let Some(root) = workspace_root {
+        paths.push(root.to_path_buf());
+    }
+    paths.push(PathBuf::from("."));
+
+    for sys_path in site_packages.iter() {
+        let dir = sys_path.as_std_path().to_path_buf();
+        let key = normalize_site_packages_pth_state_key(&dir);
+        let matched_state = pth_states.iter().find(|s| s.directory(db).as_str() == key).copied();
+        let editable = PythonAnalyzer::parse_pth_files(db, &dir, matched_state.as_ref().map(std::slice::from_ref));
+        paths.push(dir);
+        paths.extend(editable);
+    }
+
+    paths
+}
+
 /// Cached extraction of Python definition info for a `_target_` string.
 ///
 /// Wraps `PythonAnalyzer::extract_definition_info` with salsa caching.
@@ -148,8 +179,9 @@ pub fn cached_definition_info<'db>(
         "cached_definition_info: executing (cache miss)"
     );
 
-    CachedDefinitionResult::from_result(PythonAnalyzer::extract_definition_info_for_config(
-        db, target_str, config,
+    let search_paths = search_paths_for_config(db, config);
+    CachedDefinitionResult::from_result(PythonAnalyzer::extract_definition_info(
+        db, target_str, search_paths,
     ))
 }
 
@@ -252,6 +284,36 @@ mod tests {
         assert!(result2.is_empty());
         // Original result is unaffected (already cloned).
         drop(result1);
+    }
+
+    #[test]
+    fn test_search_paths_for_config_contains_workspace_root() {
+        let db = real_fs_db();
+        let examples = examples_dir();
+        let config = PythonConfig::new(
+            &db,
+            Some(examples.to_string_lossy().to_string()),
+            None,
+            vec![],
+        );
+        let paths = search_paths_for_config(&db, config);
+        assert!(
+            paths.iter().any(|p| p == &examples),
+            "workspace root should appear first in search paths"
+        );
+        assert!(
+            paths.iter().position(|p| p == &examples) == Some(0),
+            "workspace root should be at index 0"
+        );
+    }
+
+    #[test]
+    fn test_search_paths_for_config_cache_hit() {
+        let db = real_fs_db();
+        let config = PythonConfig::new(&db, None, None, vec![]);
+        let r1 = search_paths_for_config(&db, config);
+        let r2 = search_paths_for_config(&db, config);
+        assert!(std::ptr::eq(r1 as *const _, r2 as *const _));
     }
 
     #[test]

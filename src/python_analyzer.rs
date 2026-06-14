@@ -1,5 +1,5 @@
 use crate::import_resolver::ImportResolver;
-use crate::python_cache::{self, PythonConfig, SitePackagesPthState};
+use crate::python_cache::SitePackagesPthState;
 use anyhow::{Context, Result};
 use ruff_db::files::system_path_to_file;
 use ruff_db::source::{SourceText, source_text};
@@ -268,33 +268,8 @@ impl PythonAnalyzer {
         Ok(site_packages_paths.into_vec())
     }
 
-    /// Resolve a Python module path to a file path using ty's module resolution
-    ///
-    /// This implementation:
-    /// - Uses pre-computed site-packages (from the salsa-cached `site_packages_paths` query)
-    /// - Handles package hierarchies correctly
-    /// - Supports .pyi stub files
-    ///
-    /// Returns the resolved file path and the search paths used.
-    pub fn resolve_module(
-        db: &dyn ruff_db::Db,
-        module_path: &str,
-        workspace_root: Option<&Path>,
-        precomputed_site_packages: &[SystemPathBuf],
-        site_packages_pth_states: Option<&[SitePackagesPthState]>,
-    ) -> Result<(PathBuf, Vec<PathBuf>)> {
-        let search_paths = Self::build_search_paths(
-            db,
-            workspace_root,
-            precomputed_site_packages.to_vec(),
-            site_packages_pth_states,
-        );
-        let file_path = Self::resolve_module_with_search_paths(module_path, &search_paths)?;
-        Ok((file_path, search_paths))
-    }
-
     /// Resolve a Python module path to a file path using pre-built search paths
-    pub fn resolve_module_with_search_paths(
+    pub fn resolve_module(
         module_path: &str,
         search_paths: &[PathBuf],
     ) -> Result<PathBuf> {
@@ -621,7 +596,7 @@ impl PythonAnalyzer {
     }
 
     /// Build search paths from discovered site-packages
-    fn build_search_paths(
+    pub fn build_search_paths(
         db: &dyn ruff_db::Db,
         workspace_root: Option<&Path>,
         site_packages_paths: Vec<SystemPathBuf>,
@@ -747,7 +722,7 @@ impl PythonAnalyzer {
             let class_name = &base_class_expr[dot_pos + 1..];
 
             // Try to resolve the module
-            if let Ok(file_path) = Self::resolve_module_with_search_paths(module_path, search_paths)
+            if let Ok(file_path) = Self::resolve_module(module_path, search_paths)
             {
                 return Some((file_path, class_name.to_string()));
             }
@@ -996,23 +971,6 @@ impl PythonAnalyzer {
         )
     }
 
-    pub(crate) fn extract_definition_info_for_config(
-        db: &dyn ruff_db::Db,
-        target: &str,
-        config: PythonConfig,
-    ) -> Result<(DefinitionInfo, PathBuf, String, String)> {
-        let workspace_root = config.workspace_root(db).as_deref().map(PathBuf::from);
-        let site_packages_pth_states = config.site_packages_pth_states(db);
-        let precomputed_site_packages = python_cache::site_packages_paths(db, config);
-        Self::extract_definition_info(
-            db,
-            target,
-            workspace_root.as_deref().map(Path::new),
-            precomputed_site_packages.as_slice(),
-            Some(site_packages_pth_states.as_slice()),
-        )
-    }
-
     /// Extract definition info (function or class) from a target string.
     /// Returns:
     /// - DefinitionInfo (Function or Class)
@@ -1022,9 +980,7 @@ impl PythonAnalyzer {
     pub fn extract_definition_info(
         db: &dyn ruff_db::Db,
         target: &str,
-        workspace_root: Option<&Path>,
-        precomputed_site_packages: &[SystemPathBuf],
-        site_packages_pth_states: Option<&[SitePackagesPthState]>,
+        search_paths: &[PathBuf],
     ) -> Result<(DefinitionInfo, PathBuf, String, String)> {
         let (module_path, symbol_name) = Self::split_target(target)?;
 
@@ -1032,13 +988,9 @@ impl PythonAnalyzer {
         let mut module_found = false;
 
         // First try standard resolution: module.symbol where symbol is a function or class
-        if let Ok((file_path, search_paths)) = Self::resolve_module(
-            db,
-            &module_path,
-            workspace_root,
-            precomputed_site_packages,
-            site_packages_pth_states,
-        ) {
+        if let Ok(file_path) =
+            Self::resolve_module(&module_path, search_paths)
+        {
             module_found = true;
 
             // Try to extract as function first (with import resolution)
@@ -1046,7 +998,7 @@ impl PythonAnalyzer {
                 db,
                 &file_path,
                 &symbol_name,
-                search_paths.clone(),
+                search_paths.to_vec(),
             ) {
                 return Ok((
                     DefinitionInfo::Function(func_sig),
@@ -1057,9 +1009,12 @@ impl PythonAnalyzer {
             }
 
             // Try to extract as class (with import resolution)
-            if let Ok((class_info, resolved_file)) =
-                Self::extract_class_info_with_imports(db, &file_path, &symbol_name, search_paths)
-            {
+            if let Ok((class_info, resolved_file)) = Self::extract_class_info_with_imports(
+                db,
+                &file_path,
+                &symbol_name,
+                search_paths.to_vec(),
+            ) {
                 return Ok((
                     DefinitionInfo::Class(class_info),
                     resolved_file,
@@ -1072,13 +1027,7 @@ impl PythonAnalyzer {
         // Try to interpret as Class.method pattern (e.g., "my_module.MyClass.from_config")
         // or nested pattern (e.g., "my_module.OuterClass.nested.nested_class.method")
         // or nested class pattern (e.g., "my_module.OuterClass.nested.nested_class")
-        if let Some(result) = Self::resolve_class_attribute_chain(
-            db,
-            target,
-            workspace_root,
-            precomputed_site_packages,
-            site_packages_pth_states,
-        ) {
+        if let Some(result) = Self::resolve_class_attribute_chain(db, target, search_paths) {
             match result {
                 ClassAttributeChainResult::Method {
                     file_path: resolved_file,
@@ -1146,9 +1095,7 @@ impl PythonAnalyzer {
     fn resolve_class_attribute_chain(
         db: &dyn ruff_db::Db,
         target: &str,
-        workspace_root: Option<&Path>,
-        precomputed_site_packages: &[SystemPathBuf],
-        site_packages_pth_states: Option<&[SitePackagesPthState]>,
+        search_paths: &[PathBuf],
     ) -> Option<ClassAttributeChainResult> {
         let parts: Vec<&str> = target.split('.').collect();
         if parts.len() < 3 {
@@ -1168,13 +1115,8 @@ impl PythonAnalyzer {
             let remaining_parts = &parts[module_end_idx..];
 
             // Try to resolve the module
-            let Ok((file_path, search_paths)) = Self::resolve_module(
-                db,
-                &module_path,
-                workspace_root,
-                precomputed_site_packages,
-                site_packages_pth_states,
-            ) else {
+            let Ok(file_path) = Self::resolve_module(&module_path, search_paths)
+            else {
                 continue;
             };
 
@@ -1186,7 +1128,7 @@ impl PythonAnalyzer {
                 db,
                 &file_path,
                 first_symbol,
-                search_paths.clone(),
+                search_paths.to_vec(),
             ) {
                 if remaining_parts.len() == 2 {
                     // Simple case: Class.method
@@ -1204,7 +1146,7 @@ impl PythonAnalyzer {
                             file_path: resolved_file,
                             class_name: class_info.name,
                             method_name: method_name.to_string(),
-                            search_paths,
+                            search_paths: search_paths.to_vec(),
                         });
                     }
                 } else if remaining_parts.len() > 2 {
@@ -1217,7 +1159,7 @@ impl PythonAnalyzer {
                             &resolved_file,
                             &class_info.name,
                             attribute_chain,
-                            &search_paths,
+                            search_paths,
                         )
                     {
                         if let Some(method_name) = method_name_opt {
@@ -1225,13 +1167,13 @@ impl PythonAnalyzer {
                                 file_path: final_file,
                                 class_name: final_class,
                                 method_name,
-                                search_paths,
+                                search_paths: search_paths.to_vec(),
                             });
                         } else {
                             return Some(ClassAttributeChainResult::Class {
                                 file_path: final_file,
                                 class_name: final_class,
-                                search_paths,
+                                search_paths: search_paths.to_vec(),
                             });
                         }
                     }
@@ -1908,45 +1850,40 @@ mod tests {
     #[test]
     fn test_resolve_module_simple() {
         let examples_dir = get_simple_test_dir();
-        let db = test_db();
-        let result = PythonAnalyzer::resolve_module(&db, "my_module", Some(&examples_dir), &[], None);
+        let result = PythonAnalyzer::resolve_module("my_module", &[examples_dir.clone(), PathBuf::from(".")]);
         assert!(result.is_ok());
-        let (path, _) = result.unwrap();
+        let path = result.unwrap();
         assert!(path.ends_with("my_module.py"));
     }
 
     #[test]
     fn test_resolve_module_package() {
         let examples_dir = get_simple_test_dir();
-        let db = test_db();
-        let result = PythonAnalyzer::resolve_module(&db, "test_package", Some(&examples_dir), &[], None);
+        let result = PythonAnalyzer::resolve_module("test_package", &[examples_dir.clone(), PathBuf::from(".")]);
         assert!(result.is_ok());
-        let (path, _) = result.unwrap();
+        let path = result.unwrap();
         assert!(path.ends_with("__init__.py"));
     }
 
     #[test]
     fn test_resolve_module_submodule() {
         let examples_dir = get_simple_test_dir();
-        let db = test_db();
         let result = PythonAnalyzer::resolve_module(
-            &db,
             "test_package.submodule",
-            Some(&examples_dir),
-            &[],
-            None,
+            &[examples_dir.clone(), PathBuf::from(".")],
         );
         assert!(result.is_ok());
-        let (path, _) = result.unwrap();
+        let path = result.unwrap();
         assert!(path.ends_with("submodule.py"));
     }
 
     #[test]
     fn test_resolve_module_nonexistent() {
         let examples_dir = get_simple_test_dir();
-        let db = test_db();
-        let result =
-            PythonAnalyzer::resolve_module(&db, "nonexistent_module", Some(&examples_dir), &[], None);
+        let result = PythonAnalyzer::resolve_module(
+            "nonexistent_module",
+            &[examples_dir.clone(), PathBuf::from(".")],
+        );
         assert!(result.is_err());
     }
 
@@ -2253,9 +2190,7 @@ mod tests {
         let result = PythonAnalyzer::extract_definition_info(
             &test_db(),
             "my_module.ChildWithoutInit",
-            Some(&examples_dir),
-            &[],
-            None,
+            &[examples_dir.clone(), PathBuf::from(".")],
         );
         assert!(result.is_ok());
         let (definition_info, _file_path, _module_path, _symbol_name) = result.unwrap();
@@ -2284,9 +2219,7 @@ mod tests {
         let result = PythonAnalyzer::extract_definition_info(
             &test_db(),
             "class_methods.InheritedNested.nested.nested_class.from_config",
-            Some(&examples_dir),
-            &[],
-            None,
+            &[examples_dir.clone(), PathBuf::from(".")],
         );
         assert!(
             result.is_ok(),
@@ -2317,9 +2250,7 @@ mod tests {
         let result = PythonAnalyzer::extract_definition_info(
             &test_db(),
             "class_methods.InheritedNested.nested.nested_class.compute_size",
-            Some(&workspace_dir),
-            &[],
-            None,
+            &[workspace_dir.clone(), PathBuf::from(".")],
         );
 
         assert!(
@@ -2351,9 +2282,7 @@ mod tests {
         let result = PythonAnalyzer::extract_definition_info(
             &test_db(),
             "class_methods.NestedTwice.nested.inherited_nested_class",
-            Some(&examples_dir),
-            &[],
-            None,
+            &[examples_dir.clone(), PathBuf::from(".")],
         );
         assert!(
             result.is_ok(),
@@ -2389,9 +2318,7 @@ mod tests {
         let result = PythonAnalyzer::extract_definition_info(
             &test_db(),
             "my_module.simple_function",
-            Some(&examples_dir),
-            &[],
-            None,
+            &[examples_dir.clone(), PathBuf::from(".")],
         );
         assert!(result.is_ok());
         let (definition_info, _file_path, _module_path, _symbol_name) = result.unwrap();
@@ -2411,9 +2338,7 @@ mod tests {
         let result = PythonAnalyzer::extract_definition_info(
             &test_db(),
             "my_module.SimpleClass",
-            Some(&examples_dir),
-            &[],
-            None,
+            &[examples_dir.clone(), PathBuf::from(".")],
         );
         assert!(result.is_ok());
         let (definition_info, _file_path, _module_path, _symbol_name) = result.unwrap();
@@ -2433,9 +2358,7 @@ mod tests {
         let result = PythonAnalyzer::extract_definition_info(
             &test_db(),
             "test_package.submodule.SubmoduleClass",
-            Some(&examples_dir),
-            &[],
-            None,
+            &[examples_dir.clone(), PathBuf::from(".")],
         );
         assert!(result.is_ok());
         let (definition_info, _file_path, _module_path, _symbol_name) = result.unwrap();
@@ -2455,9 +2378,7 @@ mod tests {
         let result = PythonAnalyzer::extract_definition_info(
             &test_db(),
             "my_module.NonexistentSymbol",
-            Some(&examples_dir),
-            &[],
-            None,
+            &[examples_dir.clone(), PathBuf::from(".")],
         );
         assert!(result.is_err());
     }
@@ -3155,13 +3076,9 @@ mod tests {
             Some(system_python_str),
         )
         .unwrap_or_default();
-        let result_with_config = PythonAnalyzer::resolve_module(
-            &db,
-            "my_module",
-            Some(&examples_dir),
-            &site_packages,
-            None,
-        );
+        let search_paths =
+            PythonAnalyzer::build_search_paths(&db, Some(examples_dir.as_ref()), site_packages, None);
+        let result_with_config = PythonAnalyzer::resolve_module("my_module", &search_paths);
 
         // Should succeed using the configured interpreter
         assert!(
@@ -3177,8 +3094,10 @@ mod tests {
         let examples_dir = get_simple_test_dir();
 
         // Resolve a module without explicit interpreter configuration (None)
-        let db = test_db();
-        let result = PythonAnalyzer::resolve_module(&db, "my_module", Some(&examples_dir), &[], None);
+        let result = PythonAnalyzer::resolve_module(
+            "my_module",
+            &[examples_dir.clone(), PathBuf::from(".")],
+        );
 
         // Should still succeed using auto-discovery
         assert!(
@@ -3206,12 +3125,13 @@ mod tests {
             system_python_str,
         )
         .unwrap_or_default();
+        let db = test_db();
+        let search_paths =
+            PythonAnalyzer::build_search_paths(&db, Some(examples_dir.as_ref()), site_packages, None);
         let result = PythonAnalyzer::extract_definition_info(
-            &test_db(),
+            &db,
             "my_module.simple_function",
-            Some(&examples_dir),
-            &site_packages,
-            None,
+            &search_paths,
         );
 
         assert!(
@@ -3230,9 +3150,7 @@ mod tests {
         let result = PythonAnalyzer::extract_definition_info(
             &test_db(),
             "my_module.simple_function",
-            Some(&examples_dir),
-            &[],
-            None,
+            &[examples_dir.clone(), PathBuf::from(".")],
         );
 
         assert!(
@@ -3258,13 +3176,13 @@ mod tests {
                 python_path.to_str(),
             )
             .unwrap_or_default();
-            let result_configured = PythonAnalyzer::resolve_module(
+            let search_paths = PythonAnalyzer::build_search_paths(
                 &db,
-                "my_module",
-                Some(&examples_dir),
-                &site_packages,
+                Some(examples_dir.as_ref()),
+                site_packages,
                 None,
             );
+            let result_configured = PythonAnalyzer::resolve_module("my_module", &search_paths);
             assert!(
                 result_configured.is_ok(),
                 "Should resolve with configured interpreter"
@@ -3272,9 +3190,10 @@ mod tests {
         }
 
         // Test with auto-discovery (priority 2)
-        let db = test_db();
-        let result_auto =
-            PythonAnalyzer::resolve_module(&db, "my_module", Some(&examples_dir), &[], None);
+        let result_auto = PythonAnalyzer::resolve_module(
+            "my_module",
+            &[examples_dir.clone(), PathBuf::from(".")],
+        );
         assert!(result_auto.is_ok(), "Should resolve with auto-discovery");
     }
 
@@ -3298,9 +3217,7 @@ mod tests {
         let result = PythonAnalyzer::extract_definition_info(
             &test_db(),
             "mylib.Linear",
-            Some(&workspace_dir),
-            &[],
-            None,
+            &[workspace_dir.clone(), PathBuf::from(".")],
         );
 
         assert!(
@@ -3334,9 +3251,7 @@ mod tests {
         let result = PythonAnalyzer::extract_definition_info(
             &test_db(),
             "mylib.AliasedClass",
-            Some(&workspace_dir),
-            &[],
-            None,
+            &[workspace_dir.clone(), PathBuf::from(".")],
         );
 
         assert!(
@@ -3365,9 +3280,7 @@ mod tests {
         let result = PythonAnalyzer::extract_definition_info(
             &test_db(),
             "mylib.StarExportedClass",
-            Some(&workspace_dir),
-            &[],
-            None,
+            &[workspace_dir.clone(), PathBuf::from(".")],
         );
 
         assert!(
@@ -3393,9 +3306,7 @@ mod tests {
         let result = PythonAnalyzer::extract_definition_info(
             &test_db(),
             "mylib.modules.linear.DirectClass",
-            Some(&workspace_dir),
-            &[],
-            None,
+            &[workspace_dir.clone(), PathBuf::from(".")],
         );
 
         assert!(
@@ -3422,9 +3333,7 @@ mod tests {
         let result = PythonAnalyzer::extract_definition_info(
             &test_db(),
             "mylib._PrivateClass",
-            Some(&workspace_dir),
-            &[],
-            None,
+            &[workspace_dir.clone(), PathBuf::from(".")],
         );
 
         assert!(
@@ -3443,9 +3352,7 @@ mod tests {
         let result = PythonAnalyzer::extract_definition_info(
             &test_db(),
             "class_methods.ModelFactory.from_config",
-            Some(&workspace_dir),
-            &[],
-            None,
+            &[workspace_dir.clone(), PathBuf::from(".")],
         );
 
         assert!(
@@ -3479,9 +3386,7 @@ mod tests {
         let result = PythonAnalyzer::extract_definition_info(
             &test_db(),
             "class_methods.ModelFactory.compute_size",
-            Some(&workspace_dir),
-            &[],
-            None,
+            &[workspace_dir.clone(), PathBuf::from(".")],
         );
 
         assert!(
@@ -3515,9 +3420,7 @@ mod tests {
         let result = PythonAnalyzer::extract_definition_info(
             &test_db(),
             "class_methods.ModelFactory.with_defaults",
-            Some(&workspace_dir),
-            &[],
-            None,
+            &[workspace_dir.clone(), PathBuf::from(".")],
         );
 
         assert!(
@@ -3549,9 +3452,7 @@ mod tests {
         let result = PythonAnalyzer::extract_definition_info(
             &test_db(),
             "class_methods.DataProcessor.create",
-            Some(&workspace_dir),
-            &[],
-            None,
+            &[workspace_dir.clone(), PathBuf::from(".")],
         );
 
         assert!(
@@ -3661,9 +3562,7 @@ mod tests {
         let result = PythonAnalyzer::extract_definition_info(
             &test_db(),
             "class_methods.NestedTwice.nested.nested_class.from_config",
-            Some(&workspace_dir),
-            &[],
-            None,
+            &[workspace_dir.clone(), PathBuf::from(".")],
         );
 
         assert!(
@@ -3698,9 +3597,7 @@ mod tests {
         let result = PythonAnalyzer::extract_definition_info(
             &test_db(),
             "class_methods.NestedTwice.nested.nested_class.compute_size",
-            Some(&workspace_dir),
-            &[],
-            None,
+            &[workspace_dir.clone(), PathBuf::from(".")],
         );
 
         assert!(
@@ -3817,7 +3714,7 @@ mod tests {
 
         // The editable_package should now be resolvable
         let result =
-            PythonAnalyzer::resolve_module_with_search_paths("editable_package.lib", &search_paths);
+            PythonAnalyzer::resolve_module("editable_package.lib", &search_paths);
 
         assert!(
             result.is_ok(),
@@ -3846,7 +3743,7 @@ mod tests {
 
         // Resolve the module first
         let module_path =
-            PythonAnalyzer::resolve_module_with_search_paths("editable_package.lib", &search_paths)
+            PythonAnalyzer::resolve_module("editable_package.lib", &search_paths)
                 .expect("Should resolve module");
 
         // Extract the class info

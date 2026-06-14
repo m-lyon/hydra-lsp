@@ -3,6 +3,7 @@ use hydra_lsp::python_analyzer::{DefinitionInfo, PythonAnalyzer};
 use ruff_db::system::SystemPath;
 use std::fs;
 use std::io::Write;
+use std::path::PathBuf;
 use tempfile::{NamedTempFile, TempDir};
 
 #[test]
@@ -197,13 +198,12 @@ def test_function(x: int) -> int:
     fs::write(&test_file, source).unwrap();
 
     let db = HydraDatabase::new(SystemPath::new("/"));
+    let search_paths = vec![workspace_root.to_path_buf(), PathBuf::from(".")];
     let (def_info, _file_path, _module_path, _symbol_name) =
         PythonAnalyzer::extract_definition_info(
             &db,
             "workspace.test_module.test_function",
-            Some(workspace_root),
-            &[],
-            None,
+            &search_paths,
         )
         .unwrap();
 
@@ -240,13 +240,12 @@ class TestClass:
     fs::write(&test_file, source).unwrap();
 
     let db = HydraDatabase::new(SystemPath::new("/"));
+    let search_paths = vec![workspace_root.to_path_buf(), PathBuf::from(".")];
     let (def_info, _file_path, _module_path, _symbol_name) =
         PythonAnalyzer::extract_definition_info(
             &db,
             "workspace.test_class_module.TestClass",
-            Some(workspace_root),
-            &[],
-            None,
+            &search_paths,
         )
         .unwrap();
 

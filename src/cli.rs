@@ -304,12 +304,11 @@ fn trace_target_resolution(
     // Try to extract definition info
     let site_packages = PythonAnalyzer::discover_python_environment(workspace_root, python_interpreter)
         .unwrap_or_default();
+    let search_paths = PythonAnalyzer::build_search_paths(&db, workspace_root, site_packages, None);
     match PythonAnalyzer::extract_definition_info(
         &db,
         &hydra_object.target.value,
-        workspace_root,
-        &site_packages,
-        None,
+        &search_paths,
     ) {
         Ok((def_info, file_path, module_path, symbol_name)) => {
             println!("  {} {}", "Module:".dimmed(), module_path);
