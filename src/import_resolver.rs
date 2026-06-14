@@ -1,8 +1,5 @@
-use crate::python_analyzer::{
-    ClassExtractor, ClassInfo, FunctionExtractor, FunctionSignature, read_source,
-};
+use crate::python_analyzer::{ClassInfo, FunctionSignature, PythonAnalyzer, get_parsed_module};
 use ruff_python_ast::{self as ast, Expr, Stmt, visitor::Visitor};
-use ruff_python_parser::parse_module;
 use rustc_hash::FxHashSet;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -146,9 +143,7 @@ impl<'db> ImportResolver<'db> {
 
     /// Extract __all__ from a module
     fn extract_dunder_all(&mut self, file_path: &Path) -> Option<FxHashSet<String>> {
-        let source_text = read_source(self.db, file_path).ok()?;
-        let parsed = parse_module(source_text.as_str()).ok()?;
-
+        let parsed = get_parsed_module(self.db, file_path).ok()?;
         let mut dunder_all_finder = DunderAllFinder::default();
         dunder_all_finder.visit_body(parsed.suite());
         dunder_all_finder.names
@@ -160,9 +155,7 @@ impl<'db> ImportResolver<'db> {
         file_path: &Path,
         symbol_name: &str,
     ) -> Option<ImportInfo> {
-        let source_text = read_source(self.db, file_path).ok()?;
-        let parsed = parse_module(source_text.as_str()).ok()?;
-
+        let parsed = get_parsed_module(self.db, file_path).ok()?;
         let mut finder = ImportFinder {
             target_symbol: symbol_name.to_string(),
             result: None,
@@ -173,15 +166,9 @@ impl<'db> ImportResolver<'db> {
 
     /// Extract all star imports from a module
     fn find_star_imports(&mut self, file_path: &Path) -> Vec<ImportInfo> {
-        let source_text = match read_source(self.db, file_path) {
-            Ok(s) => s,
-            Err(_) => return Vec::new(),
+        let Ok(parsed) = get_parsed_module(self.db, file_path) else {
+            return Vec::new();
         };
-        let parsed = match parse_module(source_text.as_str()) {
-            Ok(p) => p,
-            Err(_) => return Vec::new(),
-        };
-
         let mut finder = StarImportFinder::default();
         finder.visit_body(parsed.suite());
         finder.star_imports
@@ -189,13 +176,7 @@ impl<'db> ImportResolver<'db> {
 
     /// Check if a class is directly defined in the file
     fn find_class_direct(&mut self, file_path: &Path, class_name: &str) -> Option<ClassInfo> {
-        let source_text = read_source(self.db, file_path).ok()?;
-        let source = source_text.as_str();
-        let parsed = parse_module(source).ok()?;
-
-        let mut visitor = ClassExtractor::new(class_name.to_string(), source.to_string());
-        visitor.visit_body(parsed.suite());
-        visitor.get_result()
+        PythonAnalyzer::extract_class_info(self.db, file_path, class_name).ok()
     }
 
     /// Check if a function is directly defined in the file
@@ -204,13 +185,7 @@ impl<'db> ImportResolver<'db> {
         file_path: &Path,
         function_name: &str,
     ) -> Option<FunctionSignature> {
-        let source_text = read_source(self.db, file_path).ok()?;
-        let source = source_text.as_str();
-        let parsed = parse_module(source).ok()?;
-
-        let mut visitor = FunctionExtractor::new(function_name.to_string(), source.to_string());
-        visitor.visit_body(parsed.suite());
-        visitor.get_result()
+        PythonAnalyzer::extract_function_signature(self.db, file_path, function_name).ok()
     }
 
     /// Resolve a symbol by following import chains

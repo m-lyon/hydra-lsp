@@ -2,10 +2,10 @@ use crate::import_resolver::ImportResolver;
 use crate::python_cache::SitePackagesPthState;
 use anyhow::{Context, Result};
 use ruff_db::files::system_path_to_file;
+use ruff_db::parsed::{ParsedModuleRef, parsed_module};
 use ruff_db::source::{SourceText, source_text};
 use ruff_db::system::{OsSystem, SystemPath, SystemPathBuf};
 use ruff_python_ast::{self as ast, Expr, Stmt, visitor::Visitor};
-use ruff_python_parser::parse_module;
 use ruff_source_file::{LineIndex, PositionEncoding};
 use ruff_text_size::TextRange;
 use std::collections::HashSet;
@@ -35,6 +35,19 @@ pub fn read_source(db: &dyn ruff_db::Db, path: &Path) -> Result<SourceText> {
         anyhow::bail!("failed to read {}: {}", path.display(), err);
     }
     Ok(source)
+}
+
+/// Parse a Python source file through ruff_db's salsa-tracked `parsed_module`.
+///
+/// Returns the salsa-cached `ParsedModuleRef` (LRU 200). Callers that also need
+/// the raw source text should call `read_source` separately — both are cache hits
+/// for the same revision.
+pub(crate) fn get_parsed_module(db: &dyn ruff_db::Db, path: &Path) -> Result<ParsedModuleRef> {
+    let sys_path = SystemPath::from_std_path(path)
+        .with_context(|| format!("non-utf8 path: {}", path.display()))?;
+    let file = system_path_to_file(db, sys_path)
+        .with_context(|| format!("could not resolve file: {}", path.display()))?;
+    Ok(parsed_module(db, file).load(db))
 }
 
 /// Normalize a directory path for use as a `SitePackagesPthState` key.
@@ -321,17 +334,19 @@ impl PythonAnalyzer {
         )
     }
 
-    /// Extract function signature from source code
+    /// Extract function signature from source code via salsa-cached parsing.
     pub fn extract_function_signature(
-        source: &str,
+        db: &dyn ruff_db::Db,
+        path: &Path,
         function_name: &str,
     ) -> Result<FunctionSignature> {
-        let parsed = parse_module(source)?;
+        let source = read_source(db, path)?;
+        let parsed = get_parsed_module(db, path)?;
 
         let mut visitor = FunctionExtractor {
             target_name: function_name.to_string(),
             result: None,
-            source: source.to_string(),
+            source: source.as_str().to_string(),
         };
 
         visitor.visit_body(parsed.suite());
@@ -341,14 +356,19 @@ impl PythonAnalyzer {
             .ok_or_else(|| anyhow::anyhow!("Function '{}' not found", function_name))
     }
 
-    /// Extract class information from source code
-    pub fn extract_class_info(source: &str, class_name: &str) -> Result<ClassInfo> {
-        let parsed = parse_module(source)?;
+    /// Extract class information from source code via salsa-cached parsing.
+    pub fn extract_class_info(
+        db: &dyn ruff_db::Db,
+        path: &Path,
+        class_name: &str,
+    ) -> Result<ClassInfo> {
+        let source = read_source(db, path)?;
+        let parsed = get_parsed_module(db, path)?;
 
         let mut visitor = ClassExtractor {
             target_name: class_name.to_string(),
             result: None,
-            source: source.to_string(),
+            source: source.as_str().to_string(),
         };
 
         visitor.visit_body(parsed.suite());
@@ -358,19 +378,21 @@ impl PythonAnalyzer {
             .ok_or_else(|| anyhow::anyhow!("Class '{}' not found", class_name))
     }
 
-    /// Extract method information from source code
+    /// Extract method information from source code via salsa-cached parsing.
     pub fn extract_method_info(
-        source: &str,
+        db: &dyn ruff_db::Db,
+        path: &Path,
         class_name: &str,
         method_name: &str,
     ) -> Result<MethodInfo> {
-        let parsed = parse_module(source)?;
+        let source = read_source(db, path)?;
+        let parsed = get_parsed_module(db, path)?;
 
         let mut visitor = MethodExtractor {
             class_name: class_name.to_string(),
             method_name: method_name.to_string(),
             result: None,
-            source: source.to_string(),
+            source: source.as_str().to_string(),
         };
 
         visitor.visit_body(parsed.suite());
@@ -384,13 +406,14 @@ impl PythonAnalyzer {
         })
     }
 
-    /// Extract class attribute from source code
+    /// Extract class attribute from source code via salsa-cached parsing.
     pub fn extract_class_attribute(
-        source: &str,
+        db: &dyn ruff_db::Db,
+        path: &Path,
         class_name: &str,
         attribute_name: &str,
     ) -> Result<ClassAttributeInfo> {
-        let parsed = parse_module(source)?;
+        let parsed = get_parsed_module(db, path)?;
 
         let mut visitor = ClassAttributeExtractor {
             class_name: class_name.to_string(),
@@ -435,16 +458,13 @@ impl PythonAnalyzer {
         }
         visited.insert(visit_key);
 
-        let source_text = read_source(db, file_path)?;
-        let source = source_text.as_str();
-
         // Try to find the attribute directly on this class
-        if let Ok(attr_info) = Self::extract_class_attribute(source, class_name, attribute_name) {
+        if let Ok(attr_info) = Self::extract_class_attribute(db, file_path, class_name, attribute_name) {
             return Ok((attr_info, file_path.to_path_buf(), class_name.to_string()));
         }
 
         // Get the class info to find parent classes
-        let class_info = Self::extract_class_info(source, class_name)?;
+        let class_info = Self::extract_class_info(db, file_path, class_name)?;
 
         // Search parent classes for the attribute
         for base_class in &class_info.base_classes {
@@ -506,13 +526,8 @@ impl PythonAnalyzer {
             let is_last = i == attribute_chain.len() - 1;
 
             // First, check if this is a method on the current class
-            {
-                let source_text = read_source(db, &current_file)?;
-                let source = source_text.as_str();
-                if is_last && Self::extract_method_info(source, &current_class, attr).is_ok() {
-                    // It's a method - return the class and method name
-                    return Ok((current_file, current_class, Some(attr.to_string())));
-                }
+            if is_last && Self::extract_method_info(db, &current_file, &current_class, attr).is_ok() {
+                return Ok((current_file, current_class, Some(attr.to_string())));
             }
 
             // Try to get the attribute as a class attribute (with inheritance support)
@@ -534,9 +549,7 @@ impl PythonAnalyzer {
                         let new_class_name = value_parts[0];
 
                         // Try direct lookup in current file
-                        let source_text = read_source(db, &current_file)?;
-                        let source = source_text.as_str();
-                        if Self::extract_class_info(source, new_class_name).is_ok() {
+                        if Self::extract_class_info(db, &current_file, new_class_name).is_ok() {
                             current_class = new_class_name.to_string();
                             continue;
                         }
@@ -742,16 +755,8 @@ impl PythonAnalyzer {
         }
 
         // Check if the class is defined in the same file
-        if let Ok(source_text) = read_source(db, current_file) {
-            let source = source_text.as_str();
-            if let Ok(parsed) = parse_module(source) {
-                let mut visitor =
-                    ClassExtractor::new(base_class_expr.to_string(), source.to_string());
-                visitor.visit_body(parsed.suite());
-                if visitor.get_result().is_some() {
-                    return Some((current_file.to_path_buf(), base_class_expr.to_string()));
-                }
-            }
+        if Self::extract_class_info(db, current_file, base_class_expr).is_ok() {
+            return Some((current_file.to_path_buf(), base_class_expr.to_string()));
         }
 
         None
@@ -808,16 +813,11 @@ impl PythonAnalyzer {
             }
             visited.insert(visit_key);
 
-            // Extract the parent class info using cache
-            let source_text = match read_source(db, &parent_file) {
-                Ok(s) => s,
+            // Extract the parent class info (salsa-cached)
+            let parent_info = match Self::extract_class_info(db, &parent_file, &parent_class_name) {
+                Ok(info) => info,
                 Err(_) => continue,
             };
-            let parent_info =
-                match Self::extract_class_info(source_text.as_str(), &parent_class_name) {
-                    Ok(info) => info,
-                    Err(_) => continue,
-                };
 
             // Check if the parent has what we need
             if needs_docstring && found_docstring.is_none() && parent_info.docstring.is_some() {
@@ -874,33 +874,30 @@ impl PythonAnalyzer {
         search_paths: Vec<PathBuf>,
     ) -> Result<(ClassInfo, PathBuf)> {
         // First try direct lookup
-        let direct = read_source(db, file_path)
-            .ok()
-            .and_then(|s| Self::extract_class_info(s.as_str(), class_name).ok());
-        let (mut class_info, resolved_file) = if let Some(class_info) = direct {
-            (class_info, file_path.to_path_buf())
-        } else {
-            // Try to resolve through imports
-            let mut resolver = ImportResolver::new(db, search_paths.clone());
-            if let Some((resolved_file, resolved_name)) =
-                resolver.resolve_symbol(file_path, class_name)
-            {
-                let actual_name = if resolved_name.is_empty() {
-                    class_name.to_string()
-                } else {
-                    resolved_name
-                };
-                let source_text = read_source(db, &resolved_file)?;
-                let class_info = Self::extract_class_info(source_text.as_str(), &actual_name)?;
-                (class_info, resolved_file)
+        let (mut class_info, resolved_file) =
+            if let Ok(class_info) = Self::extract_class_info(db, file_path, class_name) {
+                (class_info, file_path.to_path_buf())
             } else {
-                anyhow::bail!(
-                    "Class '{}' not found in {} (also checked re-exports)",
-                    class_name,
-                    file_path.display()
-                )
-            }
-        };
+                // Try to resolve through imports
+                let mut resolver = ImportResolver::new(db, search_paths.clone());
+                if let Some((resolved_file, resolved_name)) =
+                    resolver.resolve_symbol(file_path, class_name)
+                {
+                    let actual_name = if resolved_name.is_empty() {
+                        class_name.to_string()
+                    } else {
+                        resolved_name
+                    };
+                    let class_info = Self::extract_class_info(db, &resolved_file, &actual_name)?;
+                    (class_info, resolved_file)
+                } else {
+                    anyhow::bail!(
+                        "Class '{}' not found in {} (also checked re-exports)",
+                        class_name,
+                        file_path.display()
+                    )
+                }
+            };
 
         // Resolve missing properties from parent classes
         if class_info.docstring.is_none() || class_info.init_signature.is_none() {
@@ -942,10 +939,7 @@ impl PythonAnalyzer {
         search_paths: Vec<PathBuf>,
     ) -> Result<(FunctionSignature, PathBuf)> {
         // First try direct lookup
-        if let Ok(source_text) = read_source(db, file_path)
-            && let Ok(func_sig) =
-                Self::extract_function_signature(source_text.as_str(), function_name)
-        {
+        if let Ok(func_sig) = Self::extract_function_signature(db, file_path, function_name) {
             return Ok((func_sig, file_path.to_path_buf()));
         }
 
@@ -959,8 +953,7 @@ impl PythonAnalyzer {
             } else {
                 resolved_name
             };
-            let source_text = read_source(db, &resolved_file)?;
-            let func_sig = Self::extract_function_signature(source_text.as_str(), &actual_name)?;
+            let func_sig = Self::extract_function_signature(db, &resolved_file, &actual_name)?;
             return Ok((func_sig, resolved_file));
         }
 
@@ -1133,15 +1126,8 @@ impl PythonAnalyzer {
                 if remaining_parts.len() == 2 {
                     // Simple case: Class.method
                     let method_name = remaining_parts[1];
-                    // Read the resolved file source and check if method exists
-                    if let Ok(source_text) = read_source(db, &resolved_file)
-                        && Self::extract_method_info(
-                            source_text.as_str(),
-                            &class_info.name,
-                            method_name,
-                        )
-                        .is_ok()
-                    {
+                    // Check if method exists (salsa-cached)
+                    if Self::extract_method_info(db, &resolved_file, &class_info.name, method_name).is_ok() {
                         return Some(ClassAttributeChainResult::Method {
                             file_path: resolved_file,
                             class_name: class_info.name,
@@ -1194,10 +1180,7 @@ impl PythonAnalyzer {
         search_paths: Vec<PathBuf>,
     ) -> Result<(MethodInfo, PathBuf)> {
         // First try direct lookup
-        if let Ok(source_text) = read_source(db, file_path)
-            && let Ok(method_info) =
-                Self::extract_method_info(source_text.as_str(), class_name, method_name)
-        {
+        if let Ok(method_info) = Self::extract_method_info(db, file_path, class_name, method_name) {
             return Ok((method_info, file_path.to_path_buf()));
         }
 
@@ -1210,9 +1193,8 @@ impl PythonAnalyzer {
             } else {
                 resolved_name
             };
-            let source_text = read_source(db, &resolved_file)?;
             let method_info =
-                Self::extract_method_info(source_text.as_str(), &actual_class_name, method_name)?;
+                Self::extract_method_info(db, &resolved_file, &actual_class_name, method_name)?;
             return Ok((method_info, resolved_file));
         }
 
@@ -1802,7 +1784,6 @@ mod tests {
     use super::*;
     use crate::database::HydraDatabase;
     use std::env;
-    use std::fs;
 
     fn get_simple_test_dir() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1893,9 +1874,9 @@ mod tests {
     fn test_extract_simple_function() {
         let examples_dir = get_simple_test_dir();
         let test_file = examples_dir.join("my_module.py");
-        let source = fs::read_to_string(&test_file).unwrap();
+        let db = test_db();
 
-        let sig = PythonAnalyzer::extract_function_signature(&source, "simple_function").unwrap();
+        let sig = PythonAnalyzer::extract_function_signature(&db, &test_file, "simple_function").unwrap();
         assert_eq!(sig.name, "simple_function");
         assert_eq!(sig.parameters.len(), 0);
         assert!(sig.docstring.is_some());
@@ -1906,10 +1887,10 @@ mod tests {
     fn test_extract_function_with_params() {
         let examples_dir = get_simple_test_dir();
         let test_file = examples_dir.join("my_module.py");
-        let source = fs::read_to_string(&test_file).unwrap();
+        let db = test_db();
 
         let sig =
-            PythonAnalyzer::extract_function_signature(&source, "function_with_params").unwrap();
+            PythonAnalyzer::extract_function_signature(&db, &test_file, "function_with_params").unwrap();
         assert_eq!(sig.name, "function_with_params");
         assert_eq!(sig.parameters.len(), 3);
 
@@ -1937,10 +1918,10 @@ mod tests {
     fn test_extract_function_with_return() {
         let examples_dir = get_simple_test_dir();
         let test_file = examples_dir.join("my_module.py");
-        let source = fs::read_to_string(&test_file).unwrap();
+        let db = test_db();
 
         let sig =
-            PythonAnalyzer::extract_function_signature(&source, "function_with_return").unwrap();
+            PythonAnalyzer::extract_function_signature(&db, &test_file, "function_with_return").unwrap();
         assert_eq!(sig.name, "function_with_return");
         assert!(sig.return_type.is_some());
         assert_eq!(sig.return_type.as_ref().unwrap(), "int");
@@ -1950,9 +1931,9 @@ mod tests {
     fn test_extract_variadic_function() {
         let examples_dir = get_simple_test_dir();
         let test_file = examples_dir.join("my_module.py");
-        let source = fs::read_to_string(&test_file).unwrap();
+        let db = test_db();
 
-        let sig = PythonAnalyzer::extract_function_signature(&source, "variadic_function").unwrap();
+        let sig = PythonAnalyzer::extract_function_signature(&db, &test_file, "variadic_function").unwrap();
         assert_eq!(sig.name, "variadic_function");
         assert_eq!(sig.parameters.len(), 2);
 
@@ -1971,9 +1952,9 @@ mod tests {
     fn test_extract_complex_function() {
         let examples_dir = get_simple_test_dir();
         let test_file = examples_dir.join("my_module.py");
-        let source = fs::read_to_string(&test_file).unwrap();
+        let db = test_db();
 
-        let sig = PythonAnalyzer::extract_function_signature(&source, "complex_function").unwrap();
+        let sig = PythonAnalyzer::extract_function_signature(&db, &test_file, "complex_function").unwrap();
         assert_eq!(sig.name, "complex_function");
 
         // Should have: pos_only, regular, *args, keyword_only, another_kw, **kwargs
@@ -1995,9 +1976,9 @@ mod tests {
     fn test_extract_nonexistent_function() {
         let examples_dir = get_simple_test_dir();
         let test_file = examples_dir.join("my_module.py");
-        let source = fs::read_to_string(&test_file).unwrap();
+        let db = test_db();
 
-        let result = PythonAnalyzer::extract_function_signature(&source, "nonexistent");
+        let result = PythonAnalyzer::extract_function_signature(&db, &test_file, "nonexistent");
         assert!(result.is_err());
     }
 
@@ -2007,9 +1988,9 @@ mod tests {
     fn test_extract_simple_class() {
         let examples_dir = get_simple_test_dir();
         let test_file = examples_dir.join("my_module.py");
-        let source = fs::read_to_string(&test_file).unwrap();
+        let db = test_db();
 
-        let class_info = PythonAnalyzer::extract_class_info(&source, "SimpleClass").unwrap();
+        let class_info = PythonAnalyzer::extract_class_info(&db, &test_file, "SimpleClass").unwrap();
         assert_eq!(class_info.name, "SimpleClass");
         assert!(class_info.docstring.is_some());
         assert!(class_info.init_signature.is_none());
@@ -2019,9 +2000,9 @@ mod tests {
     fn test_extract_class_with_init() {
         let examples_dir = get_simple_test_dir();
         let test_file = examples_dir.join("my_module.py");
-        let source = fs::read_to_string(&test_file).unwrap();
+        let db = test_db();
 
-        let class_info = PythonAnalyzer::extract_class_info(&source, "ClassWithInit").unwrap();
+        let class_info = PythonAnalyzer::extract_class_info(&db, &test_file, "ClassWithInit").unwrap();
         assert_eq!(class_info.name, "ClassWithInit");
         assert!(class_info.docstring.is_some());
         assert!(class_info.init_signature.is_some());
@@ -2053,9 +2034,9 @@ mod tests {
     fn test_extract_complex_class() {
         let examples_dir = get_simple_test_dir();
         let test_file = examples_dir.join("my_module.py");
-        let source = fs::read_to_string(&test_file).unwrap();
+        let db = test_db();
 
-        let class_info = PythonAnalyzer::extract_class_info(&source, "ComplexClass").unwrap();
+        let class_info = PythonAnalyzer::extract_class_info(&db, &test_file, "ComplexClass").unwrap();
         assert_eq!(class_info.name, "ComplexClass");
         assert!(class_info.init_signature.is_some());
 
@@ -2068,9 +2049,9 @@ mod tests {
     fn test_extract_nonexistent_class() {
         let examples_dir = get_simple_test_dir();
         let test_file = examples_dir.join("my_module.py");
-        let source = fs::read_to_string(&test_file).unwrap();
+        let db = test_db();
 
-        let result = PythonAnalyzer::extract_class_info(&source, "NonexistentClass");
+        let result = PythonAnalyzer::extract_class_info(&db, &test_file, "NonexistentClass");
         assert!(result.is_err());
     }
 
@@ -2082,8 +2063,7 @@ mod tests {
         let test_file = examples_dir.join("my_module.py");
 
         // First verify that direct extraction does NOT give us __init__
-        let source = fs::read_to_string(&test_file).unwrap();
-        let direct_info = PythonAnalyzer::extract_class_info(&source, "ChildWithoutInit").unwrap();
+        let direct_info = PythonAnalyzer::extract_class_info(&test_db(), &test_file, "ChildWithoutInit").unwrap();
         assert_eq!(direct_info.name, "ChildWithoutInit");
         assert!(
             direct_info.init_signature.is_none(),
@@ -3746,9 +3726,8 @@ mod tests {
             PythonAnalyzer::resolve_module("editable_package.lib", &search_paths)
                 .expect("Should resolve module");
 
-        // Extract the class info
-        let source = fs::read_to_string(&module_path).expect("Should read module file");
-        let class_info = PythonAnalyzer::extract_class_info(&source, "EditableModel")
+        // Extract the class info (salsa-cached)
+        let class_info = PythonAnalyzer::extract_class_info(&db, &module_path, "EditableModel")
             .expect("Should extract class info");
 
         assert_eq!(class_info.name, "EditableModel");
