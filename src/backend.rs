@@ -9,7 +9,7 @@ use tower_lsp::{Client, LanguageServer};
 
 use ruff_db::files::File;
 use ruff_db::system::SystemPath;
-use salsa::{Database as _, Setter};
+use salsa::Setter;
 
 use crate::database::HydraDatabase;
 use crate::diagnostics::{self, DiagnosticRule};
@@ -753,18 +753,13 @@ impl LanguageServer for HydraLspBackend {
         // reuse on a subsequent `did_open` for the same URI. Salsa exposes
         // no input-deletion API, so this is the minimum-footprint
         // equivalent (matches `ruff_db::files::VirtualFile::close`).
-        //
-        // Then enforce LRU limits — evicts stale cache entries and keeps
-        // memory bounded. Skips entirely if the session is not yet
-        // initialized (notification arrived before initialize).
         let input = self.document_inputs.get(&uri).map(|entry| *entry);
-        self.with_session("closing documents", |s| {
-            let mut db = s.db.lock();
-            if let Some(input) = input {
+        if let Some(input) = input {
+            self.with_session("closing documents", |s| {
+                let mut db = s.db.lock();
                 input.close(&mut *db);
-            }
-            db.trigger_lru_eviction();
-        });
+            });
+        }
 
         self.client
             .log_message(MessageType::INFO, format!("Document closed: {}", uri))
