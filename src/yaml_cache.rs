@@ -3,7 +3,7 @@ use std::sync::Arc;
 use salsa::Setter;
 use tracing::debug;
 
-use crate::yaml_parser::{ParsedContent, YamlParseError, YamlParser};
+use crate::yaml_parser::{HydraSemanticToken, ParsedContent, YamlParseError, YamlParser};
 
 /// A salsa input representing a document's source text.
 ///
@@ -108,6 +108,22 @@ pub fn parsed_yaml(db: &dyn salsa::Database, input: DocumentInput) -> ParsedYaml
     debug!("parsed_yaml: executing (cache miss)");
     let text = input.text(db);
     ParsedYaml::new(YamlParser::parse(text))
+}
+
+/// Cached semantic-token list for a document.
+///
+/// Derives the token list from `parsed_yaml` — so it is automatically
+/// invalidated whenever the document text changes. On the warm path (same
+/// document, no edits) this is a single salsa hit that returns the cached
+/// `Vec` via `Arc`-shared storage without re-tokenising.
+#[salsa::tracked(returns(ref), lru = 256)]
+pub fn semantic_tokens(db: &dyn salsa::Database, input: DocumentInput) -> Vec<HydraSemanticToken> {
+    debug!("semantic_tokens: executing (cache miss)");
+    let parsed = parsed_yaml(db, input);
+    let Ok(content) = parsed.result() else {
+        return Vec::new();
+    };
+    content.extract_semantic_tokens()
 }
 
 #[cfg(test)]
@@ -252,6 +268,57 @@ mod tests {
         // After close, the same input observed against empty text — no
         // hydra markers, no targets — so `is_hydra_file` flips to false.
         assert!(!is_hydra_file(&db, input));
+    }
+
+    #[test]
+    fn test_semantic_tokens_hydra_file() {
+        let db = TestDb::new();
+        let input = DocumentInput::new(&db, hydra_yaml().to_string(), 1);
+        let tokens = semantic_tokens(&db, input);
+        // "my.Module" → at least a namespace token + a class token + a property token
+        assert!(!tokens.is_empty(), "should produce tokens for a hydra file");
+    }
+
+    #[test]
+    fn test_semantic_tokens_non_hydra_file() {
+        let db = TestDb::new();
+        let input = DocumentInput::new(&db, non_hydra_yaml().to_string(), 1);
+        let tokens = semantic_tokens(&db, input);
+        // Non-hydra YAML has no targets → no tokens
+        assert!(
+            tokens.is_empty(),
+            "should produce no tokens for a non-hydra file"
+        );
+    }
+
+    #[test]
+    fn test_semantic_tokens_cache_returns_same_slice() {
+        let db = TestDb::new();
+        let input = DocumentInput::new(&db, hydra_yaml().to_string(), 1);
+        let t1 = semantic_tokens(&db, input) as *const _;
+        let t2 = semantic_tokens(&db, input) as *const _;
+        // Both calls return a reference to the same cached allocation.
+        assert!(std::ptr::eq(t1, t2), "should be the same cached Vec");
+    }
+
+    #[test]
+    fn test_semantic_tokens_invalidates_on_change() {
+        let mut db = TestDb::new();
+        let input = DocumentInput::new(&db, hydra_yaml().to_string(), 1);
+        let count_before = semantic_tokens(&db, input).len();
+
+        // Change content to add a second target — token count should increase.
+        input.set_text(&mut db).to(
+            "# @hydra\nmodel:\n  _target_: my.Module\n  param: 42\nother:\n  _target_: other.Class\n"
+                .to_string(),
+        );
+        input.set_version(&mut db).to(2);
+
+        let count_after = semantic_tokens(&db, input).len();
+        assert!(
+            count_after > count_before,
+            "token count should increase after adding a second target"
+        );
     }
 
     #[test]

@@ -412,6 +412,64 @@ impl ParsedContent {
         Some((hydra_object.target.value.clone(), resolved, keyword_keys))
     }
 
+    /// Determine completion context using the precomputed parse maps.
+    ///
+    /// Uses `target_line_map` and `param_line_map` (O(1) lookups) instead of
+    /// scanning the full document backwards. Returns `None` when the cursor
+    /// line is not present in either map — i.e. the cursor is on a structural
+    /// YAML line (parent mapping key, blank line, comment) that carries no
+    /// hydra semantics. Callers should fall back to
+    /// `YamlParser::get_completion_context` in that case.
+    ///
+    /// `line_text` is only the current line (not the full document), truncated
+    /// at `position.character` by the caller or sliced here. Providing only
+    /// the single line avoids the full-document `String` clone on the hot path.
+    pub fn completion_context_at(
+        &self,
+        position: Position,
+        line_text: &str,
+    ) -> Option<CompletionContext> {
+        let cursor_col = (position.character as usize).min(line_text.len());
+
+        // Cursor is on a `_target_` value line.
+        if let Some(&idx) = self.target_line_map.get(&position.line) {
+            let target = &self.hydra_objects[idx].target;
+            let value_start = (target.value_start as usize).min(cursor_col);
+            let partial = line_text[value_start..cursor_col].trim().to_string();
+            return Some(CompletionContext::TargetValue { partial });
+        }
+
+        // Cursor is on a parameter line belonging to a hydra object.
+        if let Some((idx, context)) = self.param_line_map.get(&position.line) {
+            let hydra_object = &self.hydra_objects[*idx];
+            let prefix = &line_text[..cursor_col];
+            return match context {
+                ParameterContext::Keyword(key) => {
+                    if let Some(colon_pos) = prefix.find(':') {
+                        let partial = prefix[colon_pos + 1..].trim().to_string();
+                        Some(CompletionContext::ParameterValue {
+                            target: hydra_object.target.value.clone(),
+                            parameter: key.clone(),
+                            partial,
+                        })
+                    } else {
+                        let partial = prefix.trim().to_string();
+                        Some(CompletionContext::ParameterKey {
+                            target: hydra_object.target.value.clone(),
+                            partial,
+                        })
+                    }
+                }
+                ParameterContext::Positional(_) | ParameterContext::InlinePositional { .. } => {
+                    Some(CompletionContext::Unknown)
+                }
+            };
+        }
+
+        // Line not present in the parse maps
+        None
+    }
+
     /// Generate semantic tokens for syntax highlighting from the already
     /// parsed content. Returns tokens sorted by `(line, start_char)`.
     pub fn extract_semantic_tokens(&self) -> Vec<HydraSemanticToken> {
@@ -3274,6 +3332,110 @@ model:
         assert_eq!(
             param_ctx,
             ResolvedParameterContext::Keyword("param".to_string())
+        );
+    }
+
+    // ==================== completion_context_at tests ====================
+
+    #[test]
+    fn test_completion_context_at_target_value_partial() {
+        // Cursor mid-way through the target value on a fully-parsed line.
+        let content = "\nmodel:\n  _target_: myproject.Model\n  hidden_size: 256\n";
+        // Line 2: "  _target_: myproject.Model"
+        //          0123456789012345678
+        // value_start for "myproject.Model" is 12 (after "_target_: ").
+        let parsed = YamlParser::parse(content).unwrap();
+        // cursor at col 15 → "myp" typed so far
+        let ctx = parsed
+            .completion_context_at(Position::new(2, 15), "  _target_: myproject.Model")
+            .unwrap();
+        match ctx {
+            CompletionContext::TargetValue { partial } => assert_eq!(partial, "myp"),
+            _ => panic!("expected TargetValue"),
+        }
+    }
+
+    #[test]
+    fn test_completion_context_at_target_value_full() {
+        // Cursor past the end of the value — partial is the full value.
+        let content = "\nmodel:\n  _target_: myproject.Model\n  hidden_size: 256\n";
+        let parsed = YamlParser::parse(content).unwrap();
+        let line = "  _target_: myproject.Model";
+        let ctx = parsed
+            .completion_context_at(Position::new(2, line.len() as u32), line)
+            .unwrap();
+        match ctx {
+            CompletionContext::TargetValue { partial } => {
+                assert_eq!(partial, "myproject.Model")
+            }
+            _ => panic!("expected TargetValue"),
+        }
+    }
+
+    #[test]
+    fn test_completion_context_at_parameter_key() {
+        // Cursor on a parameter line, before the colon → ParameterKey.
+        let content = "\nmodel:\n  _target_: myproject.Model\n  hidden_size: 256\n";
+        let parsed = YamlParser::parse(content).unwrap();
+        // Line 3: "  hidden_size: 256", cursor at col 6 → "hidd"
+        let ctx = parsed
+            .completion_context_at(Position::new(3, 6), "  hidden_size: 256")
+            .unwrap();
+        match ctx {
+            CompletionContext::ParameterKey { target, partial } => {
+                assert_eq!(target, "myproject.Model");
+                assert_eq!(partial, "hidd");
+            }
+            _ => panic!("expected ParameterKey, got {:?}", ctx),
+        }
+    }
+
+    #[test]
+    fn test_completion_context_at_parameter_value() {
+        // Cursor after the colon → ParameterValue.
+        let content = "\nmodel:\n  _target_: myproject.Model\n  hidden_size: 256\n";
+        let parsed = YamlParser::parse(content).unwrap();
+        // Line 3: "  hidden_size: 256", cursor at col 17 → "25"
+        let ctx = parsed
+            .completion_context_at(Position::new(3, 17), "  hidden_size: 256")
+            .unwrap();
+        match ctx {
+            CompletionContext::ParameterValue {
+                target,
+                parameter,
+                partial,
+            } => {
+                assert_eq!(target, "myproject.Model");
+                assert_eq!(parameter, "hidden_size");
+                assert_eq!(partial, "25");
+            }
+            _ => panic!("expected ParameterValue, got {:?}", ctx),
+        }
+    }
+
+    #[test]
+    fn test_completion_context_at_unrecognized_line_returns_none() {
+        // Cursor on a line that is not in target_line_map or param_line_map
+        // (e.g. a parent mapping key line).
+        let content = "\nmodel:\n  _target_: myproject.Model\n  hidden_size: 256\n";
+        let parsed = YamlParser::parse(content).unwrap();
+        // Line 1: "model:" — not a target or parameter line.
+        let ctx = parsed.completion_context_at(Position::new(1, 3), "model:");
+        assert!(ctx.is_none(), "expected None for non-target/param line");
+    }
+
+    #[test]
+    fn test_completion_context_at_positional_args_unknown() {
+        // Cursor on an _args_ positional line → Unknown (no key completion).
+        let content = "\nmodel:\n  _target_: myproject.Model\n  _args_:\n    - val\n";
+        let parsed = YamlParser::parse(content).unwrap();
+        // Line 4: "    - val" — a Positional parameter line.
+        let ctx = parsed
+            .completion_context_at(Position::new(4, 5), "    - val")
+            .unwrap();
+        assert!(
+            matches!(ctx, CompletionContext::Unknown),
+            "expected Unknown for positional args"
         );
     }
 }

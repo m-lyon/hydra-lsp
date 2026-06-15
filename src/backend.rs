@@ -848,45 +848,41 @@ impl LanguageServer for HydraLspBackend {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
 
-        // Use the cached `is_hydra_file` salsa query, then read the document
-        // text from the salsa input. `get_completion_context` still scans the
-        // raw text since the partial-syntax case can be unparseable —
-        // finding 7 in CACHING_AND_CONCURRENCY_AUDIT.md will refactor that
-        // to prefer the cached parse for valid lines.
         let Some(input) = self.document_inputs.get(&uri).map(|e| *e) else {
             return Ok(None);
         };
-        let Some((is_hydra, content_text)) = self.with_session("completion", |s| {
-            let db = s.db.lock();
-            let is_hydra = yaml_cache::is_hydra_file(&*db, input);
-            let text = if is_hydra {
-                Some(input.text(&*db).clone()) // TODO: check whether cloning whole text is still present after refactor to prefer cached parse - and optimize if so
-            } else {
-                None
-            };
-            (is_hydra, text)
-        }) else {
-            return Ok(None);
-        };
-        if !is_hydra {
-            return Ok(None);
-        }
-        let Some(content_text) = content_text else {
-            return Ok(None);
-        };
 
-        // Get completion context
-        let context = match YamlParser::get_completion_context(&content_text, position) {
-            Ok(ctx) => ctx,
-            Err(e) => {
-                self.client
-                    .log_message(
-                        MessageType::ERROR,
-                        format!("Completion context error: {}", e),
-                    )
-                    .await;
-                return Ok(None);
-            }
+        // Resolve completion context.  On the common path (valid YAML, cursor on a
+        // recognised line) this is two salsa hits + two O(1) hashmap lookups with
+        // no full-document String clone.  Only the partial-syntax fallback (cursor
+        // on a new or mid-edit line where the parse maps have no entry) clones the
+        // full text and runs the backward line scan.
+        let Some(context) = self
+            .with_session("completion", |s| {
+                let db = s.db.lock();
+                if !yaml_cache::is_hydra_file(&*db, input) {
+                    return None;
+                }
+                let parsed = yaml_cache::parsed_yaml(&*db, input);
+
+                // Try the cached parse maps first.
+                if let Ok(content) = parsed.result() {
+                    let text = input.text(&*db);
+                    let line_text = text.lines().nth(position.line as usize).unwrap_or("");
+                    if let Some(ctx) = content.completion_context_at(position, line_text) {
+                        return Some(ctx);
+                    }
+                }
+
+                // Fallback: full raw-text scan for partial-syntax lines (e.g. the
+                // document is temporarily unparseable mid-edit, or the cursor is
+                // on a new line not yet in the parse maps).
+                let text = input.text(&*db).clone();
+                YamlParser::get_completion_context(&text, position).ok()
+            })
+            .flatten()
+        else {
+            return Ok(None);
         };
 
         match context {
@@ -1249,11 +1245,7 @@ impl LanguageServer for HydraLspBackend {
             return Ok(None);
         }
         let uri = params.text_document.uri;
-
-        let Some(parsed) = self.cached_parsed_yaml(&uri, "semantic_tokens") else {
-            return Ok(None);
-        };
-        let Ok(content) = parsed.result() else {
+        let Some(input) = self.document_inputs.get(&uri).map(|e| *e) else {
             return Ok(None);
         };
 
@@ -1261,19 +1253,29 @@ impl LanguageServer for HydraLspBackend {
             .log_message(MessageType::INFO, "Generating semantic tokens".to_string())
             .await;
 
-        // Extract semantic tokens from the cached parsed content. Finding 7
-        // will further cache the token list itself via a salsa-tracked query;
-        // for now this still re-tokenizes per request but skips the YAML
-        // re-parse, which is the dominant cost.
-        let tokens = content.extract_semantic_tokens();
-
-        // Convert to LSP format
-        let data = HydraSemanticToken::to_lsp_tokens(&tokens);
+        // Look up the salsa-cached token list. The `semantic_tokens` query
+        // depends on `parsed_yaml`, so it is automatically invalidated when
+        // the document changes and served from the cache on every other call.
+        // The LSP format conversion happens inside the closure so we only
+        // clone the small, already-converted Vec out of the lock.
+        let Some(data) = self
+            .with_session("semantic_tokens", |s| {
+                let db = s.db.lock();
+                if !yaml_cache::is_hydra_file(&*db, input) {
+                    return None;
+                }
+                let tokens = yaml_cache::semantic_tokens(&*db, input);
+                Some(HydraSemanticToken::to_lsp_tokens(tokens))
+            })
+            .flatten()
+        else {
+            return Ok(None);
+        };
 
         self.client
             .log_message(
                 MessageType::INFO,
-                format!("Generated {} semantic tokens", tokens.len()),
+                format!("Generated {} semantic tokens", data.len()),
             )
             .await;
 
