@@ -1,11 +1,13 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use tracing::debug;
-
-use crate::python_analyzer::{normalize_site_packages_pth_state_key, DefinitionInfo, PythonAnalyzer};
+use crate::import_resolver::ImportResolver;
+use crate::python_analyzer::{
+    DefinitionInfo, PythonAnalyzer, normalize_site_packages_pth_state_key,
+};
 use ruff_db::files::FileRootKind;
 use ruff_db::system::SystemPathBuf;
+use tracing::debug;
 
 /// Salsa input for Python environment configuration.
 ///
@@ -51,6 +53,18 @@ pub struct SitePackagesPthState {
 pub struct TargetString {
     #[returns(ref)]
     pub value: String,
+}
+
+/// Interned search-path list used as a salsa cache key for module resolution.
+///
+/// Salsa interns by value, so calls with equal `Vec<PathBuf>` values share a
+/// single allocation and use cheap identity comparison as the cache key.
+/// In practice all targets within one workspace session share the same search
+/// paths (derived from the workspace root and site-packages), so there is
+/// typically only one live `InternedSearchPaths` value in the database.
+#[salsa::interned]
+pub struct InternedSearchPaths {
+    pub paths: Vec<PathBuf>,
 }
 
 /// Successfully resolved Python definition data.
@@ -115,9 +129,8 @@ impl Eq for CachedDefinitionResult {}
 pub fn site_packages_paths(db: &dyn ruff_db::Db, config: PythonConfig) -> Vec<SystemPathBuf> {
     let workspace_root = config.workspace_root(db).as_deref().map(Path::new);
     let interpreter = config.interpreter(db);
-    let paths =
-        PythonAnalyzer::discover_python_environment(workspace_root, interpreter.as_deref())
-            .unwrap_or_default();
+    let paths = PythonAnalyzer::discover_python_environment(workspace_root, interpreter.as_deref())
+        .unwrap_or_default();
     for path in &paths {
         db.files()
             .try_add_root(db, path.as_path(), FileRootKind::LibrarySearchPath);
@@ -147,13 +160,77 @@ pub fn search_paths_for_config(db: &dyn ruff_db::Db, config: PythonConfig) -> Ve
     for sys_path in site_packages.iter() {
         let dir = sys_path.as_std_path().to_path_buf();
         let key = normalize_site_packages_pth_state_key(&dir);
-        let matched_state = pth_states.iter().find(|s| s.directory(db).as_str() == key).copied();
-        let editable = PythonAnalyzer::parse_pth_files(db, &dir, matched_state.as_ref().map(std::slice::from_ref));
+        let matched_state = pth_states
+            .iter()
+            .find(|s| s.directory(db).as_str() == key)
+            .copied();
+        let editable = PythonAnalyzer::parse_pth_files(
+            db,
+            &dir,
+            matched_state.as_ref().map(std::slice::from_ref),
+        );
         paths.push(dir);
         paths.extend(editable);
     }
 
     paths
+}
+
+/// Cached module path → file path resolution.
+///
+/// Wraps `PythonAnalyzer::resolve_module` with salsa memoisation so that the
+/// filesystem scan for a given `(module_path, search_paths)` pair is performed
+/// at most once per revision. The primary beneficiary is
+/// `resolve_class_attribute_chain`, which calls `resolve_module` O(k) times
+/// (k = dot-count in the target) with progressively shorter prefixes. On a
+/// second hover for any symbol in the same module, all those O(k) probes
+/// become O(1) cache lookups.
+///
+/// Returns `None` when the module cannot be resolved (mirrors `resolve_module`'s
+/// `Err` path). Uses `lru = 1024` to bound memory across large workspaces.
+#[salsa::tracked(returns(ref), lru = 1024)]
+pub fn resolve_module_cached<'db>(
+    db: &'db dyn ruff_db::Db,
+    module_path: TargetString<'db>,
+    search_paths: InternedSearchPaths<'db>,
+) -> Option<PathBuf> {
+    let module_path_str = module_path.value(db);
+    let search_paths = search_paths.paths(db);
+    let module_parts: Vec<&str> = module_path_str.split('.').collect();
+
+    for search_path in search_paths {
+        if !search_path.exists() {
+            continue;
+        }
+
+        // Try as a package with __init__.py (or __init__.pyi)
+        let mut package_path = search_path.clone();
+        for part in &module_parts {
+            package_path.push(part);
+        }
+        if let Some(found_path) = ImportResolver::find_module_file(&package_path) {
+            return Some(found_path);
+        }
+
+        // Try parent as package and last part as module file
+        if module_parts.len() > 1 {
+            let mut parent_path = search_path.clone();
+            for part in &module_parts[..module_parts.len() - 1] {
+                parent_path.push(part);
+            }
+            let last = module_parts.last().unwrap();
+            let pyi = parent_path.join(format!("{last}.pyi"));
+            if pyi.exists() {
+                return Some(pyi);
+            }
+            let py = parent_path.join(format!("{last}.py"));
+            if py.exists() {
+                return Some(py);
+            }
+        }
+    }
+
+    None
 }
 
 /// Cached extraction of Python definition info for a `_target_` string.
@@ -181,7 +258,9 @@ pub fn cached_definition_info<'db>(
 
     let search_paths = search_paths_for_config(db, config);
     CachedDefinitionResult::from_result(PythonAnalyzer::extract_definition_info(
-        db, target_str, search_paths,
+        db,
+        target_str,
+        search_paths,
     ))
 }
 

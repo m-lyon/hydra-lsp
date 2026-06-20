@@ -1,5 +1,5 @@
 use crate::import_resolver::ImportResolver;
-use crate::python_cache::SitePackagesPthState;
+use crate::python_cache::{InternedSearchPaths, SitePackagesPthState, TargetString, resolve_module_cached};
 use anyhow::{Context, Result};
 use ruff_db::files::system_path_to_file;
 use ruff_db::parsed::{ParsedModuleRef, parsed_module};
@@ -279,56 +279,6 @@ impl PythonAnalyzer {
 
         // Convert SitePackagesPaths to Vec<SystemPathBuf> for compatibility
         Ok(site_packages_paths.into_vec())
-    }
-
-    /// Resolve a Python module path to a file path using pre-built search paths
-    pub fn resolve_module(module_path: &str, search_paths: &[PathBuf]) -> Result<PathBuf> {
-        let module_parts: Vec<&str> = module_path.split('.').collect();
-        let search_path_count = search_paths.len();
-
-        // Try to find the module as a package or file
-        for search_path in search_paths {
-            // Skip empty or non-existent paths
-            if !search_path.exists() {
-                continue;
-            }
-
-            // Try as a package with __init__.py
-            let mut package_path = search_path.clone();
-            for part in &module_parts {
-                package_path.push(part);
-            }
-
-            if let Some(found_path) = ImportResolver::find_module_file(&package_path) {
-                return Ok(found_path);
-            }
-
-            // Try parent as package and last part as module
-            if module_parts.len() > 1 {
-                let mut parent_path = search_path.clone();
-                for part in &module_parts[..module_parts.len() - 1] {
-                    parent_path.push(part);
-                }
-
-                // Try .pyi first
-                let module_pyi_file =
-                    parent_path.join(format!("{}.pyi", module_parts.last().unwrap()));
-                if module_pyi_file.exists() {
-                    return Ok(module_pyi_file);
-                }
-
-                let module_file = parent_path.join(format!("{}.py", module_parts.last().unwrap()));
-                if module_file.exists() {
-                    return Ok(module_file);
-                }
-            }
-        }
-
-        anyhow::bail!(
-            "Could not resolve module: '{}' (tried {} search paths)",
-            module_path,
-            search_path_count
-        )
     }
 
     /// Extract function signature from source code via salsa-cached parsing.
@@ -728,8 +678,13 @@ impl PythonAnalyzer {
             let module_path = &base_class_expr[..dot_pos];
             let class_name = &base_class_expr[dot_pos + 1..];
 
-            // Try to resolve the module
-            if let Ok(file_path) = Self::resolve_module(module_path, search_paths) {
+            // Cached lookup: base-class resolution for the same parent module is
+            // shared across the MRO walk and across sibling hover requests.
+            let module_path_id = TargetString::new(db, module_path.to_string());
+            let search_paths_id = InternedSearchPaths::new(db, search_paths.to_vec());
+            if let Some(file_path) =
+                resolve_module_cached(db, module_path_id, search_paths_id).clone()
+            {
                 return Some((file_path, class_name.to_string()));
             }
         }
@@ -970,8 +925,15 @@ impl PythonAnalyzer {
         // Track whether we found the module but not the symbol
         let mut module_found = false;
 
+        // Intern search paths once; reused for both the initial lookup and the
+        // attribute-chain probe that may follow.
+        let search_paths_id = InternedSearchPaths::new(db, search_paths.to_vec());
+
         // First try standard resolution: module.symbol where symbol is a function or class
-        if let Ok(file_path) = Self::resolve_module(&module_path, search_paths) {
+        let module_path_id = TargetString::new(db, module_path.clone());
+        if let Some(file_path) =
+            resolve_module_cached(db, module_path_id, search_paths_id).clone()
+        {
             module_found = true;
 
             // Try to extract as function first (with import resolution)
@@ -1091,12 +1053,19 @@ impl PythonAnalyzer {
         //   module="a.b.c", attr_chain=["D", "e", "f"] (D is a class, e.f is attr chain + method)
         //   etc.
 
+        // Intern the search-path list once so all loop iterations share the same key.
+        let search_paths_id = InternedSearchPaths::new(db, search_paths.to_vec());
+
         for module_end_idx in (1..parts.len() - 1).rev() {
             let module_path = parts[..module_end_idx].join(".");
             let remaining_parts = &parts[module_end_idx..];
 
-            // Try to resolve the module
-            let Ok(file_path) = Self::resolve_module(&module_path, search_paths) else {
+            // Cached salsa lookup: same (module_path, search_paths) → cache hit on
+            // second hover for any symbol in the same module.
+            let module_path_id = TargetString::new(db, module_path);
+            let Some(file_path) =
+                resolve_module_cached(db, module_path_id, search_paths_id).clone()
+            else {
                 continue;
             };
 
@@ -1814,52 +1783,53 @@ mod tests {
         assert_eq!(symbol, "FinalClass");
     }
 
-    // ==================== resolve_module tests ====================
+    // ==================== resolve_module_cached tests ====================
 
     #[test]
     fn test_resolve_module_simple() {
         let examples_dir = get_simple_test_dir();
-        let result = PythonAnalyzer::resolve_module(
-            "my_module",
-            &[examples_dir.clone(), PathBuf::from(".")],
-        );
-        assert!(result.is_ok());
-        let path = result.unwrap();
-        assert!(path.ends_with("my_module.py"));
+        let db = test_db();
+        let search_paths = vec![examples_dir.clone(), PathBuf::from(".")];
+        let mid = TargetString::new(&db, "my_module".to_string());
+        let spid = InternedSearchPaths::new(&db, search_paths);
+        let result = resolve_module_cached(&db, mid, spid).clone();
+        assert!(result.is_some());
+        assert!(result.unwrap().ends_with("my_module.py"));
     }
 
     #[test]
     fn test_resolve_module_package() {
         let examples_dir = get_simple_test_dir();
-        let result = PythonAnalyzer::resolve_module(
-            "test_package",
-            &[examples_dir.clone(), PathBuf::from(".")],
-        );
-        assert!(result.is_ok());
-        let path = result.unwrap();
-        assert!(path.ends_with("__init__.py"));
+        let db = test_db();
+        let search_paths = vec![examples_dir.clone(), PathBuf::from(".")];
+        let mid = TargetString::new(&db, "test_package".to_string());
+        let spid = InternedSearchPaths::new(&db, search_paths);
+        let result = resolve_module_cached(&db, mid, spid).clone();
+        assert!(result.is_some());
+        assert!(result.unwrap().ends_with("__init__.py"));
     }
 
     #[test]
     fn test_resolve_module_submodule() {
         let examples_dir = get_simple_test_dir();
-        let result = PythonAnalyzer::resolve_module(
-            "test_package.submodule",
-            &[examples_dir.clone(), PathBuf::from(".")],
-        );
-        assert!(result.is_ok());
-        let path = result.unwrap();
-        assert!(path.ends_with("submodule.py"));
+        let db = test_db();
+        let search_paths = vec![examples_dir.clone(), PathBuf::from(".")];
+        let mid = TargetString::new(&db, "test_package.submodule".to_string());
+        let spid = InternedSearchPaths::new(&db, search_paths);
+        let result = resolve_module_cached(&db, mid, spid).clone();
+        assert!(result.is_some());
+        assert!(result.unwrap().ends_with("submodule.py"));
     }
 
     #[test]
     fn test_resolve_module_nonexistent() {
         let examples_dir = get_simple_test_dir();
-        let result = PythonAnalyzer::resolve_module(
-            "nonexistent_module",
-            &[examples_dir.clone(), PathBuf::from(".")],
-        );
-        assert!(result.is_err());
+        let db = test_db();
+        let search_paths = vec![examples_dir.clone(), PathBuf::from(".")];
+        let mid = TargetString::new(&db, "nonexistent_module".to_string());
+        let spid = InternedSearchPaths::new(&db, search_paths);
+        let result = resolve_module_cached(&db, mid, spid).clone();
+        assert!(result.is_none());
     }
 
     // ==================== extract_function_signature tests ====================
@@ -3065,11 +3035,13 @@ mod tests {
             site_packages,
             None,
         );
-        let result_with_config = PythonAnalyzer::resolve_module("my_module", &search_paths);
+        let mid = TargetString::new(&db, "my_module".to_string());
+        let spid = InternedSearchPaths::new(&db, search_paths);
+        let result_with_config = resolve_module_cached(&db, mid, spid).clone();
 
         // Should succeed using the configured interpreter
         assert!(
-            result_with_config.is_ok(),
+            result_with_config.is_some(),
             "Module resolution should succeed with configured interpreter"
         );
     }
@@ -3079,16 +3051,15 @@ mod tests {
         // This test verifies that when no Python interpreter is configured,
         // the system falls back to auto-discovery
         let examples_dir = get_simple_test_dir();
-
-        // Resolve a module without explicit interpreter configuration (None)
-        let result = PythonAnalyzer::resolve_module(
-            "my_module",
-            &[examples_dir.clone(), PathBuf::from(".")],
-        );
+        let db = test_db();
+        let search_paths = vec![examples_dir.clone(), PathBuf::from(".")];
+        let mid = TargetString::new(&db, "my_module".to_string());
+        let spid = InternedSearchPaths::new(&db, search_paths);
+        let result = resolve_module_cached(&db, mid, spid).clone();
 
         // Should still succeed using auto-discovery
         assert!(
-            result.is_ok(),
+            result.is_some(),
             "Module resolution should succeed with auto-discovery"
         );
     }
@@ -3173,19 +3144,22 @@ mod tests {
                 site_packages,
                 None,
             );
-            let result_configured = PythonAnalyzer::resolve_module("my_module", &search_paths);
+            let mid = TargetString::new(&db, "my_module".to_string());
+            let spid = InternedSearchPaths::new(&db, search_paths);
+            let result_configured = resolve_module_cached(&db, mid, spid).clone();
             assert!(
-                result_configured.is_ok(),
+                result_configured.is_some(),
                 "Should resolve with configured interpreter"
             );
         }
 
         // Test with auto-discovery (priority 2)
-        let result_auto = PythonAnalyzer::resolve_module(
-            "my_module",
-            &[examples_dir.clone(), PathBuf::from(".")],
-        );
-        assert!(result_auto.is_ok(), "Should resolve with auto-discovery");
+        let db = test_db();
+        let search_paths = vec![examples_dir.clone(), PathBuf::from(".")];
+        let mid = TargetString::new(&db, "my_module".to_string());
+        let spid = InternedSearchPaths::new(&db, search_paths);
+        let result_auto = resolve_module_cached(&db, mid, spid).clone();
+        assert!(result_auto.is_some(), "Should resolve with auto-discovery");
     }
 
     // ==================== Re-export resolution tests ====================
@@ -3704,12 +3678,13 @@ mod tests {
         search_paths.extend(PythonAnalyzer::parse_pth_files(&db, &site_packages, None));
 
         // The editable_package should now be resolvable
-        let result = PythonAnalyzer::resolve_module("editable_package.lib", &search_paths);
+        let mid = TargetString::new(&db, "editable_package.lib".to_string());
+        let spid = InternedSearchPaths::new(&db, search_paths);
+        let result = resolve_module_cached(&db, mid, spid).clone();
 
         assert!(
-            result.is_ok(),
-            "Should resolve editable_package.lib: {:?}",
-            result.err()
+            result.is_some(),
+            "Should resolve editable_package.lib"
         );
         let path = result.unwrap();
         assert!(
@@ -3732,7 +3707,10 @@ mod tests {
         search_paths.extend(PythonAnalyzer::parse_pth_files(&db, &site_packages, None));
 
         // Resolve the module first
-        let module_path = PythonAnalyzer::resolve_module("editable_package.lib", &search_paths)
+        let mid = TargetString::new(&db, "editable_package.lib".to_string());
+        let spid = InternedSearchPaths::new(&db, search_paths);
+        let module_path = resolve_module_cached(&db, mid, spid)
+            .clone()
             .expect("Should resolve module");
 
         // Extract the class info (salsa-cached)
