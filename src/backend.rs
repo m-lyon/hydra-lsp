@@ -248,6 +248,42 @@ pub struct HydraLspBackend {
     /// Per-URI overhead is therefore O(slot header), independent of file
     /// size. Per-query LRUs (`lru = 512`) bound cached computation memory.
     document_inputs: DashMap<Url, DocumentInput>,
+    /// Two-thread rayon pool dedicated to latency-sensitive operations
+    /// (hover, signature_help, goto_definition). Isolated from the worker
+    /// pool so that a long diagnostics run never queues behind a hover.
+    /// Wrapped in a Mutex so `initialize` can rebuild it with a user-supplied
+    /// thread count; the lock is held only for the duration of `spawn`, which
+    /// merely enqueues a closure.
+    latency_pool: parking_lot::Mutex<rayon::ThreadPool>,
+    /// Rayon pool for background work (diagnostics validation, future
+    /// workspace-wide analysis). Sized to available_parallelism − 2,
+    /// clamped to at least 1. See `latency_pool` for the Mutex rationale.
+    worker_pool: parking_lot::Mutex<rayon::ThreadPool>,
+}
+
+/// Bridge a rayon thread-pool task to an async tokio context.
+///
+/// Spawns `f` on `pool` and returns a receiver whose `.await` resolves when
+/// the task finishes. Unlike `tokio::task::spawn_blocking`, the closure runs
+/// on a caller-chosen rayon pool, which lets us separate latency-sensitive
+/// work (hover, goto_definition) from background work (diagnostics).
+///
+/// The borrow of `pool` ends immediately after `pool.spawn` returns — before
+/// any `.await` suspension — so callers do not need to hold a reference across
+/// yield points.
+fn spawn_on_pool<F, R>(
+    pool: &parking_lot::Mutex<rayon::ThreadPool>,
+    f: F,
+) -> tokio::sync::oneshot::Receiver<R>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    pool.lock().spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx
 }
 
 impl std::fmt::Debug for HydraLspBackend {
@@ -260,11 +296,32 @@ impl std::fmt::Debug for HydraLspBackend {
 
 impl HydraLspBackend {
     pub fn new(client: Client) -> Self {
+        let worker_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .saturating_sub(2)
+            .max(1);
+        let latency_pool = parking_lot::Mutex::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(2)
+                .thread_name(|i| format!("hydra-latency-{i}"))
+                .build()
+                .expect("failed to build latency thread pool"),
+        );
+        let worker_pool = parking_lot::Mutex::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(worker_threads)
+                .thread_name(|i| format!("hydra-worker-{i}"))
+                .build()
+                .expect("failed to build worker thread pool"),
+        );
         Self {
             client,
             settings: Arc::new(RwLock::new(Settings::default())),
             session: Arc::new(parking_lot::RwLock::new(None)),
             document_inputs: DashMap::new(),
+            latency_pool,
+            worker_pool,
         }
     }
 
@@ -364,7 +421,7 @@ impl HydraLspBackend {
         };
         let SessionSnapshot { db, python_config } = snapshot;
 
-        tokio::task::spawn_blocking(move || {
+        spawn_on_pool(&self.latency_pool, move || {
             let start = Instant::now();
             let target = TargetString::new(&db, target_value);
             let cached = python_cache::cached_definition_info(&db, python_config, target);
@@ -386,7 +443,7 @@ impl HydraLspBackend {
             result
         })
         .await
-        .map_err(|e| anyhow::anyhow!("Task failed: {}", e))?
+        .map_err(|e| anyhow::anyhow!("Task canceled: {}", e))?
     }
 
     /// Look up the cached `parsed_yaml` result for a URI, but only if the
@@ -489,6 +546,12 @@ impl LanguageServer for HydraLspBackend {
             // Parse feature toggle settings
             let toggles = FeatureToggles::from_json(settings);
 
+            // Parse optional thread-count override (total threads across both pools).
+            let num_threads = settings
+                .get("numThreads")
+                .and_then(|v| v.as_u64())
+                .map(|n| n.max(1) as usize);
+
             // Write settings under the lock (no awaits)
             {
                 let mut s = self.settings.write();
@@ -497,6 +560,31 @@ impl LanguageServer for HydraLspBackend {
                 }
                 s.disabled_rules = parsed_rules;
                 s.features = toggles;
+            }
+
+            // Rebuild thread pools if the user specified a total thread count.
+            if let Some(total) = num_threads {
+                let latency = 2_usize.min(total).max(1);
+                let worker = total.saturating_sub(latency).max(1);
+                *self.latency_pool.lock() = rayon::ThreadPoolBuilder::new()
+                    .num_threads(latency)
+                    .thread_name(|i| format!("hydra-latency-{i}"))
+                    .build()
+                    .expect("failed to build latency thread pool");
+                *self.worker_pool.lock() = rayon::ThreadPoolBuilder::new()
+                    .num_threads(worker)
+                    .thread_name(|i| format!("hydra-worker-{i}"))
+                    .build()
+                    .expect("failed to build worker thread pool");
+                self.client
+                    .log_message(
+                        MessageType::INFO,
+                        format!(
+                            "Thread pools configured: {} latency + {} worker ({} total)",
+                            latency, worker, total
+                        ),
+                    )
+                    .await;
             }
 
             // Log after releasing the lock
@@ -1325,11 +1413,12 @@ impl HydraLspBackend {
             // Clone disabled_rules (other settings live in salsa via python_config)
             let disabled_rules = self.settings.read().disabled_rules.clone();
 
-            // Move expensive validation (Python analysis per target) to blocking thread.
-            // The snapshot lets the cached_definition_info salsa query share results
-            // with hover/signature_help/goto on the main db. The ParsedYaml clone
-            // moves a single Arc, not the full HydraObject vec / line index.
-            let join_result = tokio::task::spawn_blocking(move || {
+            // Move expensive validation (Python analysis per target) to the
+            // worker pool so it does not compete with latency-sensitive
+            // operations (hover, goto_definition) for thread capacity.
+            // The snapshot lets the cached_definition_info salsa query share
+            // results with hover/signature_help/goto on the main db.
+            let join_result = spawn_on_pool(&self.worker_pool, move || {
                 let parsed_content = match parsed_yaml.result() {
                     Ok(content) => content,
                     Err(_) => return Vec::new(),

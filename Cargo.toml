@@ -52,6 +52,7 @@ salsa = { git = "https://github.com/salsa-rs/salsa.git", rev = "ce80691fa0b87dc2
     "salsa_unstable",
     "inventory",
 ] }
+rayon = "1"
 rustc-hash = "2.1"
 
 # Utilities
