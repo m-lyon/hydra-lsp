@@ -190,19 +190,19 @@ impl DefinitionInfo {
 pub struct PythonAnalyzer;
 
 /// Result of resolving a class attribute chain
-enum ClassAttributeChainResult {
+enum ClassAttributeChainResult<'sp> {
     /// Chain resolved to a method
     Method {
         file_path: PathBuf,
         class_name: String,
         method_name: String,
-        search_paths: Vec<PathBuf>,
+        search_paths: &'sp [PathBuf],
     },
     /// Chain resolved to a class
     Class {
         file_path: PathBuf,
         class_name: String,
-        search_paths: Vec<PathBuf>,
+        search_paths: &'sp [PathBuf],
     },
 }
 
@@ -391,7 +391,7 @@ impl PythonAnalyzer {
 
         let mut current_file = file_path.to_path_buf();
         let mut current_class = starting_class.to_string();
-        let mut resolver = ImportResolver::new(db, search_paths.to_vec());
+        let mut resolver = ImportResolver::new(db, search_paths);
         let interned_sp = InternedSearchPaths::new(db, search_paths.to_vec());
 
         // Process all but the last attribute (which might be a method)
@@ -627,7 +627,7 @@ impl PythonAnalyzer {
         }
 
         // Simple name - try to resolve through imports in the current file
-        let mut resolver = ImportResolver::new(db, search_paths.to_vec());
+        let mut resolver = ImportResolver::new(db, search_paths);
         if let Some((resolved_file, resolved_name)) =
             resolver.resolve_symbol(current_file, base_class_expr)
         {
@@ -656,14 +656,14 @@ impl PythonAnalyzer {
         db: &dyn ruff_db::Db,
         file_path: &Path,
         class_name: &str,
-        search_paths: Vec<PathBuf>,
+        search_paths: &[PathBuf],
     ) -> Result<(ClassInfo, PathBuf)> {
         let (mut class_info, resolved_file) =
             if let Ok(class_info) = Self::extract_class_info(db, file_path, class_name) {
                 (class_info, file_path.to_path_buf())
             } else {
                 // Try to resolve through imports
-                let mut resolver = ImportResolver::new(db, search_paths.clone());
+                let mut resolver = ImportResolver::new(db, search_paths);
                 if let Some((resolved_file, resolved_name)) =
                     resolver.resolve_symbol(file_path, class_name)
                 {
@@ -714,7 +714,7 @@ impl PythonAnalyzer {
         db: &dyn ruff_db::Db,
         file_path: &Path,
         function_name: &str,
-        search_paths: Vec<PathBuf>,
+        search_paths: &[PathBuf],
     ) -> Result<(FunctionSignature, PathBuf)> {
         if let Ok(func_sig) = Self::extract_function_signature(db, file_path, function_name) {
             return Ok((func_sig, file_path.to_path_buf()));
@@ -773,7 +773,7 @@ impl PythonAnalyzer {
                 db,
                 &file_path,
                 &symbol_name,
-                search_paths.to_vec(),
+                search_paths,
             ) {
                 return Ok((
                     DefinitionInfo::Function(func_sig),
@@ -788,7 +788,7 @@ impl PythonAnalyzer {
                 db,
                 &file_path,
                 &symbol_name,
-                search_paths.to_vec(),
+                search_paths,
             ) {
                 return Ok((
                     DefinitionInfo::Class(class_info),
@@ -867,11 +867,11 @@ impl PythonAnalyzer {
     /// - Nested class: `module.OuterClass.nested_attr.nested_class`
     ///
     /// Returns either a Method or Class result depending on what the chain resolves to.
-    fn resolve_class_attribute_chain(
+    fn resolve_class_attribute_chain<'sp>(
         db: &dyn ruff_db::Db,
         target: &str,
-        search_paths: &[PathBuf],
-    ) -> Option<ClassAttributeChainResult> {
+        search_paths: &'sp [PathBuf],
+    ) -> Option<ClassAttributeChainResult<'sp>> {
         let parts: Vec<&str> = target.split('.').collect();
         if parts.len() < 3 {
             return None;
@@ -909,7 +909,7 @@ impl PythonAnalyzer {
                 db,
                 &file_path,
                 first_symbol,
-                search_paths.to_vec(),
+                search_paths,
             ) {
                 if remaining_parts.len() == 2 {
                     // Simple case: Class.method
@@ -922,7 +922,7 @@ impl PythonAnalyzer {
                             file_path: resolved_file,
                             class_name: class_info.name,
                             method_name: method_name.to_string(),
-                            search_paths: search_paths.to_vec(),
+                            search_paths,
                         });
                     }
                 } else if remaining_parts.len() > 2 {
@@ -943,13 +943,13 @@ impl PythonAnalyzer {
                                 file_path: final_file,
                                 class_name: final_class,
                                 method_name,
-                                search_paths: search_paths.to_vec(),
+                                search_paths,
                             });
                         } else {
                             return Some(ClassAttributeChainResult::Class {
                                 file_path: final_file,
                                 class_name: final_class,
-                                search_paths: search_paths.to_vec(),
+                                search_paths,
                             });
                         }
                     }
@@ -967,7 +967,7 @@ impl PythonAnalyzer {
         file_path: &Path,
         class_name: &str,
         method_name: &str,
-        search_paths: Vec<PathBuf>,
+        search_paths: &[PathBuf],
     ) -> Result<(MethodInfo, PathBuf)> {
         if let Ok(method_info) = Self::extract_method_info(db, file_path, class_name, method_name) {
             return Ok((method_info, file_path.to_path_buf()));
@@ -1882,7 +1882,7 @@ mod tests {
             &test_db(),
             &test_file,
             "ChildWithoutInit",
-            search_paths,
+            &search_paths,
         )
         .unwrap();
 
@@ -1921,7 +1921,7 @@ mod tests {
             &test_db(),
             &test_file,
             "GrandchildWithoutInit",
-            search_paths,
+            &search_paths,
         )
         .unwrap();
 
@@ -1948,7 +1948,7 @@ mod tests {
             &test_db(),
             &test_file,
             "ChildWithOwnInit",
-            search_paths,
+            &search_paths,
         )
         .unwrap();
 

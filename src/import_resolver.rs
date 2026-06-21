@@ -26,15 +26,15 @@ enum ImportInfo {
 }
 
 /// Context for import resolution operations
-pub struct ImportResolver<'db> {
+pub struct ImportResolver<'db, 'sp> {
     db: &'db dyn ruff_db::Db,
-    search_paths: Vec<PathBuf>,
+    search_paths: &'sp [PathBuf],
     visited_files: HashSet<PathBuf>,
     depth: usize,
 }
 
-impl<'db> ImportResolver<'db> {
-    pub fn new(db: &'db dyn ruff_db::Db, search_paths: Vec<PathBuf>) -> Self {
+impl<'db, 'sp> ImportResolver<'db, 'sp> {
+    pub fn new(db: &'db dyn ruff_db::Db, search_paths: &'sp [PathBuf]) -> Self {
         Self {
             db,
             search_paths,
@@ -75,7 +75,7 @@ impl<'db> ImportResolver<'db> {
     pub fn resolve_module_path(&self, module_path: &str) -> Option<PathBuf> {
         let module_parts: Vec<&str> = module_path.split('.').collect();
 
-        for search_path in &self.search_paths {
+        for search_path in self.search_paths {
             if !search_path.exists() {
                 continue;
             }
@@ -114,7 +114,7 @@ impl<'db> ImportResolver<'db> {
         // Find which search path this is under
         // Sort search paths by length descending to match more specific paths first
         // (e.g., site-packages should match before workspace root)
-        let mut sorted_paths = self.search_paths.clone();
+        let mut sorted_paths = self.search_paths.to_vec();
         sorted_paths.sort_by_key(|a| a.as_os_str().len());
 
         let mut package_path: Option<String> = None;
