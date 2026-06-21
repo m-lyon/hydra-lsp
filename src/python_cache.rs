@@ -3,7 +3,8 @@ use std::sync::Arc;
 
 use crate::import_resolver::ImportResolver;
 use crate::python_analyzer::{
-    DefinitionInfo, PythonAnalyzer, normalize_site_packages_pth_state_key,
+    ClassAttributeInfo, DefinitionInfo, FunctionSignature, PythonAnalyzer,
+    normalize_site_packages_pth_state_key,
 };
 use ruff_db::files::FileRootKind;
 use ruff_db::system::SystemPathBuf;
@@ -262,6 +263,225 @@ pub fn cached_definition_info<'db>(
         target_str,
         search_paths,
     ))
+}
+
+/// Cached docstring + `__init__` resolution for a class, walking its MRO.
+///
+/// Salsa memoises each `(class_key, search_paths)` pair, so parent classes
+/// shared across different child classes are resolved at most once per revision.
+/// The own class properties take priority; parent properties fill in only what
+/// is missing.
+#[derive(Clone, Debug)]
+pub struct ClassParentDocs {
+    inner: Arc<(Option<String>, Option<FunctionSignature>)>,
+}
+
+impl ClassParentDocs {
+    fn new(docstring: Option<String>, init: Option<FunctionSignature>) -> Self {
+        Self {
+            inner: Arc::new((docstring, init)),
+        }
+    }
+
+    /// Resolved docstring — from the class itself or the nearest ancestor that has one.
+    pub fn docstring(&self) -> Option<&String> {
+        self.inner.0.as_ref()
+    }
+
+    /// Resolved `__init__` signature — from the class itself or the nearest ancestor.
+    pub fn init(&self) -> Option<&FunctionSignature> {
+        self.inner.1.as_ref()
+    }
+}
+
+impl PartialEq for ClassParentDocs {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+}
+impl Eq for ClassParentDocs {}
+
+/// Cached result of looking up a class attribute by walking the MRO.
+///
+/// `None` inner value means the attribute was not found on the class or any parent.
+#[derive(Clone, Debug)]
+pub struct CachedClassAttribute {
+    inner: Arc<Option<(ClassAttributeInfo, PathBuf, String)>>,
+}
+
+impl CachedClassAttribute {
+    fn found(attr_info: ClassAttributeInfo, file_path: PathBuf, class_name: String) -> Self {
+        Self {
+            inner: Arc::new(Some((attr_info, file_path, class_name))),
+        }
+    }
+
+    fn not_found() -> Self {
+        Self {
+            inner: Arc::new(None),
+        }
+    }
+
+    /// Returns a reference to `(ClassAttributeInfo, file_path, class_name)` if found.
+    pub fn get(&self) -> Option<&(ClassAttributeInfo, PathBuf, String)> {
+        self.inner.as_ref().as_ref()
+    }
+}
+
+impl PartialEq for CachedClassAttribute {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+}
+impl Eq for CachedClassAttribute {}
+
+/// Cached docstring + `__init__` resolution for one class, including its MRO.
+///
+/// `class_key` encodes `"canonical_file_path::ClassName"`. The query calls
+/// `extract_class_info` for the class itself and, for any missing property,
+/// recursively invokes itself for each parent (MRO order, left-to-right).
+/// Salsa memoises every node independently, so a grandparent shared by two
+/// sibling classes is resolved only once per revision.
+///
+/// `cycle_result` handles circular inheritance (invalid Python) gracefully by
+/// returning empty docs rather than panicking.
+#[salsa::tracked(lru = 512, cycle_result = class_parent_docs_cycle)]
+pub fn class_parent_docs<'db>(
+    db: &'db dyn ruff_db::Db,
+    class_key: TargetString<'db>,
+    search_paths: InternedSearchPaths<'db>,
+) -> ClassParentDocs {
+    let key_str = class_key.value(db);
+    let Some((file_path_str, class_name)) = key_str.split_once("::") else {
+        return ClassParentDocs::new(None, None);
+    };
+    let file_path = Path::new(file_path_str);
+
+    let Ok(class_info) = PythonAnalyzer::extract_class_info(db, file_path, class_name) else {
+        return ClassParentDocs::new(None, None);
+    };
+
+    let mut docstring = class_info.docstring;
+    let mut init = class_info.init_signature;
+
+    if docstring.is_some() && init.is_some() {
+        return ClassParentDocs::new(docstring, init);
+    }
+
+    let search_paths_vec = search_paths.paths(db);
+
+    for base_class in &class_info.base_classes {
+        if matches!(base_class.as_str(), "object" | "ABC" | "Protocol") {
+            continue;
+        }
+        let Some((parent_file, parent_class_name)) =
+            PythonAnalyzer::resolve_base_class(db, base_class, file_path, &search_paths_vec)
+        else {
+            continue;
+        };
+        let canonical = parent_file
+            .canonicalize()
+            .unwrap_or_else(|_| parent_file.clone());
+        let parent_key = TargetString::new(
+            db,
+            format!("{}::{}", canonical.display(), parent_class_name),
+        );
+        let parent_docs = class_parent_docs(db, parent_key, search_paths);
+
+        if docstring.is_none() {
+            docstring = parent_docs.docstring().cloned();
+        }
+        if init.is_none() {
+            init = parent_docs.init().cloned();
+        }
+        if docstring.is_some() && init.is_some() {
+            break;
+        }
+    }
+
+    ClassParentDocs::new(docstring, init)
+}
+
+fn class_parent_docs_cycle(
+    _db: &dyn ruff_db::Db,
+    _id: salsa::Id,
+    _class_key: TargetString,
+    _search_paths: InternedSearchPaths,
+) -> ClassParentDocs {
+    ClassParentDocs::new(None, None)
+}
+
+/// Cached class-attribute lookup, walking the MRO when not found directly.
+///
+/// `class_key` encodes `"canonical_file_path::ClassName"`;
+/// `attribute_key` is the bare attribute name (interned for deduplication).
+/// Each `(class_key, attribute_key, search_paths)` triple is memoised, so
+/// shared parent classes are looked up at most once per revision.
+///
+/// `cycle_result` handles circular inheritance gracefully.
+#[salsa::tracked(lru = 512, cycle_result = class_parent_attribute_cycle)]
+pub fn class_parent_attribute<'db>(
+    db: &'db dyn ruff_db::Db,
+    class_key: TargetString<'db>,
+    attribute_key: TargetString<'db>,
+    search_paths: InternedSearchPaths<'db>,
+) -> CachedClassAttribute {
+    let key_str = class_key.value(db);
+    let Some((file_path_str, class_name)) = key_str.split_once("::") else {
+        return CachedClassAttribute::not_found();
+    };
+    let file_path = Path::new(file_path_str);
+    let attribute_name = attribute_key.value(db);
+
+    if let Ok(attr_info) =
+        PythonAnalyzer::extract_class_attribute(db, file_path, class_name, attribute_name)
+    {
+        return CachedClassAttribute::found(
+            attr_info,
+            file_path.to_path_buf(),
+            class_name.to_string(),
+        );
+    }
+
+    let Ok(class_info) = PythonAnalyzer::extract_class_info(db, file_path, class_name) else {
+        return CachedClassAttribute::not_found();
+    };
+
+    let search_paths_vec = search_paths.paths(db);
+
+    for base_class in &class_info.base_classes {
+        if matches!(base_class.as_str(), "object" | "ABC" | "Protocol") {
+            continue;
+        }
+        let Some((parent_file, parent_class_name)) =
+            PythonAnalyzer::resolve_base_class(db, base_class, file_path, &search_paths_vec)
+        else {
+            continue;
+        };
+        let canonical = parent_file
+            .canonicalize()
+            .unwrap_or_else(|_| parent_file.clone());
+        let parent_key = TargetString::new(
+            db,
+            format!("{}::{}", canonical.display(), parent_class_name),
+        );
+        let result = class_parent_attribute(db, parent_key, attribute_key, search_paths);
+        if result.get().is_some() {
+            return result;
+        }
+    }
+
+    CachedClassAttribute::not_found()
+}
+
+fn class_parent_attribute_cycle(
+    _db: &dyn ruff_db::Db,
+    _id: salsa::Id,
+    _class_key: TargetString,
+    _attribute_key: TargetString,
+    _search_paths: InternedSearchPaths,
+) -> CachedClassAttribute {
+    CachedClassAttribute::not_found()
 }
 
 #[cfg(test)]

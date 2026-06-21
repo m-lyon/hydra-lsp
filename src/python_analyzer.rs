@@ -1,5 +1,8 @@
 use crate::import_resolver::ImportResolver;
-use crate::python_cache::{InternedSearchPaths, SitePackagesPthState, TargetString, resolve_module_cached};
+use crate::python_cache::{
+    InternedSearchPaths, SitePackagesPthState, TargetString, class_parent_attribute,
+    class_parent_docs, resolve_module_cached,
+};
 use anyhow::{Context, Result};
 use ruff_db::files::system_path_to_file;
 use ruff_db::parsed::{ParsedModuleRef, parsed_module};
@@ -8,13 +11,9 @@ use ruff_db::system::{OsSystem, SystemPath, SystemPathBuf};
 use ruff_python_ast::{self as ast, Expr, Stmt, visitor::Visitor};
 use ruff_source_file::{LineIndex, PositionEncoding};
 use ruff_text_size::TextRange;
-use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use ty_python_semantic::{PythonEnvironment, SysPrefixPathOrigin};
-
-/// Maximum depth for parent class resolution to prevent infinite loops
-const MAX_PARENT_DEPTH: usize = 1000;
 
 /// Read a Python source file through ruff_db's salsa-tracked `source_text`.
 ///
@@ -373,76 +372,6 @@ impl PythonAnalyzer {
         })
     }
 
-    /// Extract a class attribute, searching parent classes if not found directly.
-    ///
-    /// Returns (ClassAttributeInfo, file_path, class_name) where the attribute was found.
-    fn extract_class_attribute_with_inheritance(
-        db: &dyn ruff_db::Db,
-        file_path: &Path,
-        class_name: &str,
-        attribute_name: &str,
-        search_paths: &[PathBuf],
-        visited: &mut HashSet<String>,
-    ) -> Result<(ClassAttributeInfo, PathBuf, String)> {
-        // Limit recursion depth
-        if visited.len() >= MAX_PARENT_DEPTH {
-            anyhow::bail!("Maximum inheritance depth exceeded");
-        }
-
-        // Check for cycles
-        let canonical_path = file_path
-            .canonicalize()
-            .unwrap_or_else(|_| file_path.to_path_buf());
-        let visit_key = format!("{}::{}", canonical_path.display(), class_name);
-        if visited.contains(&visit_key) {
-            anyhow::bail!("Cycle detected in inheritance chain");
-        }
-        visited.insert(visit_key);
-
-        // Try to find the attribute directly on this class
-        if let Ok(attr_info) =
-            Self::extract_class_attribute(db, file_path, class_name, attribute_name)
-        {
-            return Ok((attr_info, file_path.to_path_buf(), class_name.to_string()));
-        }
-
-        // Get the class info to find parent classes
-        let class_info = Self::extract_class_info(db, file_path, class_name)?;
-
-        // Search parent classes for the attribute
-        for base_class in &class_info.base_classes {
-            // Skip common base classes
-            if base_class == "object" || base_class == "ABC" || base_class == "Protocol" {
-                continue;
-            }
-
-            // Resolve the parent class to a file and name
-            let Some((parent_file, parent_class_name)) =
-                Self::resolve_base_class(db, base_class, file_path, search_paths)
-            else {
-                continue;
-            };
-
-            // Recursively search in parent class
-            if let Ok(result) = Self::extract_class_attribute_with_inheritance(
-                db,
-                &parent_file,
-                &parent_class_name,
-                attribute_name,
-                search_paths,
-                visited,
-            ) {
-                return Ok(result);
-            }
-        }
-
-        anyhow::bail!(
-            "Attribute '{}' not found in class '{}' or its parents",
-            attribute_name,
-            class_name
-        )
-    }
-
     /// Resolve an attribute chain through classes.
     ///
     /// Given a starting class and an attribute chain like ["nested", "nested_class"],
@@ -463,6 +392,7 @@ impl PythonAnalyzer {
         let mut current_file = file_path.to_path_buf();
         let mut current_class = starting_class.to_string();
         let mut resolver = ImportResolver::new(db, search_paths.to_vec());
+        let interned_sp = InternedSearchPaths::new(db, search_paths.to_vec());
 
         // Process all but the last attribute (which might be a method)
         for (i, attr) in attribute_chain.iter().enumerate() {
@@ -474,17 +404,20 @@ impl PythonAnalyzer {
                 return Ok((current_file, current_class, Some(attr.to_string())));
             }
 
-            // Try to get the attribute as a class attribute (with inheritance support)
-            let mut visited = HashSet::new();
-            match Self::extract_class_attribute_with_inheritance(
+            // Try to get the attribute as a class attribute (with inheritance support).
+            // The salsa-tracked class_parent_attribute memoises each (class, attr) pair so
+            // shared parent classes are only walked once per revision.
+            let canonical = current_file
+                .canonicalize()
+                .unwrap_or_else(|_| current_file.clone());
+            let class_key = TargetString::new(
                 db,
-                &current_file,
-                &current_class,
-                attr,
-                search_paths,
-                &mut visited,
-            ) {
-                Ok((attr_info, _attr_file, _attr_class)) => {
+                format!("{}::{}", canonical.display(), current_class),
+            );
+            let attr_key = TargetString::new(db, attr.to_string());
+            let cached_attr = class_parent_attribute(db, class_key, attr_key, interned_sp);
+            match cached_attr.get() {
+                Some((attr_info, _attr_file, _attr_class)) => {
                     // The value could be a simple name or a dotted path
                     let value_parts: Vec<&str> = attr_info.value.split('.').collect();
 
@@ -535,16 +468,20 @@ impl PythonAnalyzer {
                         );
                     }
                 }
-                Err(_) if is_last => {
-                    // Last attribute and not a class attribute - maybe it's a method
-                    // that we couldn't find (could be inherited, etc.)
+                None if is_last => {
                     anyhow::bail!(
                         "Attribute or method '{}' not found in class '{}'",
                         attr,
                         current_class
                     );
                 }
-                Err(e) => return Err(e),
+                None => {
+                    anyhow::bail!(
+                        "Attribute '{}' not found in class '{}' or its parents",
+                        attr,
+                        current_class
+                    );
+                }
             }
         }
 
@@ -666,7 +603,7 @@ impl PythonAnalyzer {
     /// This function handles:
     /// - Simple names: `ParentClass` - looks up in the current file's imports
     /// - Qualified names: `module.ClassName` - resolves the module path
-    fn resolve_base_class(
+    pub(crate) fn resolve_base_class(
         db: &dyn ruff_db::Db,
         base_class_expr: &str,
         current_file: &Path,
@@ -710,106 +647,6 @@ impl PythonAnalyzer {
         None
     }
 
-    /// Resolve missing properties (docstring, __init__) from parent classes.
-    ///
-    /// This follows Python's MRO (left-to-right for simple cases) and searches
-    /// parent classes recursively when properties are not found in the child.
-    fn resolve_from_parents(
-        db: &dyn ruff_db::Db,
-        base_classes: &[String],
-        current_file: &Path,
-        search_paths: &[PathBuf],
-        visited: &mut HashSet<String>,
-        needs_docstring: bool,
-        needs_init: bool,
-    ) -> (Option<String>, Option<FunctionSignature>) {
-        // Base case: nothing needed
-        if !needs_docstring && !needs_init {
-            return (None, None);
-        }
-
-        // Limit recursion depth via visited set size
-        if visited.len() >= MAX_PARENT_DEPTH {
-            return (None, None);
-        }
-
-        let mut found_docstring: Option<String> = None;
-        let mut found_init: Option<FunctionSignature> = None;
-
-        // Iterate through base classes in MRO order (left-to-right)
-        for base_class in base_classes {
-            // Skip common base classes that won't have useful info
-            if base_class == "object" || base_class == "ABC" || base_class == "Protocol" {
-                continue;
-            }
-
-            // Resolve the base class to a file and name
-            let Some((parent_file, parent_class_name)) =
-                Self::resolve_base_class(db, base_class, current_file, search_paths)
-            else {
-                continue;
-            };
-
-            // Check for cycles using (file, class_name) as key
-            // This allows multiple classes in the same file to be visited
-            let canonical_path = parent_file
-                .canonicalize()
-                .unwrap_or_else(|_| parent_file.clone());
-            let visit_key = format!("{}::{}", canonical_path.display(), parent_class_name);
-            if visited.contains(&visit_key) {
-                continue;
-            }
-            visited.insert(visit_key);
-
-            // Extract the parent class info (salsa-cached)
-            let parent_info = match Self::extract_class_info(db, &parent_file, &parent_class_name) {
-                Ok(info) => info,
-                Err(_) => continue,
-            };
-
-            // Check if the parent has what we need
-            if needs_docstring && found_docstring.is_none() && parent_info.docstring.is_some() {
-                found_docstring = parent_info.docstring.clone();
-            }
-
-            if needs_init && found_init.is_none() && parent_info.init_signature.is_some() {
-                found_init = parent_info.init_signature.clone();
-            }
-
-            // If we still need something, recurse into grandparents
-            let still_needs_docstring = needs_docstring && found_docstring.is_none();
-            let still_needs_init = needs_init && found_init.is_none();
-
-            if still_needs_docstring || still_needs_init {
-                let (grandparent_docstring, grandparent_init) = Self::resolve_from_parents(
-                    db,
-                    &parent_info.base_classes,
-                    &parent_file,
-                    search_paths,
-                    visited,
-                    still_needs_docstring,
-                    still_needs_init,
-                );
-
-                if still_needs_docstring && found_docstring.is_none() {
-                    found_docstring = grandparent_docstring;
-                }
-                if still_needs_init && found_init.is_none() {
-                    found_init = grandparent_init;
-                }
-            }
-
-            // If we found everything, stop searching
-            if (!needs_docstring || found_docstring.is_some())
-                && (!needs_init || found_init.is_some())
-            {
-                break;
-            }
-        }
-
-        (found_docstring, found_init)
-    }
-
     /// Extract class information, following re-exports if necessary.
     /// Returns the ClassInfo and the file path where it was found.
     ///
@@ -846,30 +683,25 @@ impl PythonAnalyzer {
                 }
             };
 
-        // Resolve missing properties from parent classes
+        // Resolve missing properties from parent classes via the memoised salsa query.
+        // class_parent_docs walks the MRO recursively and caches results per (class, search_paths),
+        // so shared parent classes across different child-class lookups are resolved only once.
         if class_info.docstring.is_none() || class_info.init_signature.is_none() {
-            let mut visited = HashSet::new();
             let canonical_path = resolved_file
                 .canonicalize()
                 .unwrap_or_else(|_| resolved_file.clone());
-            let visit_key = format!("{}::{}", canonical_path.display(), class_info.name);
-            visited.insert(visit_key);
-
-            let (parent_docstring, parent_init) = Self::resolve_from_parents(
+            let class_key = TargetString::new(
                 db,
-                &class_info.base_classes,
-                &resolved_file,
-                &search_paths,
-                &mut visited,
-                class_info.docstring.is_none(),
-                class_info.init_signature.is_none(),
+                format!("{}::{}", canonical_path.display(), class_info.name),
             );
+            let interned_sp = InternedSearchPaths::new(db, search_paths.to_vec());
+            let parent_docs = class_parent_docs(db, class_key, interned_sp);
 
             if class_info.docstring.is_none() {
-                class_info.docstring = parent_docstring;
+                class_info.docstring = parent_docs.docstring().cloned();
             }
             if class_info.init_signature.is_none() {
-                class_info.init_signature = parent_init;
+                class_info.init_signature = parent_docs.init().cloned();
             }
         }
 
