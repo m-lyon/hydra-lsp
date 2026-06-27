@@ -1379,8 +1379,12 @@ fn check_method_decorators(decorators: &[ast::Decorator]) -> (bool, bool) {
 fn get_position_info(range: TextRange, source: &str) -> (u32, u32, u32, u32) {
     let line_index = LineIndex::from_source_text(source);
 
-    let start = line_index.source_location(range.start(), source, PositionEncoding::Utf32);
-    let end = line_index.source_location(range.end(), source, PositionEncoding::Utf32);
+    // The server advertises no `positionEncoding`, so the LSP default of
+    // UTF-16 applies to every position we send to the client. Emitting UTF-32
+    // (codepoint) columns here would mis-position ranges by one per non-BMP
+    // character (codepoints >= U+10000) earlier on the line.
+    let start = line_index.source_location(range.start(), source, PositionEncoding::Utf16);
+    let end = line_index.source_location(range.end(), source, PositionEncoding::Utf16);
 
     (
         start.line.to_zero_indexed() as u32,

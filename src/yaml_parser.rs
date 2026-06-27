@@ -325,9 +325,9 @@ pub struct HydraObject {
 }
 
 impl HydraObject {
-    /// Get the end position of the target value
+    /// Get the end position (UTF-16 column) of the target value
     pub fn target_value_end(&self) -> u32 {
-        self.target.value_start + self.target.value.len() as u32
+        self.target.value_start + utf16_len(&self.target.value)
     }
 
     /// Check if this HydraObject is marked as partial
@@ -346,6 +346,57 @@ pub struct ParsedContent {
     pub param_line_map: HashMap<u32, (usize, ParameterContext)>,
     /// File-wide diagnostic suppressions from header comments
     pub file_suppressions: HashSet<DiagnosticRule>,
+}
+
+/// Convert an LSP column (`Position::character`, UTF-16 units) into a UTF-8 byte offset
+/// within `line`, clamped to the end of the line and always landing on a
+/// `char` boundary.
+///
+/// The server defaults to receiving UTF-16 units from the client. Indexing a Rust
+/// `str` requires a byte offset, so passing `Position::character` straight
+/// into a slice produces wrong results whenever a multi-byte character precedes
+/// the cursor. This walks the line accumulating each character's UTF-16 length until
+/// it reaches `utf16_col`, returning the byte index at that point.
+pub(crate) fn utf16_col_to_byte_offset(line: &str, utf16_col: usize) -> usize {
+    let mut utf16_seen = 0usize;
+    for (byte_idx, ch) in line.char_indices() {
+        if utf16_seen >= utf16_col {
+            return byte_idx;
+        }
+        utf16_seen += ch.len_utf16();
+    }
+    line.len()
+}
+
+/// UTF-16 code-unit length of `s`.
+///
+/// The server defaults to UTF-16 units. Rust's `str::len()` is bytes, which diverges for
+/// any non-ASCII content, so column/length math must go through this instead.
+pub(crate) fn utf16_len(s: &str) -> u32 {
+    s.encode_utf16().count() as u32
+}
+
+/// Convert a saphyr column (a Unicode scalar / codepoint (cp) count) on 0-indexed line
+/// `line0` into a UTF-16 column.
+///
+/// saphyr reports both `Marker::col()` and `Marker::index()` in codepoints,
+/// but the default server encoding is UTF-16, where astral-plane characters
+/// (codepoints >= U+10000) count as two units. Columns past the end of the
+/// line are extended 1:1 (there is no text there to measure).
+///
+/// `lines` is the document pre-split with `str::lines()` (built once per parse),
+/// so each call is O(`cp_col`) rather than rescanning the document from the top.
+pub(crate) fn cp_to_utf16_col(lines: &[&str], line0: u32, cp_col: u32) -> u32 {
+    let line = lines.get(line0 as usize).copied().unwrap_or("");
+    let mut chars = line.chars();
+    let mut utf16 = 0u32;
+    for _ in 0..cp_col {
+        match chars.next() {
+            Some(c) => utf16 += c.len_utf16() as u32,
+            None => utf16 += 1,
+        }
+    }
+    utf16
 }
 
 impl ParsedContent {
@@ -395,12 +446,13 @@ impl ParsedContent {
                 bracket_col,
                 text_after_bracket,
             } => {
-                let cursor_chars =
+                // `position.character` and `bracket_col` are both UTF-16
+                // columns, so their difference is the cursor's UTF-16 offset
+                // into `text_after_bracket`. Convert that to a byte offset
+                // before slicing/counting commas.
+                let cursor_utf16 =
                     (position.character as usize).saturating_sub(*bracket_col as usize + 1);
-                let end: usize = text_after_bracket
-                    .char_indices()
-                    .nth(cursor_chars)
-                    .map_or(text_after_bracket.len(), |(i, _)| i);
+                let end = utf16_col_to_byte_offset(text_after_bracket, cursor_utf16);
                 let index = YamlParser::count_flow_commas(text_after_bracket, 0, end);
                 let (num_args, kw_keys) = YamlParser::count_param_kinds(&hydra_object.parameters);
                 (
@@ -429,12 +481,15 @@ impl ParsedContent {
         position: Position,
         line_text: &str,
     ) -> Option<CompletionContext> {
-        let cursor_col = (position.character as usize).min(line_text.len());
+        let cursor_col = utf16_col_to_byte_offset(line_text, position.character as usize);
 
         // Cursor is on a `_target_` value line.
         if let Some(&idx) = self.target_line_map.get(&position.line) {
             let target = &self.hydra_objects[idx].target;
-            let value_start = (target.value_start as usize).min(cursor_col);
+            // `value_start` is a UTF-16 column; convert it to a byte offset so it
+            // can slice `line_text` alongside the (already byte-based) cursor.
+            let value_start =
+                utf16_col_to_byte_offset(line_text, target.value_start as usize).min(cursor_col);
             let partial = line_text[value_start..cursor_col].trim().to_string();
             return Some(CompletionContext::TargetValue { partial });
         }
@@ -484,7 +539,10 @@ impl ParsedContent {
 }
 
 /// Convert a saphyr `MarkedYamlOwned` node to `YamlValue`
-fn node_to_yaml_value(node: &MarkedYamlOwned) -> YamlValue {
+///
+/// `lines` is the source document pre-split with `str::lines()`, needed to
+/// convert saphyr's codepoint columns into the UTF-16 columns the LSP expects.
+fn node_to_yaml_value(node: &MarkedYamlOwned, lines: &[&str]) -> YamlValue {
     let data = &node.data;
     if data.is_null() {
         YamlValue::Null
@@ -499,11 +557,16 @@ fn node_to_yaml_value(node: &MarkedYamlOwned) -> YamlValue {
     } else if let Some(seq) = data.as_sequence() {
         YamlValue::Sequence(
             seq.iter()
-                .map(|item| PositionedValue {
-                    value: node_to_yaml_value(item),
-                    line: (item.span.start.line() - 1) as u32,
-                    start: item.span.start.col() as u32,
-                    end: item.span.end.col() as u32,
+                .map(|item| {
+                    // Sequence elements are scalars on a single line; convert
+                    // both columns against the element's own line.
+                    let start_line = (item.span.start.line() - 1) as u32;
+                    PositionedValue {
+                        value: node_to_yaml_value(item, lines),
+                        line: start_line,
+                        start: cp_to_utf16_col(lines, start_line, item.span.start.col() as u32),
+                        end: cp_to_utf16_col(lines, start_line, item.span.end.col() as u32),
+                    }
                 })
                 .collect(),
         )
@@ -512,7 +575,7 @@ fn node_to_yaml_value(node: &MarkedYamlOwned) -> YamlValue {
             .iter()
             .filter_map(|(k, v)| {
                 let key_str = k.data.as_str()?.to_string();
-                Some((key_str, node_to_yaml_value(v)))
+                Some((key_str, node_to_yaml_value(v, lines)))
             })
             .collect();
         YamlValue::Mapping(entries)
@@ -544,8 +607,10 @@ impl YamlParser {
             ));
         }
 
+        let lines: Vec<&str> = content.lines().collect();
+
         let mut hydra_objects = Vec::new();
-        Self::extract_hydra_objects(&docs[0], content, &mut hydra_objects);
+        Self::extract_hydra_objects(&docs[0], &lines, &mut hydra_objects);
 
         // Parse file-wide suppressions from header comments before any YAML content
         let file_suppressions = Self::get_filewide_suppressions(content);
@@ -749,12 +814,13 @@ impl YamlParser {
     fn extract_bool_keyword(
         map: &LinkedHashMap<MarkedYamlOwned, MarkedYamlOwned>,
         keyword: &str,
+        lines: &[&str],
     ) -> Option<HydraParameter<bool>> {
         let (key_n, val_node) = map.iter().find(|(k, _)| k.data.as_str() == Some(keyword))?;
         let line = (key_n.span.start.line() - 1) as u32;
-        let key_start = key_n.span.start.col() as u32;
-        let value_start = val_node.span.start.col() as u32;
-        let value_end = val_node.span.end.col() as u32;
+        let key_start = cp_to_utf16_col(lines, line, key_n.span.start.col() as u32);
+        let value_start = cp_to_utf16_col(lines, line, val_node.span.start.col() as u32);
+        let value_end = cp_to_utf16_col(lines, line, val_node.span.end.col() as u32);
         match val_node.data.as_bool() {
             Some(b) => Some(HydraParameter {
                 value: b,
@@ -778,14 +844,15 @@ impl YamlParser {
     /// Extract the `_convert_` Hydra keyword from a mapping.
     fn extract_convert_keyword(
         map: &LinkedHashMap<MarkedYamlOwned, MarkedYamlOwned>,
+        lines: &[&str],
     ) -> Option<HydraParameter<ConvertMode>> {
         let (key_n, val_node) = map
             .iter()
             .find(|(k, _)| k.data.as_str() == Some(CONVERT_KEY))?;
         let line = (key_n.span.start.line() - 1) as u32;
-        let key_start = key_n.span.start.col() as u32;
-        let value_start = val_node.span.start.col() as u32;
-        let value_end = val_node.span.end.col() as u32;
+        let key_start = cp_to_utf16_col(lines, line, key_n.span.start.col() as u32);
+        let value_start = cp_to_utf16_col(lines, line, val_node.span.start.col() as u32);
+        let value_end = cp_to_utf16_col(lines, line, val_node.span.end.col() as u32);
         match val_node
             .data
             .as_str()
@@ -870,24 +937,26 @@ impl YamlParser {
     /// an [`InlineArgsText`] with the bracket column and trailing text.
     fn extract_args_keyword(
         map: &LinkedHashMap<MarkedYamlOwned, MarkedYamlOwned>,
-        content: &str,
+        lines: &[&str],
     ) -> Option<(HydraParameter<Option<InlineArgsText>>, Vec<Parameter>)> {
         let (key_n, val_node) = map
             .iter()
             .find(|(k, _)| k.data.as_str() == Some(ARGS_KEY))?;
         let line = (key_n.span.start.line() - 1) as u32;
-        let key_start = key_n.span.start.col() as u32;
-        let value_start = val_node.span.start.col() as u32;
-        let value_end = val_node.span.end.col() as u32;
+        let key_start = cp_to_utf16_col(lines, line, key_n.span.start.col() as u32);
+        let value_start = cp_to_utf16_col(lines, line, val_node.span.start.col() as u32);
+        let value_end = cp_to_utf16_col(lines, line, val_node.span.end.col() as u32);
         if let Some(seq) = val_node.data.as_sequence() {
             let positional_params: Vec<Parameter> = seq
                 .iter()
                 .map(|item| {
                     let arg_line = (item.span.start.line() - 1) as u32;
-                    let arg_value_start = item.span.start.col() as u32;
-                    let arg_value_end = item.span.end.col() as u32;
+                    let arg_value_start =
+                        cp_to_utf16_col(lines, arg_line, item.span.start.col() as u32);
+                    let arg_value_end =
+                        cp_to_utf16_col(lines, arg_line, item.span.end.col() as u32);
                     Parameter::Positional {
-                        value: node_to_yaml_value(item),
+                        value: node_to_yaml_value(item, lines),
                         line: arg_line,
                         value_start: arg_value_start,
                         value_end: arg_value_end,
@@ -902,18 +971,14 @@ impl YamlParser {
             let is_inline =
                 positional_params.is_empty() || positional_params.iter().all(|p| p.line() == line);
             let inline_info = if is_inline {
-                let key_byte_idx = key_n.span.start.index();
-                content[key_byte_idx..].find('[').map(|i| {
-                    let abs = key_byte_idx + i;
-                    let chars_before_bracket = content[key_byte_idx..abs].chars().count() as u32;
-                    InlineArgsText {
-                        bracket_col: key_start + chars_before_bracket,
-                        text_after_bracket: content[abs + 1..]
-                            .lines()
-                            .next()
-                            .unwrap_or("")
-                            .to_string(),
-                    }
+                // Search the key's line for the flow-sequence bracket. The
+                // `_args_` key itself contains no '[', so the first one on the
+                // line opens the sequence. `bracket_col` is reported in UTF-16
+                // units; `text_after_bracket` is the raw remainder of the line.
+                let line_text = lines.get(line as usize).copied().unwrap_or("");
+                line_text.find('[').map(|bracket_byte| InlineArgsText {
+                    bracket_col: utf16_len(&line_text[..bracket_byte]),
+                    text_after_bracket: line_text[bracket_byte + 1..].to_string(),
                 })
             } else {
                 None
@@ -949,7 +1014,7 @@ impl YamlParser {
     /// from a marked YAML node
     fn extract_hydra_objects(
         node: &MarkedYamlOwned,
-        content: &str,
+        lines: &[&str],
         hydra_objects: &mut Vec<HydraObject>,
     ) {
         if node.data.contains_mapping_key(TARGET_KEY) {
@@ -960,19 +1025,19 @@ impl YamlParser {
                 .expect("Expected _target_ key");
             let (key_node, value_node) = target_entry;
 
-            let partial = Self::extract_bool_keyword(map, PARTIAL_KEY);
-            let recursive = Self::extract_bool_keyword(map, RECURSIVE_KEY);
-            let convert = Self::extract_convert_keyword(map);
-            let args_result = Self::extract_args_keyword(map, content);
+            let partial = Self::extract_bool_keyword(map, PARTIAL_KEY, lines);
+            let recursive = Self::extract_bool_keyword(map, RECURSIVE_KEY, lines);
+            let convert = Self::extract_convert_keyword(map, lines);
+            let args_result = Self::extract_args_keyword(map, lines);
 
             if let Some(target_str) = value_node.data.as_str() {
                 // Saphyr lines are 1-indexed, LSP is 0-indexed
                 let line = (key_node.span.start.line() - 1) as u32;
-                let key_start = key_node.span.start.col() as u32;
+                let key_start = cp_to_utf16_col(lines, line, key_node.span.start.col() as u32);
 
-                // For value_start: check if the value is quoted
-                let value_start = Self::compute_value_start(value_node, content);
-                let value_end = value_start + target_str.len() as u32;
+                // For value_start: check if the value is quoted (UTF-16 column).
+                let value_start = Self::compute_value_start(value_node, lines);
+                let value_end = value_start + utf16_len(target_str);
 
                 // Create the target immediately to preserve order
                 let obj_index = hydra_objects.len();
@@ -999,7 +1064,7 @@ impl YamlParser {
                 });
 
                 // Extract keyword parameters from all other keys in this mapping
-                let mut parameters = Self::extract_parameters(map, content, hydra_objects);
+                let mut parameters = Self::extract_parameters(map, lines, hydra_objects);
                 // Add positional parameters from _args_
                 parameters.extend(positional_params);
                 hydra_objects[obj_index].parameters = parameters;
@@ -1007,35 +1072,36 @@ impl YamlParser {
         } else if let Some(map) = node.data.as_mapping() {
             // No _target_ found, recursively process nested mappings
             for (_key, val) in map {
-                Self::extract_hydra_objects(val, content, hydra_objects);
+                Self::extract_hydra_objects(val, lines, hydra_objects);
             }
         } else if let Some(seq) = node.data.as_sequence() {
             for item in seq {
-                Self::extract_hydra_objects(item, content, hydra_objects);
+                Self::extract_hydra_objects(item, lines, hydra_objects);
             }
         }
     }
 
-    /// Compute the value_start position for a target value node.
+    /// Compute the UTF-16 value_start column for a target value node.
     /// If the value is quoted, skip the opening quote character.
-    fn compute_value_start(value_node: &MarkedYamlOwned, content: &str) -> u32 {
-        let col = value_node.span.start.col() as u32;
-        let byte_index = value_node.span.start.index();
+    fn compute_value_start(value_node: &MarkedYamlOwned, lines: &[&str]) -> u32 {
+        let line0 = (value_node.span.start.line() - 1) as u32;
+        let cp_col = value_node.span.start.col() as u32;
+        let utf16_col = cp_to_utf16_col(lines, line0, cp_col);
 
-        // Check if the character at the span start is a quote
-        if byte_index < content.len() {
-            let ch = content.as_bytes()[byte_index];
-            if ch == b'"' || ch == b'\'' {
-                return col + 1;
-            }
+        // Check whether the value begins with a quote. saphyr's `index()` is a
+        // codepoint offset, not a byte offset, so read the character by
+        // codepoint position on the value's own line instead of indexing bytes.
+        let line = lines.get(line0 as usize).copied().unwrap_or("");
+        if matches!(line.chars().nth(cp_col as usize), Some('"') | Some('\'')) {
+            return utf16_col + 1;
         }
-        col
+        utf16_col
     }
 
     /// Extract parameters from a mapping that contains a `_target_` key
     fn extract_parameters(
         map_entries: &LinkedHashMap<MarkedYamlOwned, MarkedYamlOwned>,
-        content: &str,
+        lines: &[&str],
         hydra_objects: &mut Vec<HydraObject>,
     ) -> Vec<Parameter> {
         let mut parameters = Vec::new();
@@ -1045,13 +1111,13 @@ impl YamlParser {
                 && !HYDRA_KEYWORDS.contains(&key_str)
             {
                 // Recursively check for nested targets
-                Self::extract_hydra_objects(val_node, content, hydra_objects);
+                Self::extract_hydra_objects(val_node, lines, hydra_objects);
 
                 let line = (key_node.span.start.line() - 1) as u32;
-                let key_start = key_node.span.start.col() as u32;
-                let value_start = val_node.span.start.col() as u32;
-                let value_end = val_node.span.end.col() as u32;
-                let value = node_to_yaml_value(val_node);
+                let key_start = cp_to_utf16_col(lines, line, key_node.span.start.col() as u32);
+                let value_start = cp_to_utf16_col(lines, line, val_node.span.start.col() as u32);
+                let value_end = cp_to_utf16_col(lines, line, val_node.span.end.col() as u32);
+                let value = node_to_yaml_value(val_node, lines);
                 parameters.push(Parameter::Keyword {
                     key: key_str.to_string(),
                     value,
@@ -1122,7 +1188,7 @@ impl YamlParser {
         }
 
         let line = lines[position.line as usize];
-        let char_pos = (position.character as usize).min(line.len());
+        let char_pos = utf16_col_to_byte_offset(line, position.character as usize);
         let prefix = &line[..char_pos];
 
         // Check if we're completing a _target_ value
@@ -1228,10 +1294,10 @@ impl YamlParser {
                     tokens.push(HydraSemanticToken {
                         line,
                         start_char: current_pos,
-                        length: part.len() as u32,
+                        length: utf16_len(part),
                         token_type: SemanticTokenType::Namespace,
                     });
-                    current_pos += part.len() as u32;
+                    current_pos += utf16_len(part);
                 }
                 // Skip the dot (unless it's the last segment)
                 if idx < module_path.split('.').count() - 1 {
@@ -1257,7 +1323,7 @@ impl YamlParser {
             tokens.push(HydraSemanticToken {
                 line,
                 start_char: current_pos,
-                length: symbol_name.len() as u32,
+                length: utf16_len(symbol_name),
                 token_type,
             });
         } else {
@@ -1276,7 +1342,7 @@ impl YamlParser {
             tokens.push(HydraSemanticToken {
                 line,
                 start_char: start,
-                length: value.len() as u32,
+                length: utf16_len(value),
                 token_type,
             });
         }
@@ -1303,7 +1369,7 @@ impl YamlParser {
             tokens.push(HydraSemanticToken {
                 line: param_line,
                 start_char: key_start,
-                length: param_key.len() as u32,
+                length: utf16_len(param_key),
                 token_type: SemanticTokenType::Parameter,
             });
 
@@ -1355,7 +1421,7 @@ impl YamlParser {
         tokens.push(HydraSemanticToken {
             line: target.line,
             start_char: target.key_start,
-            length: TARGET_KEY.len() as u32,
+            length: utf16_len(TARGET_KEY),
             token_type: SemanticTokenType::Property,
         });
         Self::tokenize_target_value(&target.value, target.line, target.value_start, tokens);
@@ -1387,7 +1453,7 @@ impl YamlParser {
         tokens.push(HydraSemanticToken {
             line: hp.line(),
             start_char: hp.key_start(),
-            length: keyword.len() as u32,
+            length: utf16_len(keyword),
             token_type: SemanticTokenType::Property,
         });
         // Value token (if applicable and valid)
@@ -3436,6 +3502,157 @@ model:
         assert!(
             matches!(ctx, CompletionContext::Unknown),
             "expected Unknown for positional args"
+        );
+    }
+
+    #[test]
+    fn test_utf16_col_to_byte_offset() {
+        // Pure ASCII: UTF-16 column == byte offset.
+        assert_eq!(utf16_col_to_byte_offset("hidden", 3), 3);
+        // `é` is one UTF-16 unit but two UTF-8 bytes, so columns past it map
+        // to a larger byte offset.
+        let line = "  café: 256";
+        assert_eq!(utf16_col_to_byte_offset(line, 6), 7); // the ':' byte
+        // Past the end clamps to the byte length (and stays on a boundary).
+        assert_eq!(utf16_col_to_byte_offset(line, 999), line.len());
+        // Emoji (non-BMP): two UTF-16 units, four UTF-8 bytes.
+        let emoji = "ab😀cd";
+        assert_eq!(utf16_col_to_byte_offset(emoji, 2), 2); // before the emoji
+        assert_eq!(utf16_col_to_byte_offset(emoji, 4), 6); // after the emoji ('c')
+    }
+
+    #[test]
+    fn test_completion_context_at_non_ascii_param_key() {
+        // Regression: a multi-byte character before the cursor must not cause a
+        // mid-`char` byte slice panic. UTF-16 column 6 lands inside the `é`'s
+        // UTF-8 byte sequence when treated as a byte index.
+        let content = "\nmodel:\n  _target_: myproject.Model\n  café: 256\n";
+        let parsed = YamlParser::parse(content).unwrap();
+        let ctx = parsed
+            .completion_context_at(Position::new(3, 6), "  café: 256")
+            .expect("expected a completion context, not a panic");
+        match ctx {
+            CompletionContext::ParameterKey { target, partial } => {
+                assert_eq!(target, "myproject.Model");
+                assert_eq!(partial, "café");
+            }
+            _ => panic!("expected ParameterKey, got {:?}", ctx),
+        }
+    }
+
+    #[test]
+    fn test_completion_context_at_non_ascii_target_value() {
+        // Regression: non-ASCII inside a `_target_` value must not panic the
+        // value slice.
+        let content = "\nmodel:\n  _target_: café.Model\n";
+        let parsed = YamlParser::parse(content).unwrap();
+        let line = "  _target_: café.Model";
+        // UTF-16 column 16 is just after `é` (1 unit) but byte 16 is mid-`é`.
+        let ctx = parsed
+            .completion_context_at(Position::new(2, 16), line)
+            .expect("expected a completion context, not a panic");
+        match ctx {
+            CompletionContext::TargetValue { partial } => assert_eq!(partial, "café"),
+            _ => panic!("expected TargetValue, got {:?}", ctx),
+        }
+    }
+
+    // ==================== UTF-16 column encoding tests ====================
+
+    #[test]
+    fn test_utf16_param_columns_with_astral_key() {
+        // Key contains an astral-plane char (😀 = 2 UTF-16 units). Columns after
+        // it must be reported in UTF-16, not codepoints.
+        //   line 2: "  😀x: 256"
+        //   cols:    0 1 23 4 5 67...  ('😀' spans UTF-16 cols 2-3)
+        let content = "model:\n  _target_: pkg.M\n  😀x: 256\n";
+        let parsed = YamlParser::parse(content).unwrap();
+        let obj = &parsed.hydra_objects[0];
+        let param = obj
+            .parameters
+            .iter()
+            .find_map(|p| match p {
+                Parameter::Keyword {
+                    key,
+                    key_start,
+                    value_start,
+                    ..
+                } if key == "😀x" => Some((*key_start, *value_start)),
+                _ => None,
+            })
+            .expect("expected the 😀x keyword parameter");
+        assert_eq!(param.0, 2, "key_start should be UTF-16 column 2");
+        assert_eq!(param.1, 7, "value_start should be UTF-16 column 7");
+    }
+
+    #[test]
+    fn test_utf16_target_value_end_counts_utf16() {
+        // Value "café.Modèle": 11 UTF-16 units but 13 UTF-8 bytes.
+        let content = "model:\n  _target_: café.Modèle\n";
+        let parsed = YamlParser::parse(content).unwrap();
+        let obj = &parsed.hydra_objects[0];
+        assert_eq!(obj.target.value_start, 12, "value_start (UTF-16)");
+        assert_eq!(
+            obj.target_value_end() - obj.target.value_start,
+            11,
+            "value span must be the UTF-16 length, not the byte length"
+        );
+    }
+
+    #[test]
+    fn test_utf16_target_at_position_uses_utf16_bounds() {
+        let content = "model:\n  _target_: café.Modèle\n";
+        let parsed = YamlParser::parse(content).unwrap();
+        // value occupies UTF-16 cols 12..23 on line 1.
+        assert!(
+            parsed.target_at_position(Position::new(1, 15)).is_some(),
+            "cursor inside the value (UTF-16) should resolve the target"
+        );
+        assert!(
+            parsed.target_at_position(Position::new(1, 24)).is_none(),
+            "cursor past the UTF-16 end should not resolve"
+        );
+    }
+
+    #[test]
+    fn test_utf16_semantic_token_lengths_count_utf16() {
+        // "café" namespace = 4 UTF-16 units (5 bytes); "Modèle" class = 6
+        // UTF-16 units (7 bytes).
+        let content = "model:\n  _target_: café.Modèle\n";
+        let tokens = YamlParser::parse(content)
+            .unwrap()
+            .extract_semantic_tokens();
+        let ns = tokens
+            .iter()
+            .find(|t| t.token_type == SemanticTokenType::Namespace)
+            .expect("namespace token");
+        let class = tokens
+            .iter()
+            .find(|t| t.token_type == SemanticTokenType::Class)
+            .expect("class token");
+        assert_eq!(ns.length, 4, "café is 4 UTF-16 units");
+        assert_eq!(ns.start_char, 12, "café starts at UTF-16 col 12");
+        assert_eq!(class.length, 6, "Modèle is 6 UTF-16 units");
+        // class starts after "café." -> 12 + 4 + 1 = 17
+        assert_eq!(class.start_char, 17, "Modèle starts at UTF-16 col 17");
+    }
+
+    #[test]
+    fn test_utf16_inline_positional_with_astral_arg() {
+        // Regression for the InlinePositional arithmetic: an astral arg before
+        // the cursor must not shift the resolved positional index.
+        //   line 2: "  _args_: [😀, x]"
+        //   '[' at UTF-16 col 10; 😀 at 11-12; ',' at 13.
+        let content = "model:\n  _target_: pkg.M\n  _args_: [😀, x]\n";
+        let parsed = YamlParser::parse(content).unwrap();
+        // Cursor at UTF-16 col 13 (just after 😀, before the comma) => arg 0.
+        let (_target, resolved, _kw) = parsed
+            .target_for_parameter_line(Position::new(2, 13))
+            .expect("expected an inline positional context");
+        assert_eq!(
+            resolved,
+            ResolvedParameterContext::Positional(0, 2),
+            "cursor before the first comma is positional arg 0 of 2"
         );
     }
 }

@@ -623,6 +623,16 @@ impl LanguageServer for HydraLspBackend {
 
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
+                // `position_encoding` is intentionally left unset (it falls under
+                // `..Default::default()` below). Per the LSP spec, an unset
+                // encoding means the default: UTF-16. Every position we emit and
+                // consume is therefore counted in UTF-16 code units (see
+                // `cp_to_utf16_col` / `utf16_col_to_byte_offset` in yaml_parser
+                // and the `PositionEncoding::Utf16` conversion in python_analyzer).
+                // The only realistic client is the UTF-16-native VSCode extension,
+                // so explicit negotiation buys nothing; revisit only if a client
+                // that prefers UTF-8 is added (which would also require making the
+                // internals byte-native to be worthwhile).
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
                     TextDocumentSyncKind::FULL,
                 )),
