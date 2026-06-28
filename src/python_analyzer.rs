@@ -70,7 +70,7 @@ pub(crate) fn normalize_site_packages_pth_state_key(directory: &Path) -> String 
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FunctionSignature {
     pub name: String,
     pub parameters: Vec<ParameterInfo>,
@@ -82,7 +82,7 @@ pub struct FunctionSignature {
     pub end_column: u32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParameterInfo {
     pub name: String,
     pub type_annotation: Option<String>,
@@ -1260,7 +1260,7 @@ struct MethodExtractor {
 }
 
 /// Represents a class attribute assignment (e.g., `nested_class = ModelFactory`)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClassAttributeInfo {
     pub name: String,
     /// The value as a string (e.g., "ModelFactory", "SomeModule.SomeClass")

@@ -295,8 +295,9 @@ impl ClassParentDocs {
 }
 
 impl PartialEq for ClassParentDocs {
+    /// Value equality (deep-compares the resolved docstring and `__init__`).
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.inner, &other.inner)
+        self.inner == other.inner
     }
 }
 impl Eq for ClassParentDocs {}
@@ -329,8 +330,9 @@ impl CachedClassAttribute {
 }
 
 impl PartialEq for CachedClassAttribute {
+    /// Value equality (deep-compares the resolved attribute, file path, and class).
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.inner, &other.inner)
+        self.inner == other.inner
     }
 }
 impl Eq for CachedClassAttribute {}
@@ -921,5 +923,312 @@ mod tests {
         // Cloned result should be pointer-equal
         let r3 = r1.clone();
         assert!(r1 == r3);
+    }
+
+    // ---- Backdating regression tests for the recursive MRO queries ----
+    //
+    // `class_parent_docs` / `class_parent_attribute` are recursive, so each query
+    // is its own memoised dependent. Their result types must compare by *value*
+    // or salsa can never backdate, and any edit to a file in an MRO chain re-runs the
+    // entire chain even when the resolved result is identical. These tests lock in
+    // value equality.
+
+    /// Minimal `FunctionSignature` with `param_count` positional parameters.
+    fn test_sig(name: &str, param_count: usize) -> FunctionSignature {
+        FunctionSignature {
+            name: name.to_string(),
+            parameters: (0..param_count)
+                .map(|i| crate::python_analyzer::ParameterInfo {
+                    name: format!("p{i}"),
+                    type_annotation: None,
+                    default_value: None,
+                    has_default: false,
+                    is_variadic: false,
+                    is_variadic_keyword: false,
+                    is_keyword_only: false,
+                })
+                .collect(),
+            return_type: None,
+            docstring: None,
+            start_line: 1,
+            start_column: 1,
+            end_line: 2,
+            end_column: 1,
+        }
+    }
+
+    #[test]
+    fn test_class_parent_docs_value_equality() {
+        // Two independently-allocated results with identical contents must be
+        // equal so salsa can backdate. Under the old `Arc::ptr_eq` impl these
+        // were always `!=`.
+        let a = ClassParentDocs::new(Some("doc".to_string()), Some(test_sig("__init__", 1)));
+        let b = ClassParentDocs::new(Some("doc".to_string()), Some(test_sig("__init__", 1)));
+        assert_eq!(a, b, "equal contents must compare equal (value equality)");
+
+        // Differing contents must compare unequal — guards against false
+        // negatives (failing to invalidate on a real change).
+        let diff_doc =
+            ClassParentDocs::new(Some("other".to_string()), Some(test_sig("__init__", 1)));
+        assert_ne!(a, diff_doc, "different docstring must compare unequal");
+        let diff_init =
+            ClassParentDocs::new(Some("doc".to_string()), Some(test_sig("__init__", 2)));
+        assert_ne!(
+            a, diff_init,
+            "different __init__ signature must compare unequal"
+        );
+    }
+
+    #[test]
+    fn test_cached_class_attribute_value_equality() {
+        let attr = |v: &str| ClassAttributeInfo {
+            name: "factory".to_string(),
+            value: v.to_string(),
+        };
+        let a = CachedClassAttribute::found(attr("Foo"), PathBuf::from("/p.py"), "C".to_string());
+        let b = CachedClassAttribute::found(attr("Foo"), PathBuf::from("/p.py"), "C".to_string());
+        assert_eq!(a, b, "equal contents must compare equal (value equality)");
+
+        // Each component participates in equality (no false negatives).
+        let diff_value =
+            CachedClassAttribute::found(attr("Bar"), PathBuf::from("/p.py"), "C".to_string());
+        assert_ne!(
+            a, diff_value,
+            "different attribute value must compare unequal"
+        );
+        let diff_path =
+            CachedClassAttribute::found(attr("Foo"), PathBuf::from("/q.py"), "C".to_string());
+        assert_ne!(a, diff_path, "different file path must compare unequal");
+
+        let n1 = CachedClassAttribute::not_found();
+        let n2 = CachedClassAttribute::not_found();
+        assert_eq!(n1, n2, "two not-found results must compare equal");
+        assert_ne!(a, n1, "found vs not-found must compare unequal");
+    }
+
+    /// Write a 3-file `Child -> Parent -> GrandParent` workspace and return the
+    /// file paths. `gp_body` is the body of the GrandParent class file.
+    fn write_mro_workspace(workspace: &Path, gp_body: &str) -> (PathBuf, PathBuf, PathBuf) {
+        use filetime::{FileTime, set_file_mtime};
+        use std::fs;
+
+        let gp = workspace.join("gp.py");
+        fs::write(&gp, gp_body).expect("write gp");
+        let parent = workspace.join("parent.py");
+        fs::write(
+            &parent,
+            "from gp import GrandParent\n\n\nclass Parent(GrandParent):\n    pass\n",
+        )
+        .expect("write parent");
+        let child = workspace.join("child.py");
+        fs::write(
+            &child,
+            "from parent import Parent\n\n\nclass Child(Parent):\n    pass\n",
+        )
+        .expect("write child");
+        for f in [&gp, &parent, &child] {
+            set_file_mtime(f, FileTime::from_unix_time(1_000_000, 0)).expect("set mtime");
+        }
+        (gp, parent, child)
+    }
+
+    #[test]
+    fn test_class_parent_docs_backdates_on_irrelevant_ancestor_edit() {
+        use filetime::{FileTime, set_file_mtime};
+        use ruff_db::files::File;
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let workspace = tmp.path();
+        let gp_v1 = "class GrandParent:\n    \"\"\"gp docstring\"\"\"\n    def __init__(self, a):\n        pass\n";
+        let (gp, _parent, child) = write_mro_workspace(workspace, gp_v1);
+
+        let mut db = real_fs_db();
+
+        let r1 = {
+            let sp = InternedSearchPaths::new(&db, vec![workspace.to_path_buf()]);
+            let child_canonical = child.canonicalize().unwrap_or_else(|_| child.clone());
+            let child_key = TargetString::new(&db, format!("{}::Child", child_canonical.display()));
+            class_parent_docs(&db, child_key, sp)
+        };
+        // Prove the MRO walk really resolved through to GrandParent — otherwise
+        // a trivially-empty result could make this test pass for the wrong reason.
+        assert_eq!(
+            r1.docstring().map(String::as_str),
+            Some("gp docstring"),
+            "Child must inherit GrandParent's docstring via the MRO"
+        );
+        assert_eq!(
+            r1.init().map(|s| s.parameters.len()),
+            Some(2),
+            "Child must inherit GrandParent's __init__(self, a) — 2 params incl. self"
+        );
+
+        // Append an unrelated function AFTER the class so GrandParent's own
+        // docstring and __init__ spans are byte-for-byte unchanged.
+        fs::write(&gp, format!("{gp_v1}\n\ndef unrelated():\n    pass\n")).expect("write gp v2");
+        set_file_mtime(&gp, FileTime::from_unix_time(2_000_000, 0)).expect("bump gp mtime");
+        // The MRO queries open GrandParent via its *canonical* path (the
+        // recursive key canonicalises), so the sync must target that same path
+        // or it bumps a different `File` and the change goes unnoticed.
+        let gp_canonical = gp.canonicalize().unwrap_or_else(|_| gp.clone());
+        File::sync_path(&mut db, SystemPath::from_std_path(&gp_canonical).unwrap());
+
+        let r2 = {
+            let sp = InternedSearchPaths::new(&db, vec![workspace.to_path_buf()]);
+            let child_canonical = child.canonicalize().unwrap_or_else(|_| child.clone());
+            let child_key = TargetString::new(&db, format!("{}::Child", child_canonical.display()));
+            class_parent_docs(&db, child_key, sp)
+        };
+
+        // Backdating: GrandParent re-executed but produced a value-equal result,
+        // so its `changed_at` did not advance and the Parent/Child memos were
+        // never re-run — the Child result is the *same* cached Arc.
+        assert!(
+            Arc::ptr_eq(&r1.inner, &r2.inner),
+            "an irrelevant ancestor edit must backdate; the Child result must \
+             not be recomputed (this fails under Arc::ptr_eq equality)"
+        );
+    }
+
+    #[test]
+    fn test_class_parent_docs_invalidates_on_relevant_ancestor_edit() {
+        use filetime::{FileTime, set_file_mtime};
+        use ruff_db::files::File;
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let workspace = tmp.path();
+        let (gp, _parent, child) = write_mro_workspace(
+            workspace,
+            "class GrandParent:\n    \"\"\"gp docstring\"\"\"\n    def __init__(self, a):\n        pass\n",
+        );
+
+        let mut db = real_fs_db();
+        let r1 = {
+            let sp = InternedSearchPaths::new(&db, vec![workspace.to_path_buf()]);
+            let child_canonical = child.canonicalize().unwrap_or_else(|_| child.clone());
+            let child_key = TargetString::new(&db, format!("{}::Child", child_canonical.display()));
+            class_parent_docs(&db, child_key, sp)
+        };
+        assert_eq!(r1.init().map(|s| s.parameters.len()), Some(2));
+
+        // Genuinely change GrandParent's __init__ signature: the inherited
+        // result MUST update (no false negative).
+        fs::write(
+            &gp,
+            "class GrandParent:\n    \"\"\"gp docstring\"\"\"\n    def __init__(self, a, b):\n        pass\n",
+        )
+        .expect("write gp v2");
+        set_file_mtime(&gp, FileTime::from_unix_time(2_000_000, 0)).expect("bump gp mtime");
+        let gp_canonical = gp.canonicalize().unwrap_or_else(|_| gp.clone());
+        File::sync_path(&mut db, SystemPath::from_std_path(&gp_canonical).unwrap());
+
+        let r2 = {
+            let sp = InternedSearchPaths::new(&db, vec![workspace.to_path_buf()]);
+            let child_canonical = child.canonicalize().unwrap_or_else(|_| child.clone());
+            let child_key = TargetString::new(&db, format!("{}::Child", child_canonical.display()));
+            class_parent_docs(&db, child_key, sp)
+        };
+        assert_eq!(
+            r2.init().map(|s| s.parameters.len()),
+            Some(3),
+            "a real __init__ change must propagate through the MRO"
+        );
+        assert!(r1 != r2, "result must differ after a meaningful change");
+    }
+
+    #[test]
+    fn test_class_parent_attribute_backdates_on_irrelevant_ancestor_edit() {
+        use filetime::{FileTime, set_file_mtime};
+        use ruff_db::files::File;
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let workspace = tmp.path();
+        let gp_v1 = "class GrandParent:\n    factory = SomeFactory\n";
+        let (gp, _parent, child) = write_mro_workspace(workspace, gp_v1);
+
+        let mut db = real_fs_db();
+        let r1 = {
+            let sp = InternedSearchPaths::new(&db, vec![workspace.to_path_buf()]);
+            let child_canonical = child.canonicalize().unwrap_or_else(|_| child.clone());
+            let child_key = TargetString::new(&db, format!("{}::Child", child_canonical.display()));
+            let attr_key = TargetString::new(&db, "factory".to_string());
+            class_parent_attribute(&db, child_key, attr_key, sp)
+        };
+        assert_eq!(
+            r1.get().map(|(a, _, _)| a.value.as_str()),
+            Some("SomeFactory"),
+            "Child must inherit GrandParent's `factory` attribute via the MRO"
+        );
+
+        // Append unrelated content; the `factory` assignment is unchanged.
+        fs::write(&gp, format!("{gp_v1}\n\ndef unrelated():\n    pass\n")).expect("write gp v2");
+        set_file_mtime(&gp, FileTime::from_unix_time(2_000_000, 0)).expect("bump gp mtime");
+        let gp_canonical = gp.canonicalize().unwrap_or_else(|_| gp.clone());
+        File::sync_path(&mut db, SystemPath::from_std_path(&gp_canonical).unwrap());
+
+        let r2 = {
+            let sp = InternedSearchPaths::new(&db, vec![workspace.to_path_buf()]);
+            let child_canonical = child.canonicalize().unwrap_or_else(|_| child.clone());
+            let child_key = TargetString::new(&db, format!("{}::Child", child_canonical.display()));
+            let attr_key = TargetString::new(&db, "factory".to_string());
+            class_parent_attribute(&db, child_key, attr_key, sp)
+        };
+        assert!(
+            Arc::ptr_eq(&r1.inner, &r2.inner),
+            "an irrelevant ancestor edit must backdate the attribute lookup \
+             (this fails under Arc::ptr_eq equality)"
+        );
+    }
+
+    #[test]
+    fn test_class_parent_attribute_invalidates_on_relevant_ancestor_edit() {
+        use filetime::{FileTime, set_file_mtime};
+        use ruff_db::files::File;
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let workspace = tmp.path();
+        let (gp, _parent, child) =
+            write_mro_workspace(workspace, "class GrandParent:\n    factory = SomeFactory\n");
+
+        let mut db = real_fs_db();
+        let r1 = {
+            let sp = InternedSearchPaths::new(&db, vec![workspace.to_path_buf()]);
+            let child_canonical = child.canonicalize().unwrap_or_else(|_| child.clone());
+            let child_key = TargetString::new(&db, format!("{}::Child", child_canonical.display()));
+            let attr_key = TargetString::new(&db, "factory".to_string());
+            class_parent_attribute(&db, child_key, attr_key, sp)
+        };
+        assert_eq!(
+            r1.get().map(|(a, _, _)| a.value.as_str()),
+            Some("SomeFactory")
+        );
+
+        // Change the attribute's value: the inherited result MUST update.
+        fs::write(&gp, "class GrandParent:\n    factory = OtherFactory\n").expect("write gp v2");
+        set_file_mtime(&gp, FileTime::from_unix_time(2_000_000, 0)).expect("bump gp mtime");
+        let gp_canonical = gp.canonicalize().unwrap_or_else(|_| gp.clone());
+        File::sync_path(&mut db, SystemPath::from_std_path(&gp_canonical).unwrap());
+
+        let r2 = {
+            let sp = InternedSearchPaths::new(&db, vec![workspace.to_path_buf()]);
+            let child_canonical = child.canonicalize().unwrap_or_else(|_| child.clone());
+            let child_key = TargetString::new(&db, format!("{}::Child", child_canonical.display()));
+            let attr_key = TargetString::new(&db, "factory".to_string());
+            class_parent_attribute(&db, child_key, attr_key, sp)
+        };
+        assert_eq!(
+            r2.get().map(|(a, _, _)| a.value.as_str()),
+            Some("OtherFactory"),
+            "a real attribute change must propagate through the MRO"
+        );
+        assert!(r1 != r2, "result must differ after a meaningful change");
     }
 }
