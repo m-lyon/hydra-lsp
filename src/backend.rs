@@ -261,6 +261,35 @@ pub struct HydraLspBackend {
     worker_pool: parking_lot::Mutex<rayon::ThreadPool>,
 }
 
+/// Outcome of a closure run on a rayon pool via [`spawn_on_pool`].
+///
+/// Two failure modes are kept distinct because callers treat them differently:
+/// - `Cancelled` is the *expected* consequence of a concurrent write: salsa
+///   throws `salsa::Cancelled` (via `panic::resume_unwind`) to abandon a query
+///   whose revision was superseded. Callers should silently drop the result;
+///   the superseding edit will recompute it.
+/// - `Panicked` is a genuine bug worth logging.
+#[derive(Debug)]
+pub(crate) enum PoolOutcome<R> {
+    Completed(R),
+    /// Salsa cancelled the query (a concurrent write bumped the revision).
+    Cancelled,
+    /// The closure panicked for a non-cancellation reason. Carries a
+    /// best-effort message extracted from the panic payload.
+    Panicked(String),
+}
+
+/// Best-effort human-readable message from a panic payload.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
+}
+
 /// Bridge a rayon thread-pool task to an async tokio context.
 ///
 /// Spawns `f` on `pool` and returns a receiver whose `.await` resolves when
@@ -268,22 +297,64 @@ pub struct HydraLspBackend {
 /// on a caller-chosen rayon pool, which lets us separate latency-sensitive
 /// work (hover, goto_definition) from background work (diagnostics).
 ///
+/// `f` is run inside `catch_unwind` and its result is delivered as a
+/// [`PoolOutcome`], distinguishing normal completion, salsa cancellation, and a
+/// genuine panic. Without it a salsa `Cancelled` unwind would propagate into rayon and
+/// abort the process, since these pools register no `panic_handler`.
+///
 /// The borrow of `pool` ends immediately after `pool.spawn` returns — before
 /// any `.await` suspension — so callers do not need to hold a reference across
 /// yield points.
 fn spawn_on_pool<F, R>(
     pool: &parking_lot::Mutex<rayon::ThreadPool>,
     f: F,
-) -> tokio::sync::oneshot::Receiver<R>
+) -> tokio::sync::oneshot::Receiver<PoolOutcome<R>>
 where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
     let (tx, rx) = tokio::sync::oneshot::channel();
     pool.lock().spawn(move || {
-        let _ = tx.send(f());
+        let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+            Ok(r) => PoolOutcome::Completed(r),
+            Err(payload) => {
+                if payload.downcast_ref::<salsa::Cancelled>().is_some() {
+                    PoolOutcome::Cancelled
+                } else {
+                    PoolOutcome::Panicked(panic_message(&*payload))
+                }
+            }
+        };
+        let _ = tx.send(outcome);
     });
     rx
+}
+
+/// What to do with the result of the diagnostics validation task.
+#[derive(Debug, PartialEq, Eq)]
+enum DiagAction {
+    /// Publish these diagnostics to the client.
+    Publish(Vec<Diagnostic>),
+    /// Do nothing — the round was superseded (cancelled) or the receiver was
+    /// dropped. Leaves any previously published diagnostics intact.
+    Skip,
+    /// The task panicked; log the message and publish nothing.
+    LogPanic(String),
+}
+
+/// Map a diagnostics task outcome to a [`DiagAction`]. Pure so it can be tested
+/// without a live `Client` or rayon pool.
+fn classify_diag_outcome(
+    outcome: std::result::Result<
+        PoolOutcome<Vec<Diagnostic>>,
+        tokio::sync::oneshot::error::RecvError,
+    >,
+) -> DiagAction {
+    match outcome {
+        Ok(PoolOutcome::Completed(diagnostics)) => DiagAction::Publish(diagnostics),
+        Ok(PoolOutcome::Cancelled) | Err(_) => DiagAction::Skip,
+        Ok(PoolOutcome::Panicked(msg)) => DiagAction::LogPanic(msg),
+    }
 }
 
 impl std::fmt::Debug for HydraLspBackend {
@@ -443,7 +514,21 @@ impl HydraLspBackend {
             result
         })
         .await
-        .map_err(|e| anyhow::anyhow!("Task canceled: {}", e))?
+        .map_or_else(
+            // Sender dropped without sending (e.g. pool shutdown); treat like
+            // cancellation — the request is stale.
+            |_| anyhow::bail!("definition lookup superseded by a newer edit"),
+            |outcome| match outcome {
+                PoolOutcome::Completed(result) => result,
+                PoolOutcome::Cancelled => {
+                    anyhow::bail!("definition lookup superseded by a newer edit")
+                }
+                PoolOutcome::Panicked(msg) => {
+                    tracing::error!(%msg, "definition lookup panicked");
+                    anyhow::bail!("definition lookup panicked: {msg}")
+                }
+            },
+        )
     }
 
     /// Look up the cached `parsed_yaml` result for a URI, but only if the
@@ -1441,17 +1526,20 @@ impl HydraLspBackend {
                 )
             })
             .await;
-            let diagnostics = match join_result {
-                Ok(d) => d,
-                Err(e) => {
-                    tracing::error!(error = %e, "validate_document task failed");
-                    Vec::new()
+            match classify_diag_outcome(join_result) {
+                DiagAction::Publish(diagnostics) => {
+                    self.client
+                        .publish_diagnostics(uri.clone(), diagnostics, None)
+                        .await;
                 }
-            };
-
-            self.client
-                .publish_diagnostics(uri.clone(), diagnostics, None)
-                .await;
+                // Cancelled / receiver dropped: a newer edit superseded this
+                // round. Do NOT publish an empty Vec — that would clear the
+                // editor's diagnostics until the next round republishes them.
+                DiagAction::Skip => {}
+                DiagAction::LogPanic(msg) => {
+                    tracing::error!(%msg, "validate_document task panicked");
+                }
+            }
         } else {
             let e = parsed_yaml.result().err().unwrap_or("").to_string();
             let diagnostic = Diagnostic {
@@ -1478,5 +1566,134 @@ impl HydraLspBackend {
                 .publish_diagnostics(uri.clone(), vec![diagnostic], None)
                 .await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::database::tests::TestDb;
+    use salsa::{Database as _, Setter};
+    use std::time::Duration;
+
+    fn single_thread_pool() -> parking_lot::Mutex<rayon::ThreadPool> {
+        parking_lot::Mutex::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("failed to build test pool"),
+        )
+    }
+
+    // --- Test A: spawn_on_pool contract ---
+
+    #[tokio::test]
+    async fn spawn_on_pool_completes_normally() {
+        let pool = single_thread_pool();
+        let outcome = spawn_on_pool(&pool, || 42_i32)
+            .await
+            .expect("sender dropped");
+        assert!(matches!(outcome, PoolOutcome::Completed(42)));
+    }
+
+    #[tokio::test]
+    async fn spawn_on_pool_captures_panic_without_aborting() {
+        // Pre-fix, a panic in the closure would reach rayon (no panic_handler)
+        // and abort the whole test process. Reaching the assertion at all is
+        // the regression guard; the message check confirms payload capture.
+        let pool = single_thread_pool();
+        let outcome = spawn_on_pool(&pool, || -> i32 { panic!("boom-42") })
+            .await
+            .expect("sender dropped");
+        match outcome {
+            PoolOutcome::Panicked(msg) => assert!(
+                msg.contains("boom-42"),
+                "expected panic message to contain payload, got {msg:?}"
+            ),
+            other => panic!("expected Panicked, got {other:?}"),
+        }
+    }
+
+    // --- Test B: classify_diag_outcome (pure) ---
+
+    #[test]
+    fn classify_publishes_on_completion() {
+        let diags: Vec<Diagnostic> = vec![Diagnostic::default()];
+        assert_eq!(
+            classify_diag_outcome(Ok(PoolOutcome::Completed(diags.clone()))),
+            DiagAction::Publish(diags)
+        );
+    }
+
+    #[test]
+    fn classify_skips_on_cancellation() {
+        assert_eq!(
+            classify_diag_outcome(Ok(PoolOutcome::Cancelled)),
+            DiagAction::Skip
+        );
+    }
+
+    #[test]
+    fn classify_skips_on_recv_error() {
+        // A dropped sender is the only way to obtain a real RecvError.
+        let (tx, rx) = tokio::sync::oneshot::channel::<PoolOutcome<Vec<Diagnostic>>>();
+        drop(tx);
+        let err = rx.blocking_recv().unwrap_err();
+        assert_eq!(classify_diag_outcome(Err(err)), DiagAction::Skip);
+    }
+
+    #[test]
+    fn classify_logs_on_panic() {
+        assert_eq!(
+            classify_diag_outcome(Ok(PoolOutcome::Panicked("kaboom".to_string()))),
+            DiagAction::LogPanic("kaboom".to_string())
+        );
+    }
+
+    // --- Test C: real salsa cancellation is classified as Cancelled ---
+
+    #[tokio::test]
+    async fn salsa_cancellation_is_caught_and_classified() {
+        let pool = single_thread_pool();
+
+        let mut db = TestDb::new();
+        let input = DocumentInput::new(&db, "v1".to_string(), 1);
+        // Snapshot shares storage with `db`; a `&mut db` write cancels queries
+        // running on this handle.
+        let snapshot = db.clone();
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let (proceed_tx, proceed_rx) = std::sync::mpsc::channel::<()>();
+
+        let rx = spawn_on_pool(&pool, move || {
+            started_tx.send(()).expect("main receiver dropped");
+            proceed_rx.recv().expect("main sender dropped");
+            // Poll the cancellation checkpoint until the concurrent write sets
+            // the flag; this unwinds with salsa::Cancelled once observed. The
+            // bound + outer timeout keep a mis-choreographed race from hanging.
+            for _ in 0..100_000_000_u64 {
+                snapshot.unwind_if_revision_cancelled();
+                std::thread::yield_now();
+            }
+            panic!("cancellation flag was never observed");
+        });
+
+        started_rx.recv().expect("worker never started");
+        // `set_text(&mut db)` blocks in salsa's cancel_others until the snapshot
+        // handle is released, so it must run on its own thread.
+        let writer = std::thread::spawn(move || {
+            input.set_text(&mut db).to("v2".to_string());
+        });
+        proceed_tx.send(()).expect("worker receiver dropped");
+
+        let outcome = tokio::time::timeout(Duration::from_secs(10), rx)
+            .await
+            .expect("timed out waiting for cancellation")
+            .expect("sender dropped");
+        assert!(
+            matches!(outcome, PoolOutcome::Cancelled),
+            "expected Cancelled, got {outcome:?}"
+        );
+        writer.join().expect("writer thread panicked");
     }
 }
