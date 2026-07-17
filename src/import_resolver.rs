@@ -1,4 +1,6 @@
-use crate::python_analyzer::{ClassInfo, FunctionSignature, PythonAnalyzer, get_parsed_module};
+use crate::python_analyzer::{
+    ClassInfo, FunctionSignature, PythonAnalyzer, get_parsed_module, path_is_file,
+};
 use ruff_python_ast::{self as ast, Expr, Stmt, visitor::Visitor};
 use rustc_hash::FxHashSet;
 use std::collections::HashSet;
@@ -45,26 +47,31 @@ impl<'db, 'sp> ImportResolver<'db, 'sp> {
 
     /// Try to find a module file given a base package path
     /// Returns the first existing file in priority order: __init__.pyi, __init__.py, module.pyi, module.py
-    pub fn find_module_file(package_path: &Path) -> Option<PathBuf> {
+    ///
+    /// Existence checks go through `path_is_file` (salsa `system_path_to_file`)
+    /// rather than `Path::exists`, so each probed candidate is interned as a
+    /// tracked `File` and a later create/delete of that path invalidates the
+    /// calling query. See [`path_is_file`].
+    pub fn find_module_file(db: &dyn ruff_db::Db, package_path: &Path) -> Option<PathBuf> {
         // Check for package __init__.py (prioritize .pyi over .py)
         let init_pyi_path = package_path.join("__init__.pyi");
-        if init_pyi_path.exists() {
+        if path_is_file(db, &init_pyi_path) {
             return Some(init_pyi_path);
         }
 
         let init_path = package_path.join("__init__.py");
-        if init_path.exists() {
+        if path_is_file(db, &init_path) {
             return Some(init_path);
         }
 
         // Check for regular module file (prioritize .pyi over .py)
         let file_pyi_path = package_path.with_extension("pyi");
-        if file_pyi_path.exists() {
+        if path_is_file(db, &file_pyi_path) {
             return Some(file_pyi_path);
         }
 
         let file_path = package_path.with_extension("py");
-        if file_path.exists() {
+        if path_is_file(db, &file_path) {
             return Some(file_path);
         }
 
@@ -76,17 +83,13 @@ impl<'db, 'sp> ImportResolver<'db, 'sp> {
         let module_parts: Vec<&str> = module_path.split('.').collect();
 
         for search_path in self.search_paths {
-            if !search_path.exists() {
-                continue;
-            }
-
             // Try as a package with __init__.py
             let mut package_path = search_path.clone();
             for part in &module_parts {
                 package_path.push(part);
             }
 
-            if let Some(found_path) = Self::find_module_file(&package_path) {
+            if let Some(found_path) = Self::find_module_file(self.db, &package_path) {
                 return Some(found_path);
             }
         }

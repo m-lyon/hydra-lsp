@@ -4,7 +4,7 @@ use std::sync::Arc;
 use crate::import_resolver::ImportResolver;
 use crate::python_analyzer::{
     ClassAttributeInfo, DefinitionInfo, FunctionSignature, PythonAnalyzer,
-    normalize_site_packages_pth_state_key,
+    normalize_site_packages_pth_state_key, path_is_file,
 };
 use ruff_db::files::FileRootKind;
 use ruff_db::system::SystemPathBuf;
@@ -200,16 +200,12 @@ pub fn resolve_module_cached<'db>(
     let module_parts: Vec<&str> = module_path_str.split('.').collect();
 
     for search_path in search_paths {
-        if !search_path.exists() {
-            continue;
-        }
-
         // Try as a package with __init__.py (or __init__.pyi)
         let mut package_path = search_path.clone();
         for part in &module_parts {
             package_path.push(part);
         }
-        if let Some(found_path) = ImportResolver::find_module_file(&package_path) {
+        if let Some(found_path) = ImportResolver::find_module_file(db, &package_path) {
             return Some(found_path);
         }
 
@@ -221,11 +217,11 @@ pub fn resolve_module_cached<'db>(
             }
             let last = module_parts.last().unwrap();
             let pyi = parent_path.join(format!("{last}.pyi"));
-            if pyi.exists() {
+            if path_is_file(db, &pyi) {
                 return Some(pyi);
             }
             let py = parent_path.join(format!("{last}.py"));
-            if py.exists() {
+            if path_is_file(db, &py) {
                 return Some(py);
             }
         }
@@ -1230,5 +1226,50 @@ mod tests {
             "a real attribute change must propagate through the MRO"
         );
         assert!(r1 != r2, "result must differ after a meaningful change");
+    }
+
+    #[test]
+    fn test_resolve_module_invalidation_on_file_create() {
+        use ruff_db::files::File;
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let workspace = tmp.path();
+
+        let mut db = real_fs_db();
+        let search_paths = vec![workspace.to_path_buf()];
+
+        // First lookup: the module file does not exist yet.
+        let result1 = {
+            let mid = TargetString::new(&db, "new_module".to_string());
+            let spid = InternedSearchPaths::new(&db, search_paths.clone());
+            resolve_module_cached(&db, mid, spid).clone()
+        };
+        assert!(
+            result1.is_none(),
+            "module should not resolve before creation"
+        );
+
+        // Create the module file on disk and notify salsa, as the LSP does on a
+        // did_change_watched_files CREATE event.
+        // Sync the same (lexical, un-canonicalized) path the resolver probes
+        // and that the LSP passes to `File::sync_path`.
+        let py_file = workspace.join("new_module.py");
+        fs::write(&py_file, "class NewClass:\n    pass\n").expect("write module");
+        File::sync_path(&mut db, SystemPath::from_std_path(&py_file).unwrap());
+
+        // Second lookup: the create must now be observed.
+        let result2 = {
+            let mid = TargetString::new(&db, "new_module".to_string());
+            let spid = InternedSearchPaths::new(&db, search_paths);
+            resolve_module_cached(&db, mid, spid).clone()
+        };
+        assert!(
+            result2
+                .as_ref()
+                .is_some_and(|p| p.ends_with("new_module.py")),
+            "module must resolve after creation + sync_path, got {result2:?}"
+        );
     }
 }

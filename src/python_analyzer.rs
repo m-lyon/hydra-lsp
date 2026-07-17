@@ -15,6 +15,24 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use ty_python_semantic::{PythonEnvironment, SysPrefixPathOrigin};
 
+/// Tracked existence probe for a regular file.
+///
+/// Returns `true` when `path` is an existing regular file. Unlike
+/// `Path::exists`, the check goes through salsa's `system_path_to_file`, which
+/// interns `path` as a `File` *even when it does not exist* and records a
+/// dependency on that file's existence status. When the file is later created
+/// or deleted and the backend calls `File::sync_path`, every query that probed
+/// the path is invalidated on the next request.
+///
+/// Falls back to an untracked `Path::exists()` only for non-UTF-8 paths, which
+/// cannot be represented as a `SystemPath`.
+pub(crate) fn path_is_file(db: &dyn ruff_db::Db, path: &Path) -> bool {
+    match SystemPath::from_std_path(path) {
+        Some(sys_path) => system_path_to_file(db, sys_path).is_ok(),
+        None => path.exists(),
+    }
+}
+
 /// Read a Python source file through ruff_db's salsa-tracked `source_text`.
 ///
 /// File reads go through `source_text` (not `std::fs`) so that the lookup
