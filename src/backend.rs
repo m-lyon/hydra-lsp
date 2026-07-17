@@ -649,8 +649,14 @@ impl LanguageServer for HydraLspBackend {
 
             // Rebuild thread pools if the user specified a total thread count.
             if let Some(total) = num_threads {
-                let latency = 2_usize.min(total).max(1);
-                let worker = total.saturating_sub(latency).max(1);
+                // For total >= 3, reserve two latency threads; for smaller
+                // totals give each pool one thread. Every branch keeps both
+                // counts >= 1 (rayon treats num_threads(0) as "auto-detect",
+                // which would silently over-allocate).
+                let (latency, worker) = match total {
+                    1 | 2 => (1, 1),
+                    n => (2, n - 2),
+                };
                 *self.latency_pool.lock() = rayon::ThreadPoolBuilder::new()
                     .num_threads(latency)
                     .thread_name(|i| format!("hydra-latency-{i}"))
@@ -666,7 +672,9 @@ impl LanguageServer for HydraLspBackend {
                         MessageType::INFO,
                         format!(
                             "Thread pools configured: {} latency + {} worker ({} total)",
-                            latency, worker, total
+                            latency,
+                            worker,
+                            latency + worker
                         ),
                     )
                     .await;
