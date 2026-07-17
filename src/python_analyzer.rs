@@ -63,6 +63,11 @@ pub(crate) fn get_parsed_module(db: &dyn ruff_db::Db, path: &Path) -> Result<Par
 /// Falls back to the original path string if canonicalization fails
 /// (e.g. the directory was just deleted) — better to risk a stale
 /// memo for one event than to panic on a missing path.
+///
+/// KNOWN LIMITATION: each side canonicalizes its own source at its own
+/// time, so a symlinked site-packages path that is *retargeted
+/// mid-session* can decouple the two. Because this is a niche edge case, we accept the
+/// risk of a stale memo until the next session restart.
 pub(crate) fn normalize_site_packages_pth_state_key(directory: &Path) -> String {
     match std::fs::canonicalize(directory) {
         Ok(canonical) => canonical.to_string_lossy().into_owned(),
@@ -410,10 +415,8 @@ impl PythonAnalyzer {
             let canonical = current_file
                 .canonicalize()
                 .unwrap_or_else(|_| current_file.clone());
-            let class_key = TargetString::new(
-                db,
-                format!("{}::{}", canonical.display(), current_class),
-            );
+            let class_key =
+                TargetString::new(db, format!("{}::{}", canonical.display(), current_class));
             let attr_key = TargetString::new(db, attr.to_string());
             let cached_attr = class_parent_attribute(db, class_key, attr_key, interned_sp);
             match cached_attr.get() {
@@ -763,8 +766,7 @@ impl PythonAnalyzer {
 
         // First try standard resolution: module.symbol where symbol is a function or class
         let module_path_id = TargetString::new(db, module_path.clone());
-        if let Some(file_path) =
-            resolve_module_cached(db, module_path_id, search_paths_id).clone()
+        if let Some(file_path) = resolve_module_cached(db, module_path_id, search_paths_id).clone()
         {
             module_found = true;
 
@@ -784,12 +786,9 @@ impl PythonAnalyzer {
             }
 
             // Try to extract as class (with import resolution)
-            if let Ok((class_info, resolved_file)) = Self::extract_class_info_with_imports(
-                db,
-                &file_path,
-                &symbol_name,
-                search_paths,
-            ) {
+            if let Ok((class_info, resolved_file)) =
+                Self::extract_class_info_with_imports(db, &file_path, &symbol_name, search_paths)
+            {
                 return Ok((
                     DefinitionInfo::Class(class_info),
                     resolved_file,
@@ -905,12 +904,9 @@ impl PythonAnalyzer {
             let first_symbol = remaining_parts[0];
 
             // Check if this is a class
-            if let Ok((class_info, resolved_file)) = Self::extract_class_info_with_imports(
-                db,
-                &file_path,
-                first_symbol,
-                search_paths,
-            ) {
+            if let Ok((class_info, resolved_file)) =
+                Self::extract_class_info_with_imports(db, &file_path, first_symbol, search_paths)
+            {
                 if remaining_parts.len() == 2 {
                     // Simple case: Class.method
                     let method_name = remaining_parts[1];
@@ -3518,10 +3514,7 @@ mod tests {
         let spid = InternedSearchPaths::new(&db, search_paths);
         let result = resolve_module_cached(&db, mid, spid).clone();
 
-        assert!(
-            result.is_some(),
-            "Should resolve editable_package.lib"
-        );
+        assert!(result.is_some(), "Should resolve editable_package.lib");
         let path = result.unwrap();
         assert!(
             path.ends_with("lib.py"),

@@ -855,9 +855,14 @@ impl LanguageServer for HydraLspBackend {
         // `source_text` is invalidated on the next request.
         //
         // We filter to Python analysis inputs before locking: `.py`, `.pyi`,
-        // and watched `.pth` files all participate in analysis. Syncing
-        // existing files bumps the per-file revision inside ruff_db so any
-        // query that read them through `source_text` is invalidated on the
+        // and watched `.pth` files all participate in analysis. The set of
+        // extensions here must match the globs the client registers
+        // (`**/*.{yaml,yml}` and `**/*.{py,pyi,pth}`; if an extension is added here,
+        // it should be added to the client watcher too, or the events will never
+        // arrive.
+        //
+        // Syncing existing files bumps the per-file revision inside ruff_db so
+        // any query that read them through `source_text` is invalidated on the
         // next request. For `.pth` create/delete events we also bump the
         // tracked inventory for that site-packages directory so the directory
         // scan is recomputed.
