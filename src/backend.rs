@@ -1083,8 +1083,8 @@ impl LanguageServer for HydraLspBackend {
                 // Fallback: full raw-text scan for partial-syntax lines (e.g. the
                 // document is temporarily unparseable mid-edit, or the cursor is
                 // on a new line not yet in the parse maps).
-                let text = input.text(&*db).clone();
-                YamlParser::get_completion_context(&text, position).ok()
+                let text = input.text(&*db);
+                YamlParser::get_completion_context(text, position).ok()
             })
             .flatten()
         else {
