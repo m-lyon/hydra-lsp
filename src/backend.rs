@@ -632,10 +632,15 @@ impl LanguageServer for HydraLspBackend {
             let toggles = FeatureToggles::from_json(settings);
 
             // Parse optional thread-count override (total threads across both pools).
+            // Clamp to sane max threads range: at least 1
+            let max_threads = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+                .saturating_mul(8);
             let num_threads = settings
                 .get("numThreads")
                 .and_then(|v| v.as_u64())
-                .map(|n| n.max(1) as usize);
+                .map(|n| (n as usize).clamp(1, max_threads));
 
             // Write settings under the lock (no awaits)
             {
@@ -863,11 +868,11 @@ impl LanguageServer for HydraLspBackend {
         // `source_text` is invalidated on the next request.
         //
         // We filter to Python analysis inputs before locking: `.py`, `.pyi`,
-        // and watched `.pth` files all participate in analysis. The set of
-        // extensions here must match the globs the client registers
-        // (`**/*.{yaml,yml}` and `**/*.{py,pyi,pth}`; if an extension is added here,
-        // it should be added to the client watcher too, or the events will never
-        // arrive.
+        // and watched `.pth` files all participate in analysis. Extension
+        // matching is case-insensitive. The set of extensions here must match the globs
+        // the client registers (`**/*.{yaml,yml}` and `**/*.{py,pyi,pth}`; if an
+        // extension is added here, it should be added to the client watcher too, or
+        // the events will never arrive.
         //
         // Syncing existing files bumps the per-file revision inside ruff_db so
         // any query that read them through `source_text` is invalidated on the
@@ -883,7 +888,12 @@ impl LanguageServer for HydraLspBackend {
             .iter()
             .filter_map(|change| {
                 let path = change.uri.to_file_path().ok()?;
-                match path.extension().and_then(|ext| ext.to_str()) {
+                match path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .map(str::to_ascii_lowercase)
+                    .as_deref()
+                {
                     Some("py") | Some("pyi") => Some(path),
                     Some("pth") => {
                         if matches!(
