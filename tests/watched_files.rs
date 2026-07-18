@@ -91,6 +91,52 @@ async fn notify_change(ctx: &mut TestContext, doc: &str, typ: FileChangeType) {
     .await;
 }
 
+/// The server must ask the client to watch the expected globs via dynamic
+/// capability registration. This is the "does the server request the right
+/// watchers" half of the wiring; the tests below cover the "does the server
+/// react to the events" half. Together they replace the old drift-prone
+/// arrangement where the glob list lived only in the client.
+#[tokio::test]
+async fn test_server_registers_watched_file_globs() {
+    let mut ctx = TestContext::new(TestWorkspace::Simple);
+    ctx.initialize_with_watched_files_support().await;
+
+    // The server sends `client/registerCapability` from `initialized`; read it
+    // off the pipe and answer it so the server's await completes.
+    let (id, params) = ctx.recv_request("client/registerCapability").await;
+    ctx.reply_ok(id).await;
+
+    let params: RegistrationParams = serde_json::from_value(params).unwrap();
+    let globs: Vec<String> = params
+        .registrations
+        .iter()
+        .filter(|r| r.method == "workspace/didChangeWatchedFiles")
+        .filter_map(|r| {
+            serde_json::from_value::<DidChangeWatchedFilesRegistrationOptions>(
+                r.register_options.clone()?,
+            )
+            .ok()
+        })
+        .flat_map(|options| options.watchers)
+        .map(|watcher| match watcher.glob_pattern {
+            GlobPattern::String(glob) => glob,
+            other => panic!("expected a string glob pattern, got {other:?}"),
+        })
+        .collect();
+
+    assert!(
+        globs.contains(&"**/*.{py,pyi,pth}".to_string()),
+        "Python globs must be registered, got {globs:?}"
+    );
+    // YAML is intentionally NOT watched: config files are handled by
+    // text-document sync (open editor buffers), and the watched-files handler
+    // discards YAML events. See `WATCHED_GLOBS`.
+    assert!(
+        !globs.iter().any(|g| g.contains("yaml") || g.contains("yml")),
+        "YAML globs must not be registered (handled by document sync), got {globs:?}"
+    );
+}
+
 /// A `_target_` pointing at a module that does not exist yet must resolve once
 /// the module file is created on disk and a CREATE event arrives — no config
 /// touch required. This is the exact gap the raw `Path::exists()` probes left

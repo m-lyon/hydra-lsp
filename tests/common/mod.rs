@@ -246,6 +246,18 @@ impl TestContext {
     }
 
     pub async fn initialize(&mut self) {
+        self.initialize_inner(false).await;
+    }
+
+    /// Like [`initialize`], but advertises `workspace/didChangeWatchedFiles`
+    /// dynamic registration so the server registers its file watchers on
+    /// `initialized`. Use [`recv_request`]/[`reply_ok`] to observe and answer
+    /// the resulting `client/registerCapability` request.
+    pub async fn initialize_with_watched_files_support(&mut self) {
+        self.initialize_inner(true).await;
+    }
+
+    async fn initialize_inner(&mut self, watched_files_dynamic_registration: bool) {
         // Real set of initialize params with workspace configuration
         let initialize = r#"{
             "capabilities": {
@@ -293,6 +305,15 @@ impl TestContext {
         }"#;
         let mut initialize: <lsp_types::request::Initialize as Request>::Params =
             serde_json::from_str(initialize).unwrap();
+        if watched_files_dynamic_registration
+            && let Some(workspace) = initialize.capabilities.workspace.as_mut()
+        {
+            workspace.did_change_watched_files =
+                Some(lsp_types::DidChangeWatchedFilesClientCapabilities {
+                    dynamic_registration: Some(true),
+                    relative_pattern_support: None,
+                });
+        }
         let workspace_url = Url::from_file_path(self.workspace.path()).unwrap();
         initialize.root_uri = Some(workspace_url.clone());
         initialize.workspace_folders = Some(vec![WorkspaceFolder {
@@ -303,6 +324,49 @@ impl TestContext {
             .await;
         self.notify::<lsp_types::notification::Initialized>(InitializedParams {})
             .await;
+    }
+
+    /// Read messages off the pipe until a server-initiated request with the
+    /// given method arrives; return its id and params. Server notifications
+    /// (log messages, diagnostics) and unrelated requests are skipped.
+    pub async fn recv_request(&mut self, method: &str) -> (jsonrpc::Id, serde_json::Value) {
+        loop {
+            let mut clh = String::new();
+            self.response_rx.read_line(&mut clh).await.unwrap();
+            if !clh.starts_with("Content-Length") {
+                panic!("missing content length header");
+            }
+            let length = clh
+                .trim_start_matches("Content-Length: ")
+                .trim()
+                .parse::<usize>()
+                .unwrap();
+            self.response_rx.read_line(&mut clh).await.unwrap();
+            let mut content = vec![0; length];
+            self.response_rx.read_exact(&mut content).await.unwrap();
+            let content = String::from_utf8(content).unwrap();
+            eprintln!("received: {content}");
+            std::io::stderr().flush().unwrap();
+            let request = serde_json::from_str::<jsonrpc::Request>(&content).unwrap();
+            let (req_method, id, params) = request.into_parts();
+            if req_method != method {
+                continue;
+            }
+            let id = id.expect("server-initiated request must carry an id");
+            return (id, params.unwrap_or(serde_json::Value::Null));
+        }
+    }
+
+    /// Send a successful (null-result) response to a server-initiated request.
+    pub async fn reply_ok(&mut self, id: jsonrpc::Id) {
+        let response = jsonrpc::Response::from_ok(id, serde_json::Value::Null);
+        let content = serde_json::to_string(&response).unwrap();
+        eprintln!("\nreplying: {content}");
+        std::io::stderr().flush().unwrap();
+        self.request_tx
+            .write_all(encode_message(None, &content).as_bytes())
+            .await
+            .unwrap();
     }
 
     pub async fn open_document(&mut self, path: &str, content: String) {

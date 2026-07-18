@@ -2,6 +2,7 @@ use dashmap::DashMap;
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use tower_lsp::jsonrpc::{Error, Result};
 use tower_lsp::lsp_types::*;
@@ -22,6 +23,13 @@ use crate::yaml_parser::{
     ARGS_KEY, CONVERT_KEY, CompletionContext, ConvertMode, HydraSemanticToken, PARTIAL_KEY,
     RECURSIVE_KEY, ResolvedParameterContext, YamlParser,
 };
+
+/// Glob applied to every watched root — the workspace folders (via a plain
+/// string pattern) and each out-of-workspace Python search path (via relative
+/// patterns; see `initialized`). Single source of truth for on-disk change
+/// notifications; the extension filter in `did_change_watched_files` must stay
+/// aligned with the extensions here.
+const WATCHED_PY_GLOB: &str = "**/*.{py,pyi,pth}";
 
 /// Format a parameter as a string for signature labels (e.g., "*args", "name: str")
 fn format_param_label(p: &ParameterInfo) -> String {
@@ -259,6 +267,14 @@ pub struct HydraLspBackend {
     /// workspace-wide analysis). Sized to available_parallelism − 2,
     /// clamped to at least 1. See `latency_pool` for the Mutex rationale.
     worker_pool: parking_lot::Mutex<rayon::ThreadPool>,
+    /// Whether the client advertised `workspace/didChangeWatchedFiles`
+    /// dynamic registration in its `initialize` capabilities. Captured in
+    /// `initialize` and read in `initialized` to decide whether to register the
+    /// watchers at all.
+    watched_files_dynamic: AtomicBool,
+    /// Whether the client advertised relative-pattern support for watched
+    /// files. Required to watch out-of-workspace Python search paths.
+    watched_files_relative_patterns: AtomicBool,
 }
 
 /// Outcome of a closure run on a rayon pool via [`spawn_on_pool`].
@@ -393,6 +409,8 @@ impl HydraLspBackend {
             document_inputs: DashMap::new(),
             latency_pool,
             worker_pool,
+            watched_files_dynamic: AtomicBool::new(false),
+            watched_files_relative_patterns: AtomicBool::new(false),
         }
     }
 
@@ -473,6 +491,40 @@ impl HydraLspBackend {
             return None;
         }
         Some(f(session.as_ref().expect("checked Some above")))
+    }
+
+    /// Python search-path roots that live outside the workspace folder(s).
+    ///
+    /// These are the site-packages and `.pth`-target directories the resolver
+    /// reads from but that a workspace-relative watcher glob would miss (see
+    /// `initialized`). Shares the exact `search_paths_for_config` list the
+    /// resolver uses, so each watched root equals the path the resolver interns
+    /// under. Nested paths are collapsed so a parent `**` watcher isn't
+    /// duplicated by one of its children.
+    fn out_of_workspace_search_roots(&self) -> Vec<std::path::PathBuf> {
+        self.with_session("computing watched search paths", |s| {
+            let db = s.db.lock();
+            let workspace = s
+                .python_config
+                .workspace_root(&*db)
+                .as_deref()
+                .map(std::path::PathBuf::from);
+            let roots: Vec<ruff_db::system::SystemPathBuf> =
+                python_cache::search_paths_for_config(&*db, s.python_config)
+                    .iter()
+                    // Drop the relative "." entry and anything under the
+                    // workspace (already covered by the workspace-relative glob).
+                    .filter(|path| path.is_absolute())
+                    .filter(|path| workspace.as_ref().is_none_or(|w| !path.starts_with(w)))
+                    .filter_map(|path| {
+                        ruff_db::system::SystemPathBuf::from_path_buf(path.clone()).ok()
+                    })
+                    .collect();
+            ruff_db::system::deduplicate_nested_paths(roots)
+                .map(|path| path.as_std_path().to_path_buf())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
     }
 
     /// Run Python definition lookup on a blocking thread using a database snapshot.
@@ -594,6 +646,24 @@ impl LanguageServer for HydraLspBackend {
             .as_ref()
             .and_then(|root_uri| root_uri.to_file_path().ok())
             .map(|path| path.to_string_lossy().to_string());
+
+        let watched_files_caps = params
+            .capabilities
+            .workspace
+            .as_ref()
+            .and_then(|w| w.did_change_watched_files.as_ref());
+        self.watched_files_dynamic.store(
+            watched_files_caps
+                .and_then(|d| d.dynamic_registration)
+                .unwrap_or(false),
+            Ordering::Relaxed,
+        );
+        self.watched_files_relative_patterns.store(
+            watched_files_caps
+                .and_then(|d| d.relative_pattern_support)
+                .unwrap_or(false),
+            Ordering::Relaxed,
+        );
 
         self.client
             .log_message(
@@ -786,6 +856,79 @@ impl LanguageServer for HydraLspBackend {
     }
 
     async fn initialized(&self, _params: InitializedParams) {
+        // Register file watchers dynamically so the server owns the single
+        // source of truth for which paths trigger `did_change_watched_files`
+        // (see `WATCHED_PY_GLOB`). The client creates the watchers on its side
+        // in response and forwards matching events back to us.
+        if self.watched_files_dynamic.load(Ordering::Relaxed) {
+            // Workspace folders: the client matches this string glob against
+            // them, covering first-party sources and any in-workspace `.venv`.
+            let mut watchers = vec![FileSystemWatcher {
+                glob_pattern: GlobPattern::String(WATCHED_PY_GLOB.to_string()),
+                // `None` = watch for create, change, and delete.
+                kind: None,
+            }];
+
+            // Out-of-workspace Python search paths (external site-packages,
+            // editable `.pth` targets) live outside the workspace folders, so the
+            // string glob above never matches them. Watch each as a relative
+            // pattern based at its directory.
+            //
+            // Symlink model (matches ty / PyCharm: we register the exact
+            // roots the resolver interns under — site-packages roots are already
+            // canonical via ty's environment discovery — and rely on the OS
+            // reporting events under that same path. We keep no real-path to symlink
+            // reverse map, and macOS FSEvents does not fire under symlinked
+            // directories; both are accepted limitations. Do NOT re-canonicalize
+            // roots here, or watched paths would diverge from interned keys.
+            if self.watched_files_relative_patterns.load(Ordering::Relaxed) {
+                for root in self.out_of_workspace_search_roots() {
+                    if let Ok(base_uri) = Url::from_directory_path(&root) {
+                        watchers.push(FileSystemWatcher {
+                            glob_pattern: GlobPattern::Relative(RelativePattern {
+                                base_uri: OneOf::Right(base_uri),
+                                pattern: WATCHED_PY_GLOB.to_string(),
+                            }),
+                            kind: None,
+                        });
+                    }
+                }
+            } else {
+                self.client
+                    .log_message(
+                        MessageType::WARNING,
+                        "Client lacks relative-pattern watcher support; on-disk changes to \
+                         out-of-workspace site-packages/.pth dirs will not invalidate caches",
+                    )
+                    .await;
+            }
+
+            let registration = Registration {
+                id: "hydra-watched-files".to_string(),
+                method: "workspace/didChangeWatchedFiles".to_string(),
+                register_options: Some(
+                    serde_json::to_value(DidChangeWatchedFilesRegistrationOptions { watchers })
+                        .expect("watcher registration options serialize"),
+                ),
+            };
+            if let Err(error) = self.client.register_capability(vec![registration]).await {
+                self.client
+                    .log_message(
+                        MessageType::WARNING,
+                        format!("Failed to register file watchers: {error}"),
+                    )
+                    .await;
+            }
+        } else {
+            self.client
+                .log_message(
+                    MessageType::WARNING,
+                    "Client lacks workspace/didChangeWatchedFiles dynamic registration; \
+                     on-disk Python/.pth changes will not invalidate caches",
+                )
+                .await;
+        }
+
         self.client
             .log_message(MessageType::INFO, "Hydrust Server initialized")
             .await;
@@ -868,11 +1011,8 @@ impl LanguageServer for HydraLspBackend {
         // `source_text` is invalidated on the next request.
         //
         // We filter to Python analysis inputs before locking: `.py`, `.pyi`,
-        // and watched `.pth` files all participate in analysis. Extension
-        // matching is case-insensitive. The set of extensions here must match the globs
-        // the client registers (`**/*.{yaml,yml}` and `**/*.{py,pyi,pth}`; if an
-        // extension is added here, it should be added to the client watcher too, or
-        // the events will never arrive.
+        // and watched `.pth` files all participate in analysis. These extensions
+        // must stay aligned with `WATCHED_PY_GLOB`.
         //
         // Syncing existing files bumps the per-file revision inside ruff_db so
         // any query that read them through `source_text` is invalidated on the
