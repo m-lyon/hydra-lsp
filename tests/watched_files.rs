@@ -130,9 +130,11 @@ async fn test_server_registers_watched_file_globs() {
     );
     // YAML is intentionally NOT watched: config files are handled by
     // text-document sync (open editor buffers), and the watched-files handler
-    // discards YAML events. See `WATCHED_GLOBS`.
+    // discards YAML events. See `WATCHED_PY_GLOB`.
     assert!(
-        !globs.iter().any(|g| g.contains("yaml") || g.contains("yml")),
+        !globs
+            .iter()
+            .any(|g| g.contains("yaml") || g.contains("yml")),
         "YAML globs must not be registered (handled by document sync), got {globs:?}"
     );
 }
@@ -195,7 +197,11 @@ async fn test_watched_create_resolves_nested_module() {
     // Create the nested package path on disk, then notify for the leaf file.
     fs::create_dir_all(ctx.workspace.path().join("pkg").join("sub")).unwrap();
     fs::write(
-        ctx.workspace.path().join("pkg").join("sub").join("new_mod.py"),
+        ctx.workspace
+            .path()
+            .join("pkg")
+            .join("sub")
+            .join("new_mod.py"),
         "class NestedClass:\n    pass\n",
     )
     .unwrap();

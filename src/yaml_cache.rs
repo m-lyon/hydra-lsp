@@ -36,12 +36,6 @@ impl DocumentInput {
     /// text correctly.
     pub fn close(self, db: &mut dyn salsa::Database) {
         self.set_text(db).to(String::new());
-        // The version field isn't read by any tracked query, so this bump is
-        // purely defensive — it ensures any future code that does watch
-        // `version` observes the close. `wrapping_add` is safe; the next
-        // `did_open` overwrites this with the LSP-provided version anyway.
-        let next = self.version(db).wrapping_add(1);
-        self.set_version(db).to(next);
     }
 }
 
@@ -253,7 +247,7 @@ mod tests {
     }
 
     #[test]
-    fn test_close_drops_text_and_bumps_version() {
+    fn test_close_drops_text_and_invalidates() {
         let mut db = TestDb::new();
         let input = DocumentInput::new(&db, hydra_yaml().to_string(), 7);
 
@@ -263,7 +257,9 @@ mod tests {
         input.close(&mut db);
 
         assert_eq!(input.text(&db), "");
-        assert_ne!(input.version(&db), 7);
+        // `version` mirrors the LSP protocol version and is left untouched by
+        // close; it's the next `did_open` that overwrites it.
+        assert_eq!(input.version(&db), 7);
 
         // After close, the same input observed against empty text — no
         // hydra markers, no targets — so `is_hydra_file` flips to false.

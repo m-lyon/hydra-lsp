@@ -4,7 +4,7 @@ use std::sync::Arc;
 use crate::import_resolver::ImportResolver;
 use crate::python_analyzer::{
     ClassAttributeInfo, DefinitionInfo, FunctionSignature, PythonAnalyzer, normalize_path_for_key,
-    normalize_site_packages_pth_state_key, path_is_file,
+    path_is_file,
 };
 use ruff_db::files::FileRootKind;
 use ruff_db::system::SystemPathBuf;
@@ -152,29 +152,7 @@ pub fn search_paths_for_config(db: &dyn ruff_db::Db, config: PythonConfig) -> Ve
     let site_packages = site_packages_paths(db, config);
     let pth_states = config.site_packages_pth_states(db);
 
-    let mut paths = Vec::new();
-    if let Some(root) = workspace_root {
-        paths.push(root.to_path_buf());
-    }
-    paths.push(PathBuf::from("."));
-
-    for sys_path in site_packages.iter() {
-        let dir = sys_path.as_std_path().to_path_buf();
-        let key = normalize_site_packages_pth_state_key(&dir);
-        let matched_state = pth_states
-            .iter()
-            .find(|s| s.directory(db).as_str() == key)
-            .copied();
-        let editable = PythonAnalyzer::parse_pth_files(
-            db,
-            &dir,
-            matched_state.as_ref().map(std::slice::from_ref),
-        );
-        paths.push(dir);
-        paths.extend(editable);
-    }
-
-    paths
+    PythonAnalyzer::build_search_paths(db, workspace_root, site_packages.clone(), Some(pth_states))
 }
 
 /// Cached module path → file path resolution.
