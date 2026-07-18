@@ -93,6 +93,25 @@ pub(crate) fn normalize_site_packages_pth_state_key(directory: &Path) -> String 
     }
 }
 
+/// Lexically normalize a path for use in a salsa memo key, without touching the
+/// filesystem.
+///
+/// Collapses `.`/`..` and makes the path absolute against the database's current
+/// directory via `SystemPath::absolute`. This mirrors `ty`, which canonicalizes
+/// search-path *roots* at construction but keeps everything lexical downstream
+/// (module resolution + `File` keys).
+///
+/// Falls back to the original path for non-UTF8 paths that cannot be represented
+/// as a `SystemPath`.
+pub(crate) fn normalize_path_for_key(db: &dyn ruff_db::Db, path: &Path) -> PathBuf {
+    match SystemPath::from_std_path(path) {
+        Some(sys_path) => {
+            SystemPath::absolute(sys_path, db.system().current_directory()).into_std_path_buf()
+        }
+        None => path.to_path_buf(),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FunctionSignature {
     pub name: String,
@@ -430,11 +449,9 @@ impl PythonAnalyzer {
             // Try to get the attribute as a class attribute (with inheritance support).
             // The salsa-tracked class_parent_attribute memoises each (class, attr) pair so
             // shared parent classes are only walked once per revision.
-            let canonical = current_file
-                .canonicalize()
-                .unwrap_or_else(|_| current_file.clone());
+            let normalized = normalize_path_for_key(db, &current_file);
             let class_key =
-                TargetString::new(db, format!("{}::{}", canonical.display(), current_class));
+                TargetString::new(db, format!("{}::{}", normalized.display(), current_class));
             let attr_key = TargetString::new(db, attr.to_string());
             let cached_attr = class_parent_attribute(db, class_key, attr_key, interned_sp);
             match cached_attr.get() {
@@ -609,9 +626,13 @@ impl PythonAnalyzer {
                     site_packages.join(line)
                 };
 
-                // Only add if the directory exists
+                // We resolve symlinks only here, where the search-path list is
+                // first built, and keep every path lexical after this point (the
+                // same approach `ty` takes). Falls back to the original path if
+                // resolution fails (e.g. the dir was just deleted).
                 if path.is_dir() {
-                    paths.push(path);
+                    let canonical = std::fs::canonicalize(&path).unwrap_or(path);
+                    paths.push(canonical);
                 }
             }
         }
@@ -708,12 +729,10 @@ impl PythonAnalyzer {
         // class_parent_docs walks the MRO recursively and caches results per (class, search_paths),
         // so shared parent classes across different child-class lookups are resolved only once.
         if class_info.docstring.is_none() || class_info.init_signature.is_none() {
-            let canonical_path = resolved_file
-                .canonicalize()
-                .unwrap_or_else(|_| resolved_file.clone());
+            let normalized_path = normalize_path_for_key(db, &resolved_file);
             let class_key = TargetString::new(
                 db,
-                format!("{}::{}", canonical_path.display(), class_info.name),
+                format!("{}::{}", normalized_path.display(), class_info.name),
             );
             let interned_sp = InternedSearchPaths::new(db, search_paths.to_vec());
             let parent_docs = class_parent_docs(db, class_key, interned_sp);

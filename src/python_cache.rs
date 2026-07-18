@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::import_resolver::ImportResolver;
 use crate::python_analyzer::{
-    ClassAttributeInfo, DefinitionInfo, FunctionSignature, PythonAnalyzer,
+    ClassAttributeInfo, DefinitionInfo, FunctionSignature, PythonAnalyzer, normalize_path_for_key,
     normalize_site_packages_pth_state_key, path_is_file,
 };
 use ruff_db::files::FileRootKind;
@@ -377,12 +377,14 @@ pub fn class_parent_docs<'db>(
         else {
             continue;
         };
-        let canonical = parent_file
-            .canonicalize()
-            .unwrap_or_else(|_| parent_file.clone());
+        // Lexical normalization only — no `fs::canonicalize` syscall inside this
+        // tracked body (keeps the memo key a pure function of salsa inputs).
+        // Symlink resolution already happened at root construction; see
+        // `normalize_path_for_key`.
+        let normalized = normalize_path_for_key(db, &parent_file);
         let parent_key = TargetString::new(
             db,
-            format!("{}::{}", canonical.display(), parent_class_name),
+            format!("{}::{}", normalized.display(), parent_class_name),
         );
         let parent_docs = class_parent_docs(db, parent_key, search_paths);
 
@@ -456,12 +458,14 @@ pub fn class_parent_attribute<'db>(
         else {
             continue;
         };
-        let canonical = parent_file
-            .canonicalize()
-            .unwrap_or_else(|_| parent_file.clone());
+        // Lexical normalization only — no `fs::canonicalize` syscall inside this
+        // tracked body (keeps the memo key a pure function of salsa inputs).
+        // Symlink resolution already happened at root construction; see
+        // `normalize_path_for_key`.
+        let normalized = normalize_path_for_key(db, &parent_file);
         let parent_key = TargetString::new(
             db,
-            format!("{}::{}", canonical.display(), parent_class_name),
+            format!("{}::{}", normalized.display(), parent_class_name),
         );
         let result = class_parent_attribute(db, parent_key, attribute_key, search_paths);
         if result.get().is_some() {
@@ -1044,8 +1048,10 @@ mod tests {
 
         let r1 = {
             let sp = InternedSearchPaths::new(&db, vec![workspace.to_path_buf()]);
-            let child_canonical = child.canonicalize().unwrap_or_else(|_| child.clone());
-            let child_key = TargetString::new(&db, format!("{}::Child", child_canonical.display()));
+            // The LSP keys the MRO walk off the lexically-normalized path (the
+            // form the client reports on watch events); no symlink resolution.
+            let child_lexical = normalize_path_for_key(&db, &child);
+            let child_key = TargetString::new(&db, format!("{}::Child", child_lexical.display()));
             class_parent_docs(&db, child_key, sp)
         };
         // Prove the MRO walk really resolved through to GrandParent — otherwise
@@ -1065,16 +1071,18 @@ mod tests {
         // docstring and __init__ spans are byte-for-byte unchanged.
         fs::write(&gp, format!("{gp_v1}\n\ndef unrelated():\n    pass\n")).expect("write gp v2");
         set_file_mtime(&gp, FileTime::from_unix_time(2_000_000, 0)).expect("bump gp mtime");
-        // The MRO queries open GrandParent via its *canonical* path (the
-        // recursive key canonicalises), so the sync must target that same path
-        // or it bumps a different `File` and the change goes unnoticed.
-        let gp_canonical = gp.canonicalize().unwrap_or_else(|_| gp.clone());
-        File::sync_path(&mut db, SystemPath::from_std_path(&gp_canonical).unwrap());
+        // The MRO queries open GrandParent via its lexically-normalized path, so
+        // the sync must target that same (lexical) path — exactly as the LSP
+        // client reports it on a `did_change_watched_files` event.
+        let gp_lexical = normalize_path_for_key(&db, &gp);
+        File::sync_path(&mut db, SystemPath::from_std_path(&gp_lexical).unwrap());
 
         let r2 = {
             let sp = InternedSearchPaths::new(&db, vec![workspace.to_path_buf()]);
-            let child_canonical = child.canonicalize().unwrap_or_else(|_| child.clone());
-            let child_key = TargetString::new(&db, format!("{}::Child", child_canonical.display()));
+            // The LSP keys the MRO walk off the lexically-normalized path (the
+            // form the client reports on watch events); no symlink resolution.
+            let child_lexical = normalize_path_for_key(&db, &child);
+            let child_key = TargetString::new(&db, format!("{}::Child", child_lexical.display()));
             class_parent_docs(&db, child_key, sp)
         };
 
@@ -1105,8 +1113,10 @@ mod tests {
         let mut db = real_fs_db();
         let r1 = {
             let sp = InternedSearchPaths::new(&db, vec![workspace.to_path_buf()]);
-            let child_canonical = child.canonicalize().unwrap_or_else(|_| child.clone());
-            let child_key = TargetString::new(&db, format!("{}::Child", child_canonical.display()));
+            // The LSP keys the MRO walk off the lexically-normalized path (the
+            // form the client reports on watch events); no symlink resolution.
+            let child_lexical = normalize_path_for_key(&db, &child);
+            let child_key = TargetString::new(&db, format!("{}::Child", child_lexical.display()));
             class_parent_docs(&db, child_key, sp)
         };
         assert_eq!(r1.init().map(|s| s.parameters.len()), Some(2));
@@ -1119,13 +1129,18 @@ mod tests {
         )
         .expect("write gp v2");
         set_file_mtime(&gp, FileTime::from_unix_time(2_000_000, 0)).expect("bump gp mtime");
-        let gp_canonical = gp.canonicalize().unwrap_or_else(|_| gp.clone());
-        File::sync_path(&mut db, SystemPath::from_std_path(&gp_canonical).unwrap());
+        // The MRO queries open GrandParent via its lexically-normalized path, so
+        // the sync must target that same (lexical) path — exactly as the LSP
+        // client reports it on a `did_change_watched_files` event.
+        let gp_lexical = normalize_path_for_key(&db, &gp);
+        File::sync_path(&mut db, SystemPath::from_std_path(&gp_lexical).unwrap());
 
         let r2 = {
             let sp = InternedSearchPaths::new(&db, vec![workspace.to_path_buf()]);
-            let child_canonical = child.canonicalize().unwrap_or_else(|_| child.clone());
-            let child_key = TargetString::new(&db, format!("{}::Child", child_canonical.display()));
+            // The LSP keys the MRO walk off the lexically-normalized path (the
+            // form the client reports on watch events); no symlink resolution.
+            let child_lexical = normalize_path_for_key(&db, &child);
+            let child_key = TargetString::new(&db, format!("{}::Child", child_lexical.display()));
             class_parent_docs(&db, child_key, sp)
         };
         assert_eq!(
@@ -1151,8 +1166,10 @@ mod tests {
         let mut db = real_fs_db();
         let r1 = {
             let sp = InternedSearchPaths::new(&db, vec![workspace.to_path_buf()]);
-            let child_canonical = child.canonicalize().unwrap_or_else(|_| child.clone());
-            let child_key = TargetString::new(&db, format!("{}::Child", child_canonical.display()));
+            // The LSP keys the MRO walk off the lexically-normalized path (the
+            // form the client reports on watch events); no symlink resolution.
+            let child_lexical = normalize_path_for_key(&db, &child);
+            let child_key = TargetString::new(&db, format!("{}::Child", child_lexical.display()));
             let attr_key = TargetString::new(&db, "factory".to_string());
             class_parent_attribute(&db, child_key, attr_key, sp)
         };
@@ -1165,13 +1182,18 @@ mod tests {
         // Append unrelated content; the `factory` assignment is unchanged.
         fs::write(&gp, format!("{gp_v1}\n\ndef unrelated():\n    pass\n")).expect("write gp v2");
         set_file_mtime(&gp, FileTime::from_unix_time(2_000_000, 0)).expect("bump gp mtime");
-        let gp_canonical = gp.canonicalize().unwrap_or_else(|_| gp.clone());
-        File::sync_path(&mut db, SystemPath::from_std_path(&gp_canonical).unwrap());
+        // The MRO queries open GrandParent via its lexically-normalized path, so
+        // the sync must target that same (lexical) path — exactly as the LSP
+        // client reports it on a `did_change_watched_files` event.
+        let gp_lexical = normalize_path_for_key(&db, &gp);
+        File::sync_path(&mut db, SystemPath::from_std_path(&gp_lexical).unwrap());
 
         let r2 = {
             let sp = InternedSearchPaths::new(&db, vec![workspace.to_path_buf()]);
-            let child_canonical = child.canonicalize().unwrap_or_else(|_| child.clone());
-            let child_key = TargetString::new(&db, format!("{}::Child", child_canonical.display()));
+            // The LSP keys the MRO walk off the lexically-normalized path (the
+            // form the client reports on watch events); no symlink resolution.
+            let child_lexical = normalize_path_for_key(&db, &child);
+            let child_key = TargetString::new(&db, format!("{}::Child", child_lexical.display()));
             let attr_key = TargetString::new(&db, "factory".to_string());
             class_parent_attribute(&db, child_key, attr_key, sp)
         };
@@ -1197,8 +1219,10 @@ mod tests {
         let mut db = real_fs_db();
         let r1 = {
             let sp = InternedSearchPaths::new(&db, vec![workspace.to_path_buf()]);
-            let child_canonical = child.canonicalize().unwrap_or_else(|_| child.clone());
-            let child_key = TargetString::new(&db, format!("{}::Child", child_canonical.display()));
+            // The LSP keys the MRO walk off the lexically-normalized path (the
+            // form the client reports on watch events); no symlink resolution.
+            let child_lexical = normalize_path_for_key(&db, &child);
+            let child_key = TargetString::new(&db, format!("{}::Child", child_lexical.display()));
             let attr_key = TargetString::new(&db, "factory".to_string());
             class_parent_attribute(&db, child_key, attr_key, sp)
         };
@@ -1210,13 +1234,18 @@ mod tests {
         // Change the attribute's value: the inherited result MUST update.
         fs::write(&gp, "class GrandParent:\n    factory = OtherFactory\n").expect("write gp v2");
         set_file_mtime(&gp, FileTime::from_unix_time(2_000_000, 0)).expect("bump gp mtime");
-        let gp_canonical = gp.canonicalize().unwrap_or_else(|_| gp.clone());
-        File::sync_path(&mut db, SystemPath::from_std_path(&gp_canonical).unwrap());
+        // The MRO queries open GrandParent via its lexically-normalized path, so
+        // the sync must target that same (lexical) path — exactly as the LSP
+        // client reports it on a `did_change_watched_files` event.
+        let gp_lexical = normalize_path_for_key(&db, &gp);
+        File::sync_path(&mut db, SystemPath::from_std_path(&gp_lexical).unwrap());
 
         let r2 = {
             let sp = InternedSearchPaths::new(&db, vec![workspace.to_path_buf()]);
-            let child_canonical = child.canonicalize().unwrap_or_else(|_| child.clone());
-            let child_key = TargetString::new(&db, format!("{}::Child", child_canonical.display()));
+            // The LSP keys the MRO walk off the lexically-normalized path (the
+            // form the client reports on watch events); no symlink resolution.
+            let child_lexical = normalize_path_for_key(&db, &child);
+            let child_key = TargetString::new(&db, format!("{}::Child", child_lexical.display()));
             let attr_key = TargetString::new(&db, "factory".to_string());
             class_parent_attribute(&db, child_key, attr_key, sp)
         };
@@ -1226,6 +1255,71 @@ mod tests {
             "a real attribute change must propagate through the MRO"
         );
         assert!(r1 != r2, "result must differ after a meaningful change");
+    }
+
+    /// When the workspace is reached through a symlinked path (the path the LSP client
+    /// reports), a real ancestor edit must still invalidate the MRO memo.
+    #[cfg(unix)]
+    #[test]
+    fn test_class_parent_docs_invalidates_via_symlinked_workspace() {
+        use filetime::{FileTime, set_file_mtime};
+        use ruff_db::files::File;
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let real_ws = tmp.path().join("real");
+        fs::create_dir_all(&real_ws).expect("create real workspace");
+        let (gp, _parent, _child) = write_mro_workspace(
+            &real_ws,
+            "class GrandParent:\n    \"\"\"gp docstring\"\"\"\n    def __init__(self, a):\n        pass\n",
+        );
+
+        // Access the same tree through a symlink — this is the lexical path the
+        // editor/client would report, distinct from the canonical `real/` path.
+        let link_ws = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real_ws, &link_ws).expect("create workspace symlink");
+        // Sanity: the symlink path really is non-canonical.
+        assert_ne!(
+            link_ws,
+            link_ws.canonicalize().expect("canonicalize link"),
+            "symlink path must differ from its canonical target for this test to be meaningful"
+        );
+
+        let mut db = real_fs_db();
+        let child_via_link = link_ws.join("child.py");
+        let query = |db: &HydraDatabase| {
+            let sp = InternedSearchPaths::new(db, vec![link_ws.clone()]);
+            let child_lexical = normalize_path_for_key(db, &child_via_link);
+            let child_key = TargetString::new(db, format!("{}::Child", child_lexical.display()));
+            class_parent_docs(db, child_key, sp)
+        };
+
+        let r1 = query(&db);
+        assert_eq!(
+            r1.init().map(|s| s.parameters.len()),
+            Some(2),
+            "Child must inherit GrandParent's __init__(self, a) via the symlinked workspace"
+        );
+
+        // Genuinely change GrandParent's __init__, then sync the *lexical*
+        // symlink path (as the client reports on a watch event).
+        fs::write(
+            &gp,
+            "class GrandParent:\n    \"\"\"gp docstring\"\"\"\n    def __init__(self, a, b):\n        pass\n",
+        )
+        .expect("write gp v2");
+        set_file_mtime(&gp, FileTime::from_unix_time(2_000_000, 0)).expect("bump gp mtime");
+        let gp_via_link = normalize_path_for_key(&db, &link_ws.join("gp.py"));
+        File::sync_path(&mut db, SystemPath::from_std_path(&gp_via_link).unwrap());
+
+        let r2 = query(&db);
+        assert_eq!(
+            r2.init().map(|s| s.parameters.len()),
+            Some(3),
+            "a real __init__ change must invalidate the MRO memo even when the \
+             workspace is reached through a symlink"
+        );
     }
 
     #[test]
