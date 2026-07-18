@@ -732,16 +732,21 @@ impl LanguageServer for HydraLspBackend {
                     1 | 2 => (1, 1),
                     n => (2, n - 2),
                 };
-                *self.latency_pool.lock() = rayon::ThreadPoolBuilder::new()
+                let latency_pool = rayon::ThreadPoolBuilder::new()
                     .num_threads(latency)
                     .thread_name(|i| format!("hydra-latency-{i}"))
                     .build()
                     .expect("failed to build latency thread pool");
-                *self.worker_pool.lock() = rayon::ThreadPoolBuilder::new()
+                let old = std::mem::replace(&mut *self.latency_pool.lock(), latency_pool);
+                drop(old);
+
+                let worker_pool = rayon::ThreadPoolBuilder::new()
                     .num_threads(worker)
                     .thread_name(|i| format!("hydra-worker-{i}"))
                     .build()
                     .expect("failed to build worker thread pool");
+                let old = std::mem::replace(&mut *self.worker_pool.lock(), worker_pool);
+                drop(old);
                 self.client
                     .log_message(
                         MessageType::INFO,
