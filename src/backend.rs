@@ -2,6 +2,7 @@ use dashmap::DashMap;
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use tower_lsp::jsonrpc::{Error, Result};
@@ -304,17 +305,15 @@ pub struct HydraLspBackend {
     /// Per-URI overhead is therefore O(slot header), independent of file
     /// size. Per-query LRUs (`lru = 512`) bound cached computation memory.
     document_inputs: DashMap<Url, DocumentInput>,
-    /// Two-thread rayon pool dedicated to latency-sensitive operations
-    /// (hover, signature_help, goto_definition). Isolated from the worker
-    /// pool so that a long diagnostics run never queues behind a hover.
-    /// Wrapped in a Mutex so `initialize` can rebuild it with a user-supplied
-    /// thread count; the lock is held only for the duration of `spawn`, which
-    /// merely enqueues a closure.
-    latency_pool: parking_lot::Mutex<rayon::ThreadPool>,
+    /// Rayon pool dedicated to latency-sensitive operations (hover,
+    /// signature_help, goto_definition). Isolated from the worker pool so that
+    /// a long diagnostics run never queues behind a hover. Built exactly once, in
+    /// `initialize`, where the user's `numThreads` setting is available.
+    latency_pool: OnceLock<rayon::ThreadPool>,
     /// Rayon pool for background work (diagnostics validation, future
-    /// workspace-wide analysis). Sized to available_parallelism − 2,
-    /// clamped to at least 1. See `latency_pool` for the Mutex rationale.
-    worker_pool: parking_lot::Mutex<rayon::ThreadPool>,
+    /// workspace-wide analysis). Sized to available_parallelism − 2, clamped to
+    /// at least 1, unless overridden by `numThreads`.
+    worker_pool: OnceLock<rayon::ThreadPool>,
     /// Whether the client advertised `workspace/didChangeWatchedFiles`
     /// dynamic registration in its `initialize` capabilities. Captured in
     /// `initialize` and read in `initialized` to decide whether to register the
@@ -370,7 +369,7 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// any `.await` suspension — so callers do not need to hold a reference across
 /// yield points.
 fn spawn_on_pool<F, R>(
-    pool: &parking_lot::Mutex<rayon::ThreadPool>,
+    pool: &OnceLock<rayon::ThreadPool>,
     f: F,
 ) -> tokio::sync::oneshot::Receiver<PoolOutcome<R>>
 where
@@ -378,7 +377,11 @@ where
     R: Send + 'static,
 {
     let (tx, rx) = tokio::sync::oneshot::channel();
-    pool.lock().spawn(move || {
+    let Some(pool) = pool.get() else {
+        // Sender dropped on return; receiver resolves to RecvError.
+        return rx;
+    };
+    pool.spawn(move || {
         let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
             Ok(r) => PoolOutcome::Completed(r),
             Err(payload) => {
@@ -431,32 +434,13 @@ impl std::fmt::Debug for HydraLspBackend {
 
 impl HydraLspBackend {
     pub fn new(client: Client) -> Self {
-        let worker_threads = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
-            .saturating_sub(2)
-            .max(1);
-        let latency_pool = parking_lot::Mutex::new(
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(2)
-                .thread_name(|i| format!("hydra-latency-{i}"))
-                .build()
-                .expect("failed to build latency thread pool"),
-        );
-        let worker_pool = parking_lot::Mutex::new(
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(worker_threads)
-                .thread_name(|i| format!("hydra-worker-{i}"))
-                .build()
-                .expect("failed to build worker thread pool"),
-        );
         Self {
             client,
             settings: Arc::new(RwLock::new(Settings::default())),
             session: Arc::new(parking_lot::RwLock::new(None)),
             document_inputs: DashMap::new(),
-            latency_pool,
-            worker_pool,
+            latency_pool: OnceLock::new(),
+            worker_pool: OnceLock::new(),
             watched_files_dynamic: AtomicBool::new(false),
             watched_files_relative_patterns: AtomicBool::new(false),
         }
@@ -724,6 +708,7 @@ impl LanguageServer for HydraLspBackend {
             .await;
 
         // Parse initialization options
+        let mut num_threads: Option<usize> = None;
         if let Some(init_options) = params.initialization_options
             && let Some(settings) = init_options.get("settings")
         {
@@ -755,7 +740,7 @@ impl LanguageServer for HydraLspBackend {
                 .map(|n| n.get())
                 .unwrap_or(4)
                 .saturating_mul(8);
-            let num_threads = settings
+            num_threads = settings
                 .get("numThreads")
                 .and_then(|v| v.as_u64())
                 .map(|n| (n as usize).clamp(1, max_threads));
@@ -768,44 +753,6 @@ impl LanguageServer for HydraLspBackend {
                 }
                 s.disabled_rules = parsed_rules;
                 s.features = toggles;
-            }
-
-            // Rebuild thread pools if the user specified a total thread count.
-            if let Some(total) = num_threads {
-                // For total >= 3, reserve two latency threads; for smaller
-                // totals give each pool one thread. Every branch keeps both
-                // counts >= 1 (rayon treats num_threads(0) as "auto-detect",
-                // which would silently over-allocate).
-                let (latency, worker) = match total {
-                    1 | 2 => (1, 1),
-                    n => (2, n - 2),
-                };
-                let latency_pool = rayon::ThreadPoolBuilder::new()
-                    .num_threads(latency)
-                    .thread_name(|i| format!("hydra-latency-{i}"))
-                    .build()
-                    .expect("failed to build latency thread pool");
-                let old = std::mem::replace(&mut *self.latency_pool.lock(), latency_pool);
-                drop(old);
-
-                let worker_pool = rayon::ThreadPoolBuilder::new()
-                    .num_threads(worker)
-                    .thread_name(|i| format!("hydra-worker-{i}"))
-                    .build()
-                    .expect("failed to build worker thread pool");
-                let old = std::mem::replace(&mut *self.worker_pool.lock(), worker_pool);
-                drop(old);
-                self.client
-                    .log_message(
-                        MessageType::INFO,
-                        format!(
-                            "Thread pools configured: {} latency + {} worker ({} total)",
-                            latency,
-                            worker,
-                            latency + worker
-                        ),
-                    )
-                    .await;
             }
 
             // Log after releasing the lock
@@ -836,6 +783,60 @@ impl LanguageServer for HydraLspBackend {
                         format!("Disabled features: {:?}", disabled_features),
                     )
                     .await;
+            }
+        }
+
+        // Build the two rayon pools exactly once, when `numThreads` is known.
+        // `numThreads` is the total across both pools. Every branch keeps both
+        // counts >= 1 (rayon treats num_threads(0) as "auto-detect", which would
+        // silently over-allocate).
+        let (latency, worker) = match num_threads {
+            Some(1) | Some(2) => (1, 1),
+            Some(n) => (2, n - 2),
+            None => {
+                let worker = std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(4)
+                    .saturating_sub(2)
+                    .max(1);
+                (2, worker)
+            }
+        };
+        match (
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(latency)
+                .thread_name(|i| format!("hydra-latency-{i}"))
+                .build(),
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(worker)
+                .thread_name(|i| format!("hydra-worker-{i}"))
+                .build(),
+        ) {
+            (Ok(latency_pool), Ok(worker_pool)) => {
+                // `set` cannot fail: `initialize` is the sole writer, once.
+                let _ = self.latency_pool.set(latency_pool);
+                let _ = self.worker_pool.set(worker_pool);
+                self.client
+                    .log_message(
+                        MessageType::INFO,
+                        format!(
+                            "Thread pools configured: {} latency + {} worker ({} total)",
+                            latency,
+                            worker,
+                            latency + worker
+                        ),
+                    )
+                    .await;
+            }
+            _ => {
+                let msg = format!(
+                    "Failed to build thread pools ({latency} latency + {worker} worker); \
+                     the OS refused thread creation"
+                );
+                self.client.log_message(MessageType::ERROR, &msg).await;
+                let mut err = Error::internal_error();
+                err.message = msg.into();
+                return Err(err);
             }
         }
 
@@ -1783,13 +1784,15 @@ mod tests {
     use salsa::{Database as _, Setter};
     use std::time::Duration;
 
-    fn single_thread_pool() -> parking_lot::Mutex<rayon::ThreadPool> {
-        parking_lot::Mutex::new(
+    fn single_thread_pool() -> OnceLock<rayon::ThreadPool> {
+        let cell = OnceLock::new();
+        let _ = cell.set(
             rayon::ThreadPoolBuilder::new()
                 .num_threads(1)
                 .build()
                 .expect("failed to build test pool"),
-        )
+        );
+        cell
     }
 
     // --- Test A: spawn_on_pool contract ---
