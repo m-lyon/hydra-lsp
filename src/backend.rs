@@ -216,6 +216,54 @@ impl Session {
         site_packages_pth_states.insert(key, site_packages_pth_state);
         site_packages_pth_state
     }
+
+    /// Bump the tracked `.pth` inventory revision for each changed directory so
+    /// `parse_pth_files` re-scans it — but only when the directory is actually
+    /// one of the resolver's site-packages search paths.
+    ///
+    /// Both `directories` and `python_cache::site_packages_paths` go through
+    /// `normalize_site_packages_pth_state_key` so the watched-event path and the
+    /// discovered site-packages path agree despite symlink, case, or trailing separator
+    /// differences.
+    ///
+    /// Returns the number of directories actually tracked.
+    fn bump_site_packages_pth_states(&self, directories: &HashSet<std::path::PathBuf>) -> usize {
+        if directories.is_empty() {
+            return 0;
+        }
+        // Canonical keys of the directories the resolver treats as site-packages.
+        let known_site_packages_keys: HashSet<String> = {
+            let db = self.db.lock();
+            python_cache::site_packages_paths(&*db, self.python_config)
+                .iter()
+                .map(|p| normalize_site_packages_pth_state_key(p.as_std_path()))
+                .collect()
+        };
+        let mut tracked = 0usize;
+        for directory in directories {
+            if !known_site_packages_keys.contains(&normalize_site_packages_pth_state_key(directory))
+            {
+                continue;
+            }
+            // `ensure_site_packages_pth_state` takes its own locks; we hold none.
+            let site_packages_pth_state = self.ensure_site_packages_pth_state(directory);
+            let mut db = self.db.lock();
+            let next_revision = site_packages_pth_state.revision(&*db) + 1;
+            site_packages_pth_state
+                .set_revision(&mut *db)
+                .to(next_revision);
+            tracked += 1;
+        }
+        tracked
+    }
+
+    /// Number of directories currently tracked in the runtime `.pth` state map.
+    /// Test-only observability for the site-packages gating in
+    /// `bump_site_packages_pth_states`.
+    #[cfg(test)]
+    fn site_packages_pth_state_count(&self) -> usize {
+        self.site_packages_pth_states.read().len()
+    }
 }
 
 /// Cheap, send-safe view of the analysis state. Produced by
@@ -1061,7 +1109,7 @@ impl LanguageServer for HydraLspBackend {
             );
             return;
         }
-        let synced = self
+        let (synced, tracked_dirs) = self
             .with_session("watching files", |s| {
                 let mut synced = 0usize;
                 {
@@ -1074,24 +1122,15 @@ impl LanguageServer for HydraLspBackend {
                         synced += 1;
                     }
                 }
-                // `ensure_site_packages_pth_state` takes its own locks;
-                // release the db write lock above before calling so we don't
-                // deadlock.
-                for directory in &site_packages_pth_state_dirs {
-                    let site_packages_pth_state = s.ensure_site_packages_pth_state(directory);
-                    let mut db = s.db.lock();
-                    let next_revision = site_packages_pth_state.revision(&*db) + 1;
-                    site_packages_pth_state
-                        .set_revision(&mut *db)
-                        .to(next_revision);
-                }
-                synced
+                let tracked_dirs = s.bump_site_packages_pth_states(&site_packages_pth_state_dirs);
+                (synced, tracked_dirs)
             })
-            .unwrap_or(0);
+            .unwrap_or((0, 0));
         tracing::debug!(
             changed = params.changes.len(),
             synced,
-            site_packages_pth_state_dirs = site_packages_pth_state_dirs.len(),
+            site_packages_pth_state_candidate_dirs = site_packages_pth_state_dirs.len(),
+            site_packages_pth_state_tracked_dirs = tracked_dirs,
             "watched files changed; synced python analysis inputs"
         );
     }
@@ -1863,5 +1902,147 @@ mod tests {
             "expected Cancelled, got {outcome:?}"
         );
         writer.join().expect("writer thread panicked");
+    }
+
+    // --- Test D: site-packages gating in bump_site_packages_pth_states ---
+
+    /// Build a minimal on-disk venv so `discover_python_environment` returns a
+    /// real site-packages directory. Discovery uses a real `OsSystem` (not the
+    /// db's system), so this must be an actual filesystem layout, not an
+    /// in-memory one — it mirrors `python_analyzer`'s in-memory `create_mock_venv`.
+    /// The returned `TempDir` must be kept alive for the venv to persist.
+    fn session_with_real_venv() -> (Session, std::path::PathBuf, tempfile::TempDir) {
+        use std::fs;
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let venv = tmp.path().to_path_buf();
+        let version = "3.11";
+        let (exe, site_packages) = if cfg!(target_os = "windows") {
+            (
+                venv.join(r"Scripts\python.exe"),
+                venv.join(r"Lib\site-packages"),
+            )
+        } else {
+            (
+                venv.join("bin/python"),
+                venv.join(format!("lib/python{version}/site-packages")),
+            )
+        };
+        fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        fs::write(&exe, "").unwrap();
+        fs::create_dir_all(&site_packages).unwrap();
+        fs::write(
+            venv.join("pyvenv.cfg"),
+            format!("home = {}\nversion = {version}\n", venv.display()),
+        )
+        .unwrap();
+
+        let db = HydraDatabase::new(SystemPath::new(venv.to_str().unwrap()));
+        let python_config = PythonConfig::new(
+            &db,
+            Some(venv.to_string_lossy().into_owned()),
+            Some(venv.to_string_lossy().into_owned()),
+            vec![],
+        );
+        let session = Session {
+            db: parking_lot::Mutex::new(db),
+            python_config,
+            site_packages_pth_states: parking_lot::RwLock::new(HashMap::new()),
+        };
+        (session, site_packages, tmp)
+    }
+
+    /// A `.pth` change in the real site-packages dir is tracked; a change in an
+    /// unrelated directory in the same batch is skipped. This is the core of the
+    /// gating fix: unrelated `.pth` files must not grow the stores.
+    #[test]
+    fn bump_tracks_only_real_site_packages_dirs() {
+        let (session, site_packages, _tmp) = session_with_real_venv();
+        let unrelated = site_packages.parent().unwrap().join("not-site-packages");
+        std::fs::create_dir_all(&unrelated).unwrap();
+
+        let mut dirs = HashSet::new();
+        dirs.insert(site_packages);
+        dirs.insert(unrelated);
+
+        let tracked = session.bump_site_packages_pth_states(&dirs);
+        assert_eq!(tracked, 1, "only the real site-packages dir should track");
+        assert_eq!(
+            session.site_packages_pth_state_count(),
+            1,
+            "the unrelated dir must not add an entry to the runtime map"
+        );
+    }
+
+    /// A `.pth` change with no site-packages match adds nothing — the exact
+    /// unbounded-growth scenario the fix closes (an unrelated `foo.pth` anywhere
+    /// in the watched tree).
+    #[test]
+    fn bump_skips_unrelated_dir_entirely() {
+        let (session, site_packages, _tmp) = session_with_real_venv();
+        let unrelated = site_packages.parent().unwrap().join("scratch");
+        std::fs::create_dir_all(&unrelated).unwrap();
+
+        let mut dirs = HashSet::new();
+        dirs.insert(unrelated);
+
+        assert_eq!(session.bump_site_packages_pth_states(&dirs), 0);
+        assert_eq!(
+            session.site_packages_pth_state_count(),
+            0,
+            "an unrelated dir must never grow the map"
+        );
+    }
+
+    /// Repeated `.pth` events for the same real dir bump the revision each time
+    /// (so `parse_pth_files` re-scans) but never grow the map past one entry —
+    /// dedup via `ensure_site_packages_pth_state`.
+    #[test]
+    fn bump_is_idempotent_across_repeated_events() {
+        let (session, site_packages, _tmp) = session_with_real_venv();
+        let mut dirs = HashSet::new();
+        dirs.insert(site_packages);
+
+        assert_eq!(session.bump_site_packages_pth_states(&dirs), 1);
+        let state = *session
+            .site_packages_pth_states
+            .read()
+            .values()
+            .next()
+            .expect("one tracked state");
+        let rev1 = state.revision(&*session.db.lock());
+
+        assert_eq!(session.bump_site_packages_pth_states(&dirs), 1);
+        let rev2 = state.revision(&*session.db.lock());
+
+        assert_eq!(
+            session.site_packages_pth_state_count(),
+            1,
+            "repeated events must not grow the map"
+        );
+        assert!(
+            rev2 > rev1,
+            "each event must bump the revision so the directory scan is recomputed"
+        );
+    }
+
+    /// The gate normalizes both sides, so a candidate path differing from the
+    /// discovered path only by a trailing separator must still match. Regression
+    /// guard for the normalization symmetry the `.pth` invalidation relies on
+    /// (discovery also canonicalizes symlinked prefixes, e.g. macOS
+    /// `/var` → `/private/var`, which this same normalization absorbs).
+    #[test]
+    fn bump_matches_site_packages_despite_trailing_separator() {
+        let (session, site_packages, _tmp) = session_with_real_venv();
+        let mut with_sep = site_packages.into_os_string();
+        with_sep.push(std::path::MAIN_SEPARATOR.to_string());
+
+        let mut dirs = HashSet::new();
+        dirs.insert(std::path::PathBuf::from(with_sep));
+
+        assert_eq!(
+            session.bump_site_packages_pth_states(&dirs),
+            1,
+            "a trailing-separator variant of the site-packages path must still match"
+        );
     }
 }
