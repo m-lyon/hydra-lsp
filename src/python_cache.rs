@@ -20,7 +20,8 @@ use tracing::debug;
 /// changing its values invalidates cached module-resolution results. Per-file
 /// invalidation for watched Python source and existing `.pth` edits is handled
 /// separately via `ruff_db::files::File::sync_path` in the LSP backend, while
-/// `.pth` create/delete events update the per-directory state handles below.
+/// `.pth` create/delete events bump the enclosing site-packages `FileRoot`
+/// revision via `ruff_db::files::Files::touch_root`.
 #[salsa::input]
 pub struct PythonConfig {
     /// Workspace root directory path.
@@ -30,19 +31,6 @@ pub struct PythonConfig {
     /// Configured Python interpreter path.
     #[returns(ref)]
     pub interpreter: Option<String>,
-
-    /// Tracked state for site-packages directories whose `.pth` members can
-    /// affect editable-install resolution.
-    #[returns(ref)]
-    pub site_packages_pth_states: Vec<SitePackagesPthState>,
-}
-
-/// Tracked revision for the `.pth` state of one site-packages directory.
-#[salsa::input]
-pub struct SitePackagesPthState {
-    #[returns(ref)]
-    pub directory: String,
-    pub revision: u64,
 }
 
 /// Interned target string for cache key deduplication.
@@ -144,15 +132,16 @@ pub fn site_packages_paths(db: &dyn ruff_db::Db, config: PythonConfig) -> Vec<Sy
 /// Builds the ordered search-path list that module resolution walks:
 /// `[workspace_root, ".", site_packages_0, pth_paths_0…, site_packages_1, …]`.
 ///
-/// Recomputes only when `PythonConfig`'s `workspace_root`, `interpreter`, or
-/// `site_packages_pth_states` fields change, not on every module resolution call.
+/// Recomputes when `PythonConfig`'s `workspace_root` or `interpreter` fields
+/// change, and — via `PythonAnalyzer::parse_pth_files`'s dependency (called within
+/// PythonAnalyzer::build_search_paths) on each site-packages `FileRoot` revision —
+/// when a `.pth` file is created or deleted in a site-packages directory.
 #[salsa::tracked(returns(ref))]
 pub fn search_paths_for_config(db: &dyn ruff_db::Db, config: PythonConfig) -> Vec<PathBuf> {
     let workspace_root = config.workspace_root(db).as_deref().map(Path::new);
     let site_packages = site_packages_paths(db, config);
-    let pth_states = config.site_packages_pth_states(db);
 
-    PythonAnalyzer::build_search_paths(db, workspace_root, site_packages.clone(), Some(pth_states))
+    PythonAnalyzer::build_search_paths(db, workspace_root, site_packages)
 }
 
 /// Cached module path → file path resolution.
@@ -469,6 +458,7 @@ mod tests {
     use super::*;
     use crate::database::HydraDatabase;
     use crate::database::tests::TestDb;
+    use ruff_db::Db;
     use ruff_db::system::SystemPath;
     use salsa::Setter;
     use std::path::Path;
@@ -484,21 +474,7 @@ mod tests {
         db: &'db dyn ruff_db::Db,
         site_packages: SitePackagesPath<'db>,
     ) -> Vec<PathBuf> {
-        PythonAnalyzer::parse_pth_files(db, Path::new(site_packages.path(db)), None)
-    }
-
-    #[salsa::tracked(returns(ref))]
-    fn tracked_pth_paths_with_site_packages_state<'db>(
-        db: &'db dyn ruff_db::Db,
-        config: PythonConfig,
-        site_packages: SitePackagesPath<'db>,
-    ) -> Vec<PathBuf> {
-        let site_packages_pth_states = config.site_packages_pth_states(db);
-        PythonAnalyzer::parse_pth_files(
-            db,
-            Path::new(site_packages.path(db)),
-            Some(site_packages_pth_states.as_slice()),
-        )
+        PythonAnalyzer::parse_pth_files(db, Path::new(site_packages.path(db)))
     }
 
     fn examples_dir() -> PathBuf {
@@ -514,7 +490,7 @@ mod tests {
     #[test]
     fn test_site_packages_paths_no_config() {
         let db = real_fs_db();
-        let config = PythonConfig::new(&db, None, None, vec![]);
+        let config = PythonConfig::new(&db, None, None);
         // Should not panic; returns whatever the current-dir discovery finds (possibly empty).
         let paths = site_packages_paths(&db, config);
         // Result is a Vec<SystemPathBuf>; we can't assert a specific value since it
@@ -526,12 +502,7 @@ mod tests {
     fn test_site_packages_paths_cache_hit() {
         let db = real_fs_db();
         let examples = examples_dir();
-        let config = PythonConfig::new(
-            &db,
-            Some(examples.to_string_lossy().to_string()),
-            None,
-            vec![],
-        );
+        let config = PythonConfig::new(&db, Some(examples.to_string_lossy().to_string()), None);
         let result1 = site_packages_paths(&db, config);
         let result2 = site_packages_paths(&db, config);
         // Pointer equality: salsa returns the same Arc on a cache hit.
@@ -542,12 +513,7 @@ mod tests {
     fn test_site_packages_paths_invalidation_on_interpreter_change() {
         let mut db = real_fs_db();
         let examples = examples_dir();
-        let config = PythonConfig::new(
-            &db,
-            Some(examples.to_string_lossy().to_string()),
-            None,
-            vec![],
-        );
+        let config = PythonConfig::new(&db, Some(examples.to_string_lossy().to_string()), None);
         let result1 = site_packages_paths(&db, config).clone();
 
         // Changing the interpreter invalidates the memo.
@@ -569,12 +535,7 @@ mod tests {
     fn test_search_paths_for_config_contains_workspace_root() {
         let db = real_fs_db();
         let examples = examples_dir();
-        let config = PythonConfig::new(
-            &db,
-            Some(examples.to_string_lossy().to_string()),
-            None,
-            vec![],
-        );
+        let config = PythonConfig::new(&db, Some(examples.to_string_lossy().to_string()), None);
         let paths = search_paths_for_config(&db, config);
         assert!(
             paths.iter().any(|p| p == &examples),
@@ -589,7 +550,7 @@ mod tests {
     #[test]
     fn test_search_paths_for_config_cache_hit() {
         let db = real_fs_db();
-        let config = PythonConfig::new(&db, None, None, vec![]);
+        let config = PythonConfig::new(&db, None, None);
         let r1 = search_paths_for_config(&db, config);
         let r2 = search_paths_for_config(&db, config);
         assert!(std::ptr::eq(r1 as *const _, r2 as *const _));
@@ -598,29 +559,21 @@ mod tests {
     #[test]
     fn test_python_config_fields() {
         let db = TestDb::new();
-        let config = PythonConfig::new(&db, Some("/workspace".to_string()), None, vec![]);
+        let config = PythonConfig::new(&db, Some("/workspace".to_string()), None);
         assert_eq!(config.workspace_root(&db).as_deref(), Some("/workspace"));
         assert_eq!(config.interpreter(&db).as_deref(), None);
-        assert!(config.site_packages_pth_states(&db).is_empty());
     }
 
     #[test]
     fn test_python_config_update() {
         let mut db = TestDb::new();
-        let config = PythonConfig::new(&db, None, None, vec![]);
+        let config = PythonConfig::new(&db, None, None);
         assert!(config.interpreter(&db).is_none());
 
         config
             .set_interpreter(&mut db)
             .to(Some("/usr/bin/python3".to_string()));
         assert_eq!(config.interpreter(&db).as_deref(), Some("/usr/bin/python3"));
-
-        let site_packages_pth_state =
-            SitePackagesPthState::new(&db, "/workspace/site-packages".to_string(), 0);
-        config
-            .set_site_packages_pth_states(&mut db)
-            .to(vec![site_packages_pth_state]);
-        assert!(config.site_packages_pth_states(&db) == &[site_packages_pth_state]);
     }
 
     #[test]
@@ -642,12 +595,7 @@ mod tests {
     fn test_cached_definition_info_valid_target() {
         let db = real_fs_db();
         let workspace = examples_dir();
-        let config = PythonConfig::new(
-            &db,
-            Some(workspace.to_string_lossy().to_string()),
-            None,
-            vec![],
-        );
+        let config = PythonConfig::new(&db, Some(workspace.to_string_lossy().to_string()), None);
         let target = TargetString::new(&db, "my_module.DataLoader".to_string());
         let result = cached_definition_info(&db, config, target);
 
@@ -660,12 +608,7 @@ mod tests {
     fn test_cached_definition_info_invalid_target() {
         let db = TestDb::new();
         let workspace = examples_dir();
-        let config = PythonConfig::new(
-            &db,
-            Some(workspace.to_string_lossy().to_string()),
-            None,
-            vec![],
-        );
+        let config = PythonConfig::new(&db, Some(workspace.to_string_lossy().to_string()), None);
         let target = TargetString::new(&db, "nonexistent.Module".to_string());
         let result = cached_definition_info(&db, config, target);
         assert!(result.get().is_err());
@@ -675,12 +618,7 @@ mod tests {
     fn test_cached_definition_info_cache_hit() {
         let db = real_fs_db();
         let workspace = examples_dir();
-        let config = PythonConfig::new(
-            &db,
-            Some(workspace.to_string_lossy().to_string()),
-            None,
-            vec![],
-        );
+        let config = PythonConfig::new(&db, Some(workspace.to_string_lossy().to_string()), None);
         let target = TargetString::new(&db, "my_module.DataLoader".to_string());
 
         let result1 = cached_definition_info(&db, config, target);
@@ -694,12 +632,7 @@ mod tests {
     fn test_cached_definition_info_function_target() {
         let db = real_fs_db();
         let workspace = examples_dir();
-        let config = PythonConfig::new(
-            &db,
-            Some(workspace.to_string_lossy().to_string()),
-            None,
-            vec![],
-        );
+        let config = PythonConfig::new(&db, Some(workspace.to_string_lossy().to_string()), None);
         let target = TargetString::new(&db, "my_module.create_model".to_string());
         let result = cached_definition_info(&db, config, target);
 
@@ -712,12 +645,7 @@ mod tests {
     fn test_cached_definition_info_invalidation_on_config_change() {
         let mut db = real_fs_db();
         let workspace = examples_dir();
-        let config = PythonConfig::new(
-            &db,
-            Some(workspace.to_string_lossy().to_string()),
-            None,
-            vec![],
-        );
+        let config = PythonConfig::new(&db, Some(workspace.to_string_lossy().to_string()), None);
 
         let result1 = {
             let target = TargetString::new(&db, "my_module.DataLoader".to_string());
@@ -764,12 +692,7 @@ mod tests {
             .expect("set initial mtime");
 
         let mut db = real_fs_db();
-        let config = PythonConfig::new(
-            &db,
-            Some(workspace.to_string_lossy().to_string()),
-            None,
-            vec![],
-        );
+        let config = PythonConfig::new(&db, Some(workspace.to_string_lossy().to_string()), None);
         let result1 = {
             let target = TargetString::new(&db, "watched_module.WatchedClass".to_string());
             cached_definition_info(&db, config, target)
@@ -845,10 +768,8 @@ mod tests {
     }
 
     #[test]
-    fn test_site_packages_pth_state_invalidation_on_file_create() {
-        use crate::python_analyzer::normalize_site_packages_pth_state_key;
-        use filetime::{FileTime, set_file_mtime};
-        use ruff_db::files::File;
+    fn test_site_packages_pth_root_invalidation_on_file_create() {
+        use ruff_db::files::Files;
         use std::fs;
         use tempfile::TempDir;
 
@@ -859,30 +780,30 @@ mod tests {
         fs::create_dir_all(&editable_src).expect("create editable src dir");
 
         let mut db = real_fs_db();
-        // Inventory key must go through the same normalization that
-        // `parse_pth_files` applies to its lookup side; otherwise the lookup
-        // misses and the salsa dep on `inventory.revision` is never registered.
-        let inventory_key = normalize_site_packages_pth_state_key(&site_packages);
-        let site_packages_pth_state = SitePackagesPthState::new(&db, inventory_key, 0);
-        let config = PythonConfig::new(&db, None, None, vec![site_packages_pth_state]);
+        let site_packages_sys = SystemPath::from_std_path(&site_packages).unwrap();
+
+        // Register the site-packages directory as a `FileRoot`, exactly as
+        // `site_packages_paths` does in production. `parse_pth_files` then reads
+        // this root's revision, so bumping it invalidates the directory scan.
+        db.files()
+            .try_add_root(&db, site_packages_sys, FileRootKind::LibrarySearchPath);
+
         let site_packages_str = site_packages.to_string_lossy().to_string();
         let result1 = {
             let site_packages_key = SitePackagesPath::new(&db, site_packages_str.clone());
-            tracked_pth_paths_with_site_packages_state(&db, config, site_packages_key).clone()
+            tracked_pth_paths(&db, site_packages_key).clone()
         };
         assert!(result1.is_empty());
 
+        // Create a `.pth` file and bump the enclosing root, exactly as
+        // `did_change_watched_files` does on a `.pth` CREATE event.
         let pth_file = site_packages.join("editable_package.pth");
         fs::write(&pth_file, "../src\n").expect("write pth");
-        set_file_mtime(&pth_file, FileTime::from_unix_time(1_000_000, 0)).expect("set pth mtime");
-
-        let sys_path = SystemPath::from_std_path(&pth_file).unwrap();
-        File::sync_path(&mut db, sys_path);
-        site_packages_pth_state.set_revision(&mut db).to(1);
+        Files::touch_root(&mut db, site_packages_sys);
 
         let result2 = {
             let site_packages_key = SitePackagesPath::new(&db, site_packages_str);
-            tracked_pth_paths_with_site_packages_state(&db, config, site_packages_key).clone()
+            tracked_pth_paths(&db, site_packages_key).clone()
         };
         assert_eq!(result2.len(), 1);
         assert_eq!(

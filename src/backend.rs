@@ -1,6 +1,6 @@
 use dashmap::DashMap;
 use parking_lot::RwLock;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -9,16 +9,15 @@ use tower_lsp::jsonrpc::{Error, Result};
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
 
-use ruff_db::files::File;
+use ruff_db::Db;
+use ruff_db::files::{File, Files};
 use ruff_db::system::SystemPath;
 use salsa::Setter;
 
 use crate::database::HydraDatabase;
 use crate::diagnostics::{self, DiagnosticRule};
-use crate::python_analyzer::{
-    DefinitionInfo, ParameterInfo, PythonAnalyzer, normalize_site_packages_pth_state_key,
-};
-use crate::python_cache::{self, PythonConfig, SitePackagesPthState, TargetString};
+use crate::python_analyzer::{DefinitionInfo, ParameterInfo, PythonAnalyzer};
+use crate::python_cache::{self, PythonConfig, TargetString};
 use crate::yaml_cache::{self, DocumentInput, ParsedYaml};
 use crate::yaml_parser::{
     ARGS_KEY, CONVERT_KEY, CompletionContext, ConvertMode, HydraSemanticToken, PARTIAL_KEY,
@@ -154,18 +153,9 @@ pub struct Settings {
 /// acquire it long enough to mutate a salsa input. The expensive work runs
 /// on independent snapshots outside the lock — see `Session::snapshot`.
 ///
-/// `site_packages_pth_states` is a runtime index from normalized directory
-/// path to the corresponding `SitePackagesPthState` Salsa handle. It exists
-/// for fast lookup and deduplication in `ensure_site_packages_pth_state`; the
-/// salsa-tracked list of states still lives on
-/// `python_config.site_packages_pth_states`. This map is guarded by a
-/// separate `RwLock` so that the read hot path never touches it.
-/// The only mutation site is `ensure_site_packages_pth_state`, called from
-/// `did_change_watched_files`.
 struct Session {
     db: parking_lot::Mutex<HydraDatabase>,
     python_config: PythonConfig,
-    site_packages_pth_states: parking_lot::RwLock<HashMap<String, SitePackagesPthState>>,
 }
 
 impl Session {
@@ -184,86 +174,31 @@ impl Session {
         }
     }
 
-    /// Look up or create a `SitePackagesPthState` for `directory`, returning the
-    /// salsa handle.
+    /// Bump the enclosing site-packages `FileRoot` revision for each changed
+    /// directory so `parse_pth_files` re-scans it — but only when the directory
+    /// is actually a registered library root (i.e. one of the resolver's
+    /// site-packages search paths).
     ///
-    /// Uses double-checked locking on `site_packages_pth_states` so the common
-    /// "already present" case takes only a read guard. Lock order when
-    /// inserting: `site_packages_pth_states` (write) → `db` (lock). No other code
-    /// path acquires both locks, so there is no cycle.
-    fn ensure_site_packages_pth_state(&self, directory: &std::path::Path) -> SitePackagesPthState {
-        // Normalized so the watched-event side and the discovery side agree
-        // even when the path differs by symlink, case, or trailing separator.
-        // See `python_analyzer::normalize_site_packages_pth_state_key`.
-        let key = normalize_site_packages_pth_state_key(directory);
-        if let Some(site_packages_pth_state) = self.site_packages_pth_states.read().get(&key) {
-            return *site_packages_pth_state;
-        }
-
-        let mut site_packages_pth_states = self.site_packages_pth_states.write();
-        // Re-check after taking the write lock: another thread may have
-        // inserted between our read drop and write acquire.
-        if let Some(site_packages_pth_state) = site_packages_pth_states.get(&key) {
-            return *site_packages_pth_state;
-        }
-
-        let mut db = self.db.lock();
-        let site_packages_pth_state = SitePackagesPthState::new(&*db, key.clone(), 0);
-        let mut config_states = self.python_config.site_packages_pth_states(&*db).clone();
-        config_states.push(site_packages_pth_state);
-        self.python_config
-            .set_site_packages_pth_states(&mut *db)
-            .to(config_states);
-        site_packages_pth_states.insert(key, site_packages_pth_state);
-        site_packages_pth_state
-    }
-
-    /// Bump the tracked `.pth` inventory revision for each changed directory so
-    /// `parse_pth_files` re-scans it — but only when the directory is actually
-    /// one of the resolver's site-packages search paths.
-    ///
-    /// Both `directories` and `python_cache::site_packages_paths` go through
-    /// `normalize_site_packages_pth_state_key` so the watched-event path and the
-    /// discovered site-packages path agree despite symlink, case, or trailing separator
-    /// differences.
-    ///
-    /// Returns the number of directories actually tracked.
-    fn bump_site_packages_pth_states(&self, directories: &HashSet<std::path::PathBuf>) -> usize {
+    /// Returns the number of directories actually bumped.
+    fn bump_site_packages_pth_roots(&self, directories: &HashSet<std::path::PathBuf>) -> usize {
         if directories.is_empty() {
             return 0;
         }
-        // Canonical keys of the directories the resolver treats as site-packages.
-        let known_site_packages_keys: HashSet<String> = {
-            let db = self.db.lock();
-            python_cache::site_packages_paths(&*db, self.python_config)
-                .iter()
-                .map(|p| normalize_site_packages_pth_state_key(p.as_std_path()))
-                .collect()
-        };
-        let mut tracked = 0usize;
+        let mut db = self.db.lock();
+        let mut bumped = 0usize;
         for directory in directories {
-            if !known_site_packages_keys.contains(&normalize_site_packages_pth_state_key(directory))
-            {
+            let Some(sys_path) = SystemPath::from_std_path(directory) else {
                 continue;
+            };
+            // Only registered roots have a revision to bump; `root()` returns
+            // `None` for directories that aren't library search paths, so this
+            // naturally gates on site-packages membership.
+            if db.files().root(&*db, sys_path).is_some() {
+                Files::touch_root(&mut *db, sys_path);
+                bumped += 1;
             }
-            // `ensure_site_packages_pth_state` takes its own locks; we hold none.
-            let site_packages_pth_state = self.ensure_site_packages_pth_state(directory);
-            let mut db = self.db.lock();
-            let next_revision = site_packages_pth_state.revision(&*db) + 1;
-            site_packages_pth_state
-                .set_revision(&mut *db)
-                .to(next_revision);
-            tracked += 1;
         }
-        tracked
-    }
-
-    /// Number of directories currently tracked in the runtime `.pth` state map.
-    /// Test-only observability for the site-packages gating in
-    /// `bump_site_packages_pth_states`.
-    #[cfg(test)]
-    fn site_packages_pth_state_count(&self) -> usize {
-        self.site_packages_pth_states.read().len()
+        bumped
     }
 }
 
@@ -283,9 +218,8 @@ pub struct HydraLspBackend {
     /// arrived before `initialize` (LSP protocol violation) — handlers log
     /// a warning and ignore the event. The outer `RwLock` only guards the
     /// `Option`; once set, concurrent reads share the inner `Session`'s
-    /// fine-grained locks (db, site_packages_pth_states) so unrelated operations do
-    /// not all have to proceed sequentially through a single backend-wide
-    /// mutex.
+    /// db lock so unrelated operations do not all have to proceed sequentially
+    /// through a single backend-wide mutex.
     session: Arc<parking_lot::RwLock<Option<Session>>>,
     /// Map from document URI to its salsa input handle.
     ///
@@ -481,11 +415,10 @@ impl HydraLspBackend {
         };
         let cwd = SystemPath::new(&workspace_root);
         let db = HydraDatabase::new(cwd);
-        let python_config = PythonConfig::new(&db, Some(workspace_root), interpreter, vec![]);
+        let python_config = PythonConfig::new(&db, Some(workspace_root), interpreter);
         *self.session.write() = Some(Session {
             db: parking_lot::Mutex::new(db),
             python_config,
-            site_packages_pth_states: parking_lot::RwLock::new(HashMap::new()),
         });
         Ok(())
     }
@@ -509,9 +442,9 @@ impl HydraLspBackend {
     /// rather than panic.
     ///
     /// The outer `RwLock` guard is held for the duration of `f`, but `f`
-    /// only sees `&Session` — the inner db and site_packages_pth_states locks are
-    /// acquired by `f` itself, so concurrent callers with different access
-    /// patterns do not serialize on the outer lock.
+    /// only sees `&Session` — the inner db lock is acquired by `f` itself, so
+    /// concurrent callers with different access patterns do not serialize on the
+    /// outer lock.
     fn with_session<T>(&self, context: &'static str, f: impl FnOnce(&Session) -> T) -> Option<T> {
         let session = self.session.read();
         if session.is_none() {
@@ -1071,12 +1004,12 @@ impl LanguageServer for HydraLspBackend {
         // Syncing existing files bumps the per-file revision inside ruff_db so
         // any query that read them through `source_text` is invalidated on the
         // next request. For `.pth` create/delete events we also bump the
-        // tracked inventory for that site-packages directory so the directory
-        // scan is recomputed.
+        // enclosing site-packages `FileRoot` revision so the directory scan in
+        // `parse_pth_files` is recomputed.
         if params.changes.is_empty() {
             return;
         }
-        let mut site_packages_pth_state_dirs = HashSet::new();
+        let mut pth_root_dirs = HashSet::new();
         let tracked_paths: Vec<std::path::PathBuf> = params
             .changes
             .iter()
@@ -1095,7 +1028,7 @@ impl LanguageServer for HydraLspBackend {
                             FileChangeType::CREATED | FileChangeType::DELETED
                         ) && let Some(parent) = path.parent()
                         {
-                            site_packages_pth_state_dirs.insert(parent.to_path_buf());
+                            pth_root_dirs.insert(parent.to_path_buf());
                         }
                         Some(path)
                     }
@@ -1103,14 +1036,14 @@ impl LanguageServer for HydraLspBackend {
                 }
             })
             .collect();
-        if tracked_paths.is_empty() && site_packages_pth_state_dirs.is_empty() {
+        if tracked_paths.is_empty() && pth_root_dirs.is_empty() {
             tracing::debug!(
                 changed = params.changes.len(),
                 "watched files changed; no python analysis inputs to sync"
             );
             return;
         }
-        let (synced, tracked_dirs) = self
+        let (synced, bumped_roots) = self
             .with_session("watching files", |s| {
                 let mut synced = 0usize;
                 {
@@ -1123,15 +1056,15 @@ impl LanguageServer for HydraLspBackend {
                         synced += 1;
                     }
                 }
-                let tracked_dirs = s.bump_site_packages_pth_states(&site_packages_pth_state_dirs);
-                (synced, tracked_dirs)
+                let bumped_roots = s.bump_site_packages_pth_roots(&pth_root_dirs);
+                (synced, bumped_roots)
             })
             .unwrap_or((0, 0));
         tracing::debug!(
             changed = params.changes.len(),
             synced,
-            site_packages_pth_state_candidate_dirs = site_packages_pth_state_dirs.len(),
-            site_packages_pth_state_tracked_dirs = tracked_dirs,
+            pth_root_candidate_dirs = pth_root_dirs.len(),
+            pth_root_bumped_dirs = bumped_roots,
             "watched files changed; synced python analysis inputs"
         );
     }
@@ -1907,13 +1840,15 @@ mod tests {
         writer.join().expect("writer thread panicked");
     }
 
-    // --- Test D: site-packages gating in bump_site_packages_pth_states ---
+    // --- Test D: site-packages gating in bump_site_packages_pth_roots ---
 
     /// Build a minimal on-disk venv so `discover_python_environment` returns a
-    /// real site-packages directory. Discovery uses a real `OsSystem` (not the
-    /// db's system), so this must be an actual filesystem layout, not an
-    /// in-memory one — it mirrors `python_analyzer`'s in-memory `create_mock_venv`.
-    /// The returned `TempDir` must be kept alive for the venv to persist.
+    /// real site-packages directory, and register its `FileRoot`s exactly as
+    /// production does (via `python_cache::site_packages_paths`). Discovery uses
+    /// a real `OsSystem` (not the db's system), so this must be an actual
+    /// filesystem layout, not an in-memory one — it mirrors `python_analyzer`'s
+    /// in-memory `create_mock_venv`. The returned `TempDir` must be kept alive
+    /// for the venv to persist.
     fn session_with_real_venv() -> (Session, std::path::PathBuf, tempfile::TempDir) {
         use std::fs;
         let tmp = tempfile::TempDir::new().expect("tempdir");
@@ -1944,21 +1879,28 @@ mod tests {
             &db,
             Some(venv.to_string_lossy().into_owned()),
             Some(venv.to_string_lossy().into_owned()),
-            vec![],
         );
+        // Register the discovered site-packages directories as `FileRoot`s,
+        // exactly as the resolver does on its first query. Without this the
+        // event side has no root to bump. Discovery canonicalizes the sys.prefix
+        // (e.g. macOS `/var` → `/private/var`), so the registered root path is
+        // the canonical one — return that so the simulated watch events route to
+        // it lexically, exactly as real events (fired under the canonical root
+        // the watcher registered) do.
+        python_cache::site_packages_paths(&db, python_config);
+        let site_packages = std::fs::canonicalize(&site_packages).expect("canonicalize venv");
         let session = Session {
             db: parking_lot::Mutex::new(db),
             python_config,
-            site_packages_pth_states: parking_lot::RwLock::new(HashMap::new()),
         };
         (session, site_packages, tmp)
     }
 
-    /// A `.pth` change in the real site-packages dir is tracked; a change in an
-    /// unrelated directory in the same batch is skipped. This is the core of the
-    /// gating fix: unrelated `.pth` files must not grow the stores.
+    /// A `.pth` change in the real site-packages dir bumps its root; a change in
+    /// an unrelated directory in the same batch is skipped. Unrelated `.pth`
+    /// files have no registered root, so they never trigger invalidation.
     #[test]
-    fn bump_tracks_only_real_site_packages_dirs() {
+    fn bump_tracks_only_registered_site_packages_roots() {
         let (session, site_packages, _tmp) = session_with_real_venv();
         let unrelated = site_packages.parent().unwrap().join("not-site-packages");
         std::fs::create_dir_all(&unrelated).unwrap();
@@ -1967,18 +1909,12 @@ mod tests {
         dirs.insert(site_packages);
         dirs.insert(unrelated);
 
-        let tracked = session.bump_site_packages_pth_states(&dirs);
-        assert_eq!(tracked, 1, "only the real site-packages dir should track");
-        assert_eq!(
-            session.site_packages_pth_state_count(),
-            1,
-            "the unrelated dir must not add an entry to the runtime map"
-        );
+        let bumped = session.bump_site_packages_pth_roots(&dirs);
+        assert_eq!(bumped, 1, "only the registered site-packages root bumps");
     }
 
-    /// A `.pth` change with no site-packages match adds nothing — the exact
-    /// unbounded-growth scenario the fix closes (an unrelated `foo.pth` anywhere
-    /// in the watched tree).
+    /// A `.pth` change with no registered root bumps nothing — an unrelated
+    /// `foo.pth` anywhere in the watched tree is inert.
     #[test]
     fn bump_skips_unrelated_dir_entirely() {
         let (session, site_packages, _tmp) = session_with_real_venv();
@@ -1988,51 +1924,45 @@ mod tests {
         let mut dirs = HashSet::new();
         dirs.insert(unrelated);
 
-        assert_eq!(session.bump_site_packages_pth_states(&dirs), 0);
-        assert_eq!(
-            session.site_packages_pth_state_count(),
-            0,
-            "an unrelated dir must never grow the map"
-        );
+        assert_eq!(session.bump_site_packages_pth_roots(&dirs), 0);
     }
 
-    /// Repeated `.pth` events for the same real dir bump the revision each time
-    /// (so `parse_pth_files` re-scans) but never grow the map past one entry —
-    /// dedup via `ensure_site_packages_pth_state`.
+    /// Repeated `.pth` events for the same real dir bump the root revision each
+    /// time so `parse_pth_files` re-scans.
     #[test]
-    fn bump_is_idempotent_across_repeated_events() {
+    fn bump_bumps_root_revision_across_repeated_events() {
         let (session, site_packages, _tmp) = session_with_real_venv();
         let mut dirs = HashSet::new();
-        dirs.insert(site_packages);
+        dirs.insert(site_packages.clone());
 
-        assert_eq!(session.bump_site_packages_pth_states(&dirs), 1);
-        let state = *session
-            .site_packages_pth_states
-            .read()
-            .values()
-            .next()
-            .expect("one tracked state");
-        let rev1 = state.revision(&*session.db.lock());
+        let sys_path = SystemPath::from_std_path(&site_packages).unwrap();
+        let rev0 = {
+            let db = session.db.lock();
+            db.files().root(&*db, sys_path).unwrap().revision(&*db)
+        };
 
-        assert_eq!(session.bump_site_packages_pth_states(&dirs), 1);
-        let rev2 = state.revision(&*session.db.lock());
+        assert_eq!(session.bump_site_packages_pth_roots(&dirs), 1);
+        let rev1 = {
+            let db = session.db.lock();
+            db.files().root(&*db, sys_path).unwrap().revision(&*db)
+        };
 
-        assert_eq!(
-            session.site_packages_pth_state_count(),
-            1,
-            "repeated events must not grow the map"
-        );
+        assert_eq!(session.bump_site_packages_pth_roots(&dirs), 1);
+        let rev2 = {
+            let db = session.db.lock();
+            db.files().root(&*db, sys_path).unwrap().revision(&*db)
+        };
+
         assert!(
-            rev2 > rev1,
-            "each event must bump the revision so the directory scan is recomputed"
+            rev1 != rev0 && rev2 != rev1,
+            "each event must bump the root revision so the directory scan is recomputed"
         );
     }
 
-    /// The gate normalizes both sides, so a candidate path differing from the
-    /// discovered path only by a trailing separator must still match. Regression
-    /// guard for the normalization symmetry the `.pth` invalidation relies on
-    /// (discovery also canonicalizes symlinked prefixes, e.g. macOS
-    /// `/var` → `/private/var`, which this same normalization absorbs).
+    /// Routing is lexical, so a candidate path differing from the registered
+    /// root only by a trailing separator must still match (`SystemPath::absolute`
+    /// strips the trailing separator before the prefix-tree lookup). Regression
+    /// guard for the path symmetry the `.pth` invalidation relies on.
     #[test]
     fn bump_matches_site_packages_despite_trailing_separator() {
         let (session, site_packages, _tmp) = session_with_real_venv();
@@ -2043,7 +1973,7 @@ mod tests {
         dirs.insert(std::path::PathBuf::from(with_sep));
 
         assert_eq!(
-            session.bump_site_packages_pth_states(&dirs),
+            session.bump_site_packages_pth_roots(&dirs),
             1,
             "a trailing-separator variant of the site-packages path must still match"
         );

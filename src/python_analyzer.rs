@@ -1,7 +1,7 @@
 use crate::import_resolver::ImportResolver;
 use crate::python_cache::{
-    InternedSearchPaths, SitePackagesPthState, TargetString, class_parent_attribute,
-    class_parent_docs, resolve_module_cached,
+    InternedSearchPaths, TargetString, class_parent_attribute, class_parent_docs,
+    resolve_module_cached,
 };
 use anyhow::{Context, Result};
 use ruff_db::files::system_path_to_file;
@@ -65,32 +65,6 @@ pub(crate) fn get_parsed_module(db: &dyn ruff_db::Db, path: &Path) -> Result<Par
     let file = system_path_to_file(db, sys_path)
         .with_context(|| format!("could not resolve file: {}", path.display()))?;
     Ok(parsed_module(db, file).load(db))
-}
-
-/// Normalize a directory path for use as a `SitePackagesPthState` key.
-///
-/// `discover_python_environment` returns site-packages paths via
-/// `SystemPathBuf::as_std_path()` (no symlink resolution, no case
-/// folding), while `did_change_watched_files` derives the inventory key
-/// from `change.uri.to_file_path()?.parent()`. The two sources can
-/// disagree on trailing separators, symlink targets, and (on
-/// case-insensitive filesystems) case, which would make the inventory
-/// lookup miss and silently lose `.pth` invalidation.
-///
-/// Canonicalize when possible so both sources produce the same key.
-/// Falls back to the original path string if canonicalization fails
-/// (e.g. the directory was just deleted) — better to risk a stale
-/// memo for one event than to panic on a missing path.
-///
-/// KNOWN LIMITATION: each side canonicalizes its own source at its own
-/// time, so a symlinked site-packages path that is *retargeted
-/// mid-session* can decouple the two. Because this is a niche edge case, we accept the
-/// risk of a stale memo until the next session restart.
-pub(crate) fn normalize_site_packages_pth_state_key(directory: &Path) -> String {
-    match std::fs::canonicalize(directory) {
-        Ok(canonical) => canonical.to_string_lossy().into_owned(),
-        Err(_) => directory.to_string_lossy().into_owned(),
-    }
 }
 
 /// Lexically normalize a path for use in a salsa memo key, without touching the
@@ -531,8 +505,7 @@ impl PythonAnalyzer {
     pub fn build_search_paths(
         db: &dyn ruff_db::Db,
         workspace_root: Option<&Path>,
-        site_packages_paths: Vec<SystemPathBuf>,
-        site_packages_pth_states: Option<&[SitePackagesPthState]>,
+        site_packages_paths: &Vec<SystemPathBuf>,
     ) -> Vec<PathBuf> {
         let mut search_paths = Vec::new();
 
@@ -549,8 +522,7 @@ impl PythonAnalyzer {
             let site_packages = sys_path.as_std_path().to_path_buf();
 
             // Process .pth files in this site-packages directory
-            let editable_paths =
-                Self::parse_pth_files(db, &site_packages, site_packages_pth_states);
+            let editable_paths = Self::parse_pth_files(db, &site_packages);
 
             search_paths.push(site_packages);
             search_paths.extend(editable_paths);
@@ -567,28 +539,20 @@ impl PythonAnalyzer {
     /// - All other lines are treated as directories to add to `sys.path`
     ///
     /// See: https://docs.python.org/3/library/site.html
-    pub(crate) fn parse_pth_files(
-        db: &dyn ruff_db::Db,
-        site_packages: &Path,
-        site_packages_pth_states: Option<&[SitePackagesPthState]>,
-    ) -> Vec<PathBuf> {
+    pub(crate) fn parse_pth_files(db: &dyn ruff_db::Db, site_packages: &Path) -> Vec<PathBuf> {
         let mut paths = Vec::new();
 
-        // Depend on the tracked state for this directory so `.pth`
-        // create/delete events invalidate the directory scan. Both the
-        // state key and this lookup go through
-        // `normalize_site_packages_pth_state_key` so symlink/case/separator
-        // differences don't cause a miss.
-        if let Some(site_packages_pth_state) =
-            site_packages_pth_states.and_then(|site_packages_pth_states| {
-                let site_packages_key = normalize_site_packages_pth_state_key(site_packages);
-                site_packages_pth_states
-                    .iter()
-                    .copied()
-                    .find(|state| state.directory(db).as_str() == site_packages_key)
-            })
+        // Depend on the site-packages directory's `FileRoot` revision so `.pth`
+        // create/delete events invalidate this directory scan. The root is
+        // registered in `site_packages_paths` (via `try_add_root`) with the same
+        // path handed here, and `did_change_watched_files` bumps it via
+        // `Files::touch_root`. Routing is purely lexical on both sides (matching
+        // `ty`), so no filesystem syscall runs here. Falls back to no dependency
+        // when no root is registered (e.g. cli/test callers).
+        if let Some(sys_path) = SystemPath::from_std_path(site_packages)
+            && let Some(root) = db.files().root(db, sys_path)
         {
-            let _ = site_packages_pth_state.revision(db);
+            let _ = root.revision(db);
         }
 
         let Ok(entries) = fs::read_dir(site_packages) else {
@@ -2898,12 +2862,8 @@ mod tests {
             Some(system_python_str),
         )
         .unwrap_or_default();
-        let search_paths = PythonAnalyzer::build_search_paths(
-            &db,
-            Some(examples_dir.as_ref()),
-            site_packages,
-            None,
-        );
+        let search_paths =
+            PythonAnalyzer::build_search_paths(&db, Some(examples_dir.as_ref()), &site_packages);
         let mid = TargetString::new(&db, "my_module".to_string());
         let spid = InternedSearchPaths::new(&db, search_paths);
         let result_with_config = resolve_module_cached(&db, mid, spid).clone();
@@ -2953,12 +2913,8 @@ mod tests {
         )
         .unwrap_or_default();
         let db = test_db();
-        let search_paths = PythonAnalyzer::build_search_paths(
-            &db,
-            Some(examples_dir.as_ref()),
-            site_packages,
-            None,
-        );
+        let search_paths =
+            PythonAnalyzer::build_search_paths(&db, Some(examples_dir.as_ref()), &site_packages);
         let result = PythonAnalyzer::extract_definition_info(
             &db,
             "my_module.simple_function",
@@ -3010,8 +2966,7 @@ mod tests {
             let search_paths = PythonAnalyzer::build_search_paths(
                 &db,
                 Some(examples_dir.as_ref()),
-                site_packages,
-                None,
+                &site_packages,
             );
             let mid = TargetString::new(&db, "my_module".to_string());
             let spid = InternedSearchPaths::new(&db, search_paths);
@@ -3472,7 +3427,7 @@ mod tests {
         let site_packages = workspace_dir.join("site-packages");
         let db = test_db();
 
-        let paths = PythonAnalyzer::parse_pth_files(&db, &site_packages, None);
+        let paths = PythonAnalyzer::parse_pth_files(&db, &site_packages);
 
         // Should find the path from _editable_package.pth
         assert!(!paths.is_empty(), "Should find paths from .pth files");
@@ -3487,51 +3442,8 @@ mod tests {
         // Test that parsing .pth files from nonexistent directory returns empty
         let nonexistent = PathBuf::from("/nonexistent/path/site-packages");
         let db = test_db();
-        let paths = PythonAnalyzer::parse_pth_files(&db, &nonexistent, None);
+        let paths = PythonAnalyzer::parse_pth_files(&db, &nonexistent);
         assert!(paths.is_empty(), "Should return empty for nonexistent dir");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_normalize_pth_inventory_key_resolves_symlink() {
-        use tempfile::TempDir;
-        let tmp = TempDir::new().expect("tempdir");
-        let real_dir = tmp.path().join("real-site-packages");
-        std::fs::create_dir(&real_dir).expect("create real dir");
-        let symlink_dir = tmp.path().join("link-site-packages");
-        std::os::unix::fs::symlink(&real_dir, &symlink_dir).expect("create symlink");
-
-        // The watched-event side and the discovery side can arrive via either
-        // path; normalization must collapse them to the same key.
-        assert_eq!(
-            normalize_site_packages_pth_state_key(&real_dir),
-            normalize_site_packages_pth_state_key(&symlink_dir),
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_parse_pth_files_site_packages_state_lookup_via_symlink() {
-        use crate::python_cache::SitePackagesPthState;
-        use tempfile::TempDir;
-
-        let tmp = TempDir::new().expect("tempdir");
-        let real_dir = tmp.path().join("real-site-packages");
-        std::fs::create_dir(&real_dir).expect("create real dir");
-        let symlink_dir = tmp.path().join("link-site-packages");
-        std::os::unix::fs::symlink(&real_dir, &symlink_dir).expect("create symlink");
-
-        let db = test_db();
-        // Inventory keyed off the symlinked path (as a watched-event might
-        // arrive). `parse_pth_files` is then called with the real path
-        // (as `discover_python_environment` would return it).
-        let key = normalize_site_packages_pth_state_key(&symlink_dir);
-        let site_packages_pth_state = SitePackagesPthState::new(&db, key, 0);
-        let site_packages_pth_states = vec![site_packages_pth_state];
-
-        // Should not panic and should still register the salsa dep on the
-        // inventory revision via the normalized lookup.
-        let _ = PythonAnalyzer::parse_pth_files(&db, &real_dir, Some(&site_packages_pth_states));
     }
 
     #[test]
@@ -3544,7 +3456,7 @@ mod tests {
         // Build search paths manually with site-packages that has .pth files
         let mut search_paths = vec![workspace_dir.clone()];
         search_paths.push(site_packages.clone());
-        search_paths.extend(PythonAnalyzer::parse_pth_files(&db, &site_packages, None));
+        search_paths.extend(PythonAnalyzer::parse_pth_files(&db, &site_packages));
 
         // The editable_package should now be resolvable
         let mid = TargetString::new(&db, "editable_package.lib".to_string());
@@ -3570,7 +3482,7 @@ mod tests {
         // Build search paths manually with site-packages that has .pth files
         let mut search_paths = vec![workspace_dir.clone()];
         search_paths.push(site_packages.clone());
-        search_paths.extend(PythonAnalyzer::parse_pth_files(&db, &site_packages, None));
+        search_paths.extend(PythonAnalyzer::parse_pth_files(&db, &site_packages));
 
         // Resolve the module first
         let mid = TargetString::new(&db, "editable_package.lib".to_string());

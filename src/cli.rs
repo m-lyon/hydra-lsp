@@ -255,7 +255,6 @@ fn run(args: &Args) -> anyhow::Result<i32> {
             .as_ref()
             .map(|p| p.to_string_lossy().to_string()),
         python_interpreter.clone(),
-        vec![],
     );
     let diagnostics = validate_document(&parsed_content, &disabled_rules, &db, python_config);
 
@@ -302,14 +301,11 @@ fn trace_target_resolution(
     let db = HydraDatabase::new(ruff_db::system::SystemPath::new(db_root));
 
     // Try to extract definition info
-    let site_packages = PythonAnalyzer::discover_python_environment(workspace_root, python_interpreter)
-        .unwrap_or_default();
-    let search_paths = PythonAnalyzer::build_search_paths(&db, workspace_root, site_packages, None);
-    match PythonAnalyzer::extract_definition_info(
-        &db,
-        &hydra_object.target.value,
-        &search_paths,
-    ) {
+    let site_packages =
+        PythonAnalyzer::discover_python_environment(workspace_root, python_interpreter)
+            .unwrap_or_default();
+    let search_paths = PythonAnalyzer::build_search_paths(&db, workspace_root, &site_packages);
+    match PythonAnalyzer::extract_definition_info(&db, &hydra_object.target.value, &search_paths) {
         Ok((def_info, file_path, module_path, symbol_name)) => {
             println!("  {} {}", "Module:".dimmed(), module_path);
             println!("  {} {}", "Symbol:".dimmed(), symbol_name);
