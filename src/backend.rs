@@ -936,15 +936,20 @@ impl LanguageServer for HydraLspBackend {
             return;
         };
 
-        // Publish diagnostics if this is a Hydra file (using cached check)
+        // Publish diagnostics if this is a Hydra file (using cached check). When it is
+        // not a Hydra file we clear any diagnostics previously published.
         let is_hydra = self
             .with_session("opening documents", |s| {
                 let db = s.db.lock();
                 yaml_cache::is_hydra_file(&*db, input)
             })
             .unwrap_or(false);
-        if is_hydra && self.settings.read().features.diagnostics {
-            self.publish_diagnostics_for_document(&uri).await;
+        if self.settings.read().features.diagnostics {
+            if is_hydra {
+                self.publish_diagnostics_for_document(&uri).await;
+            } else {
+                self.clear_diagnostics(&uri).await;
+            }
         }
 
         self.client
@@ -964,15 +969,21 @@ impl LanguageServer for HydraLspBackend {
                 return;
             };
 
-            // Re-publish diagnostics if this is a Hydra file (using cached check)
+            // Re-publish diagnostics if this is a Hydra file (using cached
+            // check). When it is not a Hydra file we clear any diagnostics
+            // previously published.
             let is_hydra = self
                 .with_session("changing documents", |s| {
                     let db = s.db.lock();
                     yaml_cache::is_hydra_file(&*db, input)
                 })
                 .unwrap_or(false);
-            if is_hydra && self.settings.read().features.diagnostics {
-                self.publish_diagnostics_for_document(&uri).await;
+            if self.settings.read().features.diagnostics {
+                if is_hydra {
+                    self.publish_diagnostics_for_document(&uri).await;
+                } else {
+                    self.clear_diagnostics(&uri).await;
+                }
             }
 
             self.client
@@ -1083,6 +1094,12 @@ impl LanguageServer for HydraLspBackend {
                 let mut db = s.db.lock();
                 input.close(&mut *db);
             });
+        }
+
+        // Clear any diagnostics we published while the document was open, so
+        // they do not linger in the client after the document is closed.
+        if self.settings.read().features.diagnostics {
+            self.clear_diagnostics(&uri).await;
         }
 
         self.client
@@ -1611,6 +1628,13 @@ impl LanguageServer for HydraLspBackend {
 }
 
 impl HydraLspBackend {
+    /// Clear any diagnostics previously published for `uri`.
+    async fn clear_diagnostics(&self, uri: &Url) {
+        self.client
+            .publish_diagnostics(uri.clone(), Vec::new(), None)
+            .await;
+    }
+
     /// Publish diagnostics for a document.
     ///
     /// Uses the cached `parsed_yaml` query for the document's `DocumentInput`.
