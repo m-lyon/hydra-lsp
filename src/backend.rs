@@ -1147,6 +1147,21 @@ impl LanguageServer for HydraLspBackend {
             return;
         }
 
+        // A pull client without `workspace/diagnostic/refresh` has no
+        // server-driven refresh channel: we cannot nudge it to re-pull, and
+        // pushing would duplicate diagnostics into a second client-side
+        // collection. Diagnostics derived from the changed Python file stay
+        // stale until the client re-pulls on its own (next edit, open, or
+        // focus change).
+        if self.supports_pull() {
+            tracing::warn!(
+                "python inputs changed but client supports pull diagnostics without \
+                 workspace/diagnostic/refresh; diagnostics may be stale until the \
+                 client re-pulls"
+            );
+            return;
+        }
+
         // Otherwise fall back to refreshing each open Hydra doc.
         let hydra_uris: Vec<Url> = self
             .with_session("refreshing diagnostics", |s| {
