@@ -578,7 +578,7 @@ impl HydraLspBackend {
     /// Holds the dashmap entry guard across the salsa write so that concurrent
     /// callers for the same URI cannot both observe a vacant entry and create
     /// distinct inputs (which would orphan one in salsa storage and let stale
-    /// text leak through). Lock order: dashmap shard → `Session::db.write()`.
+    /// text leak through). Lock order: dashmap shard → `Session::db.lock()`.
     ///
     /// Returns `None` when the session is not yet initialized; callers
     /// (notification handlers) should treat that as a no-op.
@@ -1198,6 +1198,16 @@ impl LanguageServer for HydraLspBackend {
         // no full-document String clone.  Only the partial-syntax fallback (cursor
         // on a new or mid-edit line where the parse maps have no entry) clones the
         // full text and runs the backward line scan.
+        //
+        // This runs inline under `s.db.lock()`, which is the right call while the
+        // work stays this cheap: it holds the db lock only briefly and skips the
+        // pool-dispatch overhead. If real completions land (module/class/parameter
+        // resolution, reading Python) and the computation becomes expensive,
+        // prefer the `snapshot()` + `spawn_on_pool` pattern used by `hover` /
+        // `goto_definition`: it releases the lock so it no longer blocks the write
+        // path, and moves the CPU work off the tokio worker thread. Completion is
+        // pull-based, so the resulting salsa cancellation on a concurrent edit is
+        // free — the client re-requests.
         let Some(context) = self
             .with_session("completion", |s| {
                 let db = s.db.lock();
