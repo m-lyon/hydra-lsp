@@ -4,7 +4,6 @@ use std::sync::Arc;
 use crate::import_resolver::ImportResolver;
 use crate::python_analyzer::{
     ClassAttributeInfo, DefinitionInfo, FunctionSignature, PythonAnalyzer, normalize_path_for_key,
-    path_is_file,
 };
 use ruff_db::files::FileRootKind;
 use ruff_db::system::SystemPathBuf;
@@ -167,30 +166,14 @@ pub fn resolve_module_cached<'db>(
     let module_parts: Vec<&str> = module_path_str.split('.').collect();
 
     for search_path in search_paths {
-        // Try as a package with __init__.py (or __init__.pyi)
+        // `find_module_file` covers both shapes a module can take: a package
+        // directory with an `__init__` file, and a plain `.py`/`.pyi` file.
         let mut package_path = search_path.clone();
         for part in &module_parts {
             package_path.push(part);
         }
         if let Some(found_path) = ImportResolver::find_module_file(db, &package_path) {
             return Some(found_path);
-        }
-
-        // Try parent as package and last part as module file
-        if module_parts.len() > 1 {
-            let mut parent_path = search_path.clone();
-            for part in &module_parts[..module_parts.len() - 1] {
-                parent_path.push(part);
-            }
-            let last = module_parts.last().unwrap();
-            let pyi = parent_path.join(format!("{last}.pyi"));
-            if path_is_file(db, &pyi) {
-                return Some(pyi);
-            }
-            let py = parent_path.join(format!("{last}.py"));
-            if path_is_file(db, &py) {
-                return Some(py);
-            }
         }
     }
 

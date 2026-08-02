@@ -328,8 +328,7 @@ impl TestContext {
         if pull_diagnostics
             && let Some(text_document) = initialize.capabilities.text_document.as_mut()
         {
-            text_document.diagnostic =
-                Some(lsp_types::DiagnosticClientCapabilities::default());
+            text_document.diagnostic = Some(lsp_types::DiagnosticClientCapabilities::default());
         }
         let workspace_url = Url::from_file_path(self.workspace.path()).unwrap();
         initialize.root_uri = Some(workspace_url.clone());

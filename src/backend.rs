@@ -1791,6 +1791,10 @@ impl LanguageServer for HydraLspBackend {
         // inside the pool's catch_unwind so a `salsa::Cancelled` unwind is caught
         // rather than aborting the process.
         let join_result = spawn_on_pool(&self.worker_pool, move || {
+            if !yaml_cache::is_hydra_file(&db_snapshot, input) {
+                return Vec::new();
+            }
+
             let parsed_yaml = yaml_cache::parsed_yaml(&db_snapshot, input);
             match parsed_yaml.result() {
                 Ok(content) => diagnostics::validate_document(

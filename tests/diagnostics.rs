@@ -1414,3 +1414,61 @@ async fn test_pull_diagnostic_reflects_watched_py_edit() {
         other => panic!("expected an Unchanged report on the repeat pull, got: {other:?}"),
     }
 }
+
+/// Pull path: a non-Hydra document reports nothing, even when its YAML is
+/// unparseable.
+///
+/// The push path gates on `is_hydra_file` in `did_open` / `did_change` and
+/// clears diagnostics for files it does not own. The pull handler has to make
+/// the same call itself, or a broken plain YAML file would draw a spurious
+/// "YAML syntax error" from hydra-lsp for pull clients only. The Hydra half of
+/// this test pins the other side: the gate must not swallow syntax errors on
+/// files we do own.
+#[tokio::test]
+async fn test_pull_diagnostic_skips_non_hydra_file() {
+    use tower_lsp::lsp_types::request::DocumentDiagnosticRequest;
+
+    let mut ctx = TestContext::new(TestWorkspace::Simple);
+    ctx.initialize_with_pull_support().await;
+
+    async fn pull(ctx: &mut TestContext, uri: Url) -> Vec<Diagnostic> {
+        let report = ctx
+            .request::<DocumentDiagnosticRequest>(DocumentDiagnosticParams {
+                text_document: TextDocumentIdentifier { uri },
+                identifier: None,
+                previous_result_id: None,
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            })
+            .await;
+        match report {
+            DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Full(full)) => {
+                full.full_document_diagnostic_report.items
+            }
+            other => panic!("expected a Full report, got: {other:?}"),
+        }
+    }
+
+    // Invalid YAML (the nested key is indented under a scalar value) with no
+    // Hydra marker and no `_target_`, so `is_hydra_file` is false.
+    let broken_yaml = "services:\n  web: image\n    ports: [8080\n";
+
+    ctx.open_document("plain.yaml", broken_yaml.to_string())
+        .await;
+    let plain_uri = ctx.doc_uri("plain.yaml");
+    let plain = pull(&mut ctx, plain_uri).await;
+    assert!(
+        plain.is_empty(),
+        "a non-Hydra file should pull no diagnostics, got: {plain:?}"
+    );
+
+    // Same broken YAML, but marked as Hydra: the syntax error must still surface.
+    ctx.open_document("broken.yaml", format!("# @hydra\n{broken_yaml}"))
+        .await;
+    let broken_uri = ctx.doc_uri("broken.yaml");
+    let hydra = pull(&mut ctx, broken_uri).await;
+    assert!(
+        hydra.iter().any(|d| extract_code(d) == "yaml-syntax-error"),
+        "a Hydra file with invalid YAML should still report the syntax error, got: {hydra:?}"
+    );
+}
