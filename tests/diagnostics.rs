@@ -1,6 +1,9 @@
 mod common;
 
 use std::fs;
+use std::time::Duration;
+
+use tower_lsp::lsp_types::notification::DidChangeWatchedFiles;
 use tower_lsp::lsp_types::*;
 
 use crate::common::*;
@@ -1224,4 +1227,190 @@ func:
         "Empty _args_ should not satisfy any positional parameters, got: {:?}",
         missing_diags
     );
+}
+
+// ==================== Watched-File Refresh Tests ====================
+
+/// Editing a watched `.py` that an open Hydra config depends on must refresh
+/// that config's diagnostics — even though the YAML buffer itself is never
+/// touched.
+///
+/// This is the "stale after watched-file change" bug: `did_change_watched_files`
+/// invalidates the Python-dependent salsa queries (via `File::sync_path`) but
+/// never republishes, so the open Hydra doc keeps its now-wrong diagnostics
+/// until the user next edits *that* file.
+#[tokio::test]
+async fn test_watched_py_edit_refreshes_open_hydra_doc() {
+    let mut ctx = TestContext::new(TestWorkspace::Simple);
+    ctx.initialize().await;
+
+    // A config that resolves cleanly against the shipped `my_module.DataLoader`
+    // (mirrors `test_no_diagnostics_valid_config`).
+    let content =
+        "# @hydra\nmodel:\n  _target_: my_module.DataLoader\n  batch_size: 32\n  shuffle: true\n";
+    ctx.open_document("clean.yaml", content.to_string()).await;
+
+    // Drain the `did_open` publish and confirm the starting point is error-free.
+    // Consuming it first guarantees the next `recv` can only be a *new* publish.
+    let opened = ctx.recv::<PublishDiagnosticsParams>().await;
+    let open_errors: Vec<_> = opened
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+        .collect();
+    assert!(
+        open_errors.is_empty(),
+        "config should resolve cleanly on open, got: {open_errors:?}"
+    );
+
+    // Break the dependency on disk: overwrite `my_module.py` so the `DataLoader`
+    // symbol disappears.
+    fs::write(
+        ctx.workspace.path().join("my_module.py"),
+        "class NotDataLoader:\n    pass\n",
+    )
+    .unwrap();
+
+    // Tell the server the watched Python file changed, exactly as the client's
+    // file watcher would. (Mirrors `notify_change` in `tests/watched_files.rs`,
+    // kept local since it is used only here.)
+    async fn notify_watched_change(ctx: &mut TestContext, path: &str, typ: FileChangeType) {
+        ctx.notify::<DidChangeWatchedFiles>(DidChangeWatchedFilesParams {
+            changes: vec![FileEvent {
+                uri: ctx.doc_uri(path),
+                typ,
+            }],
+        })
+        .await;
+    }
+    notify_watched_change(&mut ctx, "my_module.py", FileChangeType::CHANGED).await;
+
+    // A fresh publish must arrive carrying the now-expected symbol error.
+    // `common::recv` awaits forever, so the `timeout` is what turns the pre-fix
+    // staleness into a clean failure instead of an indefinite hang.
+    let refreshed = tokio::time::timeout(
+        Duration::from_secs(2),
+        ctx.recv::<PublishDiagnosticsParams>(),
+    )
+    .await
+    .expect("watched .py edit must trigger a diagnostics refresh for the open Hydra doc");
+
+    assert_eq!(refreshed.uri, ctx.doc_uri("clean.yaml"));
+    let symbol_not_found = refreshed
+        .diagnostics
+        .iter()
+        .find(|d| d.message.contains("not found in module"));
+    assert!(
+        symbol_not_found.is_some(),
+        "refreshed diagnostics should report the missing DataLoader symbol, got: {:?}",
+        refreshed.diagnostics
+    );
+    assert_eq!(
+        symbol_not_found.unwrap().code,
+        Some(NumberOrString::String("unresolved-reference".to_string())),
+        "missing symbol should surface as an unresolved-reference"
+    );
+}
+
+/// Pull path: a `textDocument/diagnostic` request returns a fresh report, and a
+/// watched-file change on disk is reflected on the next pull.
+///
+/// With pull advertised the server does not push, so the report is fetched on
+/// demand: clean config → empty `Full`; break the dependency + sync the watched
+/// file → the next pull reports `unresolved-reference`; an identical follow-up
+/// pull (echoing the `result_id`) returns `Unchanged`.
+#[tokio::test]
+async fn test_pull_diagnostic_reflects_watched_py_edit() {
+    use tower_lsp::lsp_types::request::DocumentDiagnosticRequest;
+
+    let mut ctx = TestContext::new(TestWorkspace::Simple);
+    ctx.initialize_with_pull_support().await;
+
+    let content =
+        "# @hydra\nmodel:\n  _target_: my_module.DataLoader\n  batch_size: 32\n  shuffle: true\n";
+    ctx.open_document("clean.yaml", content.to_string()).await;
+
+    // Pull the diagnostics rather than waiting for a push (there is none for a
+    // pull client). A clean config yields an error-free report.
+    async fn pull(
+        ctx: &mut TestContext,
+        uri: Url,
+        previous_result_id: Option<String>,
+    ) -> DocumentDiagnosticReportResult {
+        ctx.request::<DocumentDiagnosticRequest>(DocumentDiagnosticParams {
+            text_document: TextDocumentIdentifier { uri },
+            identifier: None,
+            previous_result_id,
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
+    }
+
+    // Extract (items, result_id) from a `Full` report; panic on `Unchanged`.
+    fn full(report: &DocumentDiagnosticReportResult) -> (&[Diagnostic], Option<String>) {
+        match report {
+            DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Full(full)) => (
+                &full.full_document_diagnostic_report.items,
+                full.full_document_diagnostic_report.result_id.clone(),
+            ),
+            other => panic!("expected a Full report, got: {other:?}"),
+        }
+    }
+
+    let clean_uri = ctx.doc_uri("clean.yaml");
+    let clean = pull(&mut ctx, clean_uri.clone(), None).await;
+    let (clean_items, _) = full(&clean);
+    let clean_errors: Vec<_> = clean_items
+        .iter()
+        .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+        .collect();
+    assert!(
+        clean_errors.is_empty(),
+        "clean config should pull an error-free report, got: {clean_errors:?}"
+    );
+
+    // Break the dependency on disk, then tell the server the watched file changed
+    // so the parse of `my_module.py` is invalidated.
+    fs::write(
+        ctx.workspace.path().join("my_module.py"),
+        "class NotDataLoader:\n    pass\n",
+    )
+    .unwrap();
+    ctx.notify::<DidChangeWatchedFiles>(DidChangeWatchedFilesParams {
+        changes: vec![FileEvent {
+            uri: ctx.doc_uri("my_module.py"),
+            typ: FileChangeType::CHANGED,
+        }],
+    })
+    .await;
+
+    // The next pull recomputes at the newest revision and reports the missing
+    // symbol.
+    let broken = pull(&mut ctx, clean_uri.clone(), None).await;
+    let (broken_items, broken_id) = full(&broken);
+    let symbol_not_found = broken_items
+        .iter()
+        .find(|d| d.message.contains("not found in module"));
+    assert!(
+        symbol_not_found.is_some(),
+        "pull after the watched edit should report the missing symbol, got: {broken_items:?}"
+    );
+    assert_eq!(
+        symbol_not_found.unwrap().code,
+        Some(NumberOrString::String("unresolved-reference".to_string())),
+    );
+    let broken_id = broken_id.expect("a non-empty report should carry a result_id");
+
+    // An identical follow-up pull echoing the result_id short-circuits to Unchanged.
+    let repeat = pull(&mut ctx, clean_uri.clone(), Some(broken_id.clone())).await;
+    match repeat {
+        DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Unchanged(unchanged)) => {
+            assert_eq!(
+                unchanged.unchanged_document_diagnostic_report.result_id, broken_id,
+                "Unchanged report should echo the same result_id"
+            );
+        }
+        other => panic!("expected an Unchanged report on the repeat pull, got: {other:?}"),
+    }
 }

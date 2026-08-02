@@ -256,6 +256,15 @@ pub struct HydraLspBackend {
     /// Whether the client advertised relative-pattern support for watched
     /// files. Required to watch out-of-workspace Python search paths.
     watched_files_relative_patterns: AtomicBool,
+    /// Whether the client advertised support for pull diagnostics
+    /// (`textDocument/diagnostic`, LSP 3.17). Captured in `initialize`. When
+    /// true we answer pull requests and skip proactively pushing diagnostics;
+    /// when false we fall back to pushing via `publish_diagnostics`.
+    supports_pull_diagnostics: AtomicBool,
+    /// Whether the client advertised `workspace/diagnostic/refresh` support.
+    /// When true, a watched-file change nudges the client to re-pull instead of
+    /// the server re-publishing each open document.
+    supports_diagnostic_refresh: AtomicBool,
 }
 
 /// Outcome of a closure run on a rayon pool via [`spawn_on_pool`].
@@ -377,7 +386,21 @@ impl HydraLspBackend {
             worker_pool: OnceLock::new(),
             watched_files_dynamic: AtomicBool::new(false),
             watched_files_relative_patterns: AtomicBool::new(false),
+            supports_pull_diagnostics: AtomicBool::new(false),
+            supports_diagnostic_refresh: AtomicBool::new(false),
         }
+    }
+
+    /// Whether the client supports pull diagnostics (`textDocument/diagnostic`).
+    /// When true we answer pull requests and stop pushing diagnostics proactively.
+    fn supports_pull(&self) -> bool {
+        self.supports_pull_diagnostics.load(Ordering::Relaxed)
+    }
+
+    /// Whether the client supports `workspace/diagnostic/refresh`, letting us nudge
+    /// it to re-pull instead of re-publishing each open document ourselves.
+    fn supports_diag_refresh(&self) -> bool {
+        self.supports_diagnostic_refresh.load(Ordering::Relaxed)
     }
 
     fn fallback_workspace_root() -> Result<String> {
@@ -436,10 +459,7 @@ impl HydraLspBackend {
 
     /// Run `f` with a borrow of the initialized session, returning `None`
     /// (and logging a warning that names `context`) when the session has
-    /// not yet been built by `initialize`. The LSP protocol requires the
-    /// client to send `initialize` first, so reaching `None` means a
-    /// misbehaving client — notification handlers should ignore the event
-    /// rather than panic.
+    /// not yet been built by `initialize`.
     ///
     /// The outer `RwLock` guard is held for the duration of `f`, but `f`
     /// only sees `&Session` — the inner db lock is acquired by `f` itself, so
@@ -626,6 +646,28 @@ impl LanguageServer for HydraLspBackend {
         self.watched_files_relative_patterns.store(
             watched_files_caps
                 .and_then(|d| d.relative_pattern_support)
+                .unwrap_or(false),
+            Ordering::Relaxed,
+        );
+
+        // Pull diagnostics: does the client issue `textDocument/diagnostic`?
+        self.supports_pull_diagnostics.store(
+            params
+                .capabilities
+                .text_document
+                .as_ref()
+                .and_then(|t| t.diagnostic.as_ref())
+                .is_some(),
+            Ordering::Relaxed,
+        );
+        // Refresh: can we nudge the client to re-pull with `workspace/diagnostic/refresh`?
+        self.supports_diagnostic_refresh.store(
+            params
+                .capabilities
+                .workspace
+                .as_ref()
+                .and_then(|w| w.diagnostic.as_ref())
+                .and_then(|d| d.refresh_support)
                 .unwrap_or(false),
             Ordering::Relaxed,
         );
@@ -833,6 +875,17 @@ impl LanguageServer for HydraLspBackend {
                         },
                     ),
                 ),
+                diagnostic_provider: Some(DiagnosticServerCapabilities::Options(
+                    DiagnosticOptions {
+                        identifier: Some("hydra-lsp".to_string()),
+                        // Hydra targets resolve into watched Python files, so a
+                        // change in one file can affect another's diagnostics.
+                        inter_file_dependencies: true,
+                        // Document/open-files pull only; no whole-workspace pull.
+                        workspace_diagnostics: false,
+                        work_done_progress_options: Default::default(),
+                    },
+                )),
                 ..Default::default()
             },
             server_info: Some(ServerInfo {
@@ -946,9 +999,9 @@ impl LanguageServer for HydraLspBackend {
             .unwrap_or(false);
         if self.settings.read().features.diagnostics {
             if is_hydra {
-                self.publish_diagnostics_for_document(&uri).await;
+                self.publish_diagnostics_if_needed(&uri).await;
             } else {
-                self.clear_diagnostics(&uri).await;
+                self.clear_diagnostics_if_needed(&uri).await;
             }
         }
 
@@ -980,9 +1033,9 @@ impl LanguageServer for HydraLspBackend {
                 .unwrap_or(false);
             if self.settings.read().features.diagnostics {
                 if is_hydra {
-                    self.publish_diagnostics_for_document(&uri).await;
+                    self.publish_diagnostics_if_needed(&uri).await;
                 } else {
-                    self.clear_diagnostics(&uri).await;
+                    self.clear_diagnostics_if_needed(&uri).await;
                 }
             }
 
@@ -1078,6 +1131,38 @@ impl LanguageServer for HydraLspBackend {
             pth_root_bumped_dirs = bumped_roots,
             "watched files changed; synced python analysis inputs"
         );
+
+        // The sync above invalidated Python-dependent salsa queries but did not
+        // refresh diagnostics, now we refresh diagnostics, unless none to refresh.
+        if !self.settings.read().features.diagnostics || (synced == 0 && bumped_roots == 0) {
+            return;
+        }
+
+        // Pull clients with refresh support: a single `workspace/diagnostic/refresh`
+        // nudges the client to re-pull every open document — no per-doc work here.
+        if self.supports_pull() && self.supports_diag_refresh() {
+            if let Err(error) = self.client.workspace_diagnostic_refresh().await {
+                tracing::warn!(%error, "failed to request workspace diagnostic refresh");
+            }
+            return;
+        }
+
+        // Otherwise fall back to refreshing each open Hydra doc.
+        let hydra_uris: Vec<Url> = self
+            .with_session("refreshing diagnostics", |s| {
+                let db = s.db.lock();
+                self.document_inputs
+                    .iter()
+                    // Soft-closed docs have empty text, and `is_hydra_file`
+                    // returns false on empty text, so they self-exclude.
+                    .filter(|entry| yaml_cache::is_hydra_file(&*db, *entry.value()))
+                    .map(|entry| entry.key().clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for uri in hydra_uris {
+            self.publish_diagnostics_if_needed(&uri).await;
+        }
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
@@ -1099,7 +1184,7 @@ impl LanguageServer for HydraLspBackend {
         // Clear any diagnostics we published while the document was open, so
         // they do not linger in the client after the document is closed.
         if self.settings.read().features.diagnostics {
-            self.clear_diagnostics(&uri).await;
+            self.clear_diagnostics_if_needed(&uri).await;
         }
 
         self.client
@@ -1635,6 +1720,72 @@ impl LanguageServer for HydraLspBackend {
             data,
         })))
     }
+
+    /// Pull diagnostics: answer a `textDocument/diagnostic` request.
+    ///
+    /// Runs the same parse + validate closure the push path uses, but on a
+    /// detached snapshot on the worker pool so latency-sensitive requests keep
+    /// their thread capacity. When a concurrent write bumps the salsa revision
+    /// mid-compute the round is cancelled; we surface that as an LSP
+    /// `ServerCancelled` error with `retrigger_request: true` so the client
+    /// re-pulls — demand-driven retry, no server-side attempt counter.
+    async fn diagnostic(
+        &self,
+        params: DocumentDiagnosticParams,
+    ) -> Result<DocumentDiagnosticReportResult> {
+        let uri = params.text_document.uri;
+
+        // Diagnostics disabled, unknown document, or no session: report an empty
+        // full report rather than an error (the client shows nothing).
+        if !self.settings.read().features.diagnostics {
+            return Ok(empty_full_report());
+        }
+        let Some(input_ref) = self.document_inputs.get(&uri) else {
+            return Ok(empty_full_report());
+        };
+        let input = *input_ref;
+        drop(input_ref);
+
+        let Some(SessionSnapshot {
+            db: db_snapshot,
+            python_config,
+        }) = self.snapshot()
+        else {
+            return Ok(empty_full_report());
+        };
+        let disabled_rules = self.settings.read().disabled_rules.clone();
+
+        // Same closure as the push path: parse + validate on the worker pool,
+        // inside the pool's catch_unwind so a `salsa::Cancelled` unwind is caught
+        // rather than aborting the process.
+        let join_result = spawn_on_pool(&self.worker_pool, move || {
+            let parsed_yaml = yaml_cache::parsed_yaml(&db_snapshot, input);
+            match parsed_yaml.result() {
+                Ok(content) => diagnostics::validate_document(
+                    content,
+                    &disabled_rules,
+                    &db_snapshot,
+                    python_config,
+                ),
+                Err(e) => vec![yaml_syntax_error_diagnostic(e)],
+            }
+        })
+        .await;
+
+        match classify_diag_outcome(join_result) {
+            DiagAction::Publish(diagnostics) => Ok(build_diagnostic_report(
+                diagnostics,
+                params.previous_result_id.as_deref(),
+            )),
+            // A newer revision superseded this round. Tell the client to re-pull
+            // instead of retrying server-side.
+            DiagAction::Skip => Err(server_cancelled_error()),
+            DiagAction::LogPanic(msg) => {
+                tracing::error!(%msg, "validate_document task panicked (pull)");
+                Ok(empty_full_report())
+            }
+        }
+    }
 }
 
 impl HydraLspBackend {
@@ -1645,16 +1796,64 @@ impl HydraLspBackend {
             .await;
     }
 
-    /// Publish diagnostics for a document.
+    /// Clear diagnostics only when the client relies on push.
     ///
-    /// Uses the cached `parsed_yaml` query for the document's `DocumentInput`.
-    /// Callers (`did_open`, `did_change`) always create the input first, so
-    /// the absence of an entry is a programmer error rather than a runtime
-    /// concern — we skip publishing rather than silently parsing uncached.
+    /// Pull clients own their diagnostic state (they stop requesting a closed
+    /// document), so there is nothing for the server to clear.
+    async fn clear_diagnostics_if_needed(&self, uri: &Url) {
+        if self.supports_pull() {
+            return;
+        }
+        self.clear_diagnostics(uri).await;
+    }
+
+    /// Publish diagnostics only when the client relies on push.
+    ///
+    /// Pull clients fetch diagnostics via `textDocument/diagnostic`; pushing to
+    /// them would be redundant, so this is a no-op for them.
+    async fn publish_diagnostics_if_needed(&self, uri: &Url) {
+        if self.supports_pull() {
+            return;
+        }
+        self.publish_diagnostics_for_document(uri).await;
+    }
+
+    /// Compute the diagnostics for `uri` from the current database state.
+    ///
+    /// Returns `None` when there is no session or no `DocumentInput` for the
+    /// URI. The parse and validation run while holding the db lock so no
+    /// concurrent write can bump the salsa revision mid-compute — the same
+    /// synchronous model ty uses for its push handler, which is why no
+    /// cancellation (and therefore no retry) is possible here.
+    fn compute_diagnostics(&self, uri: &Url) -> Option<Vec<Diagnostic>> {
+        let input = *self.document_inputs.get(uri)?;
+        let disabled_rules = self.settings.read().disabled_rules.clone();
+        self.with_session("compute diagnostics", |s| {
+            // Hold the lock across the whole compute: with no interleaved
+            // `set_text`, the revision can't move under us, so `parsed_yaml`
+            // and `validate_document` never observe a `salsa::Cancelled`.
+            let db = s.db.lock();
+            let parsed_yaml = yaml_cache::parsed_yaml(&*db, input);
+            match parsed_yaml.result() {
+                Ok(content) => {
+                    diagnostics::validate_document(content, &disabled_rules, &*db, s.python_config)
+                }
+                Err(e) => vec![yaml_syntax_error_diagnostic(e)],
+            }
+        })
+    }
+
+    /// Publish diagnostics for a document (push fallback for non-pull clients).
+    ///
+    /// Computes synchronously under the db lock (see [`compute_diagnostics`])
+    /// and publishes the result. Because the compute can't be cancelled, there
+    /// is no retry loop: a single pass always reflects the newest revision.
+    ///
+    /// [`compute_diagnostics`]: Self::compute_diagnostics
     async fn publish_diagnostics_for_document(&self, uri: &Url) {
-        // Get parsed content from cache and snapshot the db for use by
-        // validate_document inside spawn_blocking.
-        let Some(input_ref) = self.document_inputs.get(uri) else {
+        // Callers (`did_open`, `did_change`) always create the input first, so a
+        // missing entry is a programmer error rather than a runtime concern.
+        if !self.document_inputs.contains_key(uri) {
             debug_assert!(
                 false,
                 "publish_diagnostics_for_document called for {} with no DocumentInput; \
@@ -1663,84 +1862,106 @@ impl HydraLspBackend {
             );
             tracing::warn!(%uri, "no DocumentInput for diagnostics; skipping");
             return;
-        };
-        let input = *input_ref;
-        drop(input_ref);
+        }
 
-        let Some(SessionSnapshot {
-            db: db_snapshot,
-            python_config,
-        }) = self.snapshot()
-        else {
-            return;
-        };
-        // Clone the cheap Arc-wrapped ParsedYaml off the snapshot; the deep
-        // ParsedContent stays inside the salsa cache.
-        let parsed_yaml = yaml_cache::parsed_yaml(&db_snapshot, input);
-
-        // Handle the parse result
-        if parsed_yaml.is_ok() {
-            // Clone disabled_rules (other settings live in salsa via python_config)
-            let disabled_rules = self.settings.read().disabled_rules.clone();
-
-            // Move expensive validation (Python analysis per target) to the
-            // worker pool so it does not compete with latency-sensitive
-            // operations (hover, goto_definition) for thread capacity.
-            // The snapshot lets the cached_definition_info salsa query share
-            // results with hover/signature_help/goto on the main db.
-            let join_result = spawn_on_pool(&self.worker_pool, move || {
-                let parsed_content = match parsed_yaml.result() {
-                    Ok(content) => content,
-                    Err(_) => return Vec::new(),
-                };
-                diagnostics::validate_document(
-                    parsed_content,
-                    &disabled_rules,
-                    &db_snapshot,
-                    python_config,
-                )
-            })
-            .await;
-            match classify_diag_outcome(join_result) {
-                DiagAction::Publish(diagnostics) => {
-                    self.client
-                        .publish_diagnostics(uri.clone(), diagnostics, None)
-                        .await;
-                }
-                // Cancelled / receiver dropped: a newer edit superseded this
-                // round. Do NOT publish an empty Vec — that would clear the
-                // editor's diagnostics until the next round republishes them.
-                DiagAction::Skip => {}
-                DiagAction::LogPanic(msg) => {
-                    tracing::error!(%msg, "validate_document task panicked");
-                }
-            }
-        } else {
-            let e = parsed_yaml.result().err().unwrap_or("").to_string();
-            let diagnostic = Diagnostic {
-                range: Range {
-                    start: Position {
-                        line: 0,
-                        character: 0,
-                    },
-                    end: Position {
-                        line: 0,
-                        character: 0,
-                    },
-                },
-                severity: Some(DiagnosticSeverity::ERROR),
-                code: Some(tower_lsp::lsp_types::NumberOrString::String(
-                    "yaml-syntax-error".to_string(),
-                )),
-                source: Some("hydra-lsp".to_string()),
-                message: format!("YAML syntax error: {}", e),
-                ..Default::default()
-            };
-
+        if let Some(diagnostics) = self.compute_diagnostics(uri) {
             self.client
-                .publish_diagnostics(uri.clone(), vec![diagnostic], None)
+                .publish_diagnostics(uri.clone(), diagnostics, None)
                 .await;
         }
+    }
+}
+
+/// Build the single diagnostic shown for a YAML document that failed to parse.
+fn yaml_syntax_error_diagnostic(msg: &str) -> Diagnostic {
+    Diagnostic {
+        range: Range {
+            start: Position {
+                line: 0,
+                character: 0,
+            },
+            end: Position {
+                line: 0,
+                character: 0,
+            },
+        },
+        severity: Some(DiagnosticSeverity::ERROR),
+        code: Some(tower_lsp::lsp_types::NumberOrString::String(
+            "yaml-syntax-error".to_string(),
+        )),
+        source: Some("hydra-lsp".to_string()),
+        message: format!("YAML syntax error: {}", msg),
+        ..Default::default()
+    }
+}
+
+/// An empty `Full` diagnostic report — nothing to show for this document.
+fn empty_full_report() -> DocumentDiagnosticReportResult {
+    DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Full(
+        RelatedFullDocumentDiagnosticReport::default(),
+    ))
+}
+
+/// A stable `result_id` for a set of diagnostics, or `None` when there are none.
+///
+/// `lsp_types::Diagnostic` isn't `Hash`, so we hash a stable JSON serialization.
+/// The client echoes this id back as `previous_result_id` on the next pull; an
+/// unchanged id lets us answer `Unchanged` and skip re-sending the items.
+fn diagnostics_result_id(diags: &[Diagnostic]) -> Option<String> {
+    if diags.is_empty() {
+        return None;
+    }
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    // Serialization is deterministic for a given value, so equal diagnostic
+    // lists hash equally. Fall back to a length-based id if serialization ever
+    // fails (it shouldn't for well-formed diagnostics).
+    match serde_json::to_vec(diags) {
+        Ok(bytes) => bytes.hash(&mut hasher),
+        Err(_) => diags.len().hash(&mut hasher),
+    }
+    Some(format!("{:016x}", hasher.finish()))
+}
+
+/// Build a pull-diagnostic report, returning `Unchanged` when the freshly
+/// computed `result_id` matches the client's `previous_result_id`.
+fn build_diagnostic_report(
+    diagnostics: Vec<Diagnostic>,
+    previous_result_id: Option<&str>,
+) -> DocumentDiagnosticReportResult {
+    let result_id = diagnostics_result_id(&diagnostics);
+    let report = match &result_id {
+        Some(new_id) if Some(new_id.as_str()) == previous_result_id => {
+            DocumentDiagnosticReport::Unchanged(RelatedUnchangedDocumentDiagnosticReport {
+                related_documents: None,
+                unchanged_document_diagnostic_report: UnchangedDocumentDiagnosticReport {
+                    result_id: new_id.clone(),
+                },
+            })
+        }
+        _ => DocumentDiagnosticReport::Full(RelatedFullDocumentDiagnosticReport {
+            related_documents: None,
+            full_document_diagnostic_report: FullDocumentDiagnosticReport {
+                result_id,
+                items: diagnostics,
+            },
+        }),
+    };
+    DocumentDiagnosticReportResult::Report(report)
+}
+
+/// The LSP `ServerCancelled` error for a superseded pull-diagnostic round.
+///
+/// `retrigger_request: true` asks the client to re-pull, which replaces any
+/// server-side retry loop with demand-driven retry.
+fn server_cancelled_error() -> tower_lsp::jsonrpc::Error {
+    tower_lsp::jsonrpc::Error {
+        code: tower_lsp::jsonrpc::ErrorCode::ServerError(-32802), // LSP ServerCancelled
+        message: "diagnostics superseded by a newer revision".into(),
+        data: serde_json::to_value(DiagnosticServerCancellationData {
+            retrigger_request: true,
+        })
+        .ok(),
     }
 }
 
@@ -1872,6 +2093,141 @@ mod tests {
             "expected Cancelled, got {outcome:?}"
         );
         writer.join().expect("writer thread panicked");
+    }
+
+    // --- Test C2: parsed_yaml on the diagnostics route is cancel-safe ---
+
+    /// Fix-guard (not a red-first repro): the diagnostics publisher must run its
+    /// `yaml_cache::parsed_yaml` call *inside* `spawn_on_pool`, so a concurrent
+    /// write that cancels it mid-flight surfaces as `PoolOutcome::Cancelled`
+    /// (→ `DiagAction::Skip`) instead of an uncaught `salsa::Cancelled` panic on
+    /// the task. This drives the exact parse the fix moves onto the pool:
+    /// `parsed_yaml` on a cloned snapshot, cancelled by `set_text(&mut db)` on
+    /// another thread. Because every salsa `fetch` begins with a cancellation
+    /// check, looping `parsed_yaml` reliably observes the pending flag the
+    /// blocked writer sets, exactly as the checkpoint loop in the test above.
+    #[tokio::test]
+    async fn parsed_yaml_cancellation_on_pool_classifies_as_skip() {
+        let pool = single_thread_pool();
+
+        let mut db = TestDb::new();
+        let input = DocumentInput::new(&db, "# @hydra\nmodel:\n  _target_: a.B\n".to_string(), 1);
+        // Snapshot shares storage with `db`; a `&mut db` write cancels queries
+        // running on this handle. `DocumentInput` is a `Copy` salsa id, so the
+        // move-closure copy below leaves `input` usable by the writer thread.
+        let snapshot = db.clone();
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let (proceed_tx, proceed_rx) = std::sync::mpsc::channel::<()>();
+
+        let rx = spawn_on_pool(&pool, move || {
+            started_tx.send(()).expect("main receiver dropped");
+            proceed_rx.recv().expect("main sender dropped");
+            // Re-run the diagnostics-route parse until the concurrent writer
+            // sets the cancellation flag; the next `fetch` then unwinds with
+            // `salsa::Cancelled`. The bound + outer timeout keep a
+            // mis-choreographed race from hanging.
+            for _ in 0..100_000_000_u64 {
+                let _ = yaml_cache::parsed_yaml(&snapshot, input);
+                std::thread::yield_now();
+            }
+            panic!("cancellation flag was never observed");
+        });
+
+        started_rx.recv().expect("worker never started");
+        // `set_text(&mut db)` blocks in salsa's cancel_others until the snapshot
+        // handle is released, so it must run on its own thread.
+        let writer = std::thread::spawn(move || {
+            input
+                .set_text(&mut db)
+                .to("# @hydra\nmodel:\n  _target_: c.D\n".to_string());
+        });
+        proceed_tx.send(()).expect("worker receiver dropped");
+
+        let outcome = tokio::time::timeout(Duration::from_secs(10), rx)
+            .await
+            .expect("timed out waiting for cancellation")
+            .expect("sender dropped");
+        assert!(
+            matches!(outcome, PoolOutcome::Cancelled),
+            "expected Cancelled, got {outcome:?}"
+        );
+        // The publisher relies on this exact classification to skip (not clear)
+        // diagnostics for a superseded round.
+        assert_eq!(classify_diag_outcome(Ok(outcome)), DiagAction::Skip);
+        writer.join().expect("writer thread panicked");
+    }
+
+    // --- Pull-diagnostic report helpers ---
+
+    fn sample_diagnostic(message: &str) -> Diagnostic {
+        Diagnostic {
+            message: message.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn diagnostics_result_id_is_none_for_empty_and_stable_for_equal() {
+        assert_eq!(diagnostics_result_id(&[]), None);
+
+        let a = vec![sample_diagnostic("boom")];
+        let b = vec![sample_diagnostic("boom")];
+        let c = vec![sample_diagnostic("different")];
+        assert_eq!(diagnostics_result_id(&a), diagnostics_result_id(&b));
+        assert_ne!(diagnostics_result_id(&a), diagnostics_result_id(&c));
+    }
+
+    #[test]
+    fn build_diagnostic_report_full_then_unchanged() {
+        let diags = vec![sample_diagnostic("boom")];
+        let id = diagnostics_result_id(&diags).expect("non-empty diags have an id");
+
+        // No previous id → Full report carrying the items and the fresh id.
+        match build_diagnostic_report(diags.clone(), None) {
+            DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Full(full)) => {
+                assert_eq!(full.full_document_diagnostic_report.items, diags);
+                assert_eq!(
+                    full.full_document_diagnostic_report.result_id,
+                    Some(id.clone())
+                );
+            }
+            other => panic!("expected Full, got {other:?}"),
+        }
+
+        // Matching previous id → Unchanged, echoing the id, dropping the items.
+        match build_diagnostic_report(diags, Some(&id)) {
+            DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Unchanged(u)) => {
+                assert_eq!(u.unchanged_document_diagnostic_report.result_id, id);
+            }
+            other => panic!("expected Unchanged, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_diagnostics_always_report_full() {
+        // An empty set has no result_id, so even a repeat pull stays Full (never
+        // Unchanged), correctly clearing any prior diagnostics on the client.
+        match build_diagnostic_report(Vec::new(), Some("stale-id")) {
+            DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Full(full)) => {
+                assert!(full.full_document_diagnostic_report.items.is_empty());
+                assert_eq!(full.full_document_diagnostic_report.result_id, None);
+            }
+            other => panic!("expected Full, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn server_cancelled_error_uses_lsp_code_and_retrigger() {
+        let err = server_cancelled_error();
+        assert!(matches!(
+            err.code,
+            tower_lsp::jsonrpc::ErrorCode::ServerError(-32802)
+        ));
+        let data = err.data.expect("cancellation carries data");
+        let cancellation: DiagnosticServerCancellationData =
+            serde_json::from_value(data).expect("valid cancellation data");
+        assert!(cancellation.retrigger_request);
     }
 
     // --- Test D: site-packages gating in bump_site_packages_pth_roots ---

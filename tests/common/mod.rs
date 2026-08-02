@@ -246,7 +246,7 @@ impl TestContext {
     }
 
     pub async fn initialize(&mut self) {
-        self.initialize_inner(false).await;
+        self.initialize_inner(false, false).await;
     }
 
     /// Like [`initialize`], but advertises `workspace/didChangeWatchedFiles`
@@ -254,10 +254,21 @@ impl TestContext {
     /// `initialized`. Use [`recv_request`]/[`reply_ok`] to observe and answer
     /// the resulting `client/registerCapability` request.
     pub async fn initialize_with_watched_files_support(&mut self) {
-        self.initialize_inner(true).await;
+        self.initialize_inner(true, false).await;
     }
 
-    async fn initialize_inner(&mut self, watched_files_dynamic_registration: bool) {
+    /// Like [`initialize`], but advertises `textDocument/diagnostic` pull
+    /// support so the server answers pull requests and suppresses proactive
+    /// pushes.
+    pub async fn initialize_with_pull_support(&mut self) {
+        self.initialize_inner(false, true).await;
+    }
+
+    async fn initialize_inner(
+        &mut self,
+        watched_files_dynamic_registration: bool,
+        pull_diagnostics: bool,
+    ) {
         // Real set of initialize params with workspace configuration
         let initialize = r#"{
             "capabilities": {
@@ -313,6 +324,12 @@ impl TestContext {
                     dynamic_registration: Some(true),
                     relative_pattern_support: None,
                 });
+        }
+        if pull_diagnostics
+            && let Some(text_document) = initialize.capabilities.text_document.as_mut()
+        {
+            text_document.diagnostic =
+                Some(lsp_types::DiagnosticClientCapabilities::default());
         }
         let workspace_url = Url::from_file_path(self.workspace.path()).unwrap();
         initialize.root_uri = Some(workspace_url.clone());
