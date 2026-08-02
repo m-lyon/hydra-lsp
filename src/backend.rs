@@ -230,6 +230,12 @@ pub struct HydraLspBackend {
     /// the lookup-or-insert atomic, which keeps concurrent `did_open` calls
     /// for the same URI from creating distinct inputs.
     ///
+    /// The corollary for readers: never take a shard guard while holding the
+    /// db lock. `DashMap::iter`/`get` hand out guards, so copy the
+    /// (`Copy`) `DocumentInput` out and let the guard drop before calling
+    /// `Session::db.lock()`. Running a salsa query inside an `iter().filter`
+    /// closure holds the shard guard for the duration and inverts the order.
+    ///
     /// This map retains one entry per unique URI ever opened — salsa
     /// exposes no API to remove an `#[salsa::input]` from storage
     /// (verified against salsa v0.26.2). On `did_close` we soft-close
@@ -1163,15 +1169,26 @@ impl LanguageServer for HydraLspBackend {
         }
 
         // Otherwise fall back to refreshing each open Hydra doc.
+        //
+        // Snapshot the map first so every shard guard is released before we
+        // take the db lock. Filtering inside `iter()` would run
+        // `is_hydra_file` — which needs the db lock — while a shard read
+        // guard is held, i.e. db → shard, the reverse of the order
+        // `get_or_create_input` uses (see the `document_inputs` field docs).
+        let candidates: Vec<(Url, DocumentInput)> = self
+            .document_inputs
+            .iter()
+            .map(|entry| (entry.key().clone(), *entry.value()))
+            .collect();
         let hydra_uris: Vec<Url> = self
             .with_session("refreshing diagnostics", |s| {
                 let db = s.db.lock();
-                self.document_inputs
-                    .iter()
+                candidates
+                    .into_iter()
                     // Soft-closed docs have empty text, and `is_hydra_file`
                     // returns false on empty text, so they self-exclude.
-                    .filter(|entry| yaml_cache::is_hydra_file(&*db, *entry.value()))
-                    .map(|entry| entry.key().clone())
+                    .filter(|(_, input)| yaml_cache::is_hydra_file(&*db, *input))
+                    .map(|(uri, _)| uri)
                     .collect()
             })
             .unwrap_or_default();
