@@ -78,61 +78,60 @@ fn build_signature_params<'a>(
     (param_strs.join(", "), param_infos, filtered)
 }
 
-/// Feature toggle settings for individual LSP capabilities.
-#[derive(Debug, Clone, Copy)]
-pub struct FeatureToggles {
-    pub hover: bool,
-    pub completion: bool,
-    pub signature_help: bool,
-    pub goto_definition: bool,
-    pub semantic_tokens: bool,
-    pub diagnostics: bool,
+/// Declare the per-capability feature toggles once, as
+/// `field => "settingKey", "logName"` triples.
+///
+/// One invocation generates everything that has to agree about a toggle: the
+/// [`FeatureToggles`] field, its default, the settings key it is parsed from,
+/// the name used when logging it as disabled, and the key list that goes out in
+/// [`HydrustCapabilities::supported_settings`]. Adding a toggle is a one-line
+/// edit here, so none of those can drift apart.
+macro_rules! feature_toggles {
+    ($($field:ident => $key:literal, $name:literal),+ $(,)?) => {
+        /// Feature toggle settings for individual LSP capabilities.
+        #[derive(Debug, Clone, Copy)]
+        pub struct FeatureToggles {
+            $(pub $field: bool,)+
+        }
+
+        impl Default for FeatureToggles {
+            fn default() -> Self {
+                Self { $($field: true,)+ }
+            }
+        }
+
+        impl FeatureToggles {
+            /// The `initializationOptions.settings` keys these toggles read.
+            /// Part of [`SUPPORTED_SETTINGS`].
+            pub const SETTING_KEYS: &'static [&'static str] = &[$($key,)+];
+
+            /// Parse feature toggles from a JSON settings object. A key that is
+            /// missing or not a boolean leaves the feature on.
+            fn from_json(settings: &serde_json::Value) -> Self {
+                Self {
+                    $($field: settings.get($key).and_then(|v| v.as_bool()).unwrap_or(true),)+
+                }
+            }
+
+            /// Return names of disabled features, if any.
+            fn disabled_names(&self) -> Vec<&'static str> {
+                let mut names = Vec::new();
+                $(if !self.$field {
+                    names.push($name);
+                })+
+                names
+            }
+        }
+    };
 }
 
-impl Default for FeatureToggles {
-    fn default() -> Self {
-        Self {
-            hover: true,
-            completion: true,
-            signature_help: true,
-            goto_definition: true,
-            semantic_tokens: true,
-            diagnostics: true,
-        }
-    }
-}
-
-impl FeatureToggles {
-    /// Parse feature toggles from a JSON settings object.
-    fn from_json(settings: &serde_json::Value) -> Self {
-        fn bool_setting(settings: &serde_json::Value, key: &str) -> bool {
-            settings.get(key).and_then(|v| v.as_bool()).unwrap_or(true)
-        }
-        Self {
-            hover: bool_setting(settings, "enableHover"),
-            completion: bool_setting(settings, "enableCompletion"),
-            signature_help: bool_setting(settings, "enableSignatureHelp"),
-            goto_definition: bool_setting(settings, "enableGotoDefinition"),
-            semantic_tokens: bool_setting(settings, "enableSemanticTokens"),
-            diagnostics: bool_setting(settings, "enableDiagnostics"),
-        }
-    }
-
-    /// Return names of disabled features, if any.
-    fn disabled_names(&self) -> Vec<&'static str> {
-        [
-            (!self.hover, "hover"),
-            (!self.completion, "completion"),
-            (!self.signature_help, "signatureHelp"),
-            (!self.goto_definition, "gotoDefinition"),
-            (!self.semantic_tokens, "semanticTokens"),
-            (!self.diagnostics, "diagnostics"),
-        ]
-        .into_iter()
-        .filter(|(disabled, _)| *disabled)
-        .map(|(_, name)| name)
-        .collect()
-    }
+feature_toggles! {
+    hover => "enableHover", "hover",
+    completion => "enableCompletion", "completion",
+    signature_help => "enableSignatureHelp", "signatureHelp",
+    goto_definition => "enableGotoDefinition", "gotoDefinition",
+    semantic_tokens => "enableSemanticTokens", "semanticTokens",
+    diagnostics => "enableDiagnostics", "diagnostics",
 }
 
 /// Server-wide settings for Hydrust Server.
@@ -141,6 +140,127 @@ pub struct Settings {
     pub python_interpreter: Option<String>,
     pub disabled_rules: HashSet<DiagnosticRule>,
     pub features: FeatureToggles,
+}
+
+/// Version of the `experimental.hydrust` block described by
+/// [`HydrustCapabilities`]. A client compares it against the highest version it
+/// knows how to read.
+///
+/// Bump this only when something already in the block changes meaning in a way
+/// that would mislead an older client: a setting key that starts doing
+/// something different, a renamed or repurposed feature name, a field that
+/// changes type. Purely additive changes do NOT need a bump, because clients are
+/// expected to ignore names they do not recognise.
+const HYDRUST_PROTOCOL_VERSION: u32 = 1;
+
+/// The non-toggle keys the server reads out of
+/// `initializationOptions.settings`. This list must stay in step with the
+/// parsing in `initialize`; the feature toggles alongside it come from
+/// [`FeatureToggles::SETTING_KEYS`], which is generated with the toggles
+/// themselves.
+const CORE_SETTINGS: &[&str] = &["pythonInterpreter", "disabledRules", "numThreads"];
+
+/// Every key the server actually reads out of `initializationOptions.settings`.
+/// Anything else a client sends is silently ignored.
+static SUPPORTED_SETTINGS: std::sync::LazyLock<Vec<&'static str>> =
+    std::sync::LazyLock::new(|| {
+        CORE_SETTINGS
+            .iter()
+            .chain(FeatureToggles::SETTING_KEYS)
+            .copied()
+            .collect()
+    });
+
+/// Which optional behaviours the server will actually use this session. Each
+/// one needs the client to have asked for it in its `initialize` capabilities,
+/// so these are read from the flags captured at the top of `initialize`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NegotiatedFeatures {
+    /// The client issues `textDocument/diagnostic`, so we answer pull requests
+    /// rather than pushing diagnostics at it.
+    pub pull_diagnostics: bool,
+    /// The client allows watchers to be registered at runtime, so we set up our
+    /// own `workspace/didChangeWatchedFiles` watchers.
+    pub watched_files: bool,
+    /// The client accepts `workspace/diagnostic/refresh`, so we can ask it to
+    /// re-pull after a watched Python file changes.
+    pub diagnostic_refresh: bool,
+}
+
+/// A feature name paired with the flag that decides whether it is on.
+type FeatureGate = (&'static str, fn(&NegotiatedFeatures) -> bool);
+
+/// The coarse feature names, each paired with the flag that decides whether it
+/// is active. Keeping the name and its gate together means a name can only be
+/// advertised when the matching behaviour really is switched on.
+///
+/// Every name here is only sent to a client that advertised the capability it
+/// depends on:
+///
+/// - `pullDiagnostics` — we answer `textDocument/diagnostic`, returning
+///   unchanged reports via result IDs. Absent when the client did not advertise
+///   pull support, in which case it gets diagnostics pushed to it instead.
+/// - `watchedFiles` — we register our own file watchers on `initialized`, so
+///   the client does not need to configure any. Absent when the client did not
+///   advertise dynamic registration for `workspace/didChangeWatchedFiles`.
+/// - `diagnosticRefresh` — we send `workspace/diagnostic/refresh` after a
+///   watched Python file changes. Absent when the client did not advertise
+///   refresh support, in which case it would need to re-pull on its own.
+const SUPPORTED_FEATURES: &[FeatureGate] = &[
+    ("pullDiagnostics", |f| f.pull_diagnostics),
+    ("watchedFiles", |f| f.watched_files),
+    ("diagnosticRefresh", |f| f.diagnostic_refresh),
+];
+
+/// What this build of the server understands, sent back from `initialize` as
+/// `capabilities.experimental.hydrust`.
+///
+/// This lets a client that may be driving any released server version discover
+/// the surface directly.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HydrustCapabilities {
+    /// See [`HYDRUST_PROTOCOL_VERSION`].
+    pub protocol_version: u32,
+    /// Setting keys under `initializationOptions.settings` that do something.
+    pub supported_settings: &'static [&'static str],
+    /// Rule codes accepted in the `disabledRules` setting, and emitted as
+    /// diagnostic codes.
+    pub supported_rules: &'static [&'static str],
+    /// The features that are switched on for this session, after matching what
+    /// the server can do against what the client asked for. A name being absent
+    /// means the behaviour will not happen on this connection, not that the
+    /// server is too old to do it. Empty when the client asked for none of
+    /// them. See [`SUPPORTED_FEATURES`].
+    pub features: Vec<&'static str>,
+}
+
+impl HydrustCapabilities {
+    /// Build the block for a session, keeping only the features the client and
+    /// server agreed on.
+    pub fn new(negotiated: NegotiatedFeatures) -> Self {
+        Self {
+            protocol_version: HYDRUST_PROTOCOL_VERSION,
+            supported_settings: SUPPORTED_SETTINGS.as_slice(),
+            supported_rules: DiagnosticRule::all_codes(),
+            features: SUPPORTED_FEATURES
+                .iter()
+                .filter(|(_, is_active)| is_active(&negotiated))
+                .map(|(name, _)| *name)
+                .collect(),
+        }
+    }
+
+    /// Build the value for `ServerCapabilities::experimental`, i.e. this block
+    /// wrapped in its `hydrust` key. Returns `None` only if serialization
+    /// fails, which it cannot for these plain fields.
+    pub fn to_experimental(&self) -> Option<serde_json::Value> {
+        #[derive(serde::Serialize)]
+        struct Experimental<'a> {
+            hydrust: &'a HydrustCapabilities,
+        }
+        serde_json::to_value(Experimental { hydrust: self }).ok()
+    }
 }
 
 /// Initialized analysis state owned by `HydraLspBackend`.
@@ -401,6 +521,13 @@ impl HydraLspBackend {
     /// When true we answer pull requests and stop pushing diagnostics proactively.
     fn supports_pull(&self) -> bool {
         self.supports_pull_diagnostics.load(Ordering::Relaxed)
+    }
+
+    /// Whether the client supports dynamic registration for
+    /// `workspace/didChangeWatchedFiles`. When true we register our own file watchers
+    /// on `initialized`, so the client does not need to configure any.
+    fn supports_dynamic_watched_files(&self) -> bool {
+        self.watched_files_dynamic.load(Ordering::Relaxed)
     }
 
     /// Whether the client supports `workspace/diagnostic/refresh`, letting us nudge
@@ -892,6 +1019,16 @@ impl LanguageServer for HydraLspBackend {
                         work_done_progress_options: Default::default(),
                     },
                 )),
+                // Tell the client which settings and rules this build
+                // understands, so it can warn about anything it sends that
+                // would be silently ignored, plus the features that are
+                // actually switched on for this session.
+                experimental: HydrustCapabilities::new(NegotiatedFeatures {
+                    pull_diagnostics: self.supports_pull(),
+                    watched_files: self.supports_dynamic_watched_files(),
+                    diagnostic_refresh: self.supports_diag_refresh(),
+                })
+                .to_experimental(),
                 ..Default::default()
             },
             server_info: Some(ServerInfo {
@@ -906,7 +1043,7 @@ impl LanguageServer for HydraLspBackend {
         // source of truth for which paths trigger `did_change_watched_files`
         // (see `WATCHED_PY_GLOB`). The client creates the watchers on its side
         // in response and forwards matching events back to us.
-        if self.watched_files_dynamic.load(Ordering::Relaxed) {
+        if self.supports_dynamic_watched_files() {
             // Workspace folders: the client matches this string glob against
             // them, covering first-party sources and any in-workspace `.venv`.
             let mut watchers = vec![FileSystemWatcher {

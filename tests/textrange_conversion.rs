@@ -33,7 +33,8 @@ class MyClass:
     let db = test_db();
 
     // Test function extraction
-    let func_sig = PythonAnalyzer::extract_function_signature(&db, test_file.path(), "my_function").unwrap();
+    let func_sig =
+        PythonAnalyzer::extract_function_signature(&db, test_file.path(), "my_function").unwrap();
 
     // The function should start at line 3
     assert_eq!(func_sig.start_line, 3, "Function should start at line 3");
@@ -108,7 +109,9 @@ fn test_indented_function() {
     let db = test_db();
 
     // Test that we can extract the nested function
-    let func_sig = PythonAnalyzer::extract_function_signature(&db, test_file.path(), "nested_function").unwrap();
+    let func_sig =
+        PythonAnalyzer::extract_function_signature(&db, test_file.path(), "nested_function")
+            .unwrap();
     // The function should start at line 1
     assert_eq!(
         func_sig.start_line, 1,
@@ -139,7 +142,8 @@ fn test_multiline_function() {
     let db = test_db();
 
     let func_sig =
-        PythonAnalyzer::extract_function_signature(&db, test_file.path(), "multiline_function").unwrap();
+        PythonAnalyzer::extract_function_signature(&db, test_file.path(), "multiline_function")
+            .unwrap();
 
     assert_eq!(
         func_sig.start_line, 0,
@@ -173,7 +177,9 @@ def target_function() -> None:
     test_file.flush().unwrap();
     let db = test_db();
 
-    let func_sig = PythonAnalyzer::extract_function_signature(&db, test_file.path(), "target_function").unwrap();
+    let func_sig =
+        PythonAnalyzer::extract_function_signature(&db, test_file.path(), "target_function")
+            .unwrap();
 
     assert_eq!(func_sig.start_line, 6, "Function should be at line 6");
 }
@@ -193,7 +199,9 @@ def unicode_function(name: str) -> str:
     test_file.flush().unwrap();
     let db = test_db();
 
-    let func_sig = PythonAnalyzer::extract_function_signature(&db, test_file.path(), "unicode_function").unwrap();
+    let func_sig =
+        PythonAnalyzer::extract_function_signature(&db, test_file.path(), "unicode_function")
+            .unwrap();
 
     assert_eq!(
         func_sig.start_line, 3,

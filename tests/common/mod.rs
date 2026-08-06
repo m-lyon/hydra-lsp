@@ -246,7 +246,24 @@ impl TestContext {
     }
 
     pub async fn initialize(&mut self) {
-        self.initialize_inner(false, false).await;
+        self.initialize_inner(false, false, false).await;
+    }
+
+    /// Like [`initialize`], but lets the test pick which client capabilities are
+    /// advertised, and hands back the server's `InitializeResult` so tests can
+    /// inspect what it advertised in return.
+    pub async fn initialize_with_capabilities(
+        &mut self,
+        watched_files_dynamic_registration: bool,
+        pull_diagnostics: bool,
+        diagnostic_refresh: bool,
+    ) -> lsp_types::InitializeResult {
+        self.initialize_inner(
+            watched_files_dynamic_registration,
+            pull_diagnostics,
+            diagnostic_refresh,
+        )
+        .await
     }
 
     /// Like [`initialize`], but advertises `workspace/didChangeWatchedFiles`
@@ -254,21 +271,22 @@ impl TestContext {
     /// `initialized`. Use [`recv_request`]/[`reply_ok`] to observe and answer
     /// the resulting `client/registerCapability` request.
     pub async fn initialize_with_watched_files_support(&mut self) {
-        self.initialize_inner(true, false).await;
+        self.initialize_inner(true, false, false).await;
     }
 
     /// Like [`initialize`], but advertises `textDocument/diagnostic` pull
     /// support so the server answers pull requests and suppresses proactive
     /// pushes.
     pub async fn initialize_with_pull_support(&mut self) {
-        self.initialize_inner(false, true).await;
+        self.initialize_inner(false, true, false).await;
     }
 
     async fn initialize_inner(
         &mut self,
         watched_files_dynamic_registration: bool,
         pull_diagnostics: bool,
-    ) {
+        diagnostic_refresh: bool,
+    ) -> lsp_types::InitializeResult {
         // Real set of initialize params with workspace configuration
         let initialize = r#"{
             "capabilities": {
@@ -330,16 +348,23 @@ impl TestContext {
         {
             text_document.diagnostic = Some(lsp_types::DiagnosticClientCapabilities::default());
         }
+        if diagnostic_refresh && let Some(workspace) = initialize.capabilities.workspace.as_mut() {
+            workspace.diagnostic = Some(lsp_types::DiagnosticWorkspaceClientCapabilities {
+                refresh_support: Some(true),
+            });
+        }
         let workspace_url = Url::from_file_path(self.workspace.path()).unwrap();
         initialize.root_uri = Some(workspace_url.clone());
         initialize.workspace_folders = Some(vec![WorkspaceFolder {
             name: "test".to_owned(),
             uri: workspace_url.clone(),
         }]);
-        self.request::<lsp_types::request::Initialize>(initialize)
+        let result = self
+            .request::<lsp_types::request::Initialize>(initialize)
             .await;
         self.notify::<lsp_types::notification::Initialized>(InitializedParams {})
             .await;
+        result
     }
 
     /// Read messages off the pipe until a server-initiated request with the
