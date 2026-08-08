@@ -1482,10 +1482,7 @@ impl LanguageServer for HydraLspBackend {
         match context {
             CompletionContext::TargetValue { partial } => {
                 // TODO: Implement module/class completion
-                self.outbox.log(
-                    MessageType::INFO,
-                    format!("Target completion requested for: {}", partial),
-                );
+                tracing::debug!(%partial, "target completion requested");
 
                 // Ok(Some(CompletionResponse::Array(vec![
                 //     CompletionItem {
@@ -1505,13 +1502,7 @@ impl LanguageServer for HydraLspBackend {
             }
             CompletionContext::ParameterKey { target, partial } => {
                 // TODO: Resolve target and get parameter completions
-                self.outbox.log(
-                    MessageType::INFO,
-                    format!(
-                        "Parameter completion requested for target: {}, partial: {}",
-                        target, partial
-                    ),
-                );
+                tracing::debug!(%target, %partial, "parameter completion requested");
 
                 // For demonstration, return some placeholder parameters
                 // Ok(Some(CompletionResponse::Array(vec![
@@ -1572,11 +1563,7 @@ impl LanguageServer for HydraLspBackend {
                     return Ok(None);
                 }
 
-                self.outbox.log(MessageType::INFO,
-                        format!(
-                            "Parameter value completion requested for target: {}, parameter: {}, partial: {}",
-                            target, parameter, partial
-                        ));
+                tracing::debug!(%target, %parameter, %partial, "parameter value completion requested");
 
                 Ok(None) // Placeholder: no completions yet
             }
