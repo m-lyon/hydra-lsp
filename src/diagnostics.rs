@@ -1,65 +1,62 @@
-use crate::python_analyzer::{DefinitionInfo, FunctionSignature, ParameterInfo, PythonAnalyzer};
+use crate::python_analyzer::{DefinitionInfo, FunctionSignature, ParameterInfo};
+use crate::python_cache::{PythonConfig, TargetString, cached_definition_info};
 use crate::yaml_parser::{
     ARGS_KEY, CONVERT_KEY, ConvertMode, HydraObject, PARTIAL_KEY, Parameter, ParsedContent,
     RECURSIVE_KEY,
 };
 use std::collections::HashSet;
 use std::fmt;
-use std::path::Path;
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 
-/// Diagnostic rule codes for Hydrust diagnostics.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum DiagnosticRule {
-    MissingArgument,
-    UnknownArgument,
-    UnresolvedReference,
-    UnresolvedImport,
-    InvalidHydraParameter,
-    ParameterAlreadyAssigned,
-    TooManyPositionalArguments,
+/// Build the `DiagnosticRule` enum and everything that maps a variant to or
+/// from its string code from one list of pairs, so the variants, the codes,
+/// and the "all rules" list can never fall out of step with each other.
+macro_rules! diagnostic_rules {
+    ($($variant:ident => $code:literal),+ $(,)?) => {
+        /// Diagnostic rule codes for Hydrust diagnostics.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub enum DiagnosticRule {
+            $($variant,)+
+        }
+
+        impl DiagnosticRule {
+            /// Return the string code for this rule.
+            pub fn as_code(&self) -> &'static str {
+                match self {
+                    $(DiagnosticRule::$variant => $code,)+
+                }
+            }
+
+            /// Parse a rule from its string code.
+            pub fn from_code(code: &str) -> Option<Self> {
+                match code {
+                    $($code => Some(DiagnosticRule::$variant),)+
+                    _ => None,
+                }
+            }
+
+            /// Return all diagnostic rules.
+            pub fn all() -> &'static [DiagnosticRule] {
+                &[$(DiagnosticRule::$variant,)+]
+            }
+
+            /// Return the string code of every rule, in the same order as
+            /// [`DiagnosticRule::all`].
+            pub fn all_codes() -> &'static [&'static str] {
+                &[$($code,)+]
+            }
+        }
+    };
 }
 
-impl DiagnosticRule {
-    /// Return the string code for this rule.
-    pub fn as_code(&self) -> &'static str {
-        match self {
-            DiagnosticRule::MissingArgument => "missing-argument",
-            DiagnosticRule::UnknownArgument => "unknown-argument",
-            DiagnosticRule::UnresolvedReference => "unresolved-reference",
-            DiagnosticRule::UnresolvedImport => "unresolved-import",
-            DiagnosticRule::InvalidHydraParameter => "invalid-hydra-parameter",
-            DiagnosticRule::ParameterAlreadyAssigned => "parameter-already-assigned",
-            DiagnosticRule::TooManyPositionalArguments => "too-many-positional-arguments",
-        }
-    }
-
-    /// Parse a rule from its string code.
-    pub fn from_code(code: &str) -> Option<Self> {
-        match code {
-            "missing-argument" => Some(DiagnosticRule::MissingArgument),
-            "unknown-argument" => Some(DiagnosticRule::UnknownArgument),
-            "unresolved-reference" => Some(DiagnosticRule::UnresolvedReference),
-            "unresolved-import" => Some(DiagnosticRule::UnresolvedImport),
-            "invalid-hydra-parameter" => Some(DiagnosticRule::InvalidHydraParameter),
-            "parameter-already-assigned" => Some(DiagnosticRule::ParameterAlreadyAssigned),
-            "too-many-positional-arguments" => Some(DiagnosticRule::TooManyPositionalArguments),
-            _ => None,
-        }
-    }
-
-    /// Return all diagnostic rules.
-    pub fn all() -> &'static [DiagnosticRule] {
-        &[
-            DiagnosticRule::MissingArgument,
-            DiagnosticRule::UnknownArgument,
-            DiagnosticRule::UnresolvedReference,
-            DiagnosticRule::UnresolvedImport,
-            DiagnosticRule::InvalidHydraParameter,
-            DiagnosticRule::ParameterAlreadyAssigned,
-            DiagnosticRule::TooManyPositionalArguments,
-        ]
-    }
+diagnostic_rules! {
+    MissingArgument => "missing-argument",
+    UnknownArgument => "unknown-argument",
+    UnresolvedReference => "unresolved-reference",
+    UnresolvedImport => "unresolved-import",
+    InvalidHydraParameter => "invalid-hydra-parameter",
+    ParameterAlreadyAssigned => "parameter-already-assigned",
+    TooManyPositionalArguments => "too-many-positional-arguments",
 }
 
 impl fmt::Display for DiagnosticRule {
@@ -97,24 +94,22 @@ fn create_diagnostic(
 
 /// Validate a Hydra `_target_` entry. Returns diagnostics and optionally the resolved
 /// DefinitionInfo.
+///
+/// Routes through `cached_definition_info`.
 fn validate_target(
     hydra_obj: &HydraObject,
-    workspace_root: Option<&Path>,
-    python_interpreter: Option<&str>,
+    db: &dyn ruff_db::Db,
+    python_config: PythonConfig,
     file_suppressions: &HashSet<DiagnosticRule>,
 ) -> (Vec<Diagnostic>, Option<DefinitionInfo>) {
     let mut diagnostics = Vec::new();
 
-    match PythonAnalyzer::extract_definition_info(
-        &hydra_obj.target.value,
-        workspace_root,
-        python_interpreter,
-    ) {
-        Ok((definition_info, _file_path, _module_path, _symbol_name)) => {
-            (diagnostics, Some(definition_info))
-        }
-        Err(err) => {
-            let error_msg = err.to_string();
+    let target = TargetString::new(db, hydra_obj.target.value.clone());
+    let cached = cached_definition_info(db, python_config, target);
+    match cached.get() {
+        Ok(def) => (diagnostics, Some(def.definition_info.clone())),
+        Err(error_msg) => {
+            let error_msg = error_msg.to_string();
             let (rule, msg) = if error_msg.starts_with("Could not resolve module:") {
                 (DiagnosticRule::UnresolvedImport, error_msg)
             } else if error_msg.starts_with("Invalid _target_ format:") {
@@ -414,21 +409,36 @@ fn validate_hydra_keywords(
     diagnostics
 }
 
-/// Validate all targets in a document
+/// Validate all targets in a document.
+///
+/// Takes a salsa database and `PythonConfig` so target resolution shares the
+/// cached_definition_info LRU with the rest of the LSP.
+///
+/// `extra_suppressions` is unioned with the file's own suppressions so the
+/// caller can inject globally-disabled rules (e.g. from user settings) without
+/// mutating the cached `ParsedContent`.
 pub fn validate_document(
-    parsed_content: ParsedContent,
-    workspace_root: Option<&Path>,
-    python_interpreter: Option<&str>,
+    parsed_content: &ParsedContent,
+    extra_suppressions: &HashSet<DiagnosticRule>,
+    db: &dyn ruff_db::Db,
+    python_config: PythonConfig,
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
 
+    let suppressions: HashSet<DiagnosticRule> = if extra_suppressions.is_empty() {
+        parsed_content.file_suppressions.clone()
+    } else {
+        parsed_content
+            .file_suppressions
+            .iter()
+            .copied()
+            .chain(extra_suppressions.iter().copied())
+            .collect()
+    };
+
     for target in &parsed_content.hydra_objects {
-        let (target_diagnostics, definition_info) = validate_target(
-            target,
-            workspace_root,
-            python_interpreter,
-            &parsed_content.file_suppressions,
-        );
+        let (target_diagnostics, definition_info) =
+            validate_target(target, db, python_config, &suppressions);
         diagnostics.extend(target_diagnostics);
 
         // Try to resolve the target and validate parameters
@@ -455,15 +465,14 @@ pub fn validate_document(
                 signature,
                 &display_name,
                 implicit_param,
-                &parsed_content.file_suppressions,
+                &suppressions,
             );
             diagnostics.extend(parameter_diagnostics);
         }
         // If Python analysis fails, we've already added a basic validation diagnostic above
 
         // Validate Hydra keyword values
-        let keyword_diagnostics =
-            validate_hydra_keywords(target, &parsed_content.file_suppressions);
+        let keyword_diagnostics = validate_hydra_keywords(target, &suppressions);
         diagnostics.extend(keyword_diagnostics);
     }
 
@@ -482,17 +491,28 @@ pub fn validate_document(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::database::HydraDatabase;
     use crate::python_analyzer::ParameterInfo;
     use crate::yaml_parser::{HydraParameter, Parameter, YamlValue};
     use hashlink::LinkedHashMap;
+    use ruff_db::system::SystemPath;
     use std::collections::HashMap;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     fn get_simple_test_dir() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests")
             .join("workspace")
             .join("simple")
+    }
+
+    /// Build a fresh salsa db + PythonConfig for tests. Uses `HydraDatabase`
+    /// (not `TestDb`) so analyzer file reads can hit the real workspace files.
+    fn test_env(workspace_root: Option<&Path>) -> (HydraDatabase, PythonConfig) {
+        let db = HydraDatabase::new(SystemPath::new("/"));
+        let workspace = workspace_root.map(|p| p.to_string_lossy().to_string());
+        let config = PythonConfig::new(&db, workspace, None);
+        (db, config)
     }
 
     /// Helper to create a HydraObject with default suppression fields.
@@ -981,8 +1001,9 @@ mod tests {
             false,
         );
 
+        let (db, config) = test_env(None);
         let (diagnostics, _definition_info) =
-            validate_target(&hydra_obj, None, None, &HashSet::new());
+            validate_target(&hydra_obj, &db, config, &HashSet::new());
         assert_eq!(diagnostics.len(), 1);
         assert!(diagnostics[0].message.contains("Invalid _target_ format"));
         assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
@@ -1005,12 +1026,10 @@ mod tests {
             false,
         );
 
-        let (diagnostics, _definition_info) = validate_target(
-            &hydra_obj,
-            Some(&get_simple_test_dir()),
-            None,
-            &HashSet::new(),
-        );
+        let resources_dir = get_simple_test_dir();
+        let (db, config) = test_env(Some(&resources_dir));
+        let (diagnostics, _definition_info) =
+            validate_target(&hydra_obj, &db, config, &HashSet::new());
         assert_eq!(diagnostics.len(), 1);
         assert!(
             diagnostics[0].message.contains("Could not resolve module"),
@@ -1038,8 +1057,9 @@ mod tests {
         );
 
         let resources_dir = get_simple_test_dir();
+        let (db, config) = test_env(Some(&resources_dir));
         let (diagnostics, _definition_info) =
-            validate_target(&hydra_obj, Some(&resources_dir), None, &HashSet::new());
+            validate_target(&hydra_obj, &db, config, &HashSet::new());
         assert_eq!(diagnostics.len(), 1);
         assert!(diagnostics[0].message.contains("Symbol"));
         assert!(diagnostics[0].message.contains("not found"));
@@ -1064,8 +1084,9 @@ mod tests {
         );
 
         let resources_dir = get_simple_test_dir();
+        let (db, config) = test_env(Some(&resources_dir));
         let (diagnostics, _definition_info) =
-            validate_target(&hydra_obj, Some(&resources_dir), None, &HashSet::new());
+            validate_target(&hydra_obj, &db, config, &HashSet::new());
 
         assert!(
             !diagnostics
@@ -1093,8 +1114,9 @@ mod tests {
         );
 
         let resources_dir = get_simple_test_dir();
+        let (db, config) = test_env(Some(&resources_dir));
         let (diagnostics, _definition_info) =
-            validate_target(&hydra_obj, Some(&resources_dir), None, &HashSet::new());
+            validate_target(&hydra_obj, &db, config, &HashSet::new());
 
         assert!(
             !diagnostics
@@ -1128,7 +1150,8 @@ mod tests {
         };
 
         let resources_dir = get_simple_test_dir();
-        let diagnostics = validate_document(parsed_content, Some(&resources_dir), None);
+        let (db, config) = test_env(Some(&resources_dir));
+        let diagnostics = validate_document(&parsed_content, &HashSet::new(), &db, config);
 
         // Should have at least 2 errors (invalid format and module not found)
         let errors: Vec<_> = diagnostics
@@ -1166,7 +1189,8 @@ mod tests {
         };
 
         let resources_dir = get_simple_test_dir();
-        let diagnostics = validate_document(parsed_content, Some(&resources_dir), None);
+        let (db, config) = test_env(Some(&resources_dir));
+        let diagnostics = validate_document(&parsed_content, &HashSet::new(), &db, config);
 
         let missing_param_diag = diagnostics.iter().find(|d| {
             d.message.contains("Missing required parameter") && d.message.contains("name")
@@ -1204,7 +1228,8 @@ mod tests {
             file_suppressions: HashSet::new(),
         };
 
-        let diagnostics = validate_document(parsed_content, Some(&resources_dir), None);
+        let (db, config) = test_env(Some(&resources_dir));
+        let diagnostics = validate_document(&parsed_content, &HashSet::new(), &db, config);
 
         assert!(
             !diagnostics
@@ -1410,7 +1435,8 @@ mod tests {
             file_suppressions,
         };
 
-        let diagnostics = validate_document(parsed_content, None, None);
+        let (db, config) = test_env(None);
+        let diagnostics = validate_document(&parsed_content, &HashSet::new(), &db, config);
 
         assert!(
             diagnostics.is_empty(),
@@ -1434,7 +1460,8 @@ mod tests {
             file_suppressions: HashSet::new(),
         };
 
-        let diagnostics = validate_document(parsed_content, None, None);
+        let (db, config) = test_env(None);
+        let diagnostics = validate_document(&parsed_content, &HashSet::new(), &db, config);
 
         assert!(
             diagnostics.is_empty(),
@@ -1463,7 +1490,8 @@ mod tests {
             file_suppressions: HashSet::new(),
         };
 
-        let diagnostics = validate_document(parsed_content, None, None);
+        let (db, config) = test_env(None);
+        let diagnostics = validate_document(&parsed_content, &HashSet::new(), &db, config);
         let keyword_diags: Vec<_> = diagnostics
             .iter()
             .filter(|d| d.message.contains("_recursive_"))
@@ -1496,7 +1524,8 @@ mod tests {
             file_suppressions: HashSet::new(),
         };
 
-        let diagnostics = validate_document(parsed_content, None, None);
+        let (db, config) = test_env(None);
+        let diagnostics = validate_document(&parsed_content, &HashSet::new(), &db, config);
         let keyword_diags: Vec<_> = diagnostics
             .iter()
             .filter(|d| d.message.contains("_convert_"))
@@ -1533,7 +1562,8 @@ mod tests {
             file_suppressions: HashSet::new(),
         };
 
-        let diagnostics = validate_document(parsed_content, None, None);
+        let (db, config) = test_env(None);
+        let diagnostics = validate_document(&parsed_content, &HashSet::new(), &db, config);
         let keyword_diags: Vec<_> = diagnostics
             .iter()
             .filter(|d| d.message.contains("_args_"))
@@ -1576,7 +1606,8 @@ mod tests {
             file_suppressions: HashSet::new(),
         };
 
-        let diagnostics = validate_document(parsed_content, None, None);
+        let (db, config) = test_env(None);
+        let diagnostics = validate_document(&parsed_content, &HashSet::new(), &db, config);
         let keyword_diags: Vec<_> = diagnostics
             .iter()
             .filter(|d| {

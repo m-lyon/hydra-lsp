@@ -14,8 +14,10 @@ use colored::Colorize;
 use tower_lsp::lsp_types::DiagnosticSeverity;
 use tracing::{Level, debug, error, info, warn};
 
+use hydra_lsp::database::HydraDatabase;
 use hydra_lsp::diagnostics::{DiagnosticRule, validate_document};
 use hydra_lsp::python_analyzer::PythonAnalyzer;
+use hydra_lsp::python_cache::PythonConfig;
 use hydra_lsp::yaml_parser::YamlParser;
 
 use std::collections::HashSet;
@@ -208,7 +210,7 @@ fn run(args: &Args) -> anyhow::Result<i32> {
 
     // Parse YAML and extract targets
     info!("Parsing YAML content...");
-    let mut parsed_content = match YamlParser::parse(&content) {
+    let parsed_content = match YamlParser::parse(&content) {
         Ok(result) => result,
         Err(e) => {
             error!("Failed to parse YAML: {}", e);
@@ -238,12 +240,23 @@ fn run(args: &Args) -> anyhow::Result<i32> {
 
     // Run diagnostics
     info!("Running diagnostics...");
-    parsed_content.file_suppressions.extend(disabled_rules);
-    let diagnostics = validate_document(
-        parsed_content,
-        workspace_root.as_deref(),
-        python_interpreter.as_deref(),
+
+    // Build an ephemeral salsa db + PythonConfig so validate_document can
+    // route lookups through cached_definition_info (cache benefit is moot
+    // for a single CLI run, but the signature is shared with the LSP).
+    let db_root = workspace_root
+        .as_deref()
+        .and_then(|p| p.to_str())
+        .unwrap_or(".");
+    let db = HydraDatabase::new(ruff_db::system::SystemPath::new(db_root));
+    let python_config = PythonConfig::new(
+        &db,
+        workspace_root
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string()),
+        python_interpreter.clone(),
     );
+    let diagnostics = validate_document(&parsed_content, &disabled_rules, &db, python_config);
 
     // Output results
     match args.format {
@@ -281,12 +294,18 @@ fn trace_target_resolution(
         hydra_object.target.line + 1
     );
 
+    // Ephemeral salsa db so analyzer file reads go through ruff_db's
+    // tracked source_text. The cache vanishes when this function returns;
+    // for a one-shot CLI trace that's fine.
+    let db_root = workspace_root.and_then(|p| p.to_str()).unwrap_or(".");
+    let db = HydraDatabase::new(ruff_db::system::SystemPath::new(db_root));
+
     // Try to extract definition info
-    match PythonAnalyzer::extract_definition_info(
-        &hydra_object.target.value,
-        workspace_root,
-        python_interpreter,
-    ) {
+    let site_packages =
+        PythonAnalyzer::discover_python_environment(workspace_root, python_interpreter)
+            .unwrap_or_default();
+    let search_paths = PythonAnalyzer::build_search_paths(&db, workspace_root, &site_packages);
+    match PythonAnalyzer::extract_definition_info(&db, &hydra_object.target.value, &search_paths) {
         Ok((def_info, file_path, module_path, symbol_name)) => {
             println!("  {} {}", "Module:".dimmed(), module_path);
             println!("  {} {}", "Symbol:".dimmed(), symbol_name);

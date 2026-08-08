@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.4.0]
+
+- Added an incremental cache built on salsa (`HydraDatabase`), so YAML parses, Python target resolutions, and diagnostics are reused between requests instead of being recomputed on every keystroke
+- Cached YAML parsing per document version through the `DocumentInput`/`ParsedYaml` salsa inputs, replacing the previous `DocumentStore`
+- Cached Python definition lookups in `python_cache`, keyed on the target string and the resolved search paths
+- Routed Python source reads through `ruff_db::source_text` so resolved Python definitions participate in salsa's dependency graph
+- Removed the `FileCache` wrapper from `PythonAnalyzer` and `ImportResolver` in favour of a single `read_source` helper backed by salsa
+- Moved analysis off the async runtime onto two `rayon` pools (a latency pool for interactive requests, a worker pool for diagnostics), sized by the new `numThreads` initialization option
+- Answered `textDocument/semanticTokens/full` from a database snapshot on the latency pool instead of inline under the database lock
+- Sized the thread pools to a fixed 2 latency + 3 worker by default, rather than scaling the worker pool with the CPU count
+- Fixed the server hanging instead of exiting when the client's pipe closes while a handler is talking to it
+- Raised `tower-lsp`'s concurrency level from its default of 4 to 8
+- Clamped `numThreads` to 11 rather than to the CPU count. Beyond that the threads are unreachable rather than merely oversubscribed.
+- Registered `workspace/didChangeWatchedFiles` dynamically for `**/*.{py,pyi,pth}`, covering the workspace folders and — where the client supports relative patterns — each out-of-workspace site-packages root
+- Replaced the `PythonConfig::cache_revision` global counter with per-file `ruff_db::files::File::sync_path` invalidation in `did_change_watched_files`, so editing one Python file no longer evicts every cached resolution
+- Added per-directory `PthInventory` salsa input so `.pth` create/delete events invalidate editable-install resolution without flushing every cache entry
+- Added pull diagnostics (`textDocument/diagnostic`), returning unchanged reports via result IDs when nothing has changed, and falling back to push publishing for clients without pull support
+- Sent `workspace/diagnostic/refresh` after watched Python files change, so open configs pick up edits made outside the editor
+- Cleared diagnostics when a document stops being a Hydra file or is closed, instead of leaving stale entries in the client
+- Returned `ServerCancelled` with `retrigger_request` when a pull-diagnostic round is superseded by a newer edit
+- Fixed server panics caused by salsa cancellation escaping into the rayon pools
+- Fixed UTF-16 position handling for non-ASCII content, so positions match the encoding advertised to the client
+- Fixed `.pth` parsing to follow Python's lexical rules, and to only cache `.pth` files on the search path
+- Added `--version` and `--help` flags to the server binary, so a client can identify a binary before launching it; any other invocation still starts the stdio language server
+- Added a self-describing `capabilities.experimental.hydrust` block to the `initialize` response, listing the protocol version, the settings keys and diagnostic rules this build understands, and the coarse features actually switched on for the session after negotiating against the client's capabilities
+
 ## [0.3.0]
 
 - Added class name for `__init__` diagnostics

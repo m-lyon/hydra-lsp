@@ -1,8 +1,7 @@
 use crate::python_analyzer::{
-    ClassExtractor, ClassInfo, FileCache, FunctionExtractor, FunctionSignature,
+    ClassInfo, FunctionSignature, PythonAnalyzer, get_parsed_module, path_is_file,
 };
 use ruff_python_ast::{self as ast, Expr, Stmt, visitor::Visitor};
-use ruff_python_parser::parse_module;
 use rustc_hash::FxHashSet;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -29,45 +28,50 @@ enum ImportInfo {
 }
 
 /// Context for import resolution operations
-pub struct ImportResolver {
-    search_paths: Vec<PathBuf>,
+pub struct ImportResolver<'db, 'sp> {
+    db: &'db dyn ruff_db::Db,
+    search_paths: &'sp [PathBuf],
     visited_files: HashSet<PathBuf>,
     depth: usize,
-    file_cache: FileCache,
 }
 
-impl ImportResolver {
-    pub fn new(search_paths: Vec<PathBuf>) -> Self {
+impl<'db, 'sp> ImportResolver<'db, 'sp> {
+    pub fn new(db: &'db dyn ruff_db::Db, search_paths: &'sp [PathBuf]) -> Self {
         Self {
+            db,
             search_paths,
             visited_files: HashSet::new(),
             depth: 0,
-            file_cache: FileCache::new(),
         }
     }
 
     /// Try to find a module file given a base package path
     /// Returns the first existing file in priority order: __init__.pyi, __init__.py, module.pyi, module.py
-    pub fn find_module_file(package_path: &Path) -> Option<PathBuf> {
+    ///
+    /// Existence checks go through `path_is_file` (salsa `system_path_to_file`)
+    /// rather than `Path::exists`, so each probed candidate is interned as a
+    /// tracked `File` and a later create/delete of that path invalidates the
+    /// calling query. See [`path_is_file`].
+    pub fn find_module_file(db: &dyn ruff_db::Db, package_path: &Path) -> Option<PathBuf> {
         // Check for package __init__.py (prioritize .pyi over .py)
         let init_pyi_path = package_path.join("__init__.pyi");
-        if init_pyi_path.exists() {
+        if path_is_file(db, &init_pyi_path) {
             return Some(init_pyi_path);
         }
 
         let init_path = package_path.join("__init__.py");
-        if init_path.exists() {
+        if path_is_file(db, &init_path) {
             return Some(init_path);
         }
 
         // Check for regular module file (prioritize .pyi over .py)
         let file_pyi_path = package_path.with_extension("pyi");
-        if file_pyi_path.exists() {
+        if path_is_file(db, &file_pyi_path) {
             return Some(file_pyi_path);
         }
 
         let file_path = package_path.with_extension("py");
-        if file_path.exists() {
+        if path_is_file(db, &file_path) {
             return Some(file_path);
         }
 
@@ -78,18 +82,14 @@ impl ImportResolver {
     pub fn resolve_module_path(&self, module_path: &str) -> Option<PathBuf> {
         let module_parts: Vec<&str> = module_path.split('.').collect();
 
-        for search_path in &self.search_paths {
-            if !search_path.exists() {
-                continue;
-            }
-
+        for search_path in self.search_paths {
             // Try as a package with __init__.py
             let mut package_path = search_path.clone();
             for part in &module_parts {
                 package_path.push(part);
             }
 
-            if let Some(found_path) = Self::find_module_file(&package_path) {
+            if let Some(found_path) = Self::find_module_file(self.db, &package_path) {
                 return Some(found_path);
             }
         }
@@ -117,7 +117,7 @@ impl ImportResolver {
         // Find which search path this is under
         // Sort search paths by length descending to match more specific paths first
         // (e.g., site-packages should match before workspace root)
-        let mut sorted_paths = self.search_paths.clone();
+        let mut sorted_paths = self.search_paths.to_vec();
         sorted_paths.sort_by_key(|a| a.as_os_str().len());
 
         let mut package_path: Option<String> = None;
@@ -146,9 +146,7 @@ impl ImportResolver {
 
     /// Extract __all__ from a module
     fn extract_dunder_all(&mut self, file_path: &Path) -> Option<FxHashSet<String>> {
-        let source = self.file_cache.get(file_path).ok()?;
-        let parsed = parse_module(source).ok()?;
-
+        let parsed = get_parsed_module(self.db, file_path).ok()?;
         let mut dunder_all_finder = DunderAllFinder::default();
         dunder_all_finder.visit_body(parsed.suite());
         dunder_all_finder.names
@@ -160,9 +158,7 @@ impl ImportResolver {
         file_path: &Path,
         symbol_name: &str,
     ) -> Option<ImportInfo> {
-        let source = self.file_cache.get(file_path).ok()?;
-        let parsed = parse_module(source).ok()?;
-
+        let parsed = get_parsed_module(self.db, file_path).ok()?;
         let mut finder = ImportFinder {
             target_symbol: symbol_name.to_string(),
             result: None,
@@ -173,15 +169,9 @@ impl ImportResolver {
 
     /// Extract all star imports from a module
     fn find_star_imports(&mut self, file_path: &Path) -> Vec<ImportInfo> {
-        let source = match self.file_cache.get(file_path) {
-            Ok(s) => s,
-            Err(_) => return Vec::new(),
+        let Ok(parsed) = get_parsed_module(self.db, file_path) else {
+            return Vec::new();
         };
-        let parsed = match parse_module(source) {
-            Ok(p) => p,
-            Err(_) => return Vec::new(),
-        };
-
         let mut finder = StarImportFinder::default();
         finder.visit_body(parsed.suite());
         finder.star_imports
@@ -189,12 +179,7 @@ impl ImportResolver {
 
     /// Check if a class is directly defined in the file
     fn find_class_direct(&mut self, file_path: &Path, class_name: &str) -> Option<ClassInfo> {
-        let source = self.file_cache.get(file_path).ok()?;
-        let parsed = parse_module(source).ok()?;
-
-        let mut visitor = ClassExtractor::new(class_name.to_string(), source.to_string());
-        visitor.visit_body(parsed.suite());
-        visitor.get_result()
+        PythonAnalyzer::extract_class_info(self.db, file_path, class_name).ok()
     }
 
     /// Check if a function is directly defined in the file
@@ -203,12 +188,7 @@ impl ImportResolver {
         file_path: &Path,
         function_name: &str,
     ) -> Option<FunctionSignature> {
-        let source = self.file_cache.get(file_path).ok()?;
-        let parsed = parse_module(source).ok()?;
-
-        let mut visitor = FunctionExtractor::new(function_name.to_string(), source.to_string());
-        visitor.visit_body(parsed.suite());
-        visitor.get_result()
+        PythonAnalyzer::extract_function_signature(self.db, file_path, function_name).ok()
     }
 
     /// Resolve a symbol by following import chains

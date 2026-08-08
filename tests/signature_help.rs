@@ -552,19 +552,35 @@ test:
 
     // Cursor before any item (on the _args_ key or '[') → first positional (pos_only, idx 0)
     let sh = sig_help_at_col(&mut ctx, 5).await.expect("should trigger");
-    assert_eq!(sh.active_parameter, Some(0), "before items → pos_only (idx 0)");
+    assert_eq!(
+        sh.active_parameter,
+        Some(0),
+        "before items → pos_only (idx 0)"
+    );
 
     // Cursor on first item '10' (col 11) → pos_only (idx 0)
     let sh = sig_help_at_col(&mut ctx, 11).await.expect("should trigger");
-    assert_eq!(sh.active_parameter, Some(0), "on first item → pos_only (idx 0)");
+    assert_eq!(
+        sh.active_parameter,
+        Some(0),
+        "on first item → pos_only (idx 0)"
+    );
 
     // Cursor after first comma (col 14, on ' 20') → regular (idx 1)
     let sh = sig_help_at_col(&mut ctx, 15).await.expect("should trigger");
-    assert_eq!(sh.active_parameter, Some(1), "on second item → regular (idx 1)");
+    assert_eq!(
+        sh.active_parameter,
+        Some(1),
+        "on second item → regular (idx 1)"
+    );
 
     // Cursor on third item '30' (col 19) → *args (idx 2), since there are only 2 regular params
     let sh = sig_help_at_col(&mut ctx, 19).await.expect("should trigger");
-    assert_eq!(sh.active_parameter, Some(2), "on third item → *args (idx 2)");
+    assert_eq!(
+        sh.active_parameter,
+        Some(2),
+        "on third item → *args (idx 2)"
+    );
 }
 
 #[tokio::test]
