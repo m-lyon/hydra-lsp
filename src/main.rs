@@ -8,7 +8,7 @@ use clap::Parser;
 use clap::error::ErrorKind;
 use tower_lsp::{LspService, Server};
 
-use hydra_lsp::backend::HydraLspBackend;
+use hydra_lsp::backend::{HydraLspBackend, MAX_CONCURRENT_REQUESTS};
 
 /// Language Server for Hydra configuration files
 #[derive(Parser)]
@@ -52,8 +52,30 @@ fn main() {
     serve();
 }
 
-#[tokio::main]
-async fn serve() {
+/// Run the LSP loop to completion.
+///
+/// Not `async`: `#[tokio::main]` only ever expanded to "build a runtime, call
+/// `block_on`", so this was already a synchronous call from `main`.
+///
+/// A single-threaded runtime, because a multi-threaded one would have nothing
+/// to give the extra threads. `tower_lsp::Server::serve` deliberately avoids
+/// `tokio::spawn` — it aims to be executor agnostic — and instead `join!`s
+/// reading stdin, writing stdout, and a `buffer_unordered` over the in-flight
+/// handlers. That is one task, so `block_on` drives the whole server on this
+/// thread and handlers interleave cooperatively rather than run in parallel.
+/// The expensive work goes to the rayon pools built in `initialize`, and a
+/// handler awaiting a pool result yields here so the next message can be read.
+///
+/// hydra-lsp spawns exactly one task of its own, the client outbox
+/// (`outbox.rs`). It only moves already-built messages out to the client, so
+/// it takes no lock and does no analysis, and on a current-thread runtime it
+/// costs no OS thread.
+///
+/// Therefore anything that blocks without awaiting — notably taking `Session::db`, a
+/// `parking_lot::Mutex` — stalls stdin and every other in-flight request until it
+/// returns. Extra runtime threads would not have helped with that, since the stdin
+/// loop shares the blocked task.
+fn serve() {
     // Initialize tracing
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
@@ -61,12 +83,30 @@ async fn serve() {
         .with_ansi(false)
         .init();
 
-    // Create the LSP service
-    let stdin = tokio::io::stdin();
-    let stdout = tokio::io::stdout();
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .thread_name("hydra-tokio")
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            // stderr, never stdout: stdout is the LSP transport.
+            eprintln!("hydra-lsp: failed to start the async runtime: {error}");
+            std::process::exit(1);
+        }
+    };
 
-    let (service, socket) = LspService::new(HydraLspBackend::new);
+    runtime.block_on(async {
+        // Create the LSP service
+        let stdin = tokio::io::stdin();
+        let stdout = tokio::io::stdout();
 
-    // Start the server
-    Server::new(stdin, stdout, socket).serve(service).await;
+        let (service, socket) = LspService::new(HydraLspBackend::new);
+
+        // Start the server
+        Server::new(stdin, stdout, socket)
+            .concurrency_level(MAX_CONCURRENT_REQUESTS)
+            .serve(service)
+            .await;
+    });
 }

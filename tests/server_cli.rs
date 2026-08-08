@@ -7,6 +7,7 @@
 
 use std::io::Write;
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 const SERVER: &str = env!("CARGO_BIN_EXE_hydra-lsp");
 
@@ -52,8 +53,20 @@ fn test_help_flag_prints_usage() {
     }
 }
 
+/// How long the server gets to exit after stdin closes.
+///
+/// Generous: this is a deadlock detector, not a performance budget. Closing
+/// stdin mid-request used to wedge the server for good, so waiting forever
+/// here would hang CI rather than fail it.
+const EXIT_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Send one `initialize` request over stdin and return everything the server
 /// wrote to stdout before stdin closed.
+///
+/// Dropping stdin is the whole point of the exercise: the server has to finish
+/// the request it is holding, write the response, and exit. Anything it wanted
+/// to send the client on the way out has nowhere to go, and must not stop it
+/// from leaving.
 fn run_lsp_exchange(args: &[&str]) -> String {
     let body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{},"processId":null}}"#;
     let message = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
@@ -71,6 +84,22 @@ fn run_lsp_exchange(args: &[&str]) -> String {
         .unwrap()
         .write_all(message.as_bytes())
         .unwrap();
+
+    let deadline = Instant::now() + EXIT_TIMEOUT;
+    loop {
+        match child.try_wait().unwrap() {
+            Some(_) => break,
+            None if Instant::now() >= deadline => {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!(
+                    "server did not exit within {EXIT_TIMEOUT:?} of stdin closing; \
+                     it is most likely waiting on a client that stopped reading"
+                );
+            }
+            None => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
 
     let output = child.wait_with_output().unwrap();
     String::from_utf8(output.stdout).unwrap()

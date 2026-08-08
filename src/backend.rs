@@ -16,6 +16,7 @@ use salsa::Setter;
 
 use crate::database::HydraDatabase;
 use crate::diagnostics::{self, DiagnosticRule};
+use crate::outbox::ClientOutbox;
 use crate::python_analyzer::{DefinitionInfo, ParameterInfo, PythonAnalyzer};
 use crate::python_cache::{self, PythonConfig, TargetString};
 use crate::yaml_cache::{self, DocumentInput, ParsedYaml};
@@ -332,7 +333,13 @@ pub struct SessionSnapshot {
 }
 
 pub struct HydraLspBackend {
-    pub client: Client,
+    /// Everything the server sends to the client goes through here.
+    ///
+    /// There is deliberately no `Client` on this struct. Awaiting the client
+    /// from a handler can wedge the whole server once the client's pipe
+    /// closes — see the [`outbox`](crate::outbox) module docs — so the only
+    /// `Client` in the process lives in the outbox's drain task.
+    pub outbox: ClientOutbox,
     pub settings: Arc<RwLock<Settings>>,
     /// Initialized lazily on `initialize`. `None` means a notification
     /// arrived before `initialize` (LSP protocol violation) — handlers log
@@ -365,14 +372,23 @@ pub struct HydraLspBackend {
     /// Per-URI overhead is therefore O(slot header), independent of file
     /// size. Per-query LRUs (`lru = 512`) bound cached computation memory.
     document_inputs: DashMap<Url, DocumentInput>,
-    /// Rayon pool dedicated to latency-sensitive operations (hover,
-    /// signature_help, goto_definition). Isolated from the worker pool so that
-    /// a long diagnostics run never queues behind a hover. Built exactly once, in
-    /// `initialize`, where the user's `numThreads` setting is available.
+    /// Rayon pool for requests on the interactive path: hover,
+    /// signature_help, goto_definition and semantic_tokens.
+    ///
+    /// Separate from the worker pool so a diagnostics run cannot occupy every
+    /// thread and leave a hover waiting. Note the isolation is over threads,
+    /// not over work: both pools reach `cached_definition_info`, and when two
+    /// requests want the same key salsa blocks one until the other finishes,
+    /// whichever pools they came from.
+    ///
+    /// Defaults to 2 threads — see [`pool_sizes`] for why. Built exactly once,
+    /// in `initialize`, where the user's `numThreads` setting is available.
     latency_pool: OnceLock<rayon::ThreadPool>,
     /// Rayon pool for background work (diagnostics validation, future
-    /// workspace-wide analysis). Sized to available_parallelism − 2, clamped to
-    /// at least 1, unless overridden by `numThreads`.
+    /// workspace-wide analysis).
+    ///
+    /// Defaults to 3 threads — see [`pool_sizes`]. Built alongside
+    /// `latency_pool`, and overridable through `numThreads`.
     worker_pool: OnceLock<rayon::ThreadPool>,
     /// Whether the client advertised `workspace/didChangeWatchedFiles`
     /// dynamic registration in its `initialize` capabilities. Captured in
@@ -502,9 +518,12 @@ impl std::fmt::Debug for HydraLspBackend {
 }
 
 impl HydraLspBackend {
+    /// # Panics
+    ///
+    /// Panics if called outside a tokio runtime: the outbox spawns a task.
     pub fn new(client: Client) -> Self {
         Self {
-            client,
+            outbox: ClientOutbox::spawn(client),
             settings: Arc::new(RwLock::new(Settings::default())),
             session: Arc::new(parking_lot::RwLock::new(None)),
             document_inputs: DashMap::new(),
@@ -805,18 +824,17 @@ impl LanguageServer for HydraLspBackend {
             Ordering::Relaxed,
         );
 
-        self.client
-            .log_message(
-                MessageType::INFO,
-                format!(
-                    "Hydrust Server initializing with options: {:?}",
-                    params.initialization_options
-                ),
-            )
-            .await;
+        self.outbox.log(
+            MessageType::INFO,
+            format!(
+                "Hydrust Server initializing with options: {:?}",
+                params.initialization_options
+            ),
+        );
 
         // Parse initialization options
         let mut num_threads: Option<usize> = None;
+        let mut num_threads_warning: Option<String> = None;
         if let Some(init_options) = params.initialization_options
             && let Some(settings) = init_options.get("settings")
         {
@@ -842,16 +860,15 @@ impl LanguageServer for HydraLspBackend {
             // Parse feature toggle settings
             let toggles = FeatureToggles::from_json(settings);
 
-            // Parse optional thread-count override (total threads across both pools).
-            // Clamp to sane max threads range: at least 1
-            let max_threads = std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(4)
-                .saturating_mul(8);
-            num_threads = settings
+            // Parse optional thread-count override (every thread the server
+            // runs, the protocol loop's included), clamped to a range the server
+            // can honour.
+            let (parsed, out_of_range) = settings
                 .get("numThreads")
                 .and_then(|v| v.as_u64())
-                .map(|n| (n as usize).clamp(1, max_threads));
+                .map_or((None, None), clamp_num_threads);
+            num_threads = parsed;
+            num_threads_warning = out_of_range;
 
             // Write settings under the lock (no awaits)
             {
@@ -865,51 +882,35 @@ impl LanguageServer for HydraLspBackend {
 
             // Log after releasing the lock
             if let Some(ref path) = interpreter_path {
-                self.client
-                    .log_message(
-                        MessageType::INFO,
-                        format!("Python interpreter configured: {}", path),
-                    )
-                    .await;
+                self.outbox.log(
+                    MessageType::INFO,
+                    format!("Python interpreter configured: {}", path),
+                );
             }
 
             if !self.settings.read().disabled_rules.is_empty() {
-                self.client
-                    .log_message(
-                        MessageType::INFO,
-                        format!("Disabled rules: {:?}", self.settings.read().disabled_rules),
-                    )
-                    .await;
+                self.outbox.log(
+                    MessageType::INFO,
+                    format!("Disabled rules: {:?}", self.settings.read().disabled_rules),
+                );
             }
 
             // Log disabled features
             let disabled_features = toggles.disabled_names();
             if !disabled_features.is_empty() {
-                self.client
-                    .log_message(
-                        MessageType::INFO,
-                        format!("Disabled features: {:?}", disabled_features),
-                    )
-                    .await;
+                self.outbox.log(
+                    MessageType::INFO,
+                    format!("Disabled features: {:?}", disabled_features),
+                );
             }
         }
 
+        if let Some(warning) = num_threads_warning {
+            self.outbox.log(MessageType::WARNING, warning);
+        }
+
         // Build the two rayon pools exactly once, when `numThreads` is known.
-        // `numThreads` is the total across both pools. Every branch keeps both
-        // counts >= 1 (rayon treats num_threads(0) as "auto-detect", which would
-        // silently over-allocate).
-        let (latency, worker) = match num_threads {
-            Some(1) | Some(2) => (1, 1),
-            Some(n) => (2, n - 2),
-            None => {
-                let worker = std::thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(4)
-                    .saturating_sub(2)
-                    .max(1);
-                (2, worker)
-            }
-        };
+        let (latency, worker) = pool_sizes(num_threads);
         match (
             rayon::ThreadPoolBuilder::new()
                 .num_threads(latency)
@@ -924,24 +925,25 @@ impl LanguageServer for HydraLspBackend {
                 // `set` cannot fail: `initialize` is the sole writer, once.
                 let _ = self.latency_pool.set(latency_pool);
                 let _ = self.worker_pool.set(worker_pool);
-                self.client
-                    .log_message(
-                        MessageType::INFO,
-                        format!(
-                            "Thread pools configured: {} latency + {} worker ({} total)",
-                            latency,
-                            worker,
-                            latency + worker
-                        ),
-                    )
-                    .await;
+                let total = latency + worker + RUNTIME_THREADS;
+                let note = match num_threads {
+                    None => cpu_limited_default_note(total),
+                    Some(_) => oversubscription_note(total),
+                };
+                self.outbox.log(
+                    MessageType::INFO,
+                    format!(
+                        "Thread pools configured: {latency} latency + {worker} worker, \
+                         plus the protocol loop ({total} threads in all){note}"
+                    ),
+                );
             }
             _ => {
                 let msg = format!(
                     "Failed to build thread pools ({latency} latency + {worker} worker); \
                      the OS refused thread creation"
                 );
-                self.client.log_message(MessageType::ERROR, &msg).await;
+                self.outbox.log(MessageType::ERROR, &msg);
                 let mut err = Error::internal_error();
                 err.message = msg.into();
                 return Err(err);
@@ -1077,13 +1079,11 @@ impl LanguageServer for HydraLspBackend {
                     }
                 }
             } else {
-                self.client
-                    .log_message(
-                        MessageType::WARNING,
-                        "Client lacks relative-pattern watcher support; on-disk changes to \
+                self.outbox.log(
+                    MessageType::WARNING,
+                    "Client lacks relative-pattern watcher support; on-disk changes to \
                          out-of-workspace site-packages/.pth dirs will not invalidate caches",
-                    )
-                    .await;
+                );
             }
 
             let registration = Registration {
@@ -1094,30 +1094,24 @@ impl LanguageServer for HydraLspBackend {
                         .expect("watcher registration options serialize"),
                 ),
             };
-            if let Err(error) = self.client.register_capability(vec![registration]).await {
-                self.client
-                    .log_message(
-                        MessageType::WARNING,
-                        format!("Failed to register file watchers: {error}"),
-                    )
-                    .await;
-            }
+            self.outbox.register_capability(vec![registration]);
         } else {
-            self.client
-                .log_message(
-                    MessageType::WARNING,
-                    "Client lacks workspace/didChangeWatchedFiles dynamic registration; \
+            self.outbox.log(
+                MessageType::WARNING,
+                "Client lacks workspace/didChangeWatchedFiles dynamic registration; \
                      on-disk Python/.pth changes will not invalidate caches",
-                )
-                .await;
+            );
         }
 
-        self.client
-            .log_message(MessageType::INFO, "Hydrust Server initialized")
-            .await;
+        self.outbox
+            .log(MessageType::INFO, "Hydrust Server initialized");
     }
 
     async fn shutdown(&self) -> Result<()> {
+        // The client is still reading at this point, so give whatever is queued
+        // a chance to arrive before `exit` tears the runtime down. Bounded, so a
+        // client that has stopped reading cannot hold up the exit.
+        self.outbox.flush().await;
         Ok(())
     }
 
@@ -1142,15 +1136,14 @@ impl LanguageServer for HydraLspBackend {
             .unwrap_or(false);
         if self.settings.read().features.diagnostics {
             if is_hydra {
-                self.publish_diagnostics_if_needed(&uri).await;
+                self.publish_diagnostics_if_needed(&uri);
             } else {
-                self.clear_diagnostics_if_needed(&uri).await;
+                self.clear_diagnostics_if_needed(&uri);
             }
         }
 
-        self.client
-            .log_message(MessageType::INFO, format!("Document opened: {}", uri))
-            .await;
+        self.outbox
+            .log(MessageType::INFO, format!("Document opened: {}", uri));
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
@@ -1176,25 +1169,22 @@ impl LanguageServer for HydraLspBackend {
                 .unwrap_or(false);
             if self.settings.read().features.diagnostics {
                 if is_hydra {
-                    self.publish_diagnostics_if_needed(&uri).await;
+                    self.publish_diagnostics_if_needed(&uri);
                 } else {
-                    self.clear_diagnostics_if_needed(&uri).await;
+                    self.clear_diagnostics_if_needed(&uri);
                 }
             }
 
-            self.client
-                .log_message(MessageType::INFO, format!("Document changed: {}", uri))
-                .await;
+            self.outbox
+                .log(MessageType::INFO, format!("Document changed: {}", uri));
         }
     }
 
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
-        self.client
-            .log_message(
-                MessageType::INFO,
-                format!("Document saved: {}", params.text_document.uri),
-            )
-            .await;
+        self.outbox.log(
+            MessageType::INFO,
+            format!("Document saved: {}", params.text_document.uri),
+        );
     }
 
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
@@ -1284,9 +1274,7 @@ impl LanguageServer for HydraLspBackend {
         // Pull clients with refresh support: a single `workspace/diagnostic/refresh`
         // nudges the client to re-pull every open document — no per-doc work here.
         if self.supports_pull() && self.supports_diag_refresh() {
-            if let Err(error) = self.client.workspace_diagnostic_refresh().await {
-                tracing::warn!(%error, "failed to request workspace diagnostic refresh");
-            }
+            self.outbox.workspace_diagnostic_refresh();
             return;
         }
 
@@ -1330,7 +1318,11 @@ impl LanguageServer for HydraLspBackend {
             })
             .unwrap_or_default();
         for uri in hydra_uris {
-            self.publish_diagnostics_if_needed(&uri).await;
+            self.publish_diagnostics_if_needed(&uri);
+            // Nothing in the loop body awaits any more, and `compute_diagnostics`
+            // holds the db lock on the runtime thread, so without this the whole
+            // refresh runs before stdin is read again.
+            tokio::task::yield_now().await;
         }
     }
 
@@ -1353,12 +1345,11 @@ impl LanguageServer for HydraLspBackend {
         // Clear any diagnostics we published while the document was open, so
         // they do not linger in the client after the document is closed.
         if self.settings.read().features.diagnostics {
-            self.clear_diagnostics_if_needed(&uri).await;
+            self.clear_diagnostics_if_needed(&uri);
         }
 
-        self.client
-            .log_message(MessageType::INFO, format!("Document closed: {}", uri))
-            .await;
+        self.outbox
+            .log(MessageType::INFO, format!("Document closed: {}", uri));
     }
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
@@ -1381,12 +1372,10 @@ impl LanguageServer for HydraLspBackend {
             return Ok(None);
         };
 
-        self.client
-            .log_message(
-                MessageType::LOG,
-                format!("Found target at position: {:?}", hydra_object),
-            )
-            .await;
+        self.outbox.log(
+            MessageType::LOG,
+            format!("Found target at position: {:?}", hydra_object),
+        );
 
         // Extract Python definition info on a blocking thread (cached + non-blocking)
         let extract_result = self
@@ -1425,9 +1414,9 @@ impl LanguageServer for HydraLspBackend {
                 // If Python analysis fails, don't show any hover, but log a warning
                 let err_msg = e.to_string();
                 if err_msg.starts_with("Invalid _target_ format:") {
-                    self.client.log_message(MessageType::ERROR, err_msg).await;
+                    self.outbox.log(MessageType::ERROR, err_msg);
                 } else {
-                    self.client.log_message(MessageType::WARNING, err_msg).await;
+                    self.outbox.log(MessageType::WARNING, err_msg);
                 }
                 Ok(None)
             }
@@ -1493,12 +1482,10 @@ impl LanguageServer for HydraLspBackend {
         match context {
             CompletionContext::TargetValue { partial } => {
                 // TODO: Implement module/class completion
-                self.client
-                    .log_message(
-                        MessageType::INFO,
-                        format!("Target completion requested for: {}", partial),
-                    )
-                    .await;
+                self.outbox.log(
+                    MessageType::INFO,
+                    format!("Target completion requested for: {}", partial),
+                );
 
                 // Ok(Some(CompletionResponse::Array(vec![
                 //     CompletionItem {
@@ -1518,15 +1505,13 @@ impl LanguageServer for HydraLspBackend {
             }
             CompletionContext::ParameterKey { target, partial } => {
                 // TODO: Resolve target and get parameter completions
-                self.client
-                    .log_message(
-                        MessageType::INFO,
-                        format!(
-                            "Parameter completion requested for target: {}, partial: {}",
-                            target, partial
-                        ),
-                    )
-                    .await;
+                self.outbox.log(
+                    MessageType::INFO,
+                    format!(
+                        "Parameter completion requested for target: {}, partial: {}",
+                        target, partial
+                    ),
+                );
 
                 // For demonstration, return some placeholder parameters
                 // Ok(Some(CompletionResponse::Array(vec![
@@ -1587,15 +1572,11 @@ impl LanguageServer for HydraLspBackend {
                     return Ok(None);
                 }
 
-                self.client
-                    .log_message(
-                        MessageType::INFO,
+                self.outbox.log(MessageType::INFO,
                         format!(
                             "Parameter value completion requested for target: {}, parameter: {}, partial: {}",
                             target, parameter, partial
-                        ),
-                    )
-                    .await;
+                        ));
 
                 Ok(None) // Placeholder: no completions yet
             }
@@ -1746,14 +1727,12 @@ impl LanguageServer for HydraLspBackend {
             Err(e) => {
                 let err_msg = e.to_string();
                 if err_msg.starts_with("Invalid _target_ format:") {
-                    self.client.log_message(MessageType::ERROR, err_msg).await;
+                    self.outbox.log(MessageType::ERROR, err_msg);
                 } else {
-                    self.client
-                        .log_message(
-                            MessageType::WARNING,
-                            format!("Python analysis failed for signature help: {}", e),
-                        )
-                        .await;
+                    self.outbox.log(
+                        MessageType::WARNING,
+                        format!("Python analysis failed for signature help: {}", e),
+                    );
                 }
                 Ok(None)
             }
@@ -1798,11 +1777,9 @@ impl LanguageServer for HydraLspBackend {
             Err(e) => {
                 let error_msg = e.to_string();
                 if error_msg.starts_with("Invalid _target_ format:") {
-                    self.client.log_message(MessageType::ERROR, error_msg).await;
+                    self.outbox.log(MessageType::ERROR, error_msg);
                 } else {
-                    self.client
-                        .log_message(MessageType::WARNING, error_msg)
-                        .await;
+                    self.outbox.log(MessageType::WARNING, error_msg);
                 }
                 return Ok(None);
             }
@@ -1812,12 +1789,10 @@ impl LanguageServer for HydraLspBackend {
         let target_uri = match Url::from_file_path(&file_path) {
             Ok(uri) => uri,
             Err(_) => {
-                self.client
-                    .log_message(
-                        MessageType::ERROR,
-                        format!("Could not convert path to URI: {}", file_path.display()),
-                    )
-                    .await;
+                self.outbox.log(
+                    MessageType::ERROR,
+                    format!("Could not convert path to URI: {}", file_path.display()),
+                );
                 return Ok(None);
             }
         };
@@ -1854,35 +1829,45 @@ impl LanguageServer for HydraLspBackend {
             return Ok(None);
         };
 
-        self.client
-            .log_message(MessageType::INFO, "Generating semantic tokens".to_string())
-            .await;
+        self.outbox
+            .log(MessageType::INFO, "Generating semantic tokens".to_string());
 
-        // Look up the salsa-cached token list. The `semantic_tokens` query
-        // depends on `parsed_yaml`, so it is automatically invalidated when
-        // the document changes and served from the cache on every other call.
-        // The LSP format conversion happens inside the closure so we only
-        // clone the small, already-converted Vec out of the lock.
-        let Some(data) = self
-            .with_session("semantic_tokens", |s| {
-                let db = s.db.lock();
-                if !yaml_cache::is_hydra_file(&*db, input) {
-                    return None;
-                }
-                let tokens = yaml_cache::semantic_tokens(&*db, input);
-                Some(HydraSemanticToken::to_lsp_tokens(tokens))
-            })
-            .flatten()
-        else {
+        let Some(SessionSnapshot { db, .. }) = self.snapshot() else {
             return Ok(None);
         };
 
-        self.client
-            .log_message(
-                MessageType::INFO,
-                format!("Generated {} semantic tokens", data.len()),
-            )
-            .await;
+        // Runs on a snapshot rather than inline under `s.db.lock()`. The
+        // `semantic_tokens` query depends on `parsed_yaml`, so the first
+        // request after an edit needs a full YAML parse — holding the db lock
+        // across that would block the next `did_change` write, which would then
+        // immediately render the parse result stale.
+        let outcome = spawn_on_pool(&self.latency_pool, move || {
+            if !yaml_cache::is_hydra_file(&db, input) {
+                return None;
+            }
+            let tokens = yaml_cache::semantic_tokens(&db, input);
+            Some(HydraSemanticToken::to_lsp_tokens(tokens))
+        })
+        .await;
+
+        let data = match outcome {
+            Ok(PoolOutcome::Completed(Some(data))) => data,
+            // Not a Hydra file.
+            Ok(PoolOutcome::Completed(None)) => return Ok(None),
+            // A concurrent edit bumped the revision out from under the query.
+            // `Err` is the same situation reached a different way: the pool is
+            // not built yet, so the sender was dropped. Both want a re-request.
+            Ok(PoolOutcome::Cancelled) | Err(_) => return Err(content_modified_error()),
+            Ok(PoolOutcome::Panicked(msg)) => {
+                tracing::error!(%msg, "semantic_tokens task panicked");
+                return Ok(None);
+            }
+        };
+
+        self.outbox.log(
+            MessageType::INFO,
+            format!("Generated {} semantic tokens", data.len()),
+        );
 
         Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
             result_id: None,
@@ -1963,32 +1948,31 @@ impl LanguageServer for HydraLspBackend {
 
 impl HydraLspBackend {
     /// Clear any diagnostics previously published for `uri`.
-    async fn clear_diagnostics(&self, uri: &Url) {
-        self.client
-            .publish_diagnostics(uri.clone(), Vec::new(), None)
-            .await;
+    fn clear_diagnostics(&self, uri: &Url) {
+        self.outbox
+            .publish_diagnostics(uri.clone(), Vec::new(), None);
     }
 
     /// Clear diagnostics only when the client relies on push.
     ///
     /// Pull clients own their diagnostic state (they stop requesting a closed
     /// document), so there is nothing for the server to clear.
-    async fn clear_diagnostics_if_needed(&self, uri: &Url) {
+    fn clear_diagnostics_if_needed(&self, uri: &Url) {
         if self.supports_pull() {
             return;
         }
-        self.clear_diagnostics(uri).await;
+        self.clear_diagnostics(uri);
     }
 
     /// Publish diagnostics only when the client relies on push.
     ///
     /// Pull clients fetch diagnostics via `textDocument/diagnostic`; pushing to
     /// them would be redundant, so this is a no-op for them.
-    async fn publish_diagnostics_if_needed(&self, uri: &Url) {
+    fn publish_diagnostics_if_needed(&self, uri: &Url) {
         if self.supports_pull() {
             return;
         }
-        self.publish_diagnostics_for_document(uri).await;
+        self.publish_diagnostics_for_document(uri);
     }
 
     /// Compute the diagnostics for `uri` from the current database state.
@@ -2023,7 +2007,7 @@ impl HydraLspBackend {
     /// is no retry loop: a single pass always reflects the newest revision.
     ///
     /// [`compute_diagnostics`]: Self::compute_diagnostics
-    async fn publish_diagnostics_for_document(&self, uri: &Url) {
+    fn publish_diagnostics_for_document(&self, uri: &Url) {
         // Callers (`did_open`, `did_change`) always create the input first, so a
         // missing entry is a programmer error rather than a runtime concern.
         if !self.document_inputs.contains_key(uri) {
@@ -2038,9 +2022,8 @@ impl HydraLspBackend {
         }
 
         if let Some(diagnostics) = self.compute_diagnostics(uri) {
-            self.client
-                .publish_diagnostics(uri.clone(), diagnostics, None)
-                .await;
+            self.outbox
+                .publish_diagnostics(uri.clone(), diagnostics, None);
         }
     }
 }
@@ -2123,6 +2106,290 @@ fn build_diagnostic_report(
     DocumentDiagnosticReportResult::Report(report)
 }
 
+/// Thread counts for the latency and worker pools, given the `numThreads`
+/// setting (`None` when the client did not set it).
+///
+/// `numThreads` is every thread the server runs, not every thread it hands to
+/// the pools: the async runtime's thread is one of them, so the pools get
+/// `numThreads - RUNTIME_THREADS`. The runtime's thread is not itself
+/// configurable: it is fixed at startup (see `serve` in `main.rs`), because the
+/// setting only arrives with `initialize`, by which time the runtime is running.
+/// It is the process's main thread rather than a spawned one, and the client
+/// outbox shares it rather than adding another.
+///
+/// So `numThreads` has no meaning below [`MIN_NUM_THREADS`] — one runtime thread
+/// plus one per pool — and [`clamp_num_threads`] lifts anything lower, with a
+/// warning, before this is called.
+///
+/// Every branch keeps both counts >= 1: rayon reads `num_threads(0)` as
+/// "auto-detect from core count", which would silently over-allocate.
+///
+/// Neither count can be used beyond [`MAX_CONCURRENT_REQUESTS`]: each handler
+/// hands off one job to one pool, so the number of pool jobs running at once is
+/// capped by the number of handlers tower-lsp will run at once. That is what
+/// [`MAX_NUM_THREADS`] clamps the setting to.
+///
+/// The *shape* of the default is fixed rather than derived from the core count,
+/// because neither pool's useful width scales with cores:
+///
+/// - Latency serves one keystroke's worth of overlapping requests.
+///   `semanticTokens/full` and `signatureHelp` fire together on an edit, and
+///   they are badly matched in cost — token extraction is nearly free once the
+///   document is parsed, while signature help can sit in a cold
+///   `cached_definition_info` reading and parsing Python. Two threads stop the
+///   cheap one queueing behind the expensive one. A third would need a third
+///   concurrent request, and that means hover, which happens when the pointer
+///   rests rather than while typing.
+///
+/// - Worker serves the one real fan-out in the server: after a watched `.py`
+///   file changes, every open Hydra document is re-validated. That fan-out is
+///   capped well below the open-document count, because documents sharing a
+///   `_target_` share one `cached_definition_info` key and salsa blocks the
+///   duplicate callers rather than computing twice. Three threads rather than
+///   two because this pool absorbs whole-workspace bursts while the latency
+///   pool only ever has one cursor position to answer for, and because the
+///   jobs are long enough that a queued document waits noticeably.
+///
+/// Its *size* is capped by the machine, though. Five threads is the width the
+/// server can use, not a promise the hardware can run them, and someone who has
+/// not set `numThreads` is asking for a sensible default rather than for that
+/// width — so the default is trimmed to fit the CPUs on hand.
+fn pool_sizes(num_threads: Option<usize>) -> (usize, usize) {
+    match num_threads {
+        // `initialize` already maps the client's 0 sentinel to `None`; matching
+        // it here too keeps the "never return 0" guarantee a property of this
+        // function rather than of its one caller.
+        None | Some(0) => split_pool_total(default_pool_total()),
+        Some(n) => split_pool_total(n.saturating_sub(RUNTIME_THREADS)),
+    }
+}
+
+/// Divide a total across the two pools, keeping both >= 1.
+///
+/// Latency is filled first and capped at its default: an override is asking for
+/// more analysis throughput, and the second latency thread is already enough for
+/// the requests one keystroke produces. Shared by both branches of
+/// [`pool_sizes`], so a clamped default splits exactly as the equivalent
+/// explicit `numThreads` would.
+fn split_pool_total(total: usize) -> (usize, usize) {
+    match total {
+        // Below three there is nothing to divide; one each is the floor.
+        0..=2 => (1, 1),
+        n => (
+            DEFAULT_LATENCY_THREADS,
+            n.saturating_sub(DEFAULT_LATENCY_THREADS),
+        ),
+    }
+}
+
+/// Total pool threads when `numThreads` is unset: [`DEFAULT_POOL_THREADS`],
+/// trimmed to leave one of the CPUs the OS reports for the runtime thread.
+///
+/// `None` means the OS would not say how many there are, which is no reason to
+/// shrink.
+fn default_pool_total() -> usize {
+    match available_cpus() {
+        Some(available) => DEFAULT_POOL_THREADS.min(available.saturating_sub(RUNTIME_THREADS)),
+        None => DEFAULT_POOL_THREADS,
+    }
+}
+
+/// CPUs this process may use, or `None` when the OS will not say.
+///
+/// The single place the count is read, so that a test can stand a number in for
+/// it. Pool sizing and both `initialize` notes have to agree about how many CPUs
+/// there are, and checking them against whatever the test machine happens to
+/// report would only check the arithmetic against itself.
+fn available_cpus() -> Option<usize> {
+    #[cfg(test)]
+    {
+        if let Some(mocked) = tests::mocked_cpus() {
+            return mocked;
+        }
+    }
+    std::thread::available_parallelism().ok().map(|n| n.get())
+}
+
+/// Clamp a raw `numThreads` into the range the server can use, and say so when
+/// it had to move.
+///
+/// `Ok(None)` is the 0 sentinel: "let the server decide". Otherwise the value is
+/// held between [`MIN_NUM_THREADS`] and [`MAX_NUM_THREADS`], and the second
+/// element is a message for the `initialize` log when it was out of range. A
+/// number that quietly becomes a different number is the kind of thing someone
+/// only notices as "the setting does nothing".
+fn clamp_num_threads(raw: u64) -> (Option<usize>, Option<String>) {
+    if raw == 0 {
+        return (None, None);
+    }
+    let requested = usize::try_from(raw).unwrap_or(MAX_NUM_THREADS);
+    let clamped = requested.clamp(MIN_NUM_THREADS, MAX_NUM_THREADS);
+    if clamped == requested {
+        return (Some(clamped), None);
+    }
+    let why = if requested < MIN_NUM_THREADS {
+        format!(
+            "the minimum is {MIN_NUM_THREADS}: one thread runs the protocol \
+             loop, and each of the two analysis pools needs at least one"
+        )
+    } else {
+        format!(
+            "the maximum is {MAX_NUM_THREADS}: beyond that the extra threads \
+             cannot be reached, because only {MAX_CONCURRENT_REQUESTS} requests \
+             run at once to feed them"
+        )
+    };
+    (
+        Some(clamped),
+        Some(format!(
+            "numThreads {requested} is out of range and was treated as \
+             {clamped} — {why}. Use 0 for the server default."
+        )),
+    )
+}
+
+/// Threads in the latency pool: hover, signature help, go-to-definition and
+/// semantic tokens. See [`pool_sizes`] for why this is 2, and why an override
+/// adds to the worker pool rather than to this one.
+const DEFAULT_LATENCY_THREADS: usize = 2;
+
+/// Threads in the worker pool: diagnostics validation. See [`pool_sizes`].
+const DEFAULT_WORKER_THREADS: usize = 3;
+
+/// Total pool threads the server will ask for by default, before the CPU count
+/// is taken into account. See [`default_pool_total`].
+const DEFAULT_POOL_THREADS: usize = DEFAULT_LATENCY_THREADS + DEFAULT_WORKER_THREADS;
+
+/// Threads that are not in either pool: the one the async runtime runs on.
+///
+/// Named rather than written as `1` because it is the difference between the
+/// user-facing `numThreads` and the number the pools divide up, and that
+/// subtraction appears in several places.
+const RUNTIME_THREADS: usize = 1;
+
+/// What `numThreads` would have to be to ask for the untrimmed default.
+const DEFAULT_NUM_THREADS: usize = DEFAULT_POOL_THREADS + RUNTIME_THREADS;
+
+/// How many LSP messages `tower_lsp` will have handlers in flight for at once,
+/// passed to `Server::concurrency_level` in `main.rs`.
+///
+/// This, not the pool sizes, is what caps parallel analysis. Every handler that
+/// does real work hands exactly one job to a rayon pool and awaits it, so
+/// in-flight pool jobs can never exceed in-flight handlers. tower-lsp's own
+/// default is 4, which is below the 5 pool threads [`pool_sizes`] hands out by
+/// default — leaving it there would make part of that sizing unreachable.
+///
+/// Eight covers the five default pool threads plus a couple of notification
+/// handlers (`did_change`, `did_open`, `did_save`) running alongside them. It is
+/// not a thread count: these are futures interleaved on the one runtime thread,
+/// so raising it costs a little memory for pending futures and nothing else.
+///
+/// Note this limits handlers *started*, not messages read. tower-lsp builds each
+/// handler future as it decodes the message and queues it 100 deep, so stdin
+/// keeps draining well past this number.
+pub const MAX_CONCURRENT_REQUESTS: usize = 8;
+
+/// Most threads the two pools can be given between them.
+///
+/// Above this the pools are unreachable rather than merely oversubscribed:
+/// filling `n` worker threads needs `n` concurrent diagnostic pulls, and only
+/// [`MAX_CONCURRENT_REQUESTS`] handlers exist at a time, so beyond
+/// `MAX_CONCURRENT_REQUESTS + DEFAULT_LATENCY_THREADS` no message mix can start
+/// them.
+const MAX_POOL_THREADS: usize = MAX_CONCURRENT_REQUESTS + DEFAULT_LATENCY_THREADS;
+
+/// Upper bound on the `numThreads` setting: [`MAX_POOL_THREADS`] plus the
+/// runtime thread the setting also counts.
+///
+/// Deliberately not the core count. Clamping an explicit setting to
+/// `available_parallelism()` was considered and rejected. It reports what is
+/// available *now* — it honours cgroup quotas and CPU affinity — so in a two-CPU
+/// container it would silently turn an explicit `numThreads: 6` into `(1, 1)`,
+/// on exactly the machine where someone was trying to tune, with no way to say
+/// otherwise. A clamp should reject numbers that are meaningless, not numbers
+/// that are merely suboptimal for the hardware; over-provisioning is reported by
+/// [`oversubscription_note`] in the `initialize` log instead.
+///
+/// The unset default *is* trimmed to the CPU count ([`default_pool_total`]),
+/// which is not in tension with the above: nobody asked for that number, so
+/// there is no intent to override.
+const MAX_NUM_THREADS: usize = MAX_POOL_THREADS + RUNTIME_THREADS;
+
+/// Lower bound on the `numThreads` setting, 0 aside: the runtime thread plus one
+/// per pool. Anything less cannot be honoured, since neither pool may be empty.
+const MIN_NUM_THREADS: usize = RUNTIME_THREADS + 2;
+
+/// The default split has to be both reachable and expressible as a setting
+/// value, which is what the two clamps above are for. Checked here rather than
+/// in a test so that changing one constant without the others cannot compile.
+const _: () = {
+    assert!(DEFAULT_POOL_THREADS <= MAX_CONCURRENT_REQUESTS);
+    assert!(DEFAULT_POOL_THREADS <= MAX_POOL_THREADS);
+    assert!(MIN_NUM_THREADS <= DEFAULT_NUM_THREADS && DEFAULT_NUM_THREADS <= MAX_NUM_THREADS);
+};
+
+/// A trailing note for the `initialize` log when an explicit `numThreads` asks
+/// for more threads than the machine reports CPUs, or the empty string when it
+/// does not. `total` counts the runtime thread, as `numThreads` does.
+///
+/// [`MAX_NUM_THREADS`] deliberately does not clamp an explicit setting to
+/// `available_parallelism`, so a `numThreads` that outruns the hardware is
+/// honoured. Saying so in the log is how someone tuning the setting finds out it
+/// went too far — otherwise the symptom is that raising it stops changing
+/// anything, with nothing to explain why. Only reported for an oversubscribing
+/// total, so the common case stays quiet.
+fn oversubscription_note(total: usize) -> String {
+    // `None` means the OS would not tell us; that is not worth reporting on.
+    let Some(available) = available_cpus() else {
+        return String::new();
+    };
+    if total <= available {
+        return String::new();
+    }
+    format!(
+        " — above the {available} CPUs available here, so these threads will \
+         share cores rather than run in parallel"
+    )
+}
+
+/// A trailing note for the `initialize` log when the unset default came out
+/// below [`DEFAULT_NUM_THREADS`] because of the CPU count, or the empty string
+/// when it did not. `total` counts the runtime thread, as `numThreads` does.
+///
+/// The counterpart to [`oversubscription_note`], and there for the same reason:
+/// a silently reduced pool looks identical to a slow server. It also points at
+/// the way out, since the reduction only applies while `numThreads` is unset.
+fn cpu_limited_default_note(total: usize) -> String {
+    if total >= DEFAULT_NUM_THREADS {
+        return String::new();
+    }
+    // Unreachable via `initialize` — a total below the default means the CPU
+    // count is what trimmed it, so the OS did answer — but the note has nothing
+    // to name without a count.
+    let Some(available) = available_cpus() else {
+        return String::new();
+    };
+    format!(
+        " — the usual default is {DEFAULT_NUM_THREADS}, reduced here to fit the \
+         {available} CPUs available; set numThreads to override"
+    )
+}
+
+/// LSP `ContentModified`: the revision this request was answered against has
+/// been superseded by an edit.
+///
+/// Distinct from [`server_cancelled_error`], which is diagnostics-specific — it
+/// carries `DiagnosticServerCancellationData` and only `textDocument/diagnostic`
+/// knows how to read it. For every other pull-based request `ContentModified` is
+/// the spec's answer, and clients re-request against the new revision.
+fn content_modified_error() -> tower_lsp::jsonrpc::Error {
+    tower_lsp::jsonrpc::Error {
+        code: tower_lsp::jsonrpc::ErrorCode::ServerError(-32801), // LSP ContentModified
+        message: "document changed while the request was in flight".into(),
+        data: None,
+    }
+}
+
 /// The LSP `ServerCancelled` error for a superseded pull-diagnostic round.
 ///
 /// `retrigger_request: true` asks the client to re-pull, which replaces any
@@ -2143,7 +2410,30 @@ mod tests {
     use super::*;
     use crate::database::tests::TestDb;
     use salsa::{Database as _, Setter};
+    use std::cell::Cell;
     use std::time::Duration;
+
+    thread_local! {
+        /// What [`available_cpus`] should report inside [`with_cpus`]: the outer
+        /// `Option` is whether a test is standing in for the OS at all, the
+        /// inner one is the count it reports.
+        static MOCK_CPUS: Cell<Option<Option<usize>>> = const { Cell::new(None) };
+    }
+
+    /// The count [`available_cpus`] should use in place of the OS, if any.
+    pub(super) fn mocked_cpus() -> Option<Option<usize>> {
+        MOCK_CPUS.get()
+    }
+
+    /// Run `body` as if the machine had `cpus` CPUs — `None` for an OS that will
+    /// not say. Thread-local, so tests running in parallel do not see each
+    /// other's stand-in.
+    fn with_cpus<T>(cpus: Option<usize>, body: impl FnOnce() -> T) -> T {
+        MOCK_CPUS.set(Some(cpus));
+        let out = body();
+        MOCK_CPUS.set(None);
+        out
+    }
 
     fn single_thread_pool() -> OnceLock<rayon::ThreadPool> {
         let cell = OnceLock::new();
@@ -2401,6 +2691,209 @@ mod tests {
         let cancellation: DiagnosticServerCancellationData =
             serde_json::from_value(data).expect("valid cancellation data");
         assert!(cancellation.retrigger_request);
+    }
+
+    #[test]
+    fn content_modified_error_uses_lsp_code() {
+        let err = content_modified_error();
+        assert!(matches!(
+            err.code,
+            tower_lsp::jsonrpc::ErrorCode::ServerError(-32801)
+        ));
+        // Unlike `server_cancelled_error`, this one is generic: no
+        // diagnostics-specific payload rides along.
+        assert!(err.data.is_none());
+    }
+
+    // --- Pool sizing ---
+
+    #[test]
+    fn default_pool_total_is_two_latency_and_three_worker_given_the_cores() {
+        // The nominal default, on any machine with a core to spare for each of
+        // the five plus the runtime thread.
+        with_cpus(Some(6), || {
+            assert_eq!(split_pool_total(default_pool_total()), (2, 3));
+        });
+        with_cpus(Some(64), || {
+            assert_eq!(split_pool_total(default_pool_total()), (2, 3));
+        });
+        // An OS that will not report a count is no reason to shrink.
+        with_cpus(None, || {
+            assert_eq!(default_pool_total(), DEFAULT_POOL_THREADS);
+        });
+    }
+
+    #[test]
+    fn default_pool_total_leaves_a_cpu_for_the_runtime_thread() {
+        // The point of the clamp: pools plus the runtime thread fit the machine.
+        for available in 2..=DEFAULT_POOL_THREADS {
+            with_cpus(Some(available), || {
+                assert_eq!(
+                    default_pool_total(),
+                    available - RUNTIME_THREADS,
+                    "{available} CPUs should leave one for the runtime thread"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn default_pool_total_still_gives_each_pool_a_thread_on_one_cpu() {
+        // A single CPU leaves no budget at all, but a pool of zero means "one
+        // per core" to rayon, so the floor has to win over the clamp.
+        with_cpus(Some(1), || {
+            assert_eq!(default_pool_total(), 0);
+            assert_eq!(split_pool_total(default_pool_total()), (1, 1));
+        });
+    }
+
+    #[test]
+    fn pool_sizes_default_never_exceeds_the_nominal_default() {
+        // Whatever this machine reports, the unset default is between the floor
+        // and the nominal 2 + 3 — it may shrink to fit, never grow.
+        let (latency, worker) = pool_sizes(None);
+        assert!(latency >= 1 && worker >= 1);
+        assert!(latency <= DEFAULT_LATENCY_THREADS);
+        assert!(latency + worker <= DEFAULT_POOL_THREADS);
+    }
+
+    #[test]
+    fn pool_sizes_default_matches_the_equivalent_explicit_total() {
+        // Whatever the default came out as on this machine, it stays
+        // expressible through the setting: `numThreads` counts the runtime
+        // thread as well as the pools, so asking for that total by name gives
+        // the same split. If the two ever diverge, one of them is describing the
+        // wrong split.
+        let (latency, worker) = pool_sizes(None);
+        assert_eq!(
+            pool_sizes(Some(latency + worker + RUNTIME_THREADS)),
+            (latency, worker)
+        );
+    }
+
+    #[test]
+    fn pool_sizes_treats_zero_as_unset() {
+        // The VS Code extension sends `numThreads: 0` whenever the user has not
+        // set the option, and package.json documents 0 as "let the server
+        // decide". Clamping it up to 1 instead would silently give the default
+        // session a 1 + 1 split.
+        assert_eq!(pool_sizes(Some(0)), pool_sizes(None));
+    }
+
+    #[test]
+    fn pool_sizes_stays_within_the_request_concurrency_limit() {
+        // The whole point of MAX_POOL_THREADS: at the ceiling the pools must
+        // still be startable, which means no more worker threads than there are
+        // handler slots to launch diagnostic pulls from. MAX_NUM_THREADS is that
+        // plus the runtime thread, so the top of the setting's range reaches it
+        // exactly.
+        let (latency, worker) = pool_sizes(Some(MAX_NUM_THREADS));
+        assert_eq!(latency + worker, MAX_POOL_THREADS);
+        assert!(
+            worker <= MAX_CONCURRENT_REQUESTS,
+            "{worker} worker threads need {worker} concurrent pulls, but only \
+             {MAX_CONCURRENT_REQUESTS} handlers run at once"
+        );
+    }
+
+    #[test]
+    fn oversubscription_note_is_quiet_at_or_below_the_cpu_count() {
+        with_cpus(Some(8), || {
+            // A total the machine can run must add nothing to the log line.
+            assert_eq!(oversubscription_note(8), "");
+            // One over is oversubscribed, and has to say so.
+            assert!(oversubscription_note(9).contains("8 CPUs available here"));
+        });
+        // Nothing to compare against, so nothing to report.
+        with_cpus(None, || assert_eq!(oversubscription_note(usize::MAX), ""));
+    }
+
+    #[test]
+    fn cpu_limited_default_note_only_fires_when_the_default_was_trimmed() {
+        // Both cases go through the same arithmetic as the `initialize` log,
+        // which reports the two pool sizes rather than the pre-split total.
+        let logged_total = || {
+            let (latency, worker) = split_pool_total(default_pool_total());
+            latency + worker + RUNTIME_THREADS
+        };
+        // A machine roomy enough for the nominal default logs nothing extra.
+        with_cpus(Some(8), || {
+            assert_eq!(cpu_limited_default_note(logged_total()), "");
+        });
+        // A two-CPU box gets one thread per pool and has to say why.
+        with_cpus(Some(2), || {
+            let note = cpu_limited_default_note(logged_total());
+            assert!(note.contains("2 CPUs available"), "got: {note:?}");
+            assert!(note.contains("numThreads"), "got: {note:?}");
+        });
+    }
+
+    #[test]
+    fn pool_sizes_honours_the_override_as_a_total_including_the_runtime_thread() {
+        // Across the whole settable range, latency stays at 2 and the remainder
+        // is worker, so the pools plus the runtime thread add up to exactly what
+        // the user asked for.
+        for total in MIN_NUM_THREADS..=MAX_NUM_THREADS {
+            let (latency, worker) = pool_sizes(Some(total));
+            assert_eq!(
+                latency + worker + RUNTIME_THREADS,
+                total,
+                "numThreads={total} should split exactly"
+            );
+            assert!(latency <= DEFAULT_LATENCY_THREADS);
+        }
+    }
+
+    #[test]
+    fn pool_sizes_never_returns_zero() {
+        // rayon reads num_threads(0) as "auto-detect from core count", so a
+        // zero here would silently spawn a pool per core — the opposite of
+        // what someone setting a low numThreads is asking for. `initialize`
+        // never passes anything below MIN_NUM_THREADS, but the guarantee belongs
+        // to this function rather than to its caller.
+        for total in 0..=MAX_NUM_THREADS {
+            let (latency, worker) = pool_sizes(Some(total));
+            assert!(latency >= 1, "numThreads={total} gave {latency} latency");
+            assert!(worker >= 1, "numThreads={total} gave {worker} worker");
+        }
+    }
+
+    #[test]
+    fn clamp_num_threads_passes_the_usable_range_through_silently() {
+        assert_eq!(clamp_num_threads(0), (None, None));
+        for n in MIN_NUM_THREADS..=MAX_NUM_THREADS {
+            assert_eq!(clamp_num_threads(n as u64), (Some(n), None));
+        }
+    }
+
+    #[test]
+    fn clamp_num_threads_warns_about_a_total_below_the_minimum() {
+        // 1 and 2 leave nothing, or not enough, once the protocol loop's thread
+        // is taken out. They are settable in older clients, so the server has to
+        // say what it did rather than silently run a different configuration.
+        for n in 1..MIN_NUM_THREADS as u64 {
+            let (clamped, warning) = clamp_num_threads(n);
+            assert_eq!(clamped, Some(MIN_NUM_THREADS));
+            let warning = warning.expect("a value below the minimum has to be reported");
+            assert!(warning.contains(&format!("numThreads {n}")), "{warning}");
+            assert!(
+                warning.contains(&format!("the minimum is {MIN_NUM_THREADS}")),
+                "{warning}"
+            );
+        }
+    }
+
+    #[test]
+    fn clamp_num_threads_warns_about_a_total_above_the_maximum() {
+        for n in [MAX_NUM_THREADS as u64 + 1, u64::MAX] {
+            let (clamped, warning) = clamp_num_threads(n);
+            assert_eq!(clamped, Some(MAX_NUM_THREADS));
+            assert!(
+                warning
+                    .expect("a value above the maximum has to be reported")
+                    .contains(&format!("the maximum is {MAX_NUM_THREADS}"))
+            );
+        }
     }
 
     // --- Test D: site-packages gating in bump_site_packages_pth_roots ---
