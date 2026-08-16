@@ -27,7 +27,7 @@ A Language Server for [Hydra](https://hydra.cc/) configuration files, written in
 
 For a list of planned features and enhancements, see the [issues](https://github.com/m-lyon/hydra-lsp/issues) page.
 
-## CLI Tool: hydra-check
+## CLI Tool: hydrust
 
 In addition to the language server, this project provides a standalone CLI tool for diagnosing Hydra YAML configuration files. This is useful for:
 
@@ -38,24 +38,33 @@ In addition to the language server, this project provides a standalone CLI tool 
 ### Usage
 
 ```bash
-# Basic usage
-hydra-check config.yaml
+# Check a single file
+hydrust check config.yaml
+
+# Check several files, or a whole directory tree
+hydrust check config.yaml overrides.yaml
+hydrust check conf/
 
 # Specify workspace root for local module resolution
-hydra-check config.yaml -w /path/to/project
+hydrust check config.yaml -w /path/to/project
 
 # Specify Python interpreter for site-packages resolution
-hydra-check config.yaml -p /path/to/venv/bin/python
+hydrust check config.yaml -p /path/to/venv/bin/python
 
 # Enable detailed resolution tracing for debugging
-hydra-check config.yaml --trace-resolution
+hydrust check config.yaml --trace-resolution
 
 # Change verbosity level (error, warn, info, debug, trace)
-hydra-check config.yaml -v debug
+hydrust check config.yaml -v debug
 
-# Output in different formats (pretty, json, compact)
-hydra-check config.yaml -f json
+# Output in different formats (pretty, json, compact, github)
+hydrust check config.yaml -f json
 ```
+
+Directories are searched recursively for `.yaml` and `.yml` files, honouring
+`.gitignore`. Files found that way are skipped when they carry no Hydra markers;
+a file named explicitly on the command line is always checked, with a warning if
+it does not look like a Hydra config.
 
 ### Options
 
@@ -64,14 +73,27 @@ hydra-check config.yaml -f json
 | `-w, --workspace <PATH>` | Working directory for resolving Python modules |
 | `-p, --python <PATH>` | Path to Python interpreter for module resolution |
 | `-v, --verbosity <LEVEL>` | Logging verbosity: error, warn, info, debug, trace |
-| `-f, --format <FORMAT>` | Output format: pretty (default), json, compact |
+| `-f, --output-format <FORMAT>` | Output format: pretty (default), json, compact, github |
 | `--trace-resolution` | Show detailed resolution steps for each target |
+| `--disable-rule <RULE>` | Disable a diagnostic rule; may be repeated |
+
+Without `--workspace`, a single file argument resolves Python modules against
+its own directory; anything broader resolves against the current directory.
+
+### Continuous integration
+
+`-f github` emits GitHub Actions workflow commands, so diagnostics appear as
+inline annotations on the pull request:
+
+```yaml
+- run: hydrust check --output-format github conf/
+```
 
 ### Exit Codes
 
 - `0`: No errors found
 - `1`: One or more errors found
-- `2`: Fatal error (file not found, parse error, etc.)
+- `2`: Fatal error (path not found, no YAML files matched, etc.)
 
 ## Client Compatibility
 
