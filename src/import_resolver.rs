@@ -8,6 +8,18 @@ use std::path::{Path, PathBuf};
 
 const MAX_IMPORT_DEPTH: usize = 10;
 
+/// Append a dotted module name to a directory, one path segment per part.
+/// Empty parts are skipped, so an empty module name gives back `base`.
+fn join_module_parts(base: &Path, module: &str) -> PathBuf {
+    let mut path = base.to_path_buf();
+    for part in module.split('.') {
+        if !part.is_empty() {
+            path.push(part);
+        }
+    }
+    path
+}
+
 /// Information about an import statement
 #[derive(Debug, Clone)]
 enum ImportInfo {
@@ -80,14 +92,9 @@ impl<'db, 'sp> ImportResolver<'db, 'sp> {
 
     /// Resolve a module path to a file path
     pub fn resolve_module_path(&self, module_path: &str) -> Option<PathBuf> {
-        let module_parts: Vec<&str> = module_path.split('.').collect();
-
         for search_path in self.search_paths {
             // Try as a package with __init__.py
-            let mut package_path = search_path.clone();
-            for part in &module_parts {
-                package_path.push(part);
-            }
+            let package_path = join_module_parts(search_path, module_path);
 
             if let Some(found_path) = Self::find_module_file(self.db, &package_path) {
                 return Some(found_path);
@@ -116,64 +123,24 @@ impl<'db, 'sp> ImportResolver<'db, 'sp> {
         module: Option<&str>,
         level: u32,
     ) -> Option<PathBuf> {
-        if let Some(current_dir) = Self::relative_import_dir(current_file, level) {
-            let mut candidate = current_dir.to_path_buf();
-            for part in module.unwrap_or_default().split('.') {
-                if !part.is_empty() {
-                    candidate.push(part);
-                }
-            }
-
-            if let Some(found_path) = Self::find_module_file(self.db, &candidate) {
-                return Some(found_path);
-            }
-        }
-
-        let module_path = self.resolve_relative_import(current_file, module, level)?;
-        self.resolve_module_path(&module_path)
-    }
-
-    /// Resolve a relative import to an absolute module path
-    fn resolve_relative_import(
-        &self,
-        current_file: &Path,
-        module: Option<&str>,
-        level: u32,
-    ) -> Option<String> {
         let current_dir = Self::relative_import_dir(current_file, level)?;
 
-        // Find which search path this is under.
-        // Sort search paths by depth descending so the most specific containing
-        // root wins (e.g. a site-packages root nested inside the workspace root
-        // must match before the workspace root itself, otherwise the stripped
-        // prefix leaves environment directories in the module name).
-        // Depth is counted in path components rather than bytes.
-        // The sort is stable, so equal-depth roots keep their original order.
-        let mut sorted_paths = self.search_paths.to_vec();
-        sorted_paths.sort_by_key(|a| std::cmp::Reverse(a.components().count()));
-
-        let mut package_path: Option<String> = None;
-        for search_path in &sorted_paths {
-            if current_dir.starts_with(search_path) {
-                let relative = current_dir.strip_prefix(search_path).ok()?;
-                let parts: Vec<&str> = relative.iter().filter_map(|p| p.to_str()).collect();
-                package_path = Some(parts.join("."));
-                break;
-            }
+        // Only walk from the importing file's directory while that directory is
+        // still inside a search root.
+        if self
+            .search_paths
+            .iter()
+            .any(|search_path| current_dir.starts_with(search_path))
+        {
+            let candidate = join_module_parts(current_dir, module.unwrap_or_default());
+            return Self::find_module_file(self.db, &candidate);
         }
 
-        let base = package_path.unwrap_or_default();
-        if let Some(module) = module {
-            if base.is_empty() {
-                Some(module.to_string())
-            } else {
-                Some(format!("{}.{}", base, module))
-            }
-        } else if base.is_empty() {
-            None
-        } else {
-            Some(base)
-        }
+        // The importing file sits outside every search root (or the import
+        // reached past one), so the only thing left to try is reading the
+        // module name as an absolute one, which keeps the result in the project.
+        let module = module.filter(|module| !module.is_empty())?;
+        self.resolve_module_path(module)
     }
 
     /// Extract __all__ from a module
@@ -648,5 +615,129 @@ mod tests {
             file_path.display()
         );
         assert_exported_class(&definition_info, &file_path);
+    }
+
+    /// The mirror of the test above: when the named sibling does not exist, the
+    /// import must fail rather than fall through to the shadowing root.
+    #[test]
+    fn test_relative_import_does_not_fall_back_to_shadowing_root() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo = temp.path().join("repo");
+
+        write_file(
+            &repo.join("src").join("pkg").join("__init__.py"),
+            "from .missing import ExportedClass\n",
+        );
+        // `pkg.missing` exists under the earlier root, but it is not a sibling
+        // of the importing file, so it must not answer `.missing`.
+        write_file(
+            &repo.join("pkg").join("missing.py"),
+            "class ExportedClass:\n    pass\n",
+        );
+
+        let db = HydraDatabase::new(SystemPath::new("/"));
+        let search_paths = vec![repo.clone(), repo.join("src")];
+
+        let result =
+            PythonAnalyzer::extract_definition_info(&db, "pkg.ExportedClass", &search_paths);
+
+        assert!(
+            result.is_err(),
+            "expected no resolution, got {:?}",
+            result.map(|(_, file_path, _, _)| file_path)
+        );
+    }
+
+    /// Write `contents` to `path`, creating the parent directories first.
+    fn write_file(path: &Path, contents: &str) {
+        fs::create_dir_all(path.parent().expect("path has a parent")).expect("create dirs");
+        fs::write(path, contents).expect("write file");
+    }
+
+    /// A relative import is resolved from the importing file's own directory,
+    /// so a same-named module under an earlier search root never answers it —
+    /// whether or not the sibling itself exists.
+    #[test]
+    fn test_resolve_relative_module_file_walks_from_the_importing_file() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo = temp.path().join("repo");
+        let package = repo.join("src").join("pkg");
+
+        write_file(&package.join("__init__.py"), "");
+        write_file(&package.join("implementation.py"), "");
+        write_file(&repo.join("pkg").join("implementation.py"), "");
+        write_file(&repo.join("pkg").join("missing.py"), "");
+
+        let db = HydraDatabase::new(SystemPath::new("/"));
+        let search_paths = vec![repo.clone(), repo.join("src")];
+        let resolver = ImportResolver::new(&db, &search_paths);
+        let importer = package.join("__init__.py");
+
+        assert_eq!(
+            resolver.resolve_relative_module_file(&importer, Some("implementation"), 1),
+            Some(package.join("implementation.py")),
+        );
+        assert_eq!(
+            resolver.resolve_relative_module_file(&importer, Some("missing"), 1),
+            None,
+        );
+    }
+
+    /// `from ..module import X` climbs one package per extra dot, and an empty
+    /// module name (`from . import x`) names the package directory itself.
+    #[test]
+    fn test_resolve_relative_module_file_handles_levels_and_empty_module() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo = temp.path().join("repo");
+        let package = repo.join("pkg");
+        let sub_package = package.join("sub");
+
+        write_file(&package.join("__init__.py"), "");
+        write_file(&package.join("implementation.py"), "");
+        write_file(&sub_package.join("__init__.py"), "");
+
+        let db = HydraDatabase::new(SystemPath::new("/"));
+        let search_paths = vec![repo.clone()];
+        let resolver = ImportResolver::new(&db, &search_paths);
+        let importer = sub_package.join("__init__.py");
+
+        assert_eq!(
+            resolver.resolve_relative_module_file(&importer, Some("implementation"), 2),
+            Some(package.join("implementation.py")),
+        );
+        assert_eq!(
+            resolver.resolve_relative_module_file(&importer, Some(""), 1),
+            Some(sub_package.join("__init__.py")),
+        );
+        assert_eq!(
+            resolver.resolve_relative_module_file(&importer, Some(""), 2),
+            Some(package.join("__init__.py")),
+        );
+    }
+
+    /// A relative import with more dots than there are packages walks out of
+    /// the project; it must not match whatever happens to sit out there.
+    #[test]
+    fn test_relative_import_does_not_escape_the_search_roots() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo = temp.path().join("repo");
+
+        write_file(&repo.join("pkg").join("__init__.py"), "");
+        // A sibling of the repo, outside every search root.
+        write_file(
+            &temp.path().join("outside.py"),
+            "class ExportedClass:\n    pass\n",
+        );
+
+        let db = HydraDatabase::new(SystemPath::new("/"));
+        let search_paths = vec![repo.clone()];
+        let resolver = ImportResolver::new(&db, &search_paths);
+        let importer = repo.join("pkg").join("__init__.py");
+
+        // `from ...outside import ExportedClass` reaches above the root.
+        assert_eq!(
+            resolver.resolve_relative_module_file(&importer, Some("outside"), 3),
+            None,
+        );
     }
 }
