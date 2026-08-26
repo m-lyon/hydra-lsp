@@ -1308,11 +1308,19 @@ mod tests {
         assert_eq!(resolve("."), None, "nor must a dot-only name");
 
         // A leading or doubled dot leaves an empty part, which must not be
-        // skipped: `/root/inside.py` exists, so both resolve without the guard.
+        // skipped: without the guard `..inside` would reach `/root/inside.py`
+        // and `pkg..sub` would reach `/root/pkg/sub.py`, both of which exist.
         assert_eq!(
             resolve("..inside"),
             None,
             "a leading-dot name must not resolve as if the dots were absent"
+        );
+        // Positive control for the doubled-dot case: the file it would reach
+        // must really be reachable under its correct name.
+        assert_eq!(
+            resolve("pkg.sub"),
+            Some(PathBuf::from("/root/pkg/sub.py")),
+            "the nested module must resolve under its correct name"
         );
         assert_eq!(
             resolve("pkg..sub"),
