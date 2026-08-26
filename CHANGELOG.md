@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.4.1]
+
+- Fixed relative re-exports failing to resolve when a package sits under more than one search root, such as a virtual environment stored inside the workspace. The most specific containing root is now used to convert a relative import to an absolute module name.
+
 ## [0.4.0]
 
 - Added an incremental cache built on salsa (`HydraDatabase`), so YAML parses, Python target resolutions, and diagnostics are reused between requests instead of being recomputed on every keystroke
