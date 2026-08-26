@@ -1254,14 +1254,24 @@ mod tests {
     #[test]
     fn test_resolve_module_cached_cannot_escape_the_search_roots() {
         use std::fs;
-        use tempfile::TempDir;
 
-        let tmp = TempDir::new().expect("tempdir");
+        // A dot in the temp path would be split into parts and mangle the
+        // absolute name, quietly making this test prove nothing.
+        let tmp = tempfile::Builder::new()
+            .prefix("hydra")
+            .tempdir()
+            .expect("tempdir");
+        assert!(
+            !tmp.path().to_str().expect("utf-8 temp path").contains('.'),
+            "fixture needs a dot-free temp path, got {}",
+            tmp.path().display()
+        );
+
         let repo = tmp.path().join("repo");
         fs::create_dir_all(&repo).expect("create repo");
         fs::write(repo.join("inside.py"), "class Thing:\n    pass\n").expect("write inside");
-        fs::write(tmp.path().join("outside.py"), "class Thing:\n    pass\n")
-            .expect("write outside");
+        let outside = tmp.path().join("outside");
+        fs::write(outside.with_extension("py"), "class Thing:\n    pass\n").expect("write outside");
 
         let db = real_fs_db();
         let search_paths = vec![repo.clone()];
@@ -1278,9 +1288,9 @@ mod tests {
             "a plain module name must still resolve"
         );
 
-        assert_eq!(resolve("../outside"), None, "`..` must not climb out");
+        // `outside.py` exists, so this fails without the guard.
         assert_eq!(
-            resolve("/etc/passwd"),
+            resolve(outside.to_str().expect("utf-8 path")),
             None,
             "an absolute name must not replace the search root"
         );

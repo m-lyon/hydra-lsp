@@ -1,6 +1,7 @@
 use crate::python_analyzer::{
     ClassInfo, FunctionSignature, PythonAnalyzer, get_parsed_module, path_is_file,
 };
+use crate::python_cache::{InternedSearchPaths, TargetString, resolve_module_cached};
 use ruff_python_ast::{self as ast, Expr, Stmt, visitor::Visitor};
 use rustc_hash::FxHashSet;
 use std::collections::HashSet;
@@ -98,21 +99,18 @@ impl<'db, 'sp> ImportResolver<'db, 'sp> {
         None
     }
 
-    /// Resolve a module path to a file path
+    /// Resolve a module path to a file path.
+    ///
+    /// Delegates to the memoised `resolve_module_cached` so that a module hit
+    /// once per `follow_import` hop is not re-probed on the filesystem, and so
+    /// there is a single copy of the resolution rules.
     pub fn resolve_module_path(&self, module_path: &str) -> Option<PathBuf> {
-        // Whether the module name is usable does not depend on the search root,
-        // so validate it once rather than per root.
-        let relative_path = join_module_parts(Path::new(""), module_path)?;
-
-        for search_path in self.search_paths {
-            // Try as a package with __init__.py
-            let package_path = search_path.join(&relative_path);
-
-            if let Some(found_path) = Self::find_module_file(self.db, &package_path) {
-                return Some(found_path);
-            }
-        }
-        None
+        resolve_module_cached(
+            self.db,
+            TargetString::new(self.db, module_path.to_string()),
+            InternedSearchPaths::new(self.db, self.search_paths.to_vec()),
+        )
+        .clone()
     }
 
     /// The directory a relative import is resolved against: the importing
@@ -747,16 +745,51 @@ mod tests {
         );
     }
 
-    /// Parts that are not plain names must not be able to walk out of the
-    /// search root, while ordinary dotted names keep resolving.
+    /// `join_module_parts` is tested directly because at the resolver level a
+    /// rejected part usually names a file that does not exist anyway, so the
+    /// assertion would hold with or without the guard.
     #[test]
-    fn test_module_parts_cannot_escape_the_base_directory() {
-        let temp = TempDir::new().expect("tempdir");
-        let repo = temp.path().join("repo");
+    fn test_join_module_parts_rejects_parts_that_are_not_plain_names() {
+        let base = Path::new("/root");
 
+        assert_eq!(
+            join_module_parts(base, "a.b"),
+            Some(base.join("a").join("b"))
+        );
+        assert_eq!(join_module_parts(base, ""), Some(base.to_path_buf()));
+        // Empty parts are skipped, so a bare `..` contributes nothing.
+        assert_eq!(join_module_parts(base, ".."), Some(base.to_path_buf()));
+
+        // An absolute part would replace `base` outright.
+        assert_eq!(join_module_parts(base, "/etc/passwd"), None);
+        // A part carrying its own separators would descend past one segment.
+        assert_eq!(join_module_parts(base, "pkg/sub"), None);
+        // `../outside` splits to a leading `/outside`, which is absolute.
+        assert_eq!(join_module_parts(base, "../outside"), None);
+        assert_eq!(join_module_parts(base, "a./b"), None);
+    }
+
+    /// The same guard at the resolver level: an absolute module name must not
+    /// resolve even when the file it points at exists.
+    #[test]
+    fn test_resolve_module_path_rejects_an_absolute_module_name() {
+        // A dot in the temp path would be split into parts and mangle the
+        // absolute name, quietly making this test prove nothing.
+        let temp = tempfile::Builder::new()
+            .prefix("hydra")
+            .tempdir()
+            .expect("tempdir");
+        assert!(
+            !temp.path().to_str().expect("utf-8 temp path").contains('.'),
+            "fixture needs a dot-free temp path, got {}",
+            temp.path().display()
+        );
+
+        let repo = temp.path().join("repo");
         write_file(&repo.join("pkg").join("__init__.py"), "");
         write_file(&repo.join("pkg").join("inside.py"), "");
-        write_file(&temp.path().join("outside.py"), "");
+        let outside = temp.path().join("outside");
+        write_file(&outside.with_extension("py"), "");
 
         let db = HydraDatabase::new(SystemPath::new("/"));
         let search_paths = vec![repo.clone()];
@@ -768,12 +801,17 @@ mod tests {
             Some(repo.join("pkg").join("inside.py")),
         );
 
-        assert_eq!(resolver.resolve_module_path("../outside"), None);
-        assert_eq!(resolver.resolve_module_path("/etc/passwd"), None);
-
-        let importer = repo.join("pkg").join("__init__.py");
         assert_eq!(
-            resolver.resolve_relative_module_file(&importer, Some("../../outside"), 1),
+            resolver.resolve_module_path(outside.to_str().expect("utf-8 path")),
+            None,
+            "an absolute name must not replace the search root",
+        );
+        assert_eq!(
+            resolver.resolve_relative_module_file(
+                &repo.join("pkg").join("__init__.py"),
+                Some(outside.to_str().expect("utf-8 path")),
+                1,
+            ),
             None,
         );
     }
