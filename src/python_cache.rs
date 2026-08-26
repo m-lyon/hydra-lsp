@@ -145,7 +145,7 @@ pub fn search_paths_for_config(db: &dyn ruff_db::Db, config: PythonConfig) -> Ve
 
 /// Cached module path → file path resolution.
 ///
-/// Validates the name with `join_module_parts`, then probes each search root in order
+/// Validates the name, then probes each search root in order
 /// with `ImportResolver::find_module_file`. Salsa memoises the result, so the
 /// filesystem scan for a given `(module_path, search_paths)` pair is performed
 /// at most once per revision. The primary beneficiaries are
@@ -156,7 +156,7 @@ pub fn search_paths_for_config(db: &dyn ruff_db::Db, config: PythonConfig) -> Ve
 /// O(1) cache lookups.
 ///
 /// Returns `None` when the module cannot be resolved, including when the name
-/// is empty or is not a plain dotted module name.
+/// is empty, has an empty dot-separated part, or is not a plain dotted module name.
 /// Uses `lru = 1024` to bound memory across large workspaces.
 #[salsa::tracked(returns(ref), lru = 1024)]
 pub fn resolve_module_cached<'db>(
@@ -167,10 +167,14 @@ pub fn resolve_module_cached<'db>(
     let module_path_str = module_path.value(db);
     let search_paths = search_paths.paths(db);
 
-    let relative_path = join_module_parts(Path::new(""), module_path_str)?;
-    if relative_path.as_os_str().is_empty() {
+    // An empty part means a leading, trailing or doubled dot. Hydra cannot
+    // instantiate such a target, and `join_module_parts` would skip the part
+    // and resolve the name as if the extra dot were not there.
+    if module_path_str.split('.').any(str::is_empty) {
         return None;
     }
+
+    let relative_path = join_module_parts(Path::new(""), module_path_str)?;
 
     for search_path in search_paths {
         // `find_module_file` covers both shapes a module can take: a package
@@ -1270,6 +1274,8 @@ mod tests {
             .expect("write inside");
         db.write_file("/outside.py", "class Thing:\n    pass\n")
             .expect("write outside");
+        db.write_file("/root/pkg/sub.py", "class Thing:\n    pass\n")
+            .expect("write sub");
 
         let search_paths = vec![PathBuf::from("/root")];
         let resolve = |module: &str| {
@@ -1300,5 +1306,18 @@ mod tests {
             "an empty name must not resolve to the search root itself"
         );
         assert_eq!(resolve("."), None, "nor must a dot-only name");
+
+        // A leading or doubled dot leaves an empty part, which must not be
+        // skipped: `/root/inside.py` exists, so both resolve without the guard.
+        assert_eq!(
+            resolve("..inside"),
+            None,
+            "a leading-dot name must not resolve as if the dots were absent"
+        );
+        assert_eq!(
+            resolve("pkg..sub"),
+            None,
+            "nor must a name with a doubled dot"
+        );
     }
 }

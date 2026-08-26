@@ -4,6 +4,7 @@ use crate::python_analyzer::{
 use crate::python_cache::{InternedSearchPaths, TargetString, resolve_module_cached};
 use ruff_python_ast::{self as ast, Expr, Stmt, visitor::Visitor};
 use rustc_hash::FxHashSet;
+use std::cell::OnceCell;
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 
@@ -52,7 +53,10 @@ enum ImportInfo {
 pub struct ImportResolver<'db, 'sp> {
     db: &'db dyn ruff_db::Db,
     search_paths: &'sp [PathBuf],
-    interned_search_paths: InternedSearchPaths<'db>,
+    /// Interned once per resolver, on first use. Interning clones and hashes the
+    /// whole search-path list, and many resolvers never resolve a module at all
+    /// (symbol found in the file, relative-only import).
+    interned_search_paths: OnceCell<InternedSearchPaths<'db>>,
     visited_files: HashSet<PathBuf>,
     depth: usize,
 }
@@ -62,7 +66,7 @@ impl<'db, 'sp> ImportResolver<'db, 'sp> {
         Self {
             db,
             search_paths,
-            interned_search_paths: InternedSearchPaths::new(db, search_paths.to_vec()),
+            interned_search_paths: OnceCell::new(),
             visited_files: HashSet::new(),
             depth: 0,
         }
@@ -107,10 +111,14 @@ impl<'db, 'sp> ImportResolver<'db, 'sp> {
     /// once per `follow_import` hop is not re-probed on the filesystem, and so
     /// there is a single copy of the resolution rules.
     pub fn resolve_module_path(&self, module_path: &str) -> Option<PathBuf> {
+        let interned = *self
+            .interned_search_paths
+            .get_or_init(|| InternedSearchPaths::new(self.db, self.search_paths.to_vec()));
+
         resolve_module_cached(
             self.db,
             TargetString::new(self.db, module_path.to_string()),
-            self.interned_search_paths,
+            interned,
         )
         .clone()
     }
