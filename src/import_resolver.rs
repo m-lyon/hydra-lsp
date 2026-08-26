@@ -52,6 +52,7 @@ enum ImportInfo {
 pub struct ImportResolver<'db, 'sp> {
     db: &'db dyn ruff_db::Db,
     search_paths: &'sp [PathBuf],
+    interned_search_paths: InternedSearchPaths<'db>,
     visited_files: HashSet<PathBuf>,
     depth: usize,
 }
@@ -61,6 +62,7 @@ impl<'db, 'sp> ImportResolver<'db, 'sp> {
         Self {
             db,
             search_paths,
+            interned_search_paths: InternedSearchPaths::new(db, search_paths.to_vec()),
             visited_files: HashSet::new(),
             depth: 0,
         }
@@ -108,7 +110,7 @@ impl<'db, 'sp> ImportResolver<'db, 'sp> {
         resolve_module_cached(
             self.db,
             TargetString::new(self.db, module_path.to_string()),
-            InternedSearchPaths::new(self.db, self.search_paths.to_vec()),
+            self.interned_search_paths,
         )
         .clone()
     }
@@ -756,6 +758,9 @@ mod tests {
             join_module_parts(base, "a.b"),
             Some(base.join("a").join("b"))
         );
+        // Landing back on `base` only means something for a relative import
+        // (`from . import x` passes ""). `resolve_module_cached` rejects these
+        // rather than resolving a malformed `_target_` to a search root.
         assert_eq!(join_module_parts(base, ""), Some(base.to_path_buf()));
         // Empty parts are skipped, so a bare `..` contributes nothing.
         assert_eq!(join_module_parts(base, ".."), Some(base.to_path_buf()));
@@ -769,47 +774,41 @@ mod tests {
         assert_eq!(join_module_parts(base, "a./b"), None);
     }
 
-    /// The same guard at the resolver level: an absolute module name must not
-    /// resolve even when the file it points at exists.
+    /// `resolve_module_path` delegates to `resolve_module_cached`, whose escape
+    /// guard is covered in `python_cache`. This only checks the delegation is
+    /// wired up, plus the same guard on the relative path, which resolves
+    /// without going through that query.
     #[test]
-    fn test_resolve_module_path_rejects_an_absolute_module_name() {
-        // A dot in the temp path would be split into parts and mangle the
-        // absolute name, quietly making this test prove nothing.
-        let temp = tempfile::Builder::new()
-            .prefix("hydra")
-            .tempdir()
-            .expect("tempdir");
-        assert!(
-            !temp.path().to_str().expect("utf-8 temp path").contains('.'),
-            "fixture needs a dot-free temp path, got {}",
-            temp.path().display()
-        );
+    fn test_resolve_module_path_delegates_to_the_cached_query() {
+        use crate::database::tests::TestDb;
+        use ruff_db::system::DbWithWritableSystem;
 
-        let repo = temp.path().join("repo");
-        write_file(&repo.join("pkg").join("__init__.py"), "");
-        write_file(&repo.join("pkg").join("inside.py"), "");
-        let outside = temp.path().join("outside");
-        write_file(&outside.with_extension("py"), "");
+        let mut db = TestDb::new();
+        db.write_file("/root/pkg/__init__.py", "")
+            .expect("write pkg init");
+        db.write_file("/root/pkg/inside.py", "")
+            .expect("write inside");
+        db.write_file("/outside.py", "").expect("write outside");
 
-        let db = HydraDatabase::new(SystemPath::new("/"));
-        let search_paths = vec![repo.clone()];
+        let search_paths = vec![PathBuf::from("/root")];
         let resolver = ImportResolver::new(&db, &search_paths);
 
         // Positive control: a guard that rejected everything would fail here.
         assert_eq!(
             resolver.resolve_module_path("pkg.inside"),
-            Some(repo.join("pkg").join("inside.py")),
+            Some(PathBuf::from("/root/pkg/inside.py")),
         );
 
+        // `/outside.py` exists, so both of these fail without the guard.
         assert_eq!(
-            resolver.resolve_module_path(outside.to_str().expect("utf-8 path")),
+            resolver.resolve_module_path("/outside"),
             None,
             "an absolute name must not replace the search root",
         );
         assert_eq!(
             resolver.resolve_relative_module_file(
-                &repo.join("pkg").join("__init__.py"),
-                Some(outside.to_str().expect("utf-8 path")),
+                Path::new("/root/pkg/__init__.py"),
+                Some("/outside"),
                 1,
             ),
             None,

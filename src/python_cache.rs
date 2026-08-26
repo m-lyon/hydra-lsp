@@ -145,16 +145,18 @@ pub fn search_paths_for_config(db: &dyn ruff_db::Db, config: PythonConfig) -> Ve
 
 /// Cached module path → file path resolution.
 ///
-/// Wraps `PythonAnalyzer::resolve_module` with salsa memoisation so that the
+/// Validates the name with `join_module_parts`, then probes each search root in order
+/// with `ImportResolver::find_module_file`. Salsa memoises the result, so the
 /// filesystem scan for a given `(module_path, search_paths)` pair is performed
-/// at most once per revision. The primary beneficiary is
-/// `resolve_class_attribute_chain`, which calls `resolve_module` O(k) times
-/// (k = dot-count in the target) with progressively shorter prefixes. On a
-/// second hover for any symbol in the same module, all those O(k) probes
-/// become O(1) cache lookups.
+/// at most once per revision. The primary beneficiaries are
+/// `resolve_class_attribute_chain`, which probes O(k) progressively shorter
+/// prefixes of a dotted target (k = dot-count), and
+/// `ImportResolver::resolve_module_path`, which runs once per import hop. On a
+/// second hover for any symbol in the same module, all those probes become
+/// O(1) cache lookups.
 ///
-/// Returns `None` when the module cannot be resolved (mirrors `resolve_module`'s
-/// `Err` path), including when the name is not a plain dotted module name.
+/// Returns `None` when the module cannot be resolved, including when the name
+/// is empty or is not a plain dotted module name.
 /// Uses `lru = 1024` to bound memory across large workspaces.
 #[salsa::tracked(returns(ref), lru = 1024)]
 pub fn resolve_module_cached<'db>(
@@ -166,6 +168,9 @@ pub fn resolve_module_cached<'db>(
     let search_paths = search_paths.paths(db);
 
     let relative_path = join_module_parts(Path::new(""), module_path_str)?;
+    if relative_path.as_os_str().is_empty() {
+        return None;
+    }
 
     for search_path in search_paths {
         // `find_module_file` covers both shapes a module can take: a package
@@ -1253,28 +1258,20 @@ mod tests {
     /// not make it probe files outside the search roots.
     #[test]
     fn test_resolve_module_cached_cannot_escape_the_search_roots() {
-        use std::fs;
+        use ruff_db::system::DbWithWritableSystem;
 
-        // A dot in the temp path would be split into parts and mangle the
-        // absolute name, quietly making this test prove nothing.
-        let tmp = tempfile::Builder::new()
-            .prefix("hydra")
-            .tempdir()
-            .expect("tempdir");
-        assert!(
-            !tmp.path().to_str().expect("utf-8 temp path").contains('.'),
-            "fixture needs a dot-free temp path, got {}",
-            tmp.path().display()
-        );
+        // Fixed in-memory paths: a real temp directory can carry a dot in its
+        // prefix, which would split the absolute name below into parts and
+        // quietly make this test prove nothing.
+        let mut db = TestDb::new();
+        db.write_file("/root/__init__.py", "class Thing:\n    pass\n")
+            .expect("write root init");
+        db.write_file("/root/inside.py", "class Thing:\n    pass\n")
+            .expect("write inside");
+        db.write_file("/outside.py", "class Thing:\n    pass\n")
+            .expect("write outside");
 
-        let repo = tmp.path().join("repo");
-        fs::create_dir_all(&repo).expect("create repo");
-        fs::write(repo.join("inside.py"), "class Thing:\n    pass\n").expect("write inside");
-        let outside = tmp.path().join("outside");
-        fs::write(outside.with_extension("py"), "class Thing:\n    pass\n").expect("write outside");
-
-        let db = real_fs_db();
-        let search_paths = vec![repo.clone()];
+        let search_paths = vec![PathBuf::from("/root")];
         let resolve = |module: &str| {
             let mid = TargetString::new(&db, module.to_string());
             let spid = InternedSearchPaths::new(&db, search_paths.clone());
@@ -1284,15 +1281,24 @@ mod tests {
         // Positive control: a guard that rejected everything would fail here.
         assert_eq!(
             resolve("inside"),
-            Some(repo.join("inside.py")),
+            Some(PathBuf::from("/root/inside.py")),
             "a plain module name must still resolve"
         );
 
-        // `outside.py` exists, so this fails without the guard.
+        // `/outside.py` exists, so this fails without the guard.
         assert_eq!(
-            resolve(outside.to_str().expect("utf-8 path")),
+            resolve("/outside"),
             None,
             "an absolute name must not replace the search root"
         );
+
+        // `_target_: ".Thing"` splits to an empty module name, and
+        // `/root/__init__.py` exists, so this fails without the dot-only guard.
+        assert_eq!(
+            resolve(""),
+            None,
+            "an empty name must not resolve to the search root itself"
+        );
+        assert_eq!(resolve("."), None, "nor must a dot-only name");
     }
 }
