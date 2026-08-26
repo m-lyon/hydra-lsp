@@ -114,11 +114,14 @@ impl<'db, 'sp> ImportResolver<'db, 'sp> {
             current_dir = current_dir.parent()?;
         }
 
-        // Find which search path this is under
-        // Sort search paths by length descending to match more specific paths first
-        // (e.g., site-packages should match before workspace root)
+        // Find which search path this is under.
+        // Sort search paths by length descending so the most specific containing
+        // root wins (e.g. a site-packages root nested inside the workspace root
+        // must match before the workspace root itself, otherwise the stripped
+        // prefix leaves environment directories in the module name).
+        // The sort is stable, so equal-length roots keep their original order.
         let mut sorted_paths = self.search_paths.to_vec();
-        sorted_paths.sort_by_key(|a| a.as_os_str().len());
+        sorted_paths.sort_by_key(|a| std::cmp::Reverse(a.as_os_str().len()));
 
         let mut package_path: Option<String> = None;
         for search_path in &sorted_paths {
@@ -445,4 +448,80 @@ fn extract_list_of_strings(expr: &Expr) -> Option<FxHashSet<String>> {
         }
     }
     Some(names)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::database::HydraDatabase;
+    use crate::python_analyzer::DefinitionInfo;
+    use ruff_db::system::SystemPath;
+    use std::fs;
+    use tempfile::TempDir;
+
+    /// Build a workspace whose interpreter search root lives inside the
+    /// workspace itself:
+    ///
+    /// ```text
+    /// workspace/.venv/lib/python3.12/site-packages/example/nested/
+    /// ```
+    ///
+    /// `nested/__init__.py` re-exports `ExportedClass` with a relative import,
+    /// so resolving it has to pick the site-packages root (not the workspace
+    /// root) when turning `.implementation` into an absolute module name.
+    fn overlapping_roots_fixture() -> (TempDir, PathBuf, PathBuf) {
+        let temp = TempDir::new().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        let site_packages = workspace
+            .join(".venv")
+            .join("lib")
+            .join("python3.12")
+            .join("site-packages");
+        let nested = site_packages.join("example").join("nested");
+        fs::create_dir_all(&nested).expect("create fixture dirs");
+
+        fs::write(
+            nested.join("__init__.py"),
+            "from .implementation import ExportedClass\n",
+        )
+        .expect("write __init__.py");
+        fs::write(
+            nested.join("implementation.py"),
+            "class ExportedClass:\n    pass\n",
+        )
+        .expect("write implementation.py");
+
+        (temp, workspace, site_packages)
+    }
+
+    #[test]
+    fn test_relative_reexport_with_nested_search_roots() {
+        let (_temp, workspace, site_packages) = overlapping_roots_fixture();
+        let db = HydraDatabase::new(SystemPath::new("/"));
+
+        // Production order: the broad workspace root comes before the nested
+        // site-packages root.
+        let search_paths = vec![workspace.clone(), site_packages.clone()];
+
+        let result = PythonAnalyzer::extract_definition_info(
+            &db,
+            "example.nested.ExportedClass",
+            &search_paths,
+        );
+
+        let (definition_info, file_path, _module_path, symbol_name) = result.expect(
+            "ExportedClass should resolve through the relative re-export when site-packages is nested inside the workspace",
+        );
+
+        assert!(
+            file_path.ends_with("implementation.py"),
+            "expected the defining module, got {}",
+            file_path.display()
+        );
+        assert_eq!(symbol_name, "ExportedClass");
+        match definition_info {
+            DefinitionInfo::Class(class_info) => assert_eq!(class_info.name, "ExportedClass"),
+            other => panic!("expected a class definition, got {other:?}"),
+        }
+    }
 }
