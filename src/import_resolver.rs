@@ -96,6 +96,43 @@ impl<'db, 'sp> ImportResolver<'db, 'sp> {
         None
     }
 
+    /// The directory a relative import is resolved against: the importing
+    /// file's own directory for level 1, one directory up for each extra level.
+    fn relative_import_dir(current_file: &Path, level: u32) -> Option<&Path> {
+        // level 1 = current package (.)
+        // level 2 = parent package (..)
+        // etc.
+        let mut current_dir = current_file.parent()?;
+        for _ in 1..level {
+            current_dir = current_dir.parent()?;
+        }
+        Some(current_dir)
+    }
+
+    /// Resolve a relative import (`from .module import name`) to the file it names.
+    fn resolve_relative_module_file(
+        &self,
+        current_file: &Path,
+        module: Option<&str>,
+        level: u32,
+    ) -> Option<PathBuf> {
+        if let Some(current_dir) = Self::relative_import_dir(current_file, level) {
+            let mut candidate = current_dir.to_path_buf();
+            for part in module.unwrap_or_default().split('.') {
+                if !part.is_empty() {
+                    candidate.push(part);
+                }
+            }
+
+            if let Some(found_path) = Self::find_module_file(self.db, &candidate) {
+                return Some(found_path);
+            }
+        }
+
+        let module_path = self.resolve_relative_import(current_file, module, level)?;
+        self.resolve_module_path(&module_path)
+    }
+
     /// Resolve a relative import to an absolute module path
     fn resolve_relative_import(
         &self,
@@ -103,25 +140,17 @@ impl<'db, 'sp> ImportResolver<'db, 'sp> {
         module: Option<&str>,
         level: u32,
     ) -> Option<String> {
-        // Get the current package path
-        let mut current_dir = current_file.parent()?;
-
-        // Navigate up based on level (each level is one "..")
-        // level 1 = current package (.)
-        // level 2 = parent package (..)
-        // etc.
-        for _ in 1..level {
-            current_dir = current_dir.parent()?;
-        }
+        let current_dir = Self::relative_import_dir(current_file, level)?;
 
         // Find which search path this is under.
-        // Sort search paths by length descending so the most specific containing
+        // Sort search paths by depth descending so the most specific containing
         // root wins (e.g. a site-packages root nested inside the workspace root
         // must match before the workspace root itself, otherwise the stripped
         // prefix leaves environment directories in the module name).
-        // The sort is stable, so equal-length roots keep their original order.
+        // Depth is counted in path components rather than bytes.
+        // The sort is stable, so equal-depth roots keep their original order.
         let mut sorted_paths = self.search_paths.to_vec();
-        sorted_paths.sort_by_key(|a| std::cmp::Reverse(a.as_os_str().len()));
+        sorted_paths.sort_by_key(|a| std::cmp::Reverse(a.components().count()));
 
         let mut package_path: Option<String> = None;
         for search_path in &sorted_paths {
@@ -237,15 +266,13 @@ impl<'db, 'sp> ImportResolver<'db, 'sp> {
 
         for star_import in star_imports {
             if let ImportInfo::StarImport { ref module, level } = star_import {
-                let resolved_module = if level > 0 {
-                    self.resolve_relative_import(starting_file, Some(module), level)
+                let module_file = if level > 0 {
+                    self.resolve_relative_module_file(starting_file, Some(module), level)
                 } else {
-                    Some(module.clone())
+                    self.resolve_module_path(module)
                 };
 
-                if let Some(module_path) = resolved_module
-                    && let Some(module_file) = self.resolve_module_path(&module_path)
-                {
+                if let Some(module_file) = module_file {
                     // Check if this symbol is exported from the star-imported module
                     let star_dunder_all = self.extract_dunder_all(&module_file);
 
@@ -284,28 +311,22 @@ impl<'db, 'sp> ImportResolver<'db, 'sp> {
                 _alias: _,
                 level,
             } => {
-                let resolved_module = if *level > 0 {
-                    self.resolve_relative_import(current_file, Some(module), *level)
+                let module_file = if *level > 0 {
+                    self.resolve_relative_module_file(current_file, Some(module), *level)?
                 } else {
-                    Some(module.clone())
+                    self.resolve_module_path(module)?
                 };
-
-                let module_path = resolved_module?;
-                let module_file = self.resolve_module_path(&module_path)?;
 
                 // Recursively resolve the symbol in the imported module
                 self.resolve_symbol(&module_file, name)
             }
             ImportInfo::StarImport { module, level } => {
                 // This shouldn't be called directly for star imports
-                let resolved_module = if *level > 0 {
-                    self.resolve_relative_import(current_file, Some(module), *level)
+                let module_file = if *level > 0 {
+                    self.resolve_relative_module_file(current_file, Some(module), *level)?
                 } else {
-                    Some(module.clone())
+                    self.resolve_module_path(module)?
                 };
-
-                let module_path = resolved_module?;
-                let module_file = self.resolve_module_path(&module_path)?;
                 Some((module_file, String::new()))
             }
             ImportInfo::Import { module, .. } => {
@@ -466,10 +487,10 @@ mod tests {
     /// workspace/.venv/lib/python3.12/site-packages/example/nested/
     /// ```
     ///
-    /// `nested/__init__.py` re-exports `ExportedClass` with a relative import,
-    /// so resolving it has to pick the site-packages root (not the workspace
-    /// root) when turning `.implementation` into an absolute module name.
-    fn overlapping_roots_fixture() -> (TempDir, PathBuf, PathBuf) {
+    /// `nested/__init__.py` re-exports `ExportedClass` with the given relative
+    /// import statement, so resolving it has to pick the site-packages root
+    /// (not the workspace root) when working out what `.implementation` means.
+    fn overlapping_roots_fixture(reexport: &str) -> (TempDir, PathBuf, PathBuf) {
         let temp = TempDir::new().expect("tempdir");
         let workspace = temp.path().join("workspace");
         let site_packages = workspace
@@ -480,11 +501,7 @@ mod tests {
         let nested = site_packages.join("example").join("nested");
         fs::create_dir_all(&nested).expect("create fixture dirs");
 
-        fs::write(
-            nested.join("__init__.py"),
-            "from .implementation import ExportedClass\n",
-        )
-        .expect("write __init__.py");
+        fs::write(nested.join("__init__.py"), reexport).expect("write __init__.py");
         fs::write(
             nested.join("implementation.py"),
             "class ExportedClass:\n    pass\n",
@@ -494,34 +511,142 @@ mod tests {
         (temp, workspace, site_packages)
     }
 
-    #[test]
-    fn test_relative_reexport_with_nested_search_roots() {
-        let (_temp, workspace, site_packages) = overlapping_roots_fixture();
+    /// Resolve `symbol_path` with the workspace root ahead of the nested
+    /// site-packages root, which is the order production builds them in.
+    fn resolve_in_overlapping_roots(
+        workspace: &Path,
+        site_packages: &Path,
+        symbol_path: &str,
+    ) -> (DefinitionInfo, PathBuf, String) {
         let db = HydraDatabase::new(SystemPath::new("/"));
+        let search_paths = vec![workspace.to_path_buf(), site_packages.to_path_buf()];
 
-        // Production order: the broad workspace root comes before the nested
-        // site-packages root.
-        let search_paths = vec![workspace.clone(), site_packages.clone()];
+        let (definition_info, file_path, _module_path, symbol_name) =
+            PythonAnalyzer::extract_definition_info(&db, symbol_path, &search_paths).unwrap_or_else(
+                |_| panic!("{symbol_path} should resolve when site-packages is nested inside the workspace"),
+            );
 
-        let result = PythonAnalyzer::extract_definition_info(
-            &db,
-            "example.nested.ExportedClass",
-            &search_paths,
-        );
+        (definition_info, file_path, symbol_name)
+    }
 
-        let (definition_info, file_path, _module_path, symbol_name) = result.expect(
-            "ExportedClass should resolve through the relative re-export when site-packages is nested inside the workspace",
-        );
-
+    fn assert_exported_class(definition_info: &DefinitionInfo, file_path: &Path) {
         assert!(
             file_path.ends_with("implementation.py"),
             "expected the defining module, got {}",
             file_path.display()
         );
-        assert_eq!(symbol_name, "ExportedClass");
         match definition_info {
             DefinitionInfo::Class(class_info) => assert_eq!(class_info.name, "ExportedClass"),
             other => panic!("expected a class definition, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_relative_reexport_with_nested_search_roots() {
+        let (_temp, workspace, site_packages) =
+            overlapping_roots_fixture("from .implementation import ExportedClass\n");
+
+        let (definition_info, file_path, symbol_name) = resolve_in_overlapping_roots(
+            &workspace,
+            &site_packages,
+            "example.nested.ExportedClass",
+        );
+
+        assert_eq!(symbol_name, "ExportedClass");
+        assert_exported_class(&definition_info, &file_path);
+    }
+
+    #[test]
+    fn test_relative_star_reexport_with_nested_search_roots() {
+        let (_temp, workspace, site_packages) =
+            overlapping_roots_fixture("from .implementation import *\n");
+
+        let (definition_info, file_path, symbol_name) = resolve_in_overlapping_roots(
+            &workspace,
+            &site_packages,
+            "example.nested.ExportedClass",
+        );
+
+        assert_eq!(symbol_name, "ExportedClass");
+        assert_exported_class(&definition_info, &file_path);
+    }
+
+    /// A file that only the workspace root contains still has to resolve
+    /// against it once the nested site-packages root is preferred elsewhere.
+    #[test]
+    fn test_relative_reexport_under_workspace_root_only() {
+        let (_temp, workspace, site_packages) =
+            overlapping_roots_fixture("from .implementation import ExportedClass\n");
+
+        let first_party = workspace.join("firstparty");
+        fs::create_dir_all(&first_party).expect("create first-party dirs");
+        fs::write(
+            first_party.join("__init__.py"),
+            "from .implementation import ExportedClass\n",
+        )
+        .expect("write __init__.py");
+        fs::write(
+            first_party.join("implementation.py"),
+            "class ExportedClass:\n    pass\n",
+        )
+        .expect("write implementation.py");
+
+        let (definition_info, file_path, symbol_name) =
+            resolve_in_overlapping_roots(&workspace, &site_packages, "firstparty.ExportedClass");
+
+        assert_eq!(symbol_name, "ExportedClass");
+        assert!(
+            file_path.starts_with(&first_party),
+            "expected the workspace copy, got {}",
+            file_path.display()
+        );
+        assert_exported_class(&definition_info, &file_path);
+    }
+
+    /// A relative import names a sibling of the importing file, so it must not
+    /// be answered by a same-named module sitting under an earlier search root.
+    #[test]
+    fn test_relative_import_prefers_sibling_over_shadowing_root() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo = temp.path().join("repo");
+        let package = repo.join("src").join("pkg");
+        fs::create_dir_all(&package).expect("create package dirs");
+
+        fs::write(
+            package.join("__init__.py"),
+            "from .implementation import ExportedClass\n",
+        )
+        .expect("write __init__.py");
+        fs::write(
+            package.join("implementation.py"),
+            "class ExportedClass:\n    pass\n",
+        )
+        .expect("write implementation.py");
+
+        // A decoy `pkg.implementation` directly under the repo root: reachable
+        // first if the relative import round-trips through a module name. It is
+        // a namespace package so that `pkg` itself still resolves to src/pkg.
+        let decoy = repo.join("pkg");
+        fs::create_dir_all(&decoy).expect("create decoy dirs");
+        fs::write(
+            decoy.join("implementation.py"),
+            "class ExportedClass:\n    pass\n",
+        )
+        .expect("write decoy implementation.py");
+
+        let db = HydraDatabase::new(SystemPath::new("/"));
+        let search_paths = vec![repo.clone(), repo.join("src")];
+
+        let (definition_info, file_path, _module_path, symbol_name) =
+            PythonAnalyzer::extract_definition_info(&db, "pkg.ExportedClass", &search_paths)
+                .expect("ExportedClass should resolve through the sibling module");
+
+        assert_eq!(symbol_name, "ExportedClass");
+        assert!(
+            file_path.starts_with(&package),
+            "expected the sibling module under src/pkg, got {}",
+            file_path.display()
+        );
+        assert_exported_class(&definition_info, &file_path);
     }
 }
