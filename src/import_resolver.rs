@@ -4,20 +4,27 @@ use crate::python_analyzer::{
 use ruff_python_ast::{self as ast, Expr, Stmt, visitor::Visitor};
 use rustc_hash::FxHashSet;
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 const MAX_IMPORT_DEPTH: usize = 10;
 
 /// Append a dotted module name to a directory, one path segment per part.
 /// Empty parts are skipped, so an empty module name gives back `base`.
-fn join_module_parts(base: &Path, module: &str) -> PathBuf {
+/// Returns `None` if a part is not a plain name (module strings come from user
+/// YAML, and `"/etc/x"` or `"../x"` would otherwise escape `base`).
+fn join_module_parts(base: &Path, module: &str) -> Option<PathBuf> {
     let mut path = base.to_path_buf();
     for part in module.split('.') {
-        if !part.is_empty() {
-            path.push(part);
+        if part.is_empty() {
+            continue;
+        }
+        let mut components = Path::new(part).components();
+        match (components.next(), components.next()) {
+            (Some(Component::Normal(name)), None) => path.push(name),
+            _ => return None,
         }
     }
-    path
+    Some(path)
 }
 
 /// Information about an import statement
@@ -94,7 +101,7 @@ impl<'db, 'sp> ImportResolver<'db, 'sp> {
     pub fn resolve_module_path(&self, module_path: &str) -> Option<PathBuf> {
         for search_path in self.search_paths {
             // Try as a package with __init__.py
-            let package_path = join_module_parts(search_path, module_path);
+            let package_path = join_module_parts(search_path, module_path)?;
 
             if let Some(found_path) = Self::find_module_file(self.db, &package_path) {
                 return Some(found_path);
@@ -125,22 +132,20 @@ impl<'db, 'sp> ImportResolver<'db, 'sp> {
     ) -> Option<PathBuf> {
         let current_dir = Self::relative_import_dir(current_file, level)?;
 
-        // Only walk from the importing file's directory while that directory is
-        // still inside a search root.
-        if self
+        // Resolve against the importing file's own directory, but only when
+        // that directory is inside a search root. Otherwise the import reached
+        // past the top-level package, which Python rejects, so there is nothing
+        // valid left to resolve against.
+        if !self
             .search_paths
             .iter()
             .any(|search_path| current_dir.starts_with(search_path))
         {
-            let candidate = join_module_parts(current_dir, module.unwrap_or_default());
-            return Self::find_module_file(self.db, &candidate);
+            return None;
         }
 
-        // The importing file sits outside every search root (or the import
-        // reached past one), so the only thing left to try is reading the
-        // module name as an absolute one, which keeps the result in the project.
-        let module = module.filter(|module| !module.is_empty())?;
-        self.resolve_module_path(module)
+        let candidate = join_module_parts(current_dir, module.unwrap_or_default())?;
+        Self::find_module_file(self.db, &candidate)
     }
 
     /// Extract __all__ from a module
@@ -447,6 +452,12 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    /// Write `contents` to `path`, creating the parent directories first.
+    fn write_file(path: &Path, contents: &str) {
+        fs::create_dir_all(path.parent().expect("path has a parent")).expect("create dirs");
+        fs::write(path, contents).expect("write file");
+    }
+
     /// Build a workspace whose interpreter search root lives inside the
     /// workspace itself:
     ///
@@ -466,14 +477,12 @@ mod tests {
             .join("python3.12")
             .join("site-packages");
         let nested = site_packages.join("example").join("nested");
-        fs::create_dir_all(&nested).expect("create fixture dirs");
 
-        fs::write(nested.join("__init__.py"), reexport).expect("write __init__.py");
-        fs::write(
-            nested.join("implementation.py"),
+        write_file(&nested.join("__init__.py"), reexport);
+        write_file(
+            &nested.join("implementation.py"),
             "class ExportedClass:\n    pass\n",
-        )
-        .expect("write implementation.py");
+        );
 
         (temp, workspace, site_packages)
     }
@@ -546,17 +555,14 @@ mod tests {
             overlapping_roots_fixture("from .implementation import ExportedClass\n");
 
         let first_party = workspace.join("firstparty");
-        fs::create_dir_all(&first_party).expect("create first-party dirs");
-        fs::write(
-            first_party.join("__init__.py"),
+        write_file(
+            &first_party.join("__init__.py"),
             "from .implementation import ExportedClass\n",
-        )
-        .expect("write __init__.py");
-        fs::write(
-            first_party.join("implementation.py"),
+        );
+        write_file(
+            &first_party.join("implementation.py"),
             "class ExportedClass:\n    pass\n",
-        )
-        .expect("write implementation.py");
+        );
 
         let (definition_info, file_path, symbol_name) =
             resolve_in_overlapping_roots(&workspace, &site_packages, "firstparty.ExportedClass");
@@ -577,29 +583,23 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let repo = temp.path().join("repo");
         let package = repo.join("src").join("pkg");
-        fs::create_dir_all(&package).expect("create package dirs");
 
-        fs::write(
-            package.join("__init__.py"),
+        write_file(
+            &package.join("__init__.py"),
             "from .implementation import ExportedClass\n",
-        )
-        .expect("write __init__.py");
-        fs::write(
-            package.join("implementation.py"),
+        );
+        write_file(
+            &package.join("implementation.py"),
             "class ExportedClass:\n    pass\n",
-        )
-        .expect("write implementation.py");
+        );
 
         // A decoy `pkg.implementation` directly under the repo root: reachable
         // first if the relative import round-trips through a module name. It is
         // a namespace package so that `pkg` itself still resolves to src/pkg.
-        let decoy = repo.join("pkg");
-        fs::create_dir_all(&decoy).expect("create decoy dirs");
-        fs::write(
-            decoy.join("implementation.py"),
+        write_file(
+            &repo.join("pkg").join("implementation.py"),
             "class ExportedClass:\n    pass\n",
-        )
-        .expect("write decoy implementation.py");
+        );
 
         let db = HydraDatabase::new(SystemPath::new("/"));
         let search_paths = vec![repo.clone(), repo.join("src")];
@@ -646,12 +646,6 @@ mod tests {
             "expected no resolution, got {:?}",
             result.map(|(_, file_path, _, _)| file_path)
         );
-    }
-
-    /// Write `contents` to `path`, creating the parent directories first.
-    fn write_file(path: &Path, contents: &str) {
-        fs::create_dir_all(path.parent().expect("path has a parent")).expect("create dirs");
-        fs::write(path, contents).expect("write file");
     }
 
     /// A relative import is resolved from the importing file's own directory,
@@ -728,6 +722,9 @@ mod tests {
             &temp.path().join("outside.py"),
             "class ExportedClass:\n    pass\n",
         );
+        // A module inside the root: it must not answer the escaping import
+        // either, since the import is invalid rather than absolute.
+        write_file(&repo.join("inside.py"), "class ExportedClass:\n    pass\n");
 
         let db = HydraDatabase::new(SystemPath::new("/"));
         let search_paths = vec![repo.clone()];
@@ -737,6 +734,37 @@ mod tests {
         // `from ...outside import ExportedClass` reaches above the root.
         assert_eq!(
             resolver.resolve_relative_module_file(&importer, Some("outside"), 3),
+            None,
+        );
+        assert_eq!(
+            resolver.resolve_relative_module_file(&importer, Some("inside"), 3),
+            None,
+        );
+    }
+
+    /// Module names come from user YAML, so parts that are not plain names must
+    /// not be able to walk out of the search root.
+    #[test]
+    fn test_module_parts_cannot_escape_the_base_directory() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo = temp.path().join("repo");
+
+        write_file(&repo.join("pkg").join("__init__.py"), "");
+        write_file(&temp.path().join("outside.py"), "");
+
+        let db = HydraDatabase::new(SystemPath::new("/"));
+        let search_paths = vec![repo.clone()];
+        let resolver = ImportResolver::new(&db, &search_paths);
+
+        assert_eq!(resolver.resolve_module_path("../outside"), None);
+        assert_eq!(
+            resolver.resolve_module_path(temp.path().join("outside").to_str().expect("utf-8")),
+            None,
+        );
+
+        let importer = repo.join("pkg").join("__init__.py");
+        assert_eq!(
+            resolver.resolve_relative_module_file(&importer, Some("../../outside"), 1),
             None,
         );
     }
