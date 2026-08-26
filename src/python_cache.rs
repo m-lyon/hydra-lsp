@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::import_resolver::ImportResolver;
+use crate::import_resolver::{ImportResolver, join_module_parts};
 use crate::python_analyzer::{
     ClassAttributeInfo, DefinitionInfo, FunctionSignature, PythonAnalyzer, normalize_path_for_key,
 };
@@ -154,7 +154,8 @@ pub fn search_paths_for_config(db: &dyn ruff_db::Db, config: PythonConfig) -> Ve
 /// become O(1) cache lookups.
 ///
 /// Returns `None` when the module cannot be resolved (mirrors `resolve_module`'s
-/// `Err` path). Uses `lru = 1024` to bound memory across large workspaces.
+/// `Err` path), including when the name is not a plain dotted module name.
+/// Uses `lru = 1024` to bound memory across large workspaces.
 #[salsa::tracked(returns(ref), lru = 1024)]
 pub fn resolve_module_cached<'db>(
     db: &'db dyn ruff_db::Db,
@@ -163,15 +164,13 @@ pub fn resolve_module_cached<'db>(
 ) -> Option<PathBuf> {
     let module_path_str = module_path.value(db);
     let search_paths = search_paths.paths(db);
-    let module_parts: Vec<&str> = module_path_str.split('.').collect();
+
+    let relative_path = join_module_parts(Path::new(""), module_path_str)?;
 
     for search_path in search_paths {
         // `find_module_file` covers both shapes a module can take: a package
         // directory with an `__init__` file, and a plain `.py`/`.pyi` file.
-        let mut package_path = search_path.clone();
-        for part in &module_parts {
-            package_path.push(part);
-        }
+        let package_path = search_path.join(&relative_path);
         if let Some(found_path) = ImportResolver::find_module_file(db, &package_path) {
             return Some(found_path);
         }
@@ -1246,6 +1245,44 @@ mod tests {
                 .as_ref()
                 .is_some_and(|p| p.ends_with("new_module.py")),
             "module must resolve after creation + sync_path, got {result2:?}"
+        );
+    }
+
+    /// The module name reaching this query is the `_target_` string a user
+    /// typed into their YAML, so segments such as `..` or an absolute path must
+    /// not make it probe files outside the search roots.
+    #[test]
+    fn test_resolve_module_cached_cannot_escape_the_search_roots() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).expect("create repo");
+        fs::write(repo.join("inside.py"), "class Thing:\n    pass\n").expect("write inside");
+        fs::write(tmp.path().join("outside.py"), "class Thing:\n    pass\n")
+            .expect("write outside");
+
+        let db = real_fs_db();
+        let search_paths = vec![repo.clone()];
+        let resolve = |module: &str| {
+            let mid = TargetString::new(&db, module.to_string());
+            let spid = InternedSearchPaths::new(&db, search_paths.clone());
+            resolve_module_cached(&db, mid, spid).clone()
+        };
+
+        // Positive control: a guard that rejected everything would fail here.
+        assert_eq!(
+            resolve("inside"),
+            Some(repo.join("inside.py")),
+            "a plain module name must still resolve"
+        );
+
+        assert_eq!(resolve("../outside"), None, "`..` must not climb out");
+        assert_eq!(
+            resolve("/etc/passwd"),
+            None,
+            "an absolute name must not replace the search root"
         );
     }
 }

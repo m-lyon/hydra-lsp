@@ -10,9 +10,10 @@ const MAX_IMPORT_DEPTH: usize = 10;
 
 /// Append a dotted module name to a directory, one path segment per part.
 /// Empty parts are skipped, so an empty module name gives back `base`.
-/// Returns `None` if a part is not a plain name (module strings come from user
-/// YAML, and `"/etc/x"` or `"../x"` would otherwise escape `base`).
-fn join_module_parts(base: &Path, module: &str) -> Option<PathBuf> {
+/// Returns `None` if a part is not a plain name. Module strings can come from
+/// user YAML (a `_target_` value), where `"/etc/x"` or `"../x"` would otherwise
+/// escape `base` — an absolute part would even replace it outright.
+pub(crate) fn join_module_parts(base: &Path, module: &str) -> Option<PathBuf> {
     let mut path = base.to_path_buf();
     for part in module.split('.') {
         if part.is_empty() {
@@ -99,9 +100,13 @@ impl<'db, 'sp> ImportResolver<'db, 'sp> {
 
     /// Resolve a module path to a file path
     pub fn resolve_module_path(&self, module_path: &str) -> Option<PathBuf> {
+        // Whether the module name is usable does not depend on the search root,
+        // so validate it once rather than per root.
+        let relative_path = join_module_parts(Path::new(""), module_path)?;
+
         for search_path in self.search_paths {
             // Try as a package with __init__.py
-            let package_path = join_module_parts(search_path, module_path)?;
+            let package_path = search_path.join(&relative_path);
 
             if let Some(found_path) = Self::find_module_file(self.db, &package_path) {
                 return Some(found_path);
@@ -742,25 +747,29 @@ mod tests {
         );
     }
 
-    /// Module names come from user YAML, so parts that are not plain names must
-    /// not be able to walk out of the search root.
+    /// Parts that are not plain names must not be able to walk out of the
+    /// search root, while ordinary dotted names keep resolving.
     #[test]
     fn test_module_parts_cannot_escape_the_base_directory() {
         let temp = TempDir::new().expect("tempdir");
         let repo = temp.path().join("repo");
 
         write_file(&repo.join("pkg").join("__init__.py"), "");
+        write_file(&repo.join("pkg").join("inside.py"), "");
         write_file(&temp.path().join("outside.py"), "");
 
         let db = HydraDatabase::new(SystemPath::new("/"));
         let search_paths = vec![repo.clone()];
         let resolver = ImportResolver::new(&db, &search_paths);
 
-        assert_eq!(resolver.resolve_module_path("../outside"), None);
+        // Positive control: a guard that rejected everything would fail here.
         assert_eq!(
-            resolver.resolve_module_path(temp.path().join("outside").to_str().expect("utf-8")),
-            None,
+            resolver.resolve_module_path("pkg.inside"),
+            Some(repo.join("pkg").join("inside.py")),
         );
+
+        assert_eq!(resolver.resolve_module_path("../outside"), None);
+        assert_eq!(resolver.resolve_module_path("/etc/passwd"), None);
 
         let importer = repo.join("pkg").join("__init__.py");
         assert_eq!(
