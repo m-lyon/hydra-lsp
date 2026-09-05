@@ -184,6 +184,67 @@ impl<'db, 'sp> ImportResolver<'db, 'sp> {
         finder.result
     }
 
+    /// Whether a module defines `__getattr__` at module level (PEP 562).
+    /// Packages use this to lazily resolve attributes that were not bound at
+    /// import time, which is how a name can be a valid runtime export
+    /// without being assigned anywhere in the module body.
+    fn has_module_level_getattr(&mut self, file_path: &Path) -> bool {
+        let Ok(parsed) = get_parsed_module(self.db, file_path) else {
+            return false;
+        };
+        parsed.suite().iter().any(|stmt| {
+            matches!(stmt, Stmt::FunctionDef(func_def) if func_def.name.as_str() == "__getattr__")
+        })
+    }
+
+    /// Find an import for `symbol_name` declared inside a module-level
+    /// `if TYPE_CHECKING:` (or `if typing.TYPE_CHECKING:`) block.
+    ///
+    /// Only the direct body of a matching top-level `if` is inspected, never
+    /// statements nested inside a function, class, or unrelated runtime
+    /// condition, so this cannot mistake an ordinary conditional import for a
+    /// package export. Callers are expected to combine this with the
+    /// `__all__` and module-level `__getattr__` guards, since a type-only
+    /// import alone does not prove the name is available at runtime.
+    fn find_type_checking_import_for_symbol(
+        &mut self,
+        file_path: &Path,
+        symbol_name: &str,
+    ) -> Option<ImportInfo> {
+        let parsed = get_parsed_module(self.db, file_path).ok()?;
+        let mut typing_aliases: Option<FxHashSet<String>> = None;
+        for stmt in parsed.suite() {
+            let Stmt::If(if_stmt) = stmt else { continue };
+            let is_guard = match if_stmt.test.as_ref() {
+                // The bare name form is deliberately loose and accepts any
+                // name spelled `TYPE_CHECKING`, without checking where it came
+                // from, since that spelling carries typing semantics by
+                // convention.
+                Expr::Name(name) => name.id.as_str() == "TYPE_CHECKING",
+                // Only the attribute form needs the alias set, and collecting
+                // it walks the module, so fill it on first need.
+                Expr::Attribute(attr) => {
+                    let aliases = typing_aliases
+                        .get_or_insert_with(|| collect_typing_aliases(parsed.suite()));
+                    is_typing_type_checking_attribute(attr, aliases)
+                }
+                _ => false,
+            };
+            if !is_guard {
+                continue;
+            }
+            let mut finder = ImportFinder {
+                target_symbol: symbol_name.to_string(),
+                result: None,
+            };
+            finder.visit_body(&if_stmt.body);
+            if finder.result.is_some() {
+                return finder.result;
+            }
+        }
+        None
+    }
+
     /// Extract all star imports from a module
     fn find_star_imports(&mut self, file_path: &Path) -> Vec<ImportInfo> {
         let Ok(parsed) = get_parsed_module(self.db, file_path) else {
@@ -244,6 +305,26 @@ impl<'db, 'sp> ImportResolver<'db, 'sp> {
             let result = self.follow_import(starting_file, import_info);
             self.depth -= 1;
             return result;
+        }
+
+        // Lazy-export fallback (see #43): a package can expose a name only
+        // through a statically declared `if TYPE_CHECKING:` import backed by
+        // a module-level `__getattr__`. Require the name to also be listed
+        // in `__all__` before following that import, so a type-only import
+        // that the module does not actually re-export at runtime still
+        // reports unresolved instead of silently matching.
+        // The cheap top-level scan runs first: modules with a module-level
+        // `__getattr__` are rare, while `extract_dunder_all` walks the whole
+        // module AST, and this block is reached on every unresolved symbol.
+        if self.has_module_level_getattr(starting_file)
+            && let Some(dunder_all) = self.extract_dunder_all(starting_file)
+            && dunder_all.contains(symbol_name)
+            && let Some(import_info) =
+                self.find_type_checking_import_for_symbol(starting_file, symbol_name)
+            && let Some(result) = self.follow_import(starting_file, &import_info)
+        {
+            self.depth -= 1;
+            return Some(result);
         }
 
         // Check star imports to see if the symbol is re-exported from another module
@@ -435,6 +516,59 @@ impl<'a> Visitor<'a> for StarImportFinder {
     }
 }
 
+/// Visitor to find the names `typing` is bound to by `import` statements.
+///
+/// Function and class bodies are skipped, since a name bound there is local
+/// and cannot be the base of a module-level guard. Every other nested body is
+/// walked, so a version-conditional binding such as
+/// `if sys.version_info >= (3, 11): import typing` is collected too.
+#[derive(Default)]
+struct TypingAliasFinder {
+    aliases: FxHashSet<String>,
+}
+
+impl<'a> Visitor<'a> for TypingAliasFinder {
+    fn visit_stmt(&mut self, stmt: &'a Stmt) {
+        match stmt {
+            Stmt::FunctionDef(_) | Stmt::ClassDef(_) => {}
+            Stmt::Import(import) => {
+                for alias in &import.names {
+                    let module = alias.name.as_str();
+                    if module == "typing" || module == "typing_extensions" {
+                        let bound = alias.asname.as_ref().map_or(module, |name| name.as_str());
+                        self.aliases.insert(bound.to_string());
+                    }
+                }
+            }
+            _ => ast::visitor::walk_stmt(self, stmt),
+        }
+    }
+}
+
+/// Names the `typing` module is bound to by the module's `import` statements,
+/// including `import typing as t`. `typing_extensions` counts too: it
+/// re-exports `TYPE_CHECKING`, and `import typing_extensions as typing` is a
+/// common version-conditional fallback.
+fn collect_typing_aliases(suite: &[Stmt]) -> FxHashSet<String> {
+    let mut finder = TypingAliasFinder::default();
+    finder.visit_body(suite);
+    finder.aliases
+}
+
+/// Whether an attribute expression is `<typing alias>.TYPE_CHECKING`, one of
+/// the two forms `typing.TYPE_CHECKING` is conventionally guarded with. The
+/// other form, the bare name, is tested by the caller.
+///
+/// The base must be a name the module actually bound to `typing`, so an
+/// unrelated `settings.TYPE_CHECKING` flag is not mistaken for a typing guard.
+fn is_typing_type_checking_attribute(
+    attr: &ast::ExprAttribute,
+    typing_aliases: &FxHashSet<String>,
+) -> bool {
+    attr.attr.as_str() == "TYPE_CHECKING"
+        && matches!(attr.value.as_ref(), Expr::Name(base) if typing_aliases.contains(base.id.as_str()))
+}
+
 /// Extract a list of strings from an expression (for __all__)
 fn extract_list_of_strings(expr: &Expr) -> Option<FxHashSet<String>> {
     let elements = match expr {
@@ -558,6 +692,424 @@ mod tests {
 
         assert_eq!(symbol_name, "ExportedClass");
         assert_exported_class(&definition_info, &file_path);
+    }
+
+    // ==================== lazy `TYPE_CHECKING` export fallback (#43) ====================
+    //
+    // Packages sometimes only expose a name through a statically declared
+    // `if TYPE_CHECKING:` import backed by a module-level `__getattr__`
+    // (PEP 562), so type checkers see the import but nothing imports it at
+    // runtime. The tests below build such a package and resolve it directly
+    // through `ImportResolver::resolve_symbol`, mirroring the reproducer from
+    // https://github.com/m-lyon/hydra-lsp/issues/43.
+
+    /// Build a package `example_pkg` whose `__init__.py` is `package_init`
+    /// and whose `_implementation.py` defines `class_name`.
+    fn lazy_export_fixture(package_init: &str, class_name: &str) -> (TempDir, PathBuf) {
+        let temp = TempDir::new().expect("tempdir");
+        let root = temp.path().join("root");
+        let package = root.join("example_pkg");
+
+        write_file(&package.join("__init__.py"), package_init);
+        write_file(
+            &package.join("_implementation.py"),
+            &format!("class {class_name}:\n    pass\n"),
+        );
+
+        (temp, root)
+    }
+
+    /// Resolve `symbol_name` starting from `example_pkg/__init__.py` under `root`.
+    fn resolve_lazy_export(root: &Path, symbol_name: &str) -> Option<(PathBuf, String)> {
+        let db = HydraDatabase::new(SystemPath::new("/"));
+        let search_paths = vec![root.to_path_buf()];
+        let mut resolver = ImportResolver::new(&db, &search_paths);
+        let init_file = root.join("example_pkg").join("__init__.py");
+        resolver.resolve_symbol(&init_file, symbol_name)
+    }
+
+    #[test]
+    fn test_lazy_export_via_type_checking_import_and_getattr() {
+        let (_temp, root) = lazy_export_fixture(
+            "from importlib import import_module\n\
+             from typing import TYPE_CHECKING\n\
+             \n\
+             if TYPE_CHECKING:\n    \
+                 from ._implementation import ExportedClass\n\
+             \n\
+             __all__ = [\"ExportedClass\"]\n\
+             \n\
+             \n\
+             def __getattr__(name):\n    \
+                 if name not in __all__:\n        \
+                     raise AttributeError(name)\n    \
+                 module = import_module(\"example_pkg._implementation\")\n    \
+                 return getattr(module, name)\n",
+            "ExportedClass",
+        );
+
+        let (file_path, symbol_name) =
+            resolve_lazy_export(&root, "ExportedClass").expect("lazy export should resolve");
+
+        assert!(file_path.ends_with("_implementation.py"));
+        assert_eq!(symbol_name, "ExportedClass");
+    }
+
+    #[test]
+    fn test_lazy_export_with_qualified_type_checking_guard() {
+        let (_temp, root) = lazy_export_fixture(
+            "import typing\n\
+             from importlib import import_module\n\
+             \n\
+             if typing.TYPE_CHECKING:\n    \
+                 from ._implementation import ExportedClass\n\
+             \n\
+             __all__ = [\"ExportedClass\"]\n\
+             \n\
+             \n\
+             def __getattr__(name):\n    \
+                 if name not in __all__:\n        \
+                     raise AttributeError(name)\n    \
+                 return getattr(import_module(\"example_pkg._implementation\"), name)\n",
+            "ExportedClass",
+        );
+
+        let (file_path, symbol_name) = resolve_lazy_export(&root, "ExportedClass")
+            .expect("`typing.TYPE_CHECKING` guard should resolve");
+
+        assert!(file_path.ends_with("_implementation.py"));
+        assert_eq!(symbol_name, "ExportedClass");
+    }
+
+    #[test]
+    fn test_lazy_export_resolves_aliased_type_checking_import() {
+        let (_temp, root) = lazy_export_fixture(
+            "from importlib import import_module\n\
+             from typing import TYPE_CHECKING\n\
+             \n\
+             if TYPE_CHECKING:\n    \
+                 from ._implementation import InternalName as ExportedClass\n\
+             \n\
+             __all__ = [\"ExportedClass\"]\n\
+             \n\
+             \n\
+             def __getattr__(name):\n    \
+                 if name not in __all__:\n        \
+                     raise AttributeError(name)\n    \
+                 return getattr(import_module(\"example_pkg._implementation\"), \"InternalName\")\n",
+            "InternalName",
+        );
+
+        let (file_path, symbol_name) = resolve_lazy_export(&root, "ExportedClass")
+            .expect("aliased import should resolve by its public alias");
+
+        assert!(file_path.ends_with("_implementation.py"));
+        assert_eq!(symbol_name, "InternalName");
+    }
+
+    /// Without a module-level `__getattr__`, the `TYPE_CHECKING` import is
+    /// exactly what it looks like: type-only. Nothing serves the name at
+    /// runtime, so it must stay unresolved rather than false-negative.
+    #[test]
+    fn test_type_checking_import_without_getattr_remains_unresolved() {
+        let (_temp, root) = lazy_export_fixture(
+            "from typing import TYPE_CHECKING\n\
+             \n\
+             if TYPE_CHECKING:\n    \
+                 from ._implementation import ExportedClass\n\
+             \n\
+             __all__ = [\"ExportedClass\"]\n",
+            "ExportedClass",
+        );
+
+        assert_eq!(resolve_lazy_export(&root, "ExportedClass"), None);
+    }
+
+    /// The fallback only looks at the direct body of a module-level `if`
+    /// whose test is `TYPE_CHECKING`. An import guarded by an unrelated
+    /// condition, or nested inside a function or class, must not be mistaken
+    /// for a package export even when `__all__` and `__getattr__` line up.
+    #[test]
+    fn test_type_checking_fallback_ignores_non_module_level_imports() {
+        let (_temp, root) = lazy_export_fixture(
+            "from importlib import import_module\n\
+             \n\
+             if some_runtime_flag:\n    \
+                 from ._implementation import ExportedClass\n\
+             \n\
+             def _lazy():\n    \
+                 from ._implementation import ExportedClass\n\
+             \n\
+             class _Wrapper:\n    \
+                 from typing import TYPE_CHECKING\n    \
+                 if TYPE_CHECKING:\n        \
+                     from ._implementation import ExportedClass\n\
+             \n\
+             __all__ = [\"ExportedClass\"]\n\
+             \n\
+             \n\
+             def __getattr__(name):\n    \
+                 if name not in __all__:\n        \
+                     raise AttributeError(name)\n    \
+                 return getattr(import_module(\"example_pkg._implementation\"), name)\n",
+            "ExportedClass",
+        );
+
+        assert_eq!(resolve_lazy_export(&root, "ExportedClass"), None);
+    }
+
+    /// `__all__` is the guard that proves the module means to re-export the
+    /// name. With a module-level `__getattr__` and a `TYPE_CHECKING` import
+    /// present but the name absent from `__all__`, the fallback must decline.
+    #[test]
+    fn test_type_checking_fallback_requires_name_in_dunder_all() {
+        let (_temp, root) = lazy_export_fixture(
+            "from importlib import import_module\n\
+             from typing import TYPE_CHECKING\n\
+             \n\
+             if TYPE_CHECKING:\n    \
+                 from ._implementation import ExportedClass\n\
+             \n\
+             __all__ = [\"SomethingElse\"]\n\
+             \n\
+             \n\
+             def __getattr__(name):\n    \
+                 if name not in __all__:\n        \
+                     raise AttributeError(name)\n    \
+                 return getattr(import_module(\"example_pkg._implementation\"), name)\n",
+            "ExportedClass",
+        );
+
+        assert_eq!(resolve_lazy_export(&root, "ExportedClass"), None);
+    }
+
+    /// A dynamically built `__all__` cannot be read statically, so the
+    /// membership guard cannot be satisfied and the fallback must decline.
+    #[test]
+    fn test_type_checking_fallback_requires_static_dunder_all() {
+        let (_temp, root) = lazy_export_fixture(
+            "from importlib import import_module\n\
+             from typing import TYPE_CHECKING\n\
+             \n\
+             if TYPE_CHECKING:\n    \
+                 from ._implementation import ExportedClass\n\
+             \n\
+             __all__ = [\"Exported\" + \"Class\"]\n\
+             \n\
+             \n\
+             def __getattr__(name):\n    \
+                 return getattr(import_module(\"example_pkg._implementation\"), name)\n",
+            "ExportedClass",
+        );
+
+        assert_eq!(resolve_lazy_export(&root, "ExportedClass"), None);
+    }
+
+    /// The attribute form of the guard must name the `typing` module. An
+    /// unrelated object that happens to carry a `TYPE_CHECKING` attribute is
+    /// a runtime flag, not a typing guard.
+    #[test]
+    fn test_type_checking_fallback_ignores_non_typing_attribute_guard() {
+        let (_temp, root) = lazy_export_fixture(
+            "from importlib import import_module\n\
+             import settings\n\
+             \n\
+             if settings.TYPE_CHECKING:\n    \
+                 from ._implementation import ExportedClass\n\
+             \n\
+             __all__ = [\"ExportedClass\"]\n\
+             \n\
+             \n\
+             def __getattr__(name):\n    \
+                 return getattr(import_module(\"example_pkg._implementation\"), name)\n",
+            "ExportedClass",
+        );
+
+        assert_eq!(resolve_lazy_export(&root, "ExportedClass"), None);
+    }
+
+    /// `import typing as t` is still a typing guard, so the aliased attribute
+    /// form must resolve.
+    #[test]
+    fn test_lazy_export_with_aliased_typing_module_guard() {
+        let (_temp, root) = lazy_export_fixture(
+            "import typing as t\n\
+             from importlib import import_module\n\
+             \n\
+             if t.TYPE_CHECKING:\n    \
+                 from ._implementation import ExportedClass\n\
+             \n\
+             __all__ = [\"ExportedClass\"]\n\
+             \n\
+             \n\
+             def __getattr__(name):\n    \
+                 return getattr(import_module(\"example_pkg._implementation\"), name)\n",
+            "ExportedClass",
+        );
+
+        let (file_path, symbol_name) = resolve_lazy_export(&root, "ExportedClass")
+            .expect("an aliased `typing` guard should resolve");
+
+        assert!(file_path.ends_with("_implementation.py"));
+        assert_eq!(symbol_name, "ExportedClass");
+    }
+
+    /// A `TYPE_CHECKING` import that cannot be followed must not short-circuit
+    /// the remaining resolution paths. Here the name is a genuine re-export
+    /// that the star import serves, so the fallback has to fall through
+    /// instead of returning `None`.
+    #[test]
+    fn test_unfollowable_type_checking_import_falls_through_to_star_import() {
+        let (_temp, root) = lazy_export_fixture(
+            "from importlib import import_module\n\
+             from typing import TYPE_CHECKING\n\
+             from ._implementation import *\n\
+             \n\
+             if TYPE_CHECKING:\n    \
+                 from ._missing import ExportedClass\n\
+             \n\
+             __all__ = [\"ExportedClass\"]\n\
+             \n\
+             \n\
+             def __getattr__(name):\n    \
+                 return getattr(import_module(\"example_pkg._implementation\"), name)\n",
+            "ExportedClass",
+        );
+
+        let (file_path, symbol_name) = resolve_lazy_export(&root, "ExportedClass")
+            .expect("an unfollowable `TYPE_CHECKING` import should fall through");
+
+        assert!(file_path.ends_with("_implementation.py"));
+        assert_eq!(symbol_name, "ExportedClass");
+    }
+
+    /// `typing` may be bound by a version-conditional import. The guard is
+    /// still a typing guard, so the alias scan must look past the top-level
+    /// statement list.
+    #[test]
+    fn test_lazy_export_with_version_conditional_typing_import() {
+        let (_temp, root) = lazy_export_fixture(
+            "import sys\n\
+             from importlib import import_module\n\
+             \n\
+             if sys.version_info >= (3, 11):\n    \
+                 import typing\n\
+             else:\n    \
+                 import typing_extensions as typing\n\
+             \n\
+             if typing.TYPE_CHECKING:\n    \
+                 from ._implementation import ExportedClass\n\
+             \n\
+             __all__ = [\"ExportedClass\"]\n\
+             \n\
+             \n\
+             def __getattr__(name):\n    \
+                 return getattr(import_module(\"example_pkg._implementation\"), name)\n",
+            "ExportedClass",
+        );
+
+        let (file_path, symbol_name) = resolve_lazy_export(&root, "ExportedClass")
+            .expect("a conditionally imported `typing` should still guard the export");
+
+        assert!(file_path.ends_with("_implementation.py"));
+        assert_eq!(symbol_name, "ExportedClass");
+    }
+
+    /// `typing_extensions` re-exports `TYPE_CHECKING`, so it licenses a guard
+    /// on its own. The module is bound under its own name, so the accepted
+    /// module name and the accepted base name cannot stand in for each other.
+    #[test]
+    fn test_lazy_export_with_typing_extensions_only_guard() {
+        let (_temp, root) = lazy_export_fixture(
+            "import typing_extensions\n\
+             from importlib import import_module\n\
+             \n\
+             if typing_extensions.TYPE_CHECKING:\n    \
+                 from ._implementation import ExportedClass\n\
+             \n\
+             __all__ = [\"ExportedClass\"]\n\
+             \n\
+             \n\
+             def __getattr__(name):\n    \
+                 return getattr(import_module(\"example_pkg._implementation\"), name)\n",
+            "ExportedClass",
+        );
+
+        let (file_path, symbol_name) = resolve_lazy_export(&root, "ExportedClass")
+            .expect("`typing_extensions` alone should license the guard");
+
+        assert!(file_path.ends_with("_implementation.py"));
+        assert_eq!(symbol_name, "ExportedClass");
+    }
+
+    /// A `typing` name bound inside a function is local to it and cannot be
+    /// the base of a module-level guard, so it must not license one.
+    #[test]
+    fn test_type_checking_fallback_ignores_function_local_typing_import() {
+        let (_temp, root) = lazy_export_fixture(
+            "from importlib import import_module\n\
+             \n\
+             def _uses_typing():\n    \
+                 import typing as settings\n\
+             \n\
+             if settings.TYPE_CHECKING:\n    \
+                 from ._implementation import ExportedClass\n\
+             \n\
+             __all__ = [\"ExportedClass\"]\n\
+             \n\
+             \n\
+             def __getattr__(name):\n    \
+                 return getattr(import_module(\"example_pkg._implementation\"), name)\n",
+            "ExportedClass",
+        );
+
+        assert_eq!(resolve_lazy_export(&root, "ExportedClass"), None);
+    }
+
+    /// End-to-end: the same lazy-export pattern resolves through
+    /// `PythonAnalyzer::extract_definition_info`, the entry point diagnostics,
+    /// hover, and go-to-definition all share.
+    #[test]
+    fn test_extract_definition_info_resolves_lazy_export() {
+        let (_temp, root) = lazy_export_fixture(
+            "from importlib import import_module\n\
+             from typing import TYPE_CHECKING\n\
+             \n\
+             if TYPE_CHECKING:\n    \
+                 from ._implementation import ExportedClass\n\
+             \n\
+             __all__ = [\"ExportedClass\"]\n\
+             \n\
+             \n\
+             def __getattr__(name):\n    \
+                 if name not in __all__:\n        \
+                     raise AttributeError(name)\n    \
+                 module = import_module(\"example_pkg._implementation\")\n    \
+                 return getattr(module, name)\n",
+            "ExportedClass",
+        );
+
+        let db = HydraDatabase::new(SystemPath::new("/"));
+        let search_paths = vec![root.clone()];
+
+        let (definition_info, file_path, _module_path, symbol_name) =
+            PythonAnalyzer::extract_definition_info(
+                &db,
+                "example_pkg.ExportedClass",
+                &search_paths,
+            )
+            .expect("the lazy export should resolve end-to-end");
+
+        assert_eq!(symbol_name, "ExportedClass");
+        assert!(
+            file_path.ends_with("_implementation.py"),
+            "expected the defining module, got {}",
+            file_path.display()
+        );
+        match definition_info {
+            DefinitionInfo::Class(class_info) => assert_eq!(class_info.name, "ExportedClass"),
+            other => panic!("expected a class definition, got {other:?}"),
+        }
     }
 
     /// A file that only the workspace root contains still has to resolve
