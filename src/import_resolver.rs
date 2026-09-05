@@ -216,13 +216,17 @@ impl<'db, 'sp> ImportResolver<'db, 'sp> {
         for stmt in parsed.suite() {
             let Stmt::If(if_stmt) = stmt else { continue };
             let is_guard = match if_stmt.test.as_ref() {
+                // The bare name form is deliberately loose and accepts any
+                // name spelled `TYPE_CHECKING`, without checking where it came
+                // from, since that spelling carries typing semantics by
+                // convention.
                 Expr::Name(name) => name.id.as_str() == "TYPE_CHECKING",
                 // Only the attribute form needs the alias set, and collecting
                 // it walks the module, so fill it on first need.
-                Expr::Attribute(_) => {
+                Expr::Attribute(attr) => {
                     let aliases = typing_aliases
                         .get_or_insert_with(|| collect_typing_aliases(parsed.suite()));
-                    is_type_checking_test(&if_stmt.test, aliases)
+                    is_typing_type_checking_attribute(attr, aliases)
                 }
                 _ => false,
             };
@@ -551,23 +555,18 @@ fn collect_typing_aliases(suite: &[Stmt]) -> FxHashSet<String> {
     finder.aliases
 }
 
-/// Whether an `if` test is `TYPE_CHECKING` or `<typing alias>.TYPE_CHECKING`,
-/// the two forms `typing.TYPE_CHECKING` is conventionally guarded with.
+/// Whether an attribute expression is `<typing alias>.TYPE_CHECKING`, one of
+/// the two forms `typing.TYPE_CHECKING` is conventionally guarded with. The
+/// other form, the bare name, is tested by the caller.
 ///
-/// The attribute form requires the base to be a name the module actually bound
-/// to `typing`, so an unrelated `settings.TYPE_CHECKING` flag is not mistaken
-/// for a typing guard. The bare name form is deliberately looser and accepts
-/// any name spelled `TYPE_CHECKING`, without checking where it came from,
-/// since that spelling carries typing semantics by convention.
-fn is_type_checking_test(test: &Expr, typing_aliases: &FxHashSet<String>) -> bool {
-    match test {
-        Expr::Name(name) => name.id.as_str() == "TYPE_CHECKING",
-        Expr::Attribute(attr) => {
-            attr.attr.as_str() == "TYPE_CHECKING"
-                && matches!(attr.value.as_ref(), Expr::Name(base) if typing_aliases.contains(base.id.as_str()))
-        }
-        _ => false,
-    }
+/// The base must be a name the module actually bound to `typing`, so an
+/// unrelated `settings.TYPE_CHECKING` flag is not mistaken for a typing guard.
+fn is_typing_type_checking_attribute(
+    attr: &ast::ExprAttribute,
+    typing_aliases: &FxHashSet<String>,
+) -> bool {
+    attr.attr.as_str() == "TYPE_CHECKING"
+        && matches!(attr.value.as_ref(), Expr::Name(base) if typing_aliases.contains(base.id.as_str()))
 }
 
 /// Extract a list of strings from an expression (for __all__)
