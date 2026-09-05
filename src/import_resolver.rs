@@ -212,17 +212,21 @@ impl<'db, 'sp> ImportResolver<'db, 'sp> {
         symbol_name: &str,
     ) -> Option<ImportInfo> {
         let parsed = get_parsed_module(self.db, file_path).ok()?;
-        let no_aliases = FxHashSet::default();
         let mut typing_aliases: Option<FxHashSet<String>> = None;
         for stmt in parsed.suite() {
             let Stmt::If(if_stmt) = stmt else { continue };
-            // Only the attribute form needs the alias set, and collecting it
-            // walks the module, so fill it on first need instead of up front.
-            if typing_aliases.is_none() && matches!(if_stmt.test.as_ref(), Expr::Attribute(_)) {
-                typing_aliases = Some(collect_typing_aliases(parsed.suite()));
-            }
-            let aliases = typing_aliases.as_ref().unwrap_or(&no_aliases);
-            if !is_type_checking_test(&if_stmt.test, aliases) {
+            let is_guard = match if_stmt.test.as_ref() {
+                Expr::Name(name) => name.id.as_str() == "TYPE_CHECKING",
+                // Only the attribute form needs the alias set, and collecting
+                // it walks the module, so fill it on first need.
+                Expr::Attribute(_) => {
+                    let aliases = typing_aliases
+                        .get_or_insert_with(|| collect_typing_aliases(parsed.suite()));
+                    is_type_checking_test(&if_stmt.test, aliases)
+                }
+                _ => false,
+            };
+            if !is_guard {
                 continue;
             }
             let mut finder = ImportFinder {
@@ -1013,14 +1017,15 @@ mod tests {
     }
 
     /// `typing_extensions` re-exports `TYPE_CHECKING`, so it licenses a guard
-    /// on its own, with no `typing` import anywhere in the module.
+    /// on its own. The module is bound under its own name, so the accepted
+    /// module name and the accepted base name cannot stand in for each other.
     #[test]
     fn test_lazy_export_with_typing_extensions_only_guard() {
         let (_temp, root) = lazy_export_fixture(
-            "import typing_extensions as typing\n\
+            "import typing_extensions\n\
              from importlib import import_module\n\
              \n\
-             if typing.TYPE_CHECKING:\n    \
+             if typing_extensions.TYPE_CHECKING:\n    \
                  from ._implementation import ExportedClass\n\
              \n\
              __all__ = [\"ExportedClass\"]\n\
