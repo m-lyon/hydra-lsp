@@ -212,10 +212,17 @@ impl<'db, 'sp> ImportResolver<'db, 'sp> {
         symbol_name: &str,
     ) -> Option<ImportInfo> {
         let parsed = get_parsed_module(self.db, file_path).ok()?;
-        let typing_aliases = collect_typing_aliases(parsed.suite());
+        let no_aliases = FxHashSet::default();
+        let mut typing_aliases: Option<FxHashSet<String>> = None;
         for stmt in parsed.suite() {
             let Stmt::If(if_stmt) = stmt else { continue };
-            if !is_type_checking_test(&if_stmt.test, &typing_aliases) {
+            // Only the attribute form needs the alias set, and collecting it
+            // walks the module, so fill it on first need instead of up front.
+            if typing_aliases.is_none() && matches!(if_stmt.test.as_ref(), Expr::Attribute(_)) {
+                typing_aliases = Some(collect_typing_aliases(parsed.suite()));
+            }
+            let aliases = typing_aliases.as_ref().unwrap_or(&no_aliases);
+            if !is_type_checking_test(&if_stmt.test, aliases) {
                 continue;
             }
             let mut finder = ImportFinder {
@@ -1000,6 +1007,32 @@ mod tests {
 
         let (file_path, symbol_name) = resolve_lazy_export(&root, "ExportedClass")
             .expect("a conditionally imported `typing` should still guard the export");
+
+        assert!(file_path.ends_with("_implementation.py"));
+        assert_eq!(symbol_name, "ExportedClass");
+    }
+
+    /// `typing_extensions` re-exports `TYPE_CHECKING`, so it licenses a guard
+    /// on its own, with no `typing` import anywhere in the module.
+    #[test]
+    fn test_lazy_export_with_typing_extensions_only_guard() {
+        let (_temp, root) = lazy_export_fixture(
+            "import typing_extensions as typing\n\
+             from importlib import import_module\n\
+             \n\
+             if typing.TYPE_CHECKING:\n    \
+                 from ._implementation import ExportedClass\n\
+             \n\
+             __all__ = [\"ExportedClass\"]\n\
+             \n\
+             \n\
+             def __getattr__(name):\n    \
+                 return getattr(import_module(\"example_pkg._implementation\"), name)\n",
+            "ExportedClass",
+        );
+
+        let (file_path, symbol_name) = resolve_lazy_export(&root, "ExportedClass")
+            .expect("`typing_extensions` alone should license the guard");
 
         assert!(file_path.ends_with("_implementation.py"));
         assert_eq!(symbol_name, "ExportedClass");
