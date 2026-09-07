@@ -199,13 +199,6 @@ impl<'db, 'sp> ImportResolver<'db, 'sp> {
 
     /// Find an import for `symbol_name` declared inside a module-level
     /// `if TYPE_CHECKING:` (or `if typing.TYPE_CHECKING:`) block.
-    ///
-    /// Only the direct body of a matching top-level `if` is inspected, never
-    /// statements nested inside a function, class, or unrelated runtime
-    /// condition, so this cannot mistake an ordinary conditional import for a
-    /// package export. Callers are expected to combine this with the
-    /// `__all__` and module-level `__getattr__` guards, since a type-only
-    /// import alone does not prove the name is available at runtime.
     fn find_type_checking_import_for_symbol(
         &mut self,
         file_path: &Path,
@@ -307,15 +300,11 @@ impl<'db, 'sp> ImportResolver<'db, 'sp> {
             return result;
         }
 
-        // Lazy-export fallback (see #43): a package can expose a name only
-        // through a statically declared `if TYPE_CHECKING:` import backed by
-        // a module-level `__getattr__`. Require the name to also be listed
-        // in `__all__` before following that import, so a type-only import
-        // that the module does not actually re-export at runtime still
-        // reports unresolved instead of silently matching.
-        // The cheap top-level scan runs first: modules with a module-level
-        // `__getattr__` are rare, while `extract_dunder_all` walks the whole
-        // module AST, and this block is reached on every unresolved symbol.
+        // Lazy-export fallback: a package can expose a name through a statically
+        // declared `if TYPE_CHECKING:` import backed by a module-level `__getattr__`.
+        // Require the name to also be listed in `__all__` before following that import,
+        // so a type-only import that the module does not actually re-export at runtime
+        // still reports unresolved instead of silently matching.
         if self.has_module_level_getattr(starting_file)
             && let Some(dunder_all) = self.extract_dunder_all(starting_file)
             && dunder_all.contains(symbol_name)
@@ -517,11 +506,6 @@ impl<'a> Visitor<'a> for StarImportFinder {
 }
 
 /// Visitor to find the names `typing` is bound to by `import` statements.
-///
-/// Function and class bodies are skipped, since a name bound there is local
-/// and cannot be the base of a module-level guard. Every other nested body is
-/// walked, so a version-conditional binding such as
-/// `if sys.version_info >= (3, 11): import typing` is collected too.
 #[derive(Default)]
 struct TypingAliasFinder {
     aliases: FxHashSet<String>,
@@ -546,9 +530,7 @@ impl<'a> Visitor<'a> for TypingAliasFinder {
 }
 
 /// Names the `typing` module is bound to by the module's `import` statements,
-/// including `import typing as t`. `typing_extensions` counts too: it
-/// re-exports `TYPE_CHECKING`, and `import typing_extensions as typing` is a
-/// common version-conditional fallback.
+/// e.g. including `import typing as t`. `typing_extensions`  is included also.
 fn collect_typing_aliases(suite: &[Stmt]) -> FxHashSet<String> {
     let mut finder = TypingAliasFinder::default();
     finder.visit_body(suite);
@@ -694,14 +676,13 @@ mod tests {
         assert_exported_class(&definition_info, &file_path);
     }
 
-    // ==================== lazy `TYPE_CHECKING` export fallback (#43) ====================
+    // ==================== lazy `TYPE_CHECKING` export fallback ====================
     //
     // Packages sometimes only expose a name through a statically declared
     // `if TYPE_CHECKING:` import backed by a module-level `__getattr__`
     // (PEP 562), so type checkers see the import but nothing imports it at
     // runtime. The tests below build such a package and resolve it directly
-    // through `ImportResolver::resolve_symbol`, mirroring the reproducer from
-    // https://github.com/m-lyon/hydra-lsp/issues/43.
+    // through `ImportResolver::resolve_symbol`.
 
     /// Build a package `example_pkg` whose `__init__.py` is `package_init`
     /// and whose `_implementation.py` defines `class_name`.
