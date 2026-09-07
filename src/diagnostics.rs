@@ -1,5 +1,6 @@
 use crate::python_analyzer::{DefinitionInfo, FunctionSignature, ParameterInfo};
-use crate::python_cache::{PythonConfig, TargetString, cached_definition_info};
+use crate::python_cache::{PythonConfig, TargetString, cached_definition_info, is_builtin_symbol};
+use crate::vendored_typeshed::BUILTINS_MODULE;
 use crate::yaml_parser::{
     ARGS_KEY, CONVERT_KEY, ConvertMode, HydraObject, PARTIAL_KEY, Parameter, ParsedContent,
     RECURSIVE_KEY,
@@ -57,6 +58,7 @@ diagnostic_rules! {
     InvalidHydraParameter => "invalid-hydra-parameter",
     ParameterAlreadyAssigned => "parameter-already-assigned",
     TooManyPositionalArguments => "too-many-positional-arguments",
+    PositionalOnlyParameter => "positional-only-parameter",
 }
 
 impl fmt::Display for DiagnosticRule {
@@ -115,7 +117,7 @@ fn validate_target(
             } else if error_msg.starts_with("Invalid _target_ format:") {
                 (
                     DiagnosticRule::InvalidHydraParameter,
-                    format!("{}. Expected format: 'module.path.SymbolName'", error_msg),
+                    format!("{}. {}", error_msg, target_format_hint(db, target)),
                 )
             } else {
                 (DiagnosticRule::UnresolvedReference, error_msg)
@@ -135,6 +137,21 @@ fn validate_target(
     }
 }
 
+/// The advice that follows an `Invalid _target_ format` error.
+///
+/// A bare name that happens to be a builtin gets the prefixed form instead of
+/// the generic shape: Hydra rejects `{"_target_": "len"}` and instantiates
+/// `{"_target_": "builtins.len"}`, so naming that is far more useful than
+/// telling the user a target needs a dot in it.
+fn target_format_hint(db: &dyn ruff_db::Db, target: TargetString<'_>) -> String {
+    let name = target.value(db);
+    if is_builtin_symbol(db, target) {
+        format!("'{name}' is a Python builtin; use '{BUILTINS_MODULE}.{name}'")
+    } else {
+        "Expected format: 'module.path.SymbolName'".to_string()
+    }
+}
+
 /// Validate parameters against a function signature.
 ///
 /// `implicit_param` is the name of the implicit first parameter (e.g. `self` / `cls`)
@@ -148,6 +165,15 @@ fn validate_parameters(
     file_suppressions: &HashSet<DiagnosticRule>,
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
+
+    // An overloaded symbol is only represented here by its first declaration,
+    // so its parameter names and arity describe one of several call shapes.
+    // Validating against it would flag arguments that a later overload accepts
+    // — typeshed's `open` has eight, `dict.__init__` another eight — so an
+    // overloaded target is treated as accepting any arguments.
+    if signature.is_overloaded {
+        return diagnostics;
+    }
 
     let key_start = hydra_obj.target.key_start;
 
@@ -199,6 +225,38 @@ fn validate_parameters(
     let has_variadic = signature.parameters.iter().any(|p| p.is_variadic);
     let has_kwargs = signature.parameters.iter().any(|p| p.is_variadic_keyword);
 
+    // Parameters declared before a `/` cannot be passed by name. They are still
+    // "expected" (so no unknown-argument fires), but Hydra can only reach them
+    // through `_args_`.
+    let positional_only: HashSet<&str> = signature
+        .parameters
+        .iter()
+        .filter(|p| p.is_positional_only && Some(p.name.as_str()) != implicit_param)
+        .map(|p| p.name.as_str())
+        .collect();
+
+    for param in &hydra_obj.parameters {
+        if let Parameter::Keyword { key, line, .. } = param
+            && positional_only.contains(key.as_str())
+            && !file_suppressions.contains(&DiagnosticRule::PositionalOnlyParameter)
+            && !hydra_obj
+                .suppressed_rules
+                .contains(&DiagnosticRule::PositionalOnlyParameter)
+        {
+            diagnostics.push(create_diagnostic(
+                *line,
+                key_start,
+                key.len() as u32 + key_start,
+                DiagnosticSeverity::ERROR,
+                Some(DiagnosticRule::PositionalOnlyParameter),
+                format!(
+                    "Parameter '{}' of '{}' is positional-only; pass it via {}",
+                    key, display_name, ARGS_KEY
+                ),
+            ));
+        }
+    }
+
     // Check for unknown parameters (only keyword params)
     for param in &hydra_obj.parameters {
         if let Parameter::Keyword { key, line, .. } = param
@@ -231,24 +289,37 @@ fn validate_parameters(
                     .suppressed_rules
                     .contains(&DiagnosticRule::MissingArgument)
             {
+                // A positional-only parameter has no keyword form, so point at
+                // `_args_` rather than implying a key could be added.
+                let message = if param.is_positional_only {
+                    format!(
+                        "Missing required positional-only parameter '{}' for '{}'; pass it via {}",
+                        param.name, display_name, ARGS_KEY
+                    )
+                } else {
+                    format!(
+                        "Missing required parameter '{}' for '{}'",
+                        param.name, display_name
+                    )
+                };
                 diagnostics.push(create_diagnostic(
                     hydra_obj.target.line,
                     hydra_obj.target.value_start,
                     hydra_obj.target_value_end(),
                     DiagnosticSeverity::ERROR,
                     Some(DiagnosticRule::MissingArgument),
-                    format!(
-                        "Missing required parameter '{}' for '{}'",
-                        param.name, display_name
-                    ),
+                    message,
                 ));
             }
         }
     }
 
-    // Check for parameters provided both positionally via _args_ and as keyword args
+    // Check for parameters provided both positionally via _args_ and as keyword args.
+    // Positional-only names are skipped: they have no keyword form at all, which
+    // the positional-only diagnostic above already says more precisely.
     for param_name in &positionally_covered {
         if param_names.contains(param_name)
+            && !positional_only.contains(param_name.as_str())
             && let Some(Parameter::Keyword { key, line, .. }) = hydra_obj
                 .parameters
                 .iter()
@@ -583,6 +654,7 @@ mod tests {
                     is_variadic: false,
                     is_variadic_keyword: false,
                     is_keyword_only: false,
+                    is_positional_only: false,
                 },
                 ParameterInfo {
                     name: "required_param".to_string(),
@@ -592,10 +664,12 @@ mod tests {
                     is_variadic: false,
                     is_variadic_keyword: false,
                     is_keyword_only: false,
+                    is_positional_only: false,
                 },
             ],
             return_type: None,
             docstring: None,
+            is_overloaded: false,
             start_line: 1,
             start_column: 1,
             end_line: 1,
@@ -638,9 +712,11 @@ mod tests {
                 is_variadic: false,
                 is_variadic_keyword: false,
                 is_keyword_only: false,
+                is_positional_only: false,
             }],
             return_type: None,
             docstring: None,
+            is_overloaded: false,
             start_line: 1,
             start_column: 1,
             end_line: 1,
@@ -680,6 +756,7 @@ mod tests {
                     is_variadic: false,
                     is_variadic_keyword: false,
                     is_keyword_only: false,
+                    is_positional_only: false,
                 },
                 ParameterInfo {
                     name: "**kwargs".to_string(),
@@ -689,10 +766,12 @@ mod tests {
                     is_variadic: false,
                     is_variadic_keyword: true,
                     is_keyword_only: false,
+                    is_positional_only: false,
                 },
             ],
             return_type: None,
             docstring: None,
+            is_overloaded: false,
             start_line: 1,
             start_column: 1,
             end_line: 1,
@@ -731,6 +810,7 @@ mod tests {
                     is_variadic: false,
                     is_variadic_keyword: false,
                     is_keyword_only: false,
+                    is_positional_only: false,
                 },
                 ParameterInfo {
                     name: "config_path".to_string(),
@@ -740,10 +820,12 @@ mod tests {
                     is_variadic: false,
                     is_variadic_keyword: false,
                     is_keyword_only: false,
+                    is_positional_only: false,
                 },
             ],
             return_type: None,
             docstring: None,
+            is_overloaded: false,
             start_line: 1,
             start_column: 1,
             end_line: 1,
@@ -798,6 +880,7 @@ mod tests {
                     is_variadic: false,
                     is_variadic_keyword: false,
                     is_keyword_only: false,
+                    is_positional_only: false,
                 },
                 ParameterInfo {
                     name: "config_path".to_string(),
@@ -807,10 +890,12 @@ mod tests {
                     is_variadic: false,
                     is_variadic_keyword: false,
                     is_keyword_only: false,
+                    is_positional_only: false,
                 },
             ],
             return_type: None,
             docstring: None,
+            is_overloaded: false,
             start_line: 1,
             start_column: 1,
             end_line: 1,
@@ -847,6 +932,7 @@ mod tests {
                     is_variadic: false,
                     is_variadic_keyword: false,
                     is_keyword_only: false,
+                    is_positional_only: false,
                 },
                 ParameterInfo {
                     name: "value".to_string(),
@@ -856,10 +942,12 @@ mod tests {
                     is_variadic: false,
                     is_variadic_keyword: false,
                     is_keyword_only: false,
+                    is_positional_only: false,
                 },
             ],
             return_type: None,
             docstring: None,
+            is_overloaded: false,
             start_line: 1,
             start_column: 1,
             end_line: 1,
@@ -913,6 +1001,7 @@ mod tests {
                     is_variadic: false,
                     is_variadic_keyword: false,
                     is_keyword_only: false,
+                    is_positional_only: false,
                 },
                 ParameterInfo {
                     name: "config_path".to_string(),
@@ -922,10 +1011,12 @@ mod tests {
                     is_variadic: false,
                     is_variadic_keyword: false,
                     is_keyword_only: false,
+                    is_positional_only: false,
                 },
             ],
             return_type: None,
             docstring: None,
+            is_overloaded: false,
             start_line: 1,
             start_column: 1,
             end_line: 1,
@@ -962,9 +1053,11 @@ mod tests {
                 is_variadic: false,
                 is_variadic_keyword: false,
                 is_keyword_only: false,
+                is_positional_only: false,
             }],
             return_type: None,
             docstring: None,
+            is_overloaded: false,
             start_line: 1,
             start_column: 1,
             end_line: 1,
@@ -1262,6 +1355,7 @@ mod tests {
                     is_variadic: false,
                     is_variadic_keyword: false,
                     is_keyword_only: false,
+                    is_positional_only: false,
                 },
                 ParameterInfo {
                     name: "required_param".to_string(),
@@ -1271,10 +1365,12 @@ mod tests {
                     is_variadic: false,
                     is_variadic_keyword: false,
                     is_keyword_only: false,
+                    is_positional_only: false,
                 },
             ],
             return_type: None,
             docstring: None,
+            is_overloaded: false,
             start_line: 1,
             start_column: 1,
             end_line: 1,
@@ -1310,6 +1406,7 @@ mod tests {
                     is_variadic: false,
                     is_variadic_keyword: false,
                     is_keyword_only: false,
+                    is_positional_only: false,
                 },
                 ParameterInfo {
                     name: "required_param".to_string(),
@@ -1319,10 +1416,12 @@ mod tests {
                     is_variadic: false,
                     is_variadic_keyword: false,
                     is_keyword_only: false,
+                    is_positional_only: false,
                 },
             ],
             return_type: None,
             docstring: None,
+            is_overloaded: false,
             start_line: 1,
             start_column: 1,
             end_line: 1,
@@ -1363,6 +1462,7 @@ mod tests {
                     is_variadic: false,
                     is_variadic_keyword: false,
                     is_keyword_only: false,
+                    is_positional_only: false,
                 },
                 ParameterInfo {
                     name: "required_param".to_string(),
@@ -1372,6 +1472,7 @@ mod tests {
                     is_variadic: false,
                     is_variadic_keyword: false,
                     is_keyword_only: false,
+                    is_positional_only: false,
                 },
                 ParameterInfo {
                     name: "valid_param".to_string(),
@@ -1381,10 +1482,12 @@ mod tests {
                     is_variadic: false,
                     is_variadic_keyword: false,
                     is_keyword_only: false,
+                    is_positional_only: false,
                 },
             ],
             return_type: None,
             docstring: None,
+            is_overloaded: false,
             start_line: 1,
             start_column: 1,
             end_line: 1,

@@ -3,8 +3,9 @@ use crate::python_cache::{
     InternedSearchPaths, TargetString, class_parent_attribute, class_parent_docs,
     resolve_module_cached,
 };
+use crate::vendored_typeshed::{is_vendored_path, to_vendored_path};
 use anyhow::{Context, Result};
-use ruff_db::files::system_path_to_file;
+use ruff_db::files::{File, system_path_to_file, vendored_path_to_file};
 use ruff_db::parsed::{ParsedModuleRef, parsed_module};
 use ruff_db::source::{SourceText, source_text};
 use ruff_db::system::{OsSystem, SystemPath, SystemPathBuf};
@@ -15,6 +16,19 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use ty_python_semantic::{PythonEnvironment, SysPrefixPathOrigin};
 
+/// Intern `path` as a salsa `File`, routing sentinel paths to the vendored
+/// typeshed archive and everything else to the host filesystem.
+///
+/// This is the single place the two file systems are distinguished; every
+/// caller below works in `std::path::Path` terms regardless of where the file
+/// actually lives. See [`crate::vendored_typeshed`] for the sentinel scheme.
+fn path_to_file(db: &dyn ruff_db::Db, path: &Path) -> Option<File> {
+    if is_vendored_path(path) {
+        return vendored_path_to_file(db, to_vendored_path(path)?).ok();
+    }
+    system_path_to_file(db, SystemPath::from_std_path(path)?).ok()
+}
+
 /// Tracked existence probe for a regular file.
 ///
 /// Returns `true` when `path` is an existing regular file. Unlike
@@ -24,9 +38,15 @@ use ty_python_semantic::{PythonEnvironment, SysPrefixPathOrigin};
 /// or deleted and the backend calls `File::sync_path`, every query that probed
 /// the path is invalidated on the next request.
 ///
+/// Vendored typeshed paths are probed against the immutable in-binary archive
+/// instead; they can never change, so no invalidation applies.
+///
 /// Falls back to an untracked `Path::exists()` only for non-UTF-8 paths, which
 /// cannot be represented as a `SystemPath`.
 pub(crate) fn path_is_file(db: &dyn ruff_db::Db, path: &Path) -> bool {
+    if is_vendored_path(path) {
+        return path_to_file(db, path).is_some();
+    }
     match SystemPath::from_std_path(path) {
         Some(sys_path) => system_path_to_file(db, sys_path).is_ok(),
         None => path.exists(),
@@ -43,9 +63,7 @@ pub(crate) fn path_is_file(db: &dyn ruff_db::Db, path: &Path) -> bool {
 /// The returned `SourceText` is `Arc`-backed; callers should bind it to a
 /// local and call `.as_str()` to get a borrowed `&str`.
 pub fn read_source(db: &dyn ruff_db::Db, path: &Path) -> Result<SourceText> {
-    let sys_path = SystemPath::from_std_path(path)
-        .with_context(|| format!("non-utf8 path: {}", path.display()))?;
-    let file = system_path_to_file(db, sys_path)
+    let file = path_to_file(db, path)
         .with_context(|| format!("could not resolve file: {}", path.display()))?;
     let source = source_text(db, file);
     if let Some(err) = source.read_error() {
@@ -60,9 +78,7 @@ pub fn read_source(db: &dyn ruff_db::Db, path: &Path) -> Result<SourceText> {
 /// the raw source text should call `read_source` separately — both are cache hits
 /// for the same revision.
 pub(crate) fn get_parsed_module(db: &dyn ruff_db::Db, path: &Path) -> Result<ParsedModuleRef> {
-    let sys_path = SystemPath::from_std_path(path)
-        .with_context(|| format!("non-utf8 path: {}", path.display()))?;
-    let file = system_path_to_file(db, sys_path)
+    let file = path_to_file(db, path)
         .with_context(|| format!("could not resolve file: {}", path.display()))?;
     Ok(parsed_module(db, file).load(db))
 }
@@ -78,6 +94,12 @@ pub(crate) fn get_parsed_module(db: &dyn ruff_db::Db, path: &Path) -> Result<Par
 /// Falls back to the original path for non-UTF8 paths that cannot be represented
 /// as a `SystemPath`.
 pub(crate) fn normalize_path_for_key(db: &dyn ruff_db::Db, path: &Path) -> PathBuf {
+    // Vendored sentinel paths are already canonical, and absolutizing one would
+    // prepend the cwd and stop `is_vendored_path` from recognising it when the
+    // key is split back apart (see `class_parent_docs`).
+    if is_vendored_path(path) {
+        return path.to_path_buf();
+    }
     match SystemPath::from_std_path(path) {
         Some(sys_path) => {
             SystemPath::absolute(sys_path, db.system().current_directory()).into_std_path_buf()
@@ -92,6 +114,15 @@ pub struct FunctionSignature {
     pub parameters: Vec<ParameterInfo>,
     pub return_type: Option<String>,
     pub docstring: Option<String>,
+    /// Set when the symbol is declared more than once in the same scope, or
+    /// carries an `@overload` decorator.
+    ///
+    /// `parameters` then describes only the *first* declaration, so it is not a
+    /// sound basis for argument diagnostics: typeshed gives `open` eight
+    /// overloads and `dict.__init__` eight more, and first-overload-wins would
+    /// report the wrong names and arity. Consumers should treat an overloaded
+    /// symbol as accepting any arguments rather than validating against it.
+    pub is_overloaded: bool,
     pub start_line: u32,
     pub start_column: u32,
     pub end_line: u32,
@@ -107,6 +138,11 @@ pub struct ParameterInfo {
     pub is_variadic: bool,         // *args
     pub is_variadic_keyword: bool, // **kwargs
     pub is_keyword_only: bool,
+    /// Declared before a `/` marker, so it can never be passed by name.
+    ///
+    /// Most builtins are shaped this way (`def len(obj: Sized, /) -> int`).
+    /// Hydra can only reach such a parameter through `_args_`.
+    pub is_positional_only: bool,
 }
 
 impl ParameterInfo {
@@ -314,6 +350,29 @@ impl PythonAnalyzer {
         visitor
             .result
             .ok_or_else(|| anyhow::anyhow!("Function '{}' not found", function_name))
+    }
+
+    /// Whether `name` is bound at the top level of the module at `path`.
+    ///
+    /// Only module-scope bindings count — a method or a nested class with the
+    /// same name does not. Covers `def`, `class` and (annotated) assignment,
+    /// which is every shape a stub uses to expose a name.
+    pub fn module_defines_top_level(db: &dyn ruff_db::Db, path: &Path, name: &str) -> bool {
+        let Ok(parsed) = get_parsed_module(db, path) else {
+            return false;
+        };
+        parsed.suite().iter().any(|stmt| match stmt {
+            Stmt::FunctionDef(func_def) => func_def.name.as_str() == name,
+            Stmt::ClassDef(class_def) => class_def.name.as_str() == name,
+            Stmt::Assign(assign) => assign
+                .targets
+                .iter()
+                .any(|target| matches!(target, Expr::Name(n) if n.id.as_str() == name)),
+            Stmt::AnnAssign(ann_assign) => {
+                matches!(ann_assign.target.as_ref(), Expr::Name(n) if n.id.as_str() == name)
+            }
+            _ => false,
+        })
     }
 
     /// Extract class information from source code via salsa-cached parsing.
@@ -1014,12 +1073,32 @@ impl PythonAnalyzer {
         s
     }
 
+    /// Render a parameter list, inserting the `/` that closes a run of
+    /// positional-only parameters — `def len(obj: Sized, /) -> int`.
+    fn format_parameters(params: &[ParameterInfo]) -> Vec<String> {
+        let last_positional_only = params.iter().rposition(|p| p.is_positional_only);
+        let mut result = Vec::with_capacity(params.len() + 1);
+        for (index, param) in params.iter().enumerate() {
+            result.push(Self::format_parameter(param));
+            if Some(index) == last_positional_only {
+                result.push("/".to_string());
+            }
+        }
+        result
+    }
+
     /// Format a function signature for display (e.g., in hover)
     pub fn format_function(sig: &FunctionSignature) -> String {
         let mut result = String::new();
         result.push_str("```python\n");
 
-        let param_strs: Vec<String> = sig.parameters.iter().map(Self::format_parameter).collect();
+        // Only the first overload is shown; say so rather than presenting one
+        // of `open`'s eight signatures as if it were the whole story.
+        if sig.is_overloaded {
+            result.push_str("@overload\n");
+        }
+
+        let param_strs = Self::format_parameters(&sig.parameters);
 
         result.push_str(&Self::format_definition(
             "def",
@@ -1053,19 +1132,20 @@ impl PythonAnalyzer {
             None,
         ));
 
-        // Add __init__ method if present
+        // Add the constructor (`__init__`, or `__new__` when that is all the
+        // class declares) if present
         if let Some(init_sig) = &class.init_signature {
-            let param_strs: Vec<String> = init_sig
-                .parameters
-                .iter()
-                .map(Self::format_parameter)
-                .collect();
+            let param_strs = Self::format_parameters(&init_sig.parameters);
 
             result.push_str("\n\n");
 
+            if init_sig.is_overloaded {
+                result.push_str("    @overload\n");
+            }
+
             result.push_str(&Self::format_definition(
                 "def",
-                "__init__",
+                &init_sig.name,
                 &param_strs,
                 true,
                 init_sig.return_type.as_ref(),
@@ -1092,12 +1172,11 @@ impl PythonAnalyzer {
             result.push_str("@staticmethod\n");
         }
 
-        let param_strs: Vec<String> = method
-            .signature
-            .parameters
-            .iter()
-            .map(Self::format_parameter)
-            .collect();
+        if method.signature.is_overloaded {
+            result.push_str("@overload\n");
+        }
+
+        let param_strs = Self::format_parameters(&method.signature.parameters);
 
         result.push_str(&Self::format_definition(
             "def",
@@ -1192,19 +1271,36 @@ impl FunctionExtractor {
 }
 
 impl<'a> Visitor<'a> for FunctionExtractor {
+    /// Matching is done per *body* rather than per statement so that the
+    /// sibling declarations are in scope: a name declared more than once, or
+    /// decorated with `@overload`, is overloaded, and only the enclosing body
+    /// can tell. Statement order is otherwise unchanged — each statement is
+    /// still tested before descending into it.
+    fn visit_body(&mut self, body: &'a [Stmt]) {
+        for stmt in body {
+            if self.result.is_some() {
+                return; // Already found
+            }
+            if let Stmt::FunctionDef(func_def) = stmt
+                && func_def.name.as_str() == self.target_name
+            {
+                self.result = Some(extract_signature_with_overloads(
+                    body,
+                    func_def,
+                    &self.source,
+                ));
+                return;
+            }
+            self.visit_stmt(stmt);
+        }
+    }
+
     fn visit_stmt(&mut self, stmt: &'a Stmt) {
         if self.result.is_some() {
             return; // Already found
         }
 
-        if let Stmt::FunctionDef(func_def) = stmt
-            && func_def.name.as_str() == self.target_name
-        {
-            self.result = Some(extract_function_signature_from_def(func_def, &self.source));
-            return;
-        }
-
-        // Continue walking
+        // Matching happens in `visit_body`; this only descends.
         ast::visitor::walk_stmt(self, stmt);
     }
 }
@@ -1330,7 +1426,8 @@ impl<'a> Visitor<'a> for MethodExtractor {
                 if let Stmt::FunctionDef(func_def) = class_stmt
                     && func_def.name.as_str() == self.method_name
                 {
-                    let signature = extract_function_signature_from_def(func_def, &self.source);
+                    let signature =
+                        extract_signature_with_overloads(&class_def.body, func_def, &self.source);
 
                     // Check decorators for @classmethod or @staticmethod
                     let (is_classmethod, is_staticmethod) =
@@ -1351,6 +1448,63 @@ impl<'a> Visitor<'a> for MethodExtractor {
         // Continue walking to find nested classes
         ast::visitor::walk_stmt(self, stmt);
     }
+}
+
+/// The signature Hydra will call when instantiating a class.
+///
+/// `__init__` when the class declares one, otherwise `__new__`. Typeshed
+/// declares no `__init__` at all for `int`, `str`, `float`, `bool`, `tuple` and
+/// `range` — without the fallback, `_target_: builtins.int` would look like a
+/// class that takes no arguments and every argument would be flagged unknown.
+fn find_constructor(body: &[Stmt], source: &str) -> Option<FunctionSignature> {
+    ["__init__", "__new__"].iter().find_map(|name| {
+        body.iter()
+            .find_map(|stmt| match stmt {
+                Stmt::FunctionDef(func_def) if func_def.name.as_str() == *name => Some(func_def),
+                _ => None,
+            })
+            .map(|func_def| extract_signature_with_overloads(body, func_def, source))
+    })
+}
+
+/// Extract `func_def`'s signature and record whether the name is overloaded in
+/// the body that declares it.
+fn extract_signature_with_overloads(
+    body: &[Stmt],
+    func_def: &ast::StmtFunctionDef,
+    source: &str,
+) -> FunctionSignature {
+    let mut signature = extract_function_signature_from_def(func_def, source);
+    signature.is_overloaded = is_overloaded_in_body(body, func_def.name.as_str());
+    signature
+}
+
+/// Whether `name` is overloaded within `body`: declared more than once, or
+/// declared with an `@overload` decorator.
+fn is_overloaded_in_body(body: &[Stmt], name: &str) -> bool {
+    let mut declarations = 0;
+    for stmt in body {
+        if let Stmt::FunctionDef(func_def) = stmt
+            && func_def.name.as_str() == name
+        {
+            if has_overload_decorator(&func_def.decorator_list) {
+                return true;
+            }
+            declarations += 1;
+            if declarations > 1 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Check for `@overload`, however `typing.overload` was imported.
+fn has_overload_decorator(decorators: &[ast::Decorator]) -> bool {
+    decorators.iter().any(|decorator| {
+        let name = expr_to_string(&decorator.expression);
+        name == "overload" || name.ends_with(".overload")
+    })
 }
 
 /// Check if a function has @classmethod or @staticmethod decorators
@@ -1407,6 +1561,9 @@ fn extract_function_signature_from_def(
         parameters,
         return_type,
         docstring,
+        // Overload status depends on the sibling statements, which this node
+        // alone cannot see; `extract_signature_with_overloads` fills it in.
+        is_overloaded: false,
         start_line,
         start_column,
         end_line,
@@ -1423,15 +1580,7 @@ fn extract_class_info_from_def(class_def: &ast::StmtClassDef, source: &str) -> C
     // Extract base classes
     let base_classes: Vec<String> = class_def.bases().iter().map(expr_to_string).collect();
 
-    // Look for __init__ method
-    let init_signature = class_def.body.iter().find_map(|stmt| {
-        if let Stmt::FunctionDef(func_def) = stmt
-            && func_def.name.as_str() == "__init__"
-        {
-            return Some(extract_function_signature_from_def(func_def, source));
-        }
-        None
-    });
+    let init_signature = find_constructor(&class_def.body, source);
 
     ClassInfo {
         name: class_def.name.to_string(),
@@ -1450,7 +1599,12 @@ fn extract_parameters(params: &ast::Parameters) -> Vec<ParameterInfo> {
     let mut result = Vec::new();
 
     // Process regular parameters and positional-only
-    for param_with_default in params.posonlyargs.iter().chain(params.args.iter()) {
+    for (param_with_default, is_positional_only) in params
+        .posonlyargs
+        .iter()
+        .map(|p| (p, true))
+        .chain(params.args.iter().map(|p| (p, false)))
+    {
         let param = &param_with_default.parameter;
         result.push(ParameterInfo {
             name: param.name.to_string(),
@@ -1463,6 +1617,7 @@ fn extract_parameters(params: &ast::Parameters) -> Vec<ParameterInfo> {
             is_variadic: false,
             is_variadic_keyword: false,
             is_keyword_only: false,
+            is_positional_only,
         });
     }
 
@@ -1476,6 +1631,7 @@ fn extract_parameters(params: &ast::Parameters) -> Vec<ParameterInfo> {
             is_variadic: true,
             is_variadic_keyword: false,
             is_keyword_only: false,
+            is_positional_only: false,
         });
     }
 
@@ -1493,6 +1649,7 @@ fn extract_parameters(params: &ast::Parameters) -> Vec<ParameterInfo> {
             is_variadic: false,
             is_variadic_keyword: false,
             is_keyword_only: true,
+            is_positional_only: false,
         });
     }
 
@@ -1506,6 +1663,7 @@ fn extract_parameters(params: &ast::Parameters) -> Vec<ParameterInfo> {
             is_variadic: false,
             is_variadic_keyword: true,
             is_keyword_only: false,
+            is_positional_only: false,
         });
     }
 
@@ -2178,6 +2336,7 @@ mod tests {
             parameters: vec![],
             return_type: None,
             docstring: None,
+            is_overloaded: false,
             start_line: 0,
             start_column: 0,
             end_line: 5,
@@ -2203,6 +2362,7 @@ mod tests {
                     is_variadic: false,
                     is_variadic_keyword: false,
                     is_keyword_only: false,
+                    is_positional_only: false,
                 },
                 ParameterInfo {
                     name: "y".to_string(),
@@ -2212,10 +2372,12 @@ mod tests {
                     is_variadic: false,
                     is_variadic_keyword: false,
                     is_keyword_only: false,
+                    is_positional_only: false,
                 },
             ],
             return_type: Some("bool".to_string()),
             docstring: Some("Test docstring".to_string()),
+            is_overloaded: false,
             start_line: 0,
             start_column: 0,
             end_line: 5,
@@ -2240,6 +2402,7 @@ mod tests {
                     is_variadic: true,
                     is_variadic_keyword: false,
                     is_keyword_only: false,
+                    is_positional_only: false,
                 },
                 ParameterInfo {
                     name: "kwargs".to_string(),
@@ -2249,10 +2412,12 @@ mod tests {
                     is_variadic: false,
                     is_variadic_keyword: true,
                     is_keyword_only: false,
+                    is_positional_only: false,
                 },
             ],
             return_type: None,
             docstring: None,
+            is_overloaded: false,
             start_line: 0,
             start_column: 0,
             end_line: 5,
@@ -2306,6 +2471,7 @@ mod tests {
                         is_variadic: false,
                         is_variadic_keyword: false,
                         is_keyword_only: false,
+                        is_positional_only: false,
                     },
                     ParameterInfo {
                         name: "value".to_string(),
@@ -2315,10 +2481,12 @@ mod tests {
                         is_variadic: false,
                         is_variadic_keyword: false,
                         is_keyword_only: false,
+                        is_positional_only: false,
                     },
                 ],
                 return_type: None,
                 docstring: None,
+                is_overloaded: false,
                 start_line: 0,
                 start_column: 0,
                 end_line: 5,
@@ -2357,6 +2525,7 @@ mod tests {
                         is_variadic: false,
                         is_variadic_keyword: false,
                         is_keyword_only: false,
+                        is_positional_only: false,
                     },
                     ParameterInfo {
                         name: "name".to_string(),
@@ -2366,10 +2535,12 @@ mod tests {
                         is_variadic: false,
                         is_variadic_keyword: false,
                         is_keyword_only: false,
+                        is_positional_only: false,
                     },
                 ],
                 return_type: None,
                 docstring: None,
+                is_overloaded: false,
                 start_line: 0,
                 start_column: 0,
                 end_line: 5,
@@ -3281,6 +3452,7 @@ mod tests {
                         is_variadic: false,
                         is_variadic_keyword: false,
                         is_keyword_only: false,
+                        is_positional_only: false,
                     },
                     ParameterInfo {
                         name: "config".to_string(),
@@ -3290,10 +3462,12 @@ mod tests {
                         is_variadic: false,
                         is_variadic_keyword: false,
                         is_keyword_only: false,
+                        is_positional_only: false,
                     },
                 ],
                 return_type: Some("MyClass".to_string()),
                 docstring: Some("Create from config".to_string()),
+                is_overloaded: false,
                 start_line: 0,
                 start_column: 0,
                 end_line: 5,
@@ -3324,9 +3498,11 @@ mod tests {
                     is_variadic: false,
                     is_variadic_keyword: false,
                     is_keyword_only: false,
+                    is_positional_only: false,
                 }],
                 return_type: Some("int".to_string()),
                 docstring: None,
+                is_overloaded: false,
                 start_line: 0,
                 start_column: 0,
                 end_line: 5,
@@ -3520,9 +3696,11 @@ mod tests {
                 is_variadic: false,
                 is_variadic_keyword: false,
                 is_keyword_only: false,
+                is_positional_only: false,
             }],
             return_type: None,
             docstring: None,
+            is_overloaded: false,
             start_line: 0,
             start_column: 0,
             end_line: 0,
@@ -3548,6 +3726,7 @@ mod tests {
                         is_variadic: false,
                         is_variadic_keyword: false,
                         is_keyword_only: false,
+                        is_positional_only: false,
                     },
                     ParameterInfo {
                         name: "value".to_string(),
@@ -3557,10 +3736,12 @@ mod tests {
                         is_variadic: false,
                         is_variadic_keyword: false,
                         is_keyword_only: false,
+                        is_positional_only: false,
                     },
                 ],
                 return_type: None,
                 docstring: None,
+                is_overloaded: false,
                 start_line: 0,
                 start_column: 0,
                 end_line: 0,
@@ -3590,9 +3771,11 @@ mod tests {
                     is_variadic: false,
                     is_variadic_keyword: false,
                     is_keyword_only: false,
+                    is_positional_only: false,
                 }],
                 return_type: None,
                 docstring: None,
+                is_overloaded: false,
                 start_line: 0,
                 start_column: 0,
                 end_line: 0,
@@ -3636,9 +3819,11 @@ mod tests {
                     is_variadic: false,
                     is_variadic_keyword: false,
                     is_keyword_only: false,
+                    is_positional_only: false,
                 }],
                 return_type: None,
                 docstring: None,
+                is_overloaded: false,
                 start_line: 0,
                 start_column: 0,
                 end_line: 0,
@@ -3665,9 +3850,11 @@ mod tests {
                     is_variadic: false,
                     is_variadic_keyword: false,
                     is_keyword_only: false,
+                    is_positional_only: false,
                 }],
                 return_type: None,
                 docstring: None,
+                is_overloaded: false,
                 start_line: 0,
                 start_column: 0,
                 end_line: 0,
@@ -3694,9 +3881,11 @@ mod tests {
                     is_variadic: false,
                     is_variadic_keyword: false,
                     is_keyword_only: false,
+                    is_positional_only: false,
                 }],
                 return_type: None,
                 docstring: None,
+                is_overloaded: false,
                 start_line: 0,
                 start_column: 0,
                 end_line: 0,
@@ -3723,9 +3912,11 @@ mod tests {
                     is_variadic: false,
                     is_variadic_keyword: false,
                     is_keyword_only: false,
+                    is_positional_only: false,
                 }],
                 return_type: None,
                 docstring: None,
+                is_overloaded: false,
                 start_line: 0,
                 start_column: 0,
                 end_line: 0,
@@ -3735,5 +3926,166 @@ mod tests {
             is_staticmethod: true,
         });
         assert_eq!(def.implicit_param(), None);
+    }
+
+    // ==================== vendored typeshed tests ====================
+    //
+    // These run against the real `builtins.pyi` shipped by `ty_vendored`
+    // rather than a fixture: the constructs that motivated this handling
+    // (`@overload`, `__new__`-only classes, positional-only parameters) are
+    // exactly the ones a hand-written fixture would get subtly wrong.
+
+    use crate::vendored_typeshed::stdlib_search_root;
+
+    fn builtins_stub() -> PathBuf {
+        stdlib_search_root().join("builtins.pyi")
+    }
+
+    #[test]
+    fn test_vendored_builtins_stub_is_readable() {
+        let db = test_db();
+        assert!(path_is_file(&db, &builtins_stub()));
+        let source = read_source(&db, &builtins_stub()).unwrap();
+        assert!(source.as_str().contains("def len("));
+    }
+
+    #[test]
+    fn test_builtin_len_parameter_is_positional_only() {
+        let db = test_db();
+        let sig = PythonAnalyzer::extract_function_signature(&db, &builtins_stub(), "len").unwrap();
+
+        assert!(!sig.is_overloaded);
+        assert_eq!(sig.parameters.len(), 1);
+        assert_eq!(sig.parameters[0].name, "obj");
+        assert!(sig.parameters[0].is_positional_only);
+        assert!(sig.docstring.is_some());
+        assert!(
+            PythonAnalyzer::format_function(&sig).contains("def len(obj: Sized, /) -> int"),
+            "formatted signature should carry the `/` marker"
+        );
+    }
+
+    #[test]
+    fn test_builtin_open_is_overloaded() {
+        let db = test_db();
+        let sig =
+            PythonAnalyzer::extract_function_signature(&db, &builtins_stub(), "open").unwrap();
+
+        assert!(
+            sig.is_overloaded,
+            "typeshed declares `open` eight times; validating against the first \
+             declaration alone would report the wrong arity"
+        );
+        assert!(PythonAnalyzer::format_function(&sig).contains("@overload"));
+    }
+
+    #[test]
+    fn test_builtin_int_uses_new_as_its_constructor() {
+        let db = test_db();
+        let class_info = PythonAnalyzer::extract_class_info(&db, &builtins_stub(), "int").unwrap();
+
+        let init = class_info
+            .init_signature
+            .as_ref()
+            .expect("int declares no __init__, so __new__ must stand in");
+        assert_eq!(init.name, "__new__");
+        assert!(init.is_overloaded);
+        assert_eq!(
+            DefinitionInfo::Class(class_info.clone()).implicit_param(),
+            Some("cls"),
+            "the implicit first parameter of __new__ is cls, not self"
+        );
+        assert!(PythonAnalyzer::format_class(&class_info).contains("def __new__("));
+    }
+
+    #[test]
+    fn test_builtin_dict_init_is_overloaded() {
+        let db = test_db();
+        let class_info = PythonAnalyzer::extract_class_info(&db, &builtins_stub(), "dict").unwrap();
+
+        let init = class_info
+            .init_signature
+            .as_ref()
+            .expect("dict declares __init__");
+        assert_eq!(init.name, "__init__");
+        assert!(init.is_overloaded);
+    }
+
+    #[test]
+    fn test_builtin_tuple_new_is_not_flagged_overloaded() {
+        let db = test_db();
+        let class_info =
+            PythonAnalyzer::extract_class_info(&db, &builtins_stub(), "tuple").unwrap();
+
+        let init = class_info.init_signature.as_ref().unwrap();
+        assert_eq!(init.name, "__new__");
+        assert!(
+            !init.is_overloaded,
+            "a single undecorated declaration is not an overload set"
+        );
+    }
+
+    #[test]
+    fn test_module_defines_top_level_ignores_methods() {
+        let db = test_db();
+        assert!(PythonAnalyzer::module_defines_top_level(
+            &db,
+            &builtins_stub(),
+            "len"
+        ));
+        assert!(PythonAnalyzer::module_defines_top_level(
+            &db,
+            &builtins_stub(),
+            "dict"
+        ));
+        assert!(
+            !PythonAnalyzer::module_defines_top_level(&db, &builtins_stub(), "count"),
+            "`count` is a method of `list`, not a builtin"
+        );
+    }
+
+    #[test]
+    fn test_overload_detection_on_first_party_source() {
+        let db = test_db();
+        let source = r#"
+from typing import overload
+
+@overload
+def render(value: int) -> str: ...
+@overload
+def render(value: str) -> str: ...
+def render(value):
+    """Render a value."""
+    return str(value)
+
+def plain(value, /, other, *, flag=False):
+    """Not overloaded."""
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mod.py");
+        std::fs::write(&path, source).unwrap();
+
+        let render = PythonAnalyzer::extract_function_signature(&db, &path, "render").unwrap();
+        assert!(render.is_overloaded);
+
+        let plain = PythonAnalyzer::extract_function_signature(&db, &path, "plain").unwrap();
+        assert!(!plain.is_overloaded);
+        let flags: Vec<_> = plain
+            .parameters
+            .iter()
+            .map(|p| (p.name.as_str(), p.is_positional_only, p.is_keyword_only))
+            .collect();
+        assert_eq!(
+            flags,
+            vec![
+                ("value", true, false),
+                ("other", false, false),
+                ("flag", false, true)
+            ]
+        );
+        assert!(
+            PythonAnalyzer::format_function(&plain)
+                .contains("plain(value, /, other, flag = False)")
+        );
     }
 }

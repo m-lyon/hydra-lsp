@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.5.0]
+
+- Added support for Python builtins as a `_target_`, resolved from the typeshed stubs vendored by `ty_vendored` rather than from disk (fixes #34). `builtins.len`, `builtins.dict`, `builtins.open` and the rest now hover and validate; `builtins` is a C module, so a stub is the only place its signatures and docstrings exist.
+- Scoped stub resolution to `builtins`. Wiring in typeshed makes the whole stdlib reachable, but enabling it is deliberately left to a follow-up — see `vendored_typeshed::is_vendored_module`.
+- Added handling for `@overload`: an overloaded symbol is now recorded as such and treated as accepting any arguments, instead of validating against whichever declaration came first. Typeshed gives `open` eight overloads and `dict.__init__` another eight.
+- Added a `__new__` fallback when a class declares no `__init__`. `int`, `str`, `float`, `bool`, `tuple` and `range` are all shaped that way, and every argument to them was previously reported as unknown.
+- Added `is_positional_only` to parameters, along with a new `positional-only-parameter` diagnostic. Hover now renders the `/` marker (`def len(obj: Sized, /) -> int`), and a positional-only parameter passed by name — or missing entirely — is reported with a message that points at `_args_`.
+- Improved the bare-name `_target_` error: `len` now reports that it is a builtin and names `builtins.len`, the form Hydra actually accepts.
+- Go-to-definition on a target that resolves into a vendored stub is a no-op rather than an error, since there is no file on disk to open. Hover and diagnostics are unaffected.
+- Fixed a panic when `_args_` contained a nested list or mapping (`_args_: [[1, 2, 3]]`). saphyr gives collection nodes no position, which underflowed the line conversion.
+
 ## [0.4.2]
 
 - Fixed lazy package exports declared under `if TYPE_CHECKING:` (or `if typing.TYPE_CHECKING:`) not resolving when combined with a module-level `__getattr__` and `__all__` (fixes #43)

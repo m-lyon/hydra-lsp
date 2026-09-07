@@ -538,11 +538,26 @@ impl ParsedContent {
     }
 }
 
+/// Convert saphyr's 1-based marker line to the 0-based line the LSP wants.
+///
+/// saphyr leaves the span unset on every collection node: a sequence or mapping
+/// reports `(0, 0)..(0, 0)`, including the inner list of `_args_: [[1, 2], 3]`.
+/// Subtracting one from an unset marker underflows, so it falls back to
+/// `enclosing` — the line of the nearest node that does carry a position.
+pub(crate) fn marker_to_line0(marker_line: usize, enclosing: u32) -> u32 {
+    match marker_line.checked_sub(1) {
+        Some(line) => line as u32,
+        None => enclosing,
+    }
+}
+
 /// Convert a saphyr `MarkedYamlOwned` node to `YamlValue`
 ///
 /// `lines` is the source document pre-split with `str::lines()`, needed to
 /// convert saphyr's codepoint columns into the UTF-16 columns the LSP expects.
-fn node_to_yaml_value(node: &MarkedYamlOwned, lines: &[&str]) -> YamlValue {
+/// `enclosing_line` is the 0-based line to attribute nested values to when
+/// saphyr gives them no position of their own — see [`marker_to_line0`].
+fn node_to_yaml_value(node: &MarkedYamlOwned, lines: &[&str], enclosing_line: u32) -> YamlValue {
     let data = &node.data;
     if data.is_null() {
         YamlValue::Null
@@ -558,11 +573,12 @@ fn node_to_yaml_value(node: &MarkedYamlOwned, lines: &[&str]) -> YamlValue {
         YamlValue::Sequence(
             seq.iter()
                 .map(|item| {
-                    // Sequence elements are scalars on a single line; convert
-                    // both columns against the element's own line.
-                    let start_line = (item.span.start.line() - 1) as u32;
+                    // Scalar elements sit on a single line; convert both columns
+                    // against the element's own line. A nested collection has no
+                    // position of its own, so it inherits the enclosing line.
+                    let start_line = marker_to_line0(item.span.start.line(), enclosing_line);
                     PositionedValue {
-                        value: node_to_yaml_value(item, lines),
+                        value: node_to_yaml_value(item, lines, start_line),
                         line: start_line,
                         start: cp_to_utf16_col(lines, start_line, item.span.start.col() as u32),
                         end: cp_to_utf16_col(lines, start_line, item.span.end.col() as u32),
@@ -575,7 +591,8 @@ fn node_to_yaml_value(node: &MarkedYamlOwned, lines: &[&str]) -> YamlValue {
             .iter()
             .filter_map(|(k, v)| {
                 let key_str = k.data.as_str()?.to_string();
-                Some((key_str, node_to_yaml_value(v, lines)))
+                let key_line = marker_to_line0(k.span.start.line(), enclosing_line);
+                Some((key_str, node_to_yaml_value(v, lines, key_line)))
             })
             .collect();
         YamlValue::Mapping(entries)
@@ -950,13 +967,15 @@ impl YamlParser {
             let positional_params: Vec<Parameter> = seq
                 .iter()
                 .map(|item| {
-                    let arg_line = (item.span.start.line() - 1) as u32;
+                    // A nested list (`_args_: [[1, 2, 3]]`) carries no position
+                    // of its own; attribute it to the `_args_` key's line.
+                    let arg_line = marker_to_line0(item.span.start.line(), line);
                     let arg_value_start =
                         cp_to_utf16_col(lines, arg_line, item.span.start.col() as u32);
                     let arg_value_end =
                         cp_to_utf16_col(lines, arg_line, item.span.end.col() as u32);
                     Parameter::Positional {
-                        value: node_to_yaml_value(item, lines),
+                        value: node_to_yaml_value(item, lines, arg_line),
                         line: arg_line,
                         value_start: arg_value_start,
                         value_end: arg_value_end,
@@ -1117,7 +1136,7 @@ impl YamlParser {
                 let key_start = cp_to_utf16_col(lines, line, key_node.span.start.col() as u32);
                 let value_start = cp_to_utf16_col(lines, line, val_node.span.start.col() as u32);
                 let value_end = cp_to_utf16_col(lines, line, val_node.span.end.col() as u32);
-                let value = node_to_yaml_value(val_node, lines);
+                let value = node_to_yaml_value(val_node, lines, line);
                 parameters.push(Parameter::Keyword {
                     key: key_str.to_string(),
                     value,
@@ -3246,6 +3265,54 @@ model:
                 .parameters
                 .iter()
                 .all(|p| p.key() != Some("_args_"))
+        );
+    }
+
+    /// saphyr gives collection nodes no position at all, so a list nested
+    /// inside `_args_` used to underflow the 1-based line conversion and panic.
+    /// Passing a list as a single positional argument is exactly what
+    /// `_target_: builtins.len` with `_args_: [[1, 2, 3]]` needs.
+    #[test]
+    fn test_args_with_nested_collections() {
+        let content = r#"
+model:
+  _target_: builtins.len
+  _args_: [[1, 2, 3], {a: 1}]
+"#;
+        let parsed = YamlParser::parse(content).unwrap();
+        let hydra_object = &parsed.hydra_objects[0];
+
+        let positional: Vec<_> = hydra_object
+            .parameters
+            .iter()
+            .filter(|p| matches!(p, Parameter::Positional { .. }))
+            .collect();
+        assert_eq!(positional.len(), 2);
+        // Both nested values are attributed to the `_args_` key's line (index 3,
+        // counting the leading blank line) rather than to line 0.
+        assert!(positional.iter().all(|p| p.line() == 3));
+    }
+
+    /// A block-style `_args_` whose entries are themselves lists: each entry
+    /// has no position, so it inherits the `_args_` line.
+    #[test]
+    fn test_args_block_style_with_nested_collections() {
+        let content = r#"
+model:
+  _target_: builtins.max
+  _args_:
+    - [1, 2]
+    - [3, 4]
+"#;
+        let parsed = YamlParser::parse(content).unwrap();
+        let hydra_object = &parsed.hydra_objects[0];
+        assert_eq!(
+            hydra_object
+                .parameters
+                .iter()
+                .filter(|p| matches!(p, Parameter::Positional { .. }))
+                .count(),
+            2
         );
     }
 

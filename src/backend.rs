@@ -1772,6 +1772,17 @@ impl LanguageServer for HydraLspBackend {
             }
         };
 
+        // A definition inside the vendored typeshed archive has no file on disk
+        // to jump to. Hover and diagnostics still work; go-to-definition is a
+        // silent no-op rather than an error the user cannot act on.
+        if crate::vendored_typeshed::is_vendored_path(&file_path) {
+            tracing::debug!(
+                path = %file_path.display(),
+                "goto_definition: target is a vendored stub; nothing to open"
+            );
+            return Ok(None);
+        }
+
         // Convert file path to URI
         let target_uri = match Url::from_file_path(&file_path) {
             Ok(uri) => uri,

@@ -5,5 +5,6 @@ mod import_resolver;
 pub mod outbox;
 pub mod python_analyzer;
 pub mod python_cache;
+pub mod vendored_typeshed;
 pub mod yaml_cache;
 pub mod yaml_parser;

@@ -5,6 +5,7 @@ use crate::import_resolver::{ImportResolver, join_module_parts};
 use crate::python_analyzer::{
     ClassAttributeInfo, DefinitionInfo, FunctionSignature, PythonAnalyzer, normalize_path_for_key,
 };
+use crate::vendored_typeshed::{BUILTINS_MODULE, is_vendored_module, stdlib_search_root};
 use ruff_db::files::FileRootKind;
 use ruff_db::system::SystemPathBuf;
 use tracing::debug;
@@ -158,6 +159,11 @@ pub fn search_paths_for_config(db: &dyn ruff_db::Db, config: PythonConfig) -> Ve
 /// Returns `None` when the module cannot be resolved, including when the name
 /// is empty, has an empty dot-separated part, or is not a plain dotted module name.
 /// Uses `lru = 1024` to bound memory across large workspaces.
+///
+/// When nothing on the real search path matches, resolution falls through to
+/// the vendored typeshed stubs — currently only for `builtins`, see
+/// [`is_vendored_module`]. The fallback is last so a first-party or installed
+/// `builtins.py` still wins, matching how Python itself would import it.
 #[salsa::tracked(returns(ref), lru = 1024)]
 pub fn resolve_module_cached<'db>(
     db: &'db dyn ruff_db::Db,
@@ -185,7 +191,36 @@ pub fn resolve_module_cached<'db>(
         }
     }
 
+    if is_vendored_module(module_path_str) {
+        return ImportResolver::find_module_file(db, &stdlib_search_root().join(&relative_path));
+    }
+
     None
+}
+
+/// Whether `name` is a symbol defined at the top level of the vendored
+/// `builtins` stub.
+///
+/// Used to turn the bare-name `_target_` error into a message that names the
+/// prefixed form Hydra actually accepts: `len` is rejected, `builtins.len`
+/// works. The stub is immutable and shared by every workspace, so the query
+/// takes no search paths and its memo survives for the life of the database.
+#[salsa::tracked]
+pub fn is_builtin_symbol<'db>(db: &'db dyn ruff_db::Db, name: TargetString<'db>) -> bool {
+    let name = name.value(db);
+    if name.is_empty() || name.contains('.') {
+        return false;
+    }
+    let Some(stub) = ImportResolver::find_module_file(
+        db,
+        &stdlib_search_root().join(Path::new(BUILTINS_MODULE)),
+    ) else {
+        return false;
+    };
+    // Top-level only: the extractors walk nested scopes, so asking them would
+    // also match methods such as `list.count` and suggest a `builtins.count`
+    // that does not exist.
+    PythonAnalyzer::module_defines_top_level(db, &stub, name)
 }
 
 /// Cached extraction of Python definition info for a `_target_` string.
@@ -836,10 +871,12 @@ mod tests {
                     is_variadic: false,
                     is_variadic_keyword: false,
                     is_keyword_only: false,
+                    is_positional_only: false,
                 })
                 .collect(),
             return_type: None,
             docstring: None,
+            is_overloaded: false,
             start_line: 1,
             start_column: 1,
             end_line: 2,
@@ -1327,5 +1364,63 @@ mod tests {
             None,
             "nor must a name with a doubled dot"
         );
+    }
+
+    // ==================== vendored typeshed resolution ====================
+
+    /// Resolve `module` against `search_paths` on a fresh database.
+    fn resolve_on(db: &TestDb, search_paths: Vec<PathBuf>, module: &str) -> Option<PathBuf> {
+        let mid = TargetString::new(db, module.to_string());
+        let spid = InternedSearchPaths::new(db, search_paths);
+        resolve_module_cached(db, mid, spid).clone()
+    }
+
+    #[test]
+    fn test_builtins_resolves_to_the_vendored_stub() {
+        let db = TestDb::new();
+        assert_eq!(
+            resolve_on(&db, vec![PathBuf::from("/root")], "builtins"),
+            Some(stdlib_search_root().join("builtins.pyi")),
+        );
+    }
+
+    #[test]
+    fn test_vendored_fallback_is_gated_to_builtins() {
+        let db = TestDb::new();
+        // `datetime.pyi` is in the same archive directory as `builtins.pyi`;
+        // only the gate keeps it out of reach.
+        assert_eq!(
+            resolve_on(&db, vec![PathBuf::from("/root")], "datetime"),
+            None,
+        );
+    }
+
+    /// A real `builtins` on the search path is what Python itself would import,
+    /// so it must win over the stub.
+    #[test]
+    fn test_workspace_builtins_shadows_the_vendored_stub() {
+        use ruff_db::system::DbWithWritableSystem;
+
+        let mut db = TestDb::new();
+        db.write_file("/root/builtins.py", "def len(obj):\n    pass\n")
+            .expect("write shadowing builtins");
+
+        assert_eq!(
+            resolve_on(&db, vec![PathBuf::from("/root")], "builtins"),
+            Some(PathBuf::from("/root/builtins.py")),
+        );
+    }
+
+    #[test]
+    fn test_is_builtin_symbol() {
+        let db = TestDb::new();
+        let check = |name: &str| is_builtin_symbol(&db, TargetString::new(&db, name.to_string()));
+
+        assert!(check("len"), "a builtin function");
+        assert!(check("dict"), "a builtin class");
+        assert!(!check("not_a_builtin"));
+        assert!(!check("count"), "a method of `list`, not a builtin");
+        assert!(!check(""));
+        assert!(!check("builtins.len"), "a dotted name is not a bare name");
     }
 }
