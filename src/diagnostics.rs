@@ -228,23 +228,21 @@ fn validate_parameters(
     // Parameters declared before a `/` cannot be passed by name. They are still
     // "expected" (so no unknown-argument fires), but Hydra can only reach them
     // through `_args_`.
-    //
-    // Unless the function also takes `**kwargs`: `def f(a, /, **kw)` accepts
-    // `a=1` perfectly well — the value lands in `kw` rather than in the
-    // positional slot — so there is nothing to report.
-    let positional_only: HashSet<&str> = if has_kwargs {
-        HashSet::new()
-    } else {
-        signature
-            .parameters
-            .iter()
-            .filter(|p| p.is_positional_only && Some(p.name.as_str()) != implicit_param)
-            .map(|p| p.name.as_str())
-            .collect()
-    };
+    let positional_only: HashSet<&str> = signature
+        .parameters
+        .iter()
+        .filter(|p| p.is_positional_only && Some(p.name.as_str()) != implicit_param)
+        .map(|p| p.name.as_str())
+        .collect();
 
+    // ...unless the function also takes `**kwargs`, in which case `a=1` on
+    // `def f(a, /, **kw)` is perfectly legal — the value lands in `kw` rather
+    // than in the positional slot. Only the report is suppressed, not the set
+    // itself, which is still what tells the already-assigned check below that
+    // the keyword and the positional argument are not the same binding.
     for param in &hydra_obj.parameters {
         if let Parameter::Keyword { key, line, .. } = param
+            && !has_kwargs
             && positional_only.contains(key.as_str())
             && !file_suppressions.contains(&DiagnosticRule::PositionalOnlyParameter)
             && !hydra_obj
@@ -527,6 +525,13 @@ pub fn validate_document(
             let (signature, display_name) = match definition_info {
                 DefinitionInfo::Function(sig) => (sig, sig.name.clone()),
                 DefinitionInfo::Class(class_info) => {
+                    // A `__new__` that only stood in because part of the MRO is
+                    // unresolvable is not a sound thing to validate against —
+                    // the real `__init__` may be in the ancestor we could not
+                    // read. Hover still shows it; diagnostics stay quiet.
+                    if class_info.constructor_is_uncertain() {
+                        continue;
+                    }
                     // For classes, use the __init__ signature if available
                     if let Some(init_sig) = &class_info.init_signature {
                         (init_sig, format!("{}.{}", class_info.name, init_sig.name))
@@ -1602,6 +1607,52 @@ mod tests {
                     if c == DiagnosticRule::PositionalOnlyParameter.as_code()
             )),
             "**kwargs gives the name somewhere to land, got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// `def f(a, /, **kw)` with `_args_: [1]` and `a: 2` binds `a` positionally
+    /// and puts `{'a': 2}` in `kw` — two different bindings, not a conflict.
+    #[test]
+    fn test_positional_only_with_kwargs_is_not_already_assigned() {
+        let mut hydra_obj = build_hydra_object(
+            "mod.f",
+            vec![
+                make_param("a", YamlValue::Integer(2), 1),
+                Parameter::Positional {
+                    value: YamlValue::Integer(1),
+                    line: 2,
+                    value_start: 0,
+                    value_end: 0,
+                    suppressed_rules: HashSet::new(),
+                },
+            ],
+            0,
+            0,
+            0,
+            false,
+        );
+        hydra_obj.args = Some(HydraParameter {
+            value: None,
+            line: 2,
+            invalid: false,
+            key_start: 0,
+            value_start: 0,
+            value_end: 0,
+        });
+        let signature = sig_for(
+            "f",
+            vec![sig_param("a", true, false), sig_param("kw", false, true)],
+        );
+
+        let diagnostics = validate_parameters(&hydra_obj, &signature, "f", None, &HashSet::new());
+        assert!(
+            !diagnostics.iter().any(|d| matches!(
+                &d.code,
+                Some(tower_lsp::lsp_types::NumberOrString::String(c))
+                    if c == DiagnosticRule::ParameterAlreadyAssigned.as_code()
+            )),
+            "got: {:?}",
             diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
     }

@@ -7,9 +7,11 @@
 - Added handling for `@overload`: an overloaded symbol is now recorded as such and treated as accepting any arguments, instead of validating against whichever declaration came first. Typeshed gives `open` eight overloads and `dict.__init__` another eight.
 - Added a `__new__` fallback when a class declares no `__init__`. `int`, `str`, `float`, `bool`, `tuple` and `range` are all shaped that way, and every argument to them was previously reported as unknown.
 - Added `is_positional_only` to parameters, along with a new `positional-only-parameter` diagnostic. Hover now renders the `/` marker (`def len(obj: Sized, /) -> int`), and a positional-only parameter passed by name — or missing entirely — is reported with a message that points at `_args_`.
+- Left argument validation off when a class's constructor came from `__new__` while part of its MRO could not be resolved: the real `__init__` may be in the ancestor that is missing. Hover still shows what was found.
 - Improved the bare-name `_target_` error: `len` now reports that it is a builtin and names `builtins.len`, the form Hydra actually accepts.
 - Go-to-definition on a target that resolves into a vendored stub is a no-op rather than an error, since there is no file on disk to open. Hover and diagnostics are unaffected.
-- Fixed a panic when `_args_` contained a nested list or mapping (`_args_: [[1, 2, 3]]`). saphyr gives collection nodes no position, which underflowed the line conversion.
+- Hover now renders the bare `*` that opens a run of keyword-only parameters, alongside the `/` — `def sorted(iterable, /, *, key=None, reverse=False)`.
+- Fixed a panic when `_args_` contained a nested list or mapping (`_args_: [[1, 2, 3]]`). saphyr gives collection nodes no position, which underflowed the line conversion. Such a node now borrows its position from its first positioned descendant, so a block-style `- [1, 2]` keeps its own line and still gets signature help.
 
 ## [0.4.2]
 

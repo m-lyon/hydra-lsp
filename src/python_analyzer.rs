@@ -173,10 +173,34 @@ pub struct ClassInfo {
     /// `__init__` anywhere in their MRO, so for them this is the only
     /// constructor there is.
     pub new_signature: Option<FunctionSignature>,
+    /// At least one base class along the MRO could not be resolved, so an
+    /// `__init__` declared up there is invisible here.
+    ///
+    /// Set by [`PythonAnalyzer::extract_class_info_with_imports`]; always
+    /// `false` straight out of [`PythonAnalyzer::extract_class_info`], which
+    /// does not walk the MRO at all.
+    pub unresolved_base_classes: bool,
     pub start_line: u32,
     pub start_column: u32,
     pub end_line: u32,
     pub end_column: u32,
+}
+
+impl ClassInfo {
+    /// Whether `init_signature` might not be the signature Hydra actually calls.
+    ///
+    /// True only when `__new__` stood in for a missing `__init__` *and* part of
+    /// the MRO could not be resolved: the class may well inherit a real
+    /// `__init__` that this build cannot see, and validating arguments against
+    /// `__new__` would then report the wrong parameters. Hover still shows the
+    /// `__new__` it found, which is better than showing nothing.
+    pub fn constructor_is_uncertain(&self) -> bool {
+        self.unresolved_base_classes
+            && self
+                .init_signature
+                .as_ref()
+                .is_some_and(|sig| sig.name == "__new__")
+    }
 }
 
 /// Represents a method within a class
@@ -802,6 +826,7 @@ impl PythonAnalyzer {
             if class_info.new_signature.is_none() {
                 class_info.new_signature = parent_docs.new_signature().cloned();
             }
+            class_info.unresolved_base_classes = !parent_docs.all_bases_resolved();
         }
 
         // `__new__` stands in only once no `__init__` has been found anywhere in
@@ -1117,12 +1142,25 @@ impl PythonAnalyzer {
         s
     }
 
-    /// Render a parameter list, inserting the `/` that closes a run of
-    /// positional-only parameters — `def len(obj: Sized, /) -> int`.
+    /// Render a parameter list with the markers that say how each parameter can
+    /// be passed: the `/` closing a run of positional-only parameters and the
+    /// bare `*` opening a run of keyword-only ones —
+    /// `def sorted(iterable, /, *, key=None, reverse=False)`.
+    ///
+    /// The `*` is only written when no `*args` precedes the keyword-only run,
+    /// since `*args` already opens it.
     fn format_parameters(params: &[ParameterInfo]) -> Vec<String> {
         let last_positional_only = params.iter().rposition(|p| p.is_positional_only);
-        let mut result = Vec::with_capacity(params.len() + 1);
+        let first_keyword_only = params
+            .iter()
+            .position(|p| p.is_keyword_only)
+            .filter(|_| !params.iter().any(|p| p.is_variadic));
+
+        let mut result = Vec::with_capacity(params.len() + 2);
         for (index, param) in params.iter().enumerate() {
+            if Some(index) == first_keyword_only {
+                result.push("*".to_string());
+            }
             result.push(Self::format_parameter(param));
             if Some(index) == last_positional_only {
                 result.push("/".to_string());
@@ -1624,6 +1662,7 @@ fn extract_class_info_from_def(class_def: &ast::StmtClassDef, source: &str) -> C
         docstring,
         init_signature,
         new_signature,
+        unresolved_base_classes: false,
         start_line,
         start_column,
         end_line,
@@ -2476,6 +2515,7 @@ mod tests {
             docstring: Some("A test class".to_string()),
             init_signature: None,
             new_signature: None,
+            unresolved_base_classes: false,
             start_line: 0,
             start_column: 0,
             end_line: 5,
@@ -2531,6 +2571,7 @@ mod tests {
                 end_column: 5,
             }),
             new_signature: None,
+            unresolved_base_classes: false,
         };
 
         let formatted = PythonAnalyzer::format_class(&class_info);
@@ -2586,6 +2627,7 @@ mod tests {
                 end_column: 5,
             }),
             new_signature: None,
+            unresolved_base_classes: false,
         };
 
         let formatted = PythonAnalyzer::format_class(&class_info);
@@ -3788,6 +3830,7 @@ mod tests {
                 end_column: 0,
             }),
             new_signature: None,
+            unresolved_base_classes: false,
             start_line: 0,
             start_column: 0,
             end_line: 0,
@@ -3823,6 +3866,7 @@ mod tests {
                 end_column: 0,
             }),
             new_signature: None,
+            unresolved_base_classes: false,
             start_line: 0,
             start_column: 0,
             end_line: 0,
@@ -3839,6 +3883,7 @@ mod tests {
             docstring: None,
             init_signature: None,
             new_signature: None,
+            unresolved_base_classes: false,
             start_line: 0,
             start_column: 0,
             end_line: 0,
@@ -4104,6 +4149,60 @@ class Child(Base):
         );
     }
 
+    /// `__new__` may only stand in for a missing `__init__` when the whole MRO
+    /// was readable. An unresolvable base could be hiding the real `__init__`,
+    /// and validating arguments against `__new__` would then be wrong.
+    #[test]
+    fn test_new_fallback_is_uncertain_when_a_base_is_unresolvable() {
+        let db = test_db();
+        let source = r#"
+from not_installed import Widget
+
+class Thing(Widget):
+    def __new__(cls, *args, **kwargs):
+        return super().__new__(cls)
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("uncertain.py");
+        std::fs::write(&path, source).unwrap();
+        let search_paths = vec![dir.path().to_path_buf()];
+
+        let (class_info, _) =
+            PythonAnalyzer::extract_class_info_with_imports(&db, &path, "Thing", &search_paths)
+                .unwrap();
+
+        assert_eq!(class_info.init_signature.as_ref().unwrap().name, "__new__");
+        assert!(class_info.unresolved_base_classes);
+        assert!(class_info.constructor_is_uncertain());
+    }
+
+    /// The same shape with every base readable: the fallback is trustworthy and
+    /// arguments are validated against it.
+    #[test]
+    fn test_new_fallback_is_certain_when_the_mro_resolves() {
+        let db = test_db();
+        let source = r#"
+class Widget:
+    """A widget."""
+
+class Thing(Widget):
+    def __new__(cls, size: int):
+        return super().__new__(cls)
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("certain.py");
+        std::fs::write(&path, source).unwrap();
+        let search_paths = vec![dir.path().to_path_buf()];
+
+        let (class_info, _) =
+            PythonAnalyzer::extract_class_info_with_imports(&db, &path, "Thing", &search_paths)
+                .unwrap();
+
+        assert_eq!(class_info.init_signature.as_ref().unwrap().name, "__new__");
+        assert!(!class_info.unresolved_base_classes);
+        assert!(!class_info.constructor_is_uncertain());
+    }
+
     /// Two declarations of one name are not an overload set. A property and its
     /// setter are the common shape, and treating them as overloaded would
     /// silently switch off argument validation for the target.
@@ -4194,7 +4293,8 @@ def plain(value, /, other, *, flag=False):
         );
         assert!(
             PythonAnalyzer::format_function(&plain)
-                .contains("plain(value, /, other, flag = False)")
+                .contains("plain(value, /, other, *, flag = False)"),
+            "both the positional-only `/` and the keyword-only `*` must be shown"
         );
     }
 }

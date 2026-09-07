@@ -260,13 +260,17 @@ pub fn cached_definition_info<'db>(
 /// shared across different child classes are resolved at most once per revision.
 /// The own class properties take priority; parent properties fill in only what
 /// is missing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ResolvedClassDocs {
+    docstring: Option<String>,
+    init: Option<FunctionSignature>,
+    new_signature: Option<FunctionSignature>,
+    all_bases_resolved: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct ClassParentDocs {
-    inner: Arc<(
-        Option<String>,
-        Option<FunctionSignature>,
-        Option<FunctionSignature>,
-    )>,
+    inner: Arc<ResolvedClassDocs>,
 }
 
 impl ClassParentDocs {
@@ -274,20 +278,26 @@ impl ClassParentDocs {
         docstring: Option<String>,
         init: Option<FunctionSignature>,
         new_signature: Option<FunctionSignature>,
+        all_bases_resolved: bool,
     ) -> Self {
         Self {
-            inner: Arc::new((docstring, init, new_signature)),
+            inner: Arc::new(ResolvedClassDocs {
+                docstring,
+                init,
+                new_signature,
+                all_bases_resolved,
+            }),
         }
     }
 
     /// Resolved docstring — from the class itself or the nearest ancestor that has one.
     pub fn docstring(&self) -> Option<&String> {
-        self.inner.0.as_ref()
+        self.inner.docstring.as_ref()
     }
 
     /// Resolved `__init__` signature — from the class itself or the nearest ancestor.
     pub fn init(&self) -> Option<&FunctionSignature> {
-        self.inner.1.as_ref()
+        self.inner.init.as_ref()
     }
 
     /// Resolved `__new__` signature — from the class itself or the nearest ancestor.
@@ -295,7 +305,17 @@ impl ClassParentDocs {
     /// Only meaningful when [`init`](Self::init) is `None`; see
     /// [`ClassInfo::new_signature`](crate::python_analyzer::ClassInfo::new_signature).
     pub fn new_signature(&self) -> Option<&FunctionSignature> {
-        self.inner.2.as_ref()
+        self.inner.new_signature.as_ref()
+    }
+
+    /// Whether every base class along the walked MRO was found.
+    ///
+    /// `false` means an ancestor could not be resolved — an uninstalled
+    /// dependency, an unresolved re-export — so an `__init__` it declares is
+    /// invisible here, and the absence of one must not be read as proof that
+    /// the class has none.
+    pub fn all_bases_resolved(&self) -> bool {
+        self.inner.all_bases_resolved
     }
 }
 
@@ -360,12 +380,12 @@ pub fn class_parent_docs<'db>(
 ) -> ClassParentDocs {
     let key_str = class_key.value(db);
     let Some((file_path_str, class_name)) = key_str.split_once("::") else {
-        return ClassParentDocs::new(None, None, None);
+        return ClassParentDocs::new(None, None, None, true);
     };
     let file_path = Path::new(file_path_str);
 
     let Ok(class_info) = PythonAnalyzer::extract_class_info(db, file_path, class_name) else {
-        return ClassParentDocs::new(None, None, None);
+        return ClassParentDocs::new(None, None, None, true);
     };
 
     let mut docstring = class_info.docstring;
@@ -375,8 +395,12 @@ pub fn class_parent_docs<'db>(
     // `new_signature` deliberately does not gate the walk: once an `__init__`
     // is in hand, `__new__` is never consulted, so there is nothing left to find.
     if docstring.is_some() && init.is_some() {
-        return ClassParentDocs::new(docstring, init, new_signature);
+        return ClassParentDocs::new(docstring, init, new_signature, true);
     }
+
+    // Tracks whether the walk saw the whole hierarchy. Only meaningful when it
+    // finds no `__init__` — see `ClassParentDocs::all_bases_resolved`.
+    let mut all_bases_resolved = true;
 
     let search_paths_vec = search_paths.paths(db);
 
@@ -387,6 +411,7 @@ pub fn class_parent_docs<'db>(
         let Some((parent_file, parent_class_name)) =
             PythonAnalyzer::resolve_base_class(db, base_class, file_path, &search_paths_vec)
         else {
+            all_bases_resolved = false;
             continue;
         };
         // Lexical normalization only — no `fs::canonicalize` syscall inside this
@@ -399,6 +424,7 @@ pub fn class_parent_docs<'db>(
             format!("{}::{}", normalized.display(), parent_class_name),
         );
         let parent_docs = class_parent_docs(db, parent_key, search_paths);
+        all_bases_resolved &= parent_docs.all_bases_resolved();
 
         if docstring.is_none() {
             docstring = parent_docs.docstring().cloned();
@@ -414,7 +440,7 @@ pub fn class_parent_docs<'db>(
         }
     }
 
-    ClassParentDocs::new(docstring, init, new_signature)
+    ClassParentDocs::new(docstring, init, new_signature, all_bases_resolved)
 }
 
 fn class_parent_docs_cycle(
@@ -423,7 +449,9 @@ fn class_parent_docs_cycle(
     _class_key: TargetString,
     _search_paths: InternedSearchPaths,
 ) -> ClassParentDocs {
-    ClassParentDocs::new(None, None, None)
+    // A circular hierarchy is invalid Python; reporting the bases as resolved
+    // keeps the cycle from also disabling the `__new__` fallback.
+    ClassParentDocs::new(None, None, None, true)
 }
 
 /// Cached class-attribute lookup, walking the MRO when not found directly.
@@ -911,8 +939,18 @@ mod tests {
         // Two independently-allocated results with identical contents must be
         // equal so salsa can backdate. Under the old `Arc::ptr_eq` impl these
         // were always `!=`.
-        let a = ClassParentDocs::new(Some("doc".to_string()), Some(test_sig("__init__", 1)), None);
-        let b = ClassParentDocs::new(Some("doc".to_string()), Some(test_sig("__init__", 1)), None);
+        let a = ClassParentDocs::new(
+            Some("doc".to_string()),
+            Some(test_sig("__init__", 1)),
+            None,
+            true,
+        );
+        let b = ClassParentDocs::new(
+            Some("doc".to_string()),
+            Some(test_sig("__init__", 1)),
+            None,
+            true,
+        );
         assert_eq!(a, b, "equal contents must compare equal (value equality)");
 
         // Differing contents must compare unequal — guards against false
@@ -921,10 +959,15 @@ mod tests {
             Some("other".to_string()),
             Some(test_sig("__init__", 1)),
             None,
+            true,
         );
         assert_ne!(a, diff_doc, "different docstring must compare unequal");
-        let diff_init =
-            ClassParentDocs::new(Some("doc".to_string()), Some(test_sig("__init__", 2)), None);
+        let diff_init = ClassParentDocs::new(
+            Some("doc".to_string()),
+            Some(test_sig("__init__", 2)),
+            None,
+            true,
+        );
         assert_ne!(
             a, diff_init,
             "different __init__ signature must compare unequal"
