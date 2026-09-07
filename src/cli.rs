@@ -9,9 +9,10 @@ use std::io::stderr;
 use std::path::{Path, PathBuf};
 use std::process;
 
-use clap::{Parser, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use colored::Colorize;
-use tower_lsp::lsp_types::DiagnosticSeverity;
+use ignore::WalkBuilder;
+use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
 use tracing::{Level, debug, error, info, warn};
 
 use hydra_lsp::database::HydraDatabase;
@@ -24,12 +25,26 @@ use std::collections::HashSet;
 
 /// CLI tool for diagnosing Hydra YAML configuration files
 #[derive(Parser)]
-#[command(name = "hydra-check")]
-#[command(author, version, about, long_about = None)]
-struct Args {
-    /// Path to the YAML file to check
-    #[arg(required = true)]
-    file: PathBuf,
+#[command(name = "hydrust")]
+#[command(author, version, long_about = None)]
+#[command(about = "Check Hydra YAML configuration files for diagnostics")]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Check Hydra YAML configuration files for diagnostics.
+    Check(CheckCommand),
+}
+
+#[derive(Args)]
+struct CheckCommand {
+    /// Files or directories to check. Directories are searched recursively for
+    /// `.yaml` and `.yml` files, honouring `.gitignore`.
+    #[arg(required = true, value_name = "PATH")]
+    paths: Vec<PathBuf>,
 
     /// Working directory for resolving Python modules (defaults to current directory)
     #[arg(short, long)]
@@ -44,15 +59,20 @@ struct Args {
     verbosity: Verbosity,
 
     /// Output format
-    #[arg(short, long, value_enum, default_value = "pretty")]
+    #[arg(
+        short = 'f',
+        long = "output-format",
+        value_enum,
+        default_value = "pretty"
+    )]
     format: OutputFormat,
 
     /// Show detailed resolution steps for each target
     #[arg(long)]
     trace_resolution: bool,
 
-    /// Disable a diagnostic rule (can be repeated). Valid rules: missing-argument,
-    /// unknown-argument, unresolved-reference, unresolved-import, invalid-target
+    /// Disable a diagnostic rule (can be repeated). For valid rules, see
+    /// `diagnostics::DiagnosticRule::all()`
     #[arg(long = "disable-rule", value_name = "RULE")]
     disable_rules: Vec<String>,
 }
@@ -68,10 +88,11 @@ impl fmt::Debug for OptionalPath<'_> {
     }
 }
 
-impl fmt::Debug for Args {
+impl fmt::Debug for CheckCommand {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Args")
-            .field("file", &self.file.display().to_string())
+        let paths: Vec<String> = self.paths.iter().map(|p| p.display().to_string()).collect();
+        f.debug_struct("CheckCommand")
+            .field("paths", &paths)
             .field("workspace", &OptionalPath(self.workspace.as_ref()))
             .field("python", &OptionalPath(self.python.as_ref()))
             .field("verbosity", &self.verbosity)
@@ -116,10 +137,43 @@ enum OutputFormat {
     Json,
     /// Compact single-line per diagnostic
     Compact,
+    /// GitHub Actions workflow commands, rendered as inline annotations
+    Github,
+}
+
+/// A file selected for checking, plus whether it was explicitly selected, or
+/// discovered by walking a directory.
+struct CheckTarget {
+    /// Absolute, canonicalized path, used to read the file.
+    path: PathBuf,
+    /// Path as reported to the user: relative to the current directory where possible.
+    display: String,
+    explicit: bool,
+}
+
+/// The outcome of checking one file.
+struct FileReport {
+    path: String,
+    diagnostics: Vec<Diagnostic>,
+    /// Set when the file could not be read or parsed at all.
+    failure: Option<String>,
+}
+
+impl FileReport {
+    fn error_count(&self) -> usize {
+        let parse_failure = usize::from(self.failure.is_some());
+        parse_failure
+            + self
+                .diagnostics
+                .iter()
+                .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+                .count()
+    }
 }
 
 fn main() {
-    let args = Args::parse();
+    let cli = Cli::parse();
+    let Command::Check(args) = &cli.command;
 
     // Initialize tracing with the specified verbosity
     let level: Level = args.verbosity.into();
@@ -129,11 +183,11 @@ fn main() {
         .with_ansi(true)
         .init();
 
-    info!("hydra-check starting");
+    info!("hydrust starting");
     debug!("Arguments: {:?}", args);
 
     // Run the main logic and handle errors
-    match run(&args) {
+    match run(args) {
         Ok(exit_code) => process::exit(exit_code),
         Err(e) => {
             error!("Fatal error: {}", e);
@@ -143,23 +197,14 @@ fn main() {
     }
 }
 
-fn run(args: &Args) -> anyhow::Result<i32> {
-    // Validate file exists
-    if !args.file.exists() {
-        anyhow::bail!("File not found: {}", args.file.display());
+fn run(args: &CheckCommand) -> anyhow::Result<i32> {
+    let targets = collect_targets(&args.paths)?;
+    if targets.is_empty() {
+        anyhow::bail!("No YAML files found in the given path(s)");
     }
+    info!("Checking {} file(s)", targets.len());
 
-    // Resolve absolute paths
-    let file_path = args.file.canonicalize()?;
-    info!("Checking file: {}", file_path.display());
-
-    let workspace_root = if let Some(ref ws) = args.workspace {
-        Some(ws.canonicalize()?)
-    } else {
-        // Default to parent directory of the file
-        file_path.parent().map(PathBuf::from)
-    };
-
+    let workspace_root = resolve_workspace_root(args, &targets)?;
     if let Some(ref ws) = workspace_root {
         info!("Workspace root: {}", ws.display());
     }
@@ -172,9 +217,149 @@ fn run(args: &Args) -> anyhow::Result<i32> {
         info!("Python interpreter: {}", py);
     }
 
-    // Parse disabled rules
+    let disabled_rules = parse_disabled_rules(&args.disable_rules);
+
+    // One salsa db + PythonConfig shared across every file, so module
+    // resolution done for the first file is reused by the rest.
+    let db_root = workspace_root
+        .as_deref()
+        .and_then(|p| p.to_str())
+        .unwrap_or(".");
+    let db = HydraDatabase::new(ruff_db::system::SystemPath::new(db_root));
+    let python_config = PythonConfig::new(
+        &db,
+        workspace_root
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string()),
+        python_interpreter.clone(),
+    );
+
+    let mut reports = Vec::with_capacity(targets.len());
+    for target in &targets {
+        if let Some(report) = check_target(target, args, &db, python_config, &disabled_rules) {
+            reports.push(report);
+        }
+    }
+
+    match args.format {
+        OutputFormat::Pretty => output_pretty(&reports),
+        OutputFormat::Json => output_json(&reports)?,
+        OutputFormat::Compact => output_compact(&reports),
+        OutputFormat::Github => output_github(&reports),
+    }
+
+    // Return exit code: 0 if no errors, 1 if there are errors
+    let error_count: usize = reports.iter().map(FileReport::error_count).sum();
+    if error_count > 0 {
+        info!("Found {} error(s)", error_count);
+        Ok(1)
+    } else {
+        info!("No errors found");
+        Ok(0)
+    }
+}
+
+/// Expand the command-line paths into the set of files to check.
+///
+/// Files are taken as given; directories are walked recursively for `.yaml` and
+/// `.yml` files, respecting `.gitignore`. Duplicates are dropped, so overlapping
+/// arguments (`config.yaml conf/`) check each file once.
+fn collect_targets(paths: &[PathBuf]) -> anyhow::Result<Vec<CheckTarget>> {
+    let mut targets = Vec::new();
+    let mut seen = HashSet::new();
+    let cwd = std::env::current_dir()
+        .and_then(|dir| dir.canonicalize())
+        .ok();
+
+    for path in paths {
+        if !path.exists() {
+            anyhow::bail!("Path not found: {}", path.display());
+        }
+
+        if path.is_file() {
+            let canonical = path.canonicalize()?;
+            if seen.insert(canonical.clone()) {
+                targets.push(CheckTarget {
+                    display: display_path(&canonical, cwd.as_deref()),
+                    path: canonical,
+                    explicit: true,
+                });
+            }
+            continue;
+        }
+
+        // `require_git(false)` so that `.gitignore` is honoured whether or not
+        // the tree happens to be a git checkout; otherwise which files get
+        // checked would depend on the presence of `.git`. Sorted so that output
+        // is reproducible across runs and platforms.
+        let walk = WalkBuilder::new(path)
+            .require_git(false)
+            .sort_by_file_path(|a, b| a.cmp(b))
+            .build();
+        for entry in walk {
+            let entry = entry?;
+            if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+                continue;
+            }
+            if !is_yaml_file(entry.path()) {
+                continue;
+            }
+            let canonical = entry.path().canonicalize()?;
+            if seen.insert(canonical.clone()) {
+                targets.push(CheckTarget {
+                    display: display_path(&canonical, cwd.as_deref()),
+                    path: canonical,
+                    explicit: false,
+                });
+            }
+        }
+    }
+
+    Ok(targets)
+}
+
+/// Render `path` relative to `base` when it sits underneath it, otherwise as
+/// the absolute path.
+fn display_path(path: &Path, base: Option<&Path>) -> String {
+    base.and_then(|base| path.strip_prefix(base).ok())
+        .unwrap_or(path)
+        .display()
+        .to_string()
+}
+
+fn is_yaml_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("yaml") || ext.eq_ignore_ascii_case("yml"))
+}
+
+/// Pick the root used for Python module resolution.
+///
+/// An explicit `--workspace` always wins. Otherwise a single file argument
+/// resolves against its own directory, which keeps the common
+/// `hydrust check config.yaml` case working without configuration; anything
+/// broader resolves against the current directory, since there is no one
+/// parent directory that is right for every file.
+fn resolve_workspace_root(
+    args: &CheckCommand,
+    targets: &[CheckTarget],
+) -> anyhow::Result<Option<PathBuf>> {
+    if let Some(ref ws) = args.workspace {
+        return Ok(Some(ws.canonicalize()?));
+    }
+
+    if let [single] = targets
+        && single.explicit
+    {
+        return Ok(single.path.parent().map(PathBuf::from));
+    }
+
+    Ok(Some(std::env::current_dir()?))
+}
+
+fn parse_disabled_rules(rules: &[String]) -> HashSet<DiagnosticRule> {
     let mut disabled_rules = HashSet::new();
-    for rule_str in &args.disable_rules {
+    for rule_str in rules {
         match DiagnosticRule::from_code(rule_str) {
             Some(rule) => {
                 disabled_rules.insert(rule);
@@ -194,28 +379,57 @@ fn run(args: &Args) -> anyhow::Result<i32> {
             }
         }
     }
+    disabled_rules
+}
 
-    // Read file content
-    let content = fs::read_to_string(&file_path)?;
+/// Check a single file. Returns `None` when the file was discovered by walking
+/// a directory and turns out not to be a Hydra config.
+fn check_target(
+    target: &CheckTarget,
+    args: &CheckCommand,
+    db: &HydraDatabase,
+    python_config: PythonConfig,
+    disabled_rules: &HashSet<DiagnosticRule>,
+) -> Option<FileReport> {
+    let file_path = &target.path;
+    info!("Checking file: {}", target.display);
+
+    let content = match fs::read_to_string(file_path) {
+        Ok(content) => content,
+        Err(e) => {
+            error!("Failed to read {}: {}", target.display, e);
+            return Some(FileReport {
+                path: target.display.clone(),
+                diagnostics: Vec::new(),
+                failure: Some(format!("Failed to read file: {e}")),
+            });
+        }
+    };
     debug!("File content length: {} bytes", content.len());
 
-    // Check if it's a Hydra file
     if !YamlParser::is_hydra_file(&content) {
+        if !target.explicit {
+            debug!("Skipping non-Hydra file: {}", target.display);
+            return None;
+        }
         warn!("File does not appear to be a Hydra configuration file");
-        println!(
-            "{}: File does not contain Hydra markers (# @hydra, # @package) or _target_ keys",
-            "Warning".yellow().bold()
+        eprintln!(
+            "{}: {} does not contain Hydra markers (# @hydra, # @package) or _target_ keys",
+            "Warning".yellow().bold(),
+            target.display
         );
     }
 
-    // Parse YAML and extract targets
     info!("Parsing YAML content...");
     let parsed_content = match YamlParser::parse(&content) {
         Ok(result) => result,
         Err(e) => {
             error!("Failed to parse YAML: {}", e);
-            println!("{}: Failed to parse YAML: {}", "Error".red().bold(), e);
-            return Ok(1);
+            return Some(FileReport {
+                path: target.display.clone(),
+                diagnostics: Vec::new(),
+                failure: Some(format!("Failed to parse YAML: {e}")),
+            });
         }
     };
 
@@ -226,65 +440,32 @@ fn run(args: &Args) -> anyhow::Result<i32> {
 
     // If trace_resolution is enabled, show detailed info for each target
     if args.trace_resolution {
-        println!("\n{}", "=== Target Resolution Trace ===".cyan().bold());
-        for (i, target) in parsed_content.hydra_objects.iter().enumerate() {
-            trace_target_resolution(
-                i,
-                target,
-                workspace_root.as_deref(),
-                python_interpreter.as_deref(),
-            );
+        println!(
+            "\n{} {}",
+            "=== Target Resolution Trace ===".cyan().bold(),
+            target.display
+        );
+        for (i, hydra_object) in parsed_content.hydra_objects.iter().enumerate() {
+            trace_target_resolution(i, hydra_object, db, python_config);
         }
         println!();
     }
 
-    // Run diagnostics
     info!("Running diagnostics...");
+    let diagnostics = validate_document(&parsed_content, disabled_rules, db, python_config);
 
-    // Build an ephemeral salsa db + PythonConfig so validate_document can
-    // route lookups through cached_definition_info (cache benefit is moot
-    // for a single CLI run, but the signature is shared with the LSP).
-    let db_root = workspace_root
-        .as_deref()
-        .and_then(|p| p.to_str())
-        .unwrap_or(".");
-    let db = HydraDatabase::new(ruff_db::system::SystemPath::new(db_root));
-    let python_config = PythonConfig::new(
-        &db,
-        workspace_root
-            .as_ref()
-            .map(|p| p.to_string_lossy().to_string()),
-        python_interpreter.clone(),
-    );
-    let diagnostics = validate_document(&parsed_content, &disabled_rules, &db, python_config);
-
-    // Output results
-    match args.format {
-        OutputFormat::Pretty => output_pretty(&file_path, &diagnostics),
-        OutputFormat::Json => output_json(&file_path, &diagnostics)?,
-        OutputFormat::Compact => output_compact(&file_path, &diagnostics),
-    }
-
-    // Return exit code: 0 if no errors, 1 if there are errors
-    let error_count = diagnostics
-        .iter()
-        .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
-        .count();
-
-    if error_count > 0 {
-        info!("Found {} error(s)", error_count);
-        Ok(1)
-    } else {
-        info!("No errors found");
-        Ok(0)
-    }
+    Some(FileReport {
+        path: target.display.clone(),
+        diagnostics,
+        failure: None,
+    })
 }
 
 fn trace_target_resolution(
     index: usize,
     hydra_object: &hydra_lsp::yaml_parser::HydraObject,
-    workspace_root: Option<&Path>,
-    python_interpreter: Option<&str>,
+    db: &HydraDatabase,
+    python_config: PythonConfig,
 ) {
     println!(
         "\n{} [{}] {} (line {})",
@@ -294,18 +475,8 @@ fn trace_target_resolution(
         hydra_object.target.line + 1
     );
 
-    // Ephemeral salsa db so analyzer file reads go through ruff_db's
-    // tracked source_text. The cache vanishes when this function returns;
-    // for a one-shot CLI trace that's fine.
-    let db_root = workspace_root.and_then(|p| p.to_str()).unwrap_or(".");
-    let db = HydraDatabase::new(ruff_db::system::SystemPath::new(db_root));
-
-    // Try to extract definition info
-    let site_packages =
-        PythonAnalyzer::discover_python_environment(workspace_root, python_interpreter)
-            .unwrap_or_default();
-    let search_paths = PythonAnalyzer::build_search_paths(&db, workspace_root, &site_packages);
-    match PythonAnalyzer::extract_definition_info(&db, &hydra_object.target.value, &search_paths) {
+    let search_paths = hydra_lsp::python_cache::search_paths_for_config(db, python_config);
+    match PythonAnalyzer::extract_definition_info(db, &hydra_object.target.value, search_paths) {
         Ok((def_info, file_path, module_path, symbol_name)) => {
             println!("  {} {}", "Module:".dimmed(), module_path);
             println!("  {} {}", "Symbol:".dimmed(), symbol_name);
@@ -409,113 +580,155 @@ fn format_signature_brief(
     format!("({})", params.join(", "))
 }
 
-fn output_pretty(file_path: &Path, diagnostics: &[tower_lsp::lsp_types::Diagnostic]) {
-    if diagnostics.is_empty() {
-        println!(
-            "\n{} {} - no issues found",
-            "✓".green().bold(),
-            file_path.display()
-        );
-        return;
+fn severity_label(diagnostic: &Diagnostic) -> &'static str {
+    match diagnostic.severity {
+        Some(DiagnosticSeverity::ERROR) => "error",
+        Some(DiagnosticSeverity::WARNING) => "warning",
+        Some(DiagnosticSeverity::INFORMATION) => "info",
+        Some(DiagnosticSeverity::HINT) => "hint",
+        _ => "unknown",
+    }
+}
+
+fn diagnostic_code(diagnostic: &Diagnostic) -> String {
+    match &diagnostic.code {
+        Some(tower_lsp::lsp_types::NumberOrString::String(s)) => s.clone(),
+        Some(tower_lsp::lsp_types::NumberOrString::Number(n)) => n.to_string(),
+        None => String::new(),
+    }
+}
+
+/// Totals across every checked file, used by the summary lines.
+struct Totals {
+    files: usize,
+    errors: usize,
+    warnings: usize,
+    other: usize,
+}
+
+impl Totals {
+    fn of(reports: &[FileReport]) -> Self {
+        let mut totals = Totals {
+            files: reports.len(),
+            errors: 0,
+            warnings: 0,
+            other: 0,
+        };
+        for report in reports {
+            if report.failure.is_some() {
+                totals.errors += 1;
+            }
+            for diag in &report.diagnostics {
+                match diag.severity {
+                    Some(DiagnosticSeverity::ERROR) => totals.errors += 1,
+                    Some(DiagnosticSeverity::WARNING) => totals.warnings += 1,
+                    _ => totals.other += 1,
+                }
+            }
+        }
+        totals
     }
 
-    println!(
-        "\n{} {}",
-        "Diagnostics for".bold(),
-        file_path.display().to_string().underline()
-    );
-    println!("{}", "─".repeat(60));
+    fn is_clean(&self) -> bool {
+        self.errors == 0 && self.warnings == 0 && self.other == 0
+    }
+}
 
-    for diag in diagnostics {
-        let severity_str = match diag.severity {
-            Some(DiagnosticSeverity::ERROR) => "ERROR".red().bold(),
-            Some(DiagnosticSeverity::WARNING) => "WARNING".yellow().bold(),
-            Some(DiagnosticSeverity::INFORMATION) => "INFO".blue().bold(),
-            Some(DiagnosticSeverity::HINT) => "HINT".dimmed().bold(),
-            _ => "UNKNOWN".dimmed().bold(),
-        };
+fn output_pretty(reports: &[FileReport]) {
+    for report in reports {
+        if let Some(ref failure) = report.failure {
+            println!("\n{} {}", "Diagnostics for".bold(), report.path.underline());
+            println!("{}", "─".repeat(60));
+            println!("\n  {} {}", "ERROR".red().bold(), failure);
+            continue;
+        }
 
-        let code_str = match &diag.code {
-            Some(tower_lsp::lsp_types::NumberOrString::String(s)) => format!("[{}]", s),
-            Some(tower_lsp::lsp_types::NumberOrString::Number(n)) => format!("[{}]", n),
-            None => String::new(),
-        };
+        if report.diagnostics.is_empty() {
+            println!("\n{} {} - no issues found", "✓".green().bold(), report.path);
+            continue;
+        }
 
-        println!(
-            "\n  {} {} at line {}:{}",
-            severity_str,
-            code_str.dimmed(),
-            diag.range.start.line + 1,
-            diag.range.start.character + 1
-        );
-        println!("  {}", diag.message);
+        println!("\n{} {}", "Diagnostics for".bold(), report.path.underline());
+        println!("{}", "─".repeat(60));
+
+        for diag in &report.diagnostics {
+            let severity_str = match diag.severity {
+                Some(DiagnosticSeverity::ERROR) => "ERROR".red().bold(),
+                Some(DiagnosticSeverity::WARNING) => "WARNING".yellow().bold(),
+                Some(DiagnosticSeverity::INFORMATION) => "INFO".blue().bold(),
+                Some(DiagnosticSeverity::HINT) => "HINT".dimmed().bold(),
+                _ => "UNKNOWN".dimmed().bold(),
+            };
+
+            let code = diagnostic_code(diag);
+            let code_str = if code.is_empty() {
+                String::new()
+            } else {
+                format!("[{}]", code)
+            };
+
+            println!(
+                "\n  {} {} at line {}:{}",
+                severity_str,
+                code_str.dimmed(),
+                diag.range.start.line + 1,
+                diag.range.start.character + 1
+            );
+            println!("  {}", diag.message);
+        }
     }
 
     // Summary
-    let error_count = diagnostics
-        .iter()
-        .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
-        .count();
-    let warning_count = diagnostics
-        .iter()
-        .filter(|d| d.severity == Some(DiagnosticSeverity::WARNING))
-        .count();
-    let other_count = diagnostics.len() - error_count - warning_count;
+    let totals = Totals::of(reports);
 
     println!("\n{}", "─".repeat(60));
     print!("{}", "Summary: ".bold());
-    if error_count > 0 {
-        print!("{} error(s)", error_count.to_string().red().bold());
+    if totals.errors > 0 {
+        print!("{} error(s)", totals.errors.to_string().red().bold());
     }
-    if warning_count > 0 {
-        if error_count > 0 {
+    if totals.warnings > 0 {
+        if totals.errors > 0 {
             print!(", ");
         }
-        print!("{} warning(s)", warning_count.to_string().yellow().bold());
+        print!("{} warning(s)", totals.warnings.to_string().yellow().bold());
     }
-    if other_count > 0 {
-        if error_count > 0 || warning_count > 0 {
+    if totals.other > 0 {
+        if totals.errors > 0 || totals.warnings > 0 {
             print!(", ");
         }
-        print!("{} other(s)", other_count.to_string().blue());
+        print!("{} other(s)", totals.other.to_string().blue());
     }
-    if error_count == 0 && warning_count == 0 && other_count == 0 {
+    if totals.is_clean() {
         print!("{}", "No issues".green());
     }
-    println!();
+    println!(" across {} file(s)", totals.files);
 }
 
-fn output_json(
-    file_path: &Path,
-    diagnostics: &[tower_lsp::lsp_types::Diagnostic],
-) -> anyhow::Result<()> {
+fn output_json(reports: &[FileReport]) -> anyhow::Result<()> {
+    let totals = Totals::of(reports);
     let output = serde_json::json!({
-        "file": file_path.display().to_string(),
-        "diagnostics": diagnostics.iter().map(|d| {
+        "files": reports.iter().map(|report| {
             serde_json::json!({
-                "severity": match d.severity {
-                    Some(DiagnosticSeverity::ERROR) => "error",
-                    Some(DiagnosticSeverity::WARNING) => "warning",
-                    Some(DiagnosticSeverity::INFORMATION) => "information",
-                    Some(DiagnosticSeverity::HINT) => "hint",
-                    _ => "unknown",
-                },
-                "code": match &d.code {
-                    Some(tower_lsp::lsp_types::NumberOrString::String(s)) => s.clone(),
-                    Some(tower_lsp::lsp_types::NumberOrString::Number(n)) => n.to_string(),
-                    None => String::new(),
-                },
-                "line": d.range.start.line + 1,
-                "column": d.range.start.character + 1,
-                "end_line": d.range.end.line + 1,
-                "end_column": d.range.end.character + 1,
-                "message": d.message.clone(),
+                "file": report.path.to_string(),
+                "error": report.failure,
+                "diagnostics": report.diagnostics.iter().map(|d| {
+                    serde_json::json!({
+                        "severity": severity_label(d),
+                        "code": diagnostic_code(d),
+                        "line": d.range.start.line + 1,
+                        "column": d.range.start.character + 1,
+                        "end_line": d.range.end.line + 1,
+                        "end_column": d.range.end.character + 1,
+                        "message": d.message.clone(),
+                    })
+                }).collect::<Vec<_>>(),
             })
         }).collect::<Vec<_>>(),
         "summary": {
-            "total": diagnostics.len(),
-            "errors": diagnostics.iter().filter(|d| d.severity == Some(DiagnosticSeverity::ERROR)).count(),
-            "warnings": diagnostics.iter().filter(|d| d.severity == Some(DiagnosticSeverity::WARNING)).count(),
+            "files": totals.files,
+            "total": totals.errors + totals.warnings + totals.other,
+            "errors": totals.errors,
+            "warnings": totals.warnings,
         }
     });
 
@@ -523,35 +736,93 @@ fn output_json(
     Ok(())
 }
 
-fn output_compact(file_path: &Path, diagnostics: &[tower_lsp::lsp_types::Diagnostic]) {
-    if diagnostics.is_empty() {
-        println!("{}:0:0: OK - no issues found", file_path.display());
-        return;
+fn output_compact(reports: &[FileReport]) {
+    for report in reports {
+        if let Some(ref failure) = report.failure {
+            println!(
+                "{}:1:1: error: [] {}",
+                report.path,
+                failure.replace('\n', " ")
+            );
+            continue;
+        }
+
+        for diag in &report.diagnostics {
+            println!(
+                "{}:{}:{}: {}: [{}] {}",
+                report.path,
+                diag.range.start.line + 1,
+                diag.range.start.character + 1,
+                severity_label(diag),
+                diagnostic_code(diag),
+                diag.message.replace('\n', " ")
+            );
+        }
     }
 
-    for diag in diagnostics {
-        let severity = match diag.severity {
-            Some(DiagnosticSeverity::ERROR) => "error",
-            Some(DiagnosticSeverity::WARNING) => "warning",
-            Some(DiagnosticSeverity::INFORMATION) => "info",
-            Some(DiagnosticSeverity::HINT) => "hint",
-            _ => "unknown",
-        };
+    let totals = Totals::of(reports);
+    if totals.is_clean() {
+        println!("OK - no issues found across {} file(s)", totals.files);
+    }
+}
 
-        let code = match &diag.code {
-            Some(tower_lsp::lsp_types::NumberOrString::String(s)) => s.clone(),
-            Some(tower_lsp::lsp_types::NumberOrString::Number(n)) => n.to_string(),
-            None => String::new(),
-        };
+/// Escape a value for the body of a GitHub Actions workflow command.
+///
+/// See <https://docs.github.com/actions/reference/workflow-commands-for-github-actions>.
+fn escape_workflow_data(value: &str) -> String {
+    value
+        .replace('%', "%25")
+        .replace('\r', "%0D")
+        .replace('\n', "%0A")
+}
 
-        println!(
-            "{}:{}:{}: {}: [{}] {}",
-            file_path.display(),
-            diag.range.start.line + 1,
-            diag.range.start.character + 1,
-            severity,
-            code,
-            diag.message.replace('\n', " ")
-        );
+/// Escape a value used as a workflow command property, which additionally may
+/// not contain the `:` and `,` separators.
+fn escape_workflow_property(value: &str) -> String {
+    escape_workflow_data(value)
+        .replace(':', "%3A")
+        .replace(',', "%2C")
+}
+
+fn output_github(reports: &[FileReport]) {
+    for report in reports {
+        let file = escape_workflow_property(&report.path);
+
+        if let Some(ref failure) = report.failure {
+            println!(
+                "::error file={},line=1,col=1,title=hydrust::{}",
+                file,
+                escape_workflow_data(failure)
+            );
+            continue;
+        }
+
+        for diag in &report.diagnostics {
+            // GitHub only renders error, warning and notice.
+            let level = match diag.severity {
+                Some(DiagnosticSeverity::ERROR) => "error",
+                Some(DiagnosticSeverity::WARNING) => "warning",
+                _ => "notice",
+            };
+
+            let code = diagnostic_code(diag);
+            let title = if code.is_empty() {
+                "hydrust".to_string()
+            } else {
+                format!("hydrust({})", escape_workflow_property(&code))
+            };
+
+            println!(
+                "::{} file={},line={},col={},endLine={},endColumn={},title={}::{}",
+                level,
+                file,
+                diag.range.start.line + 1,
+                diag.range.start.character + 1,
+                diag.range.end.line + 1,
+                diag.range.end.character + 1,
+                title,
+                escape_workflow_data(&diag.message)
+            );
+        }
     }
 }

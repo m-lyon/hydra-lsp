@@ -6,7 +6,7 @@ This is a **Language Server Protocol (LSP) implementation** for [Hydra](https://
 
 **Monorepo structure:**
 
-- `hydra-lsp/` - Rust LSP server and CLI tool (`hydra-check`)
+- `hydra-lsp/` - Rust LSP server and CLI tool (`hydrust`)
 - `hydra-lsp-vscode/` - TypeScript VS Code extension that wraps the server
 
 ## Architecture

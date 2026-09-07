@@ -800,6 +800,7 @@ dependencies = [
  "filetime",
  "fs_extra",
  "hashlink",
+ "ignore",
  "insta",
  "parking_lot",
  "rayon",
