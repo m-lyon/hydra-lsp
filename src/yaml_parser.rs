@@ -551,6 +551,73 @@ pub(crate) fn marker_to_line0(marker_line: usize, enclosing: u32) -> u32 {
     }
 }
 
+/// The first node at or below `node` that saphyr gave a position, in document
+/// order. `None` only for an empty collection, which has nothing to borrow from.
+fn first_positioned(node: &MarkedYamlOwned) -> Option<&MarkedYamlOwned> {
+    if node.span.start.line() != 0 {
+        return Some(node);
+    }
+    if let Some(seq) = node.data.as_sequence() {
+        return seq.iter().find_map(first_positioned);
+    }
+    if let Some(map) = node.data.as_mapping() {
+        return map
+            .iter()
+            .find_map(|(k, v)| first_positioned(k).or_else(|| first_positioned(v)));
+    }
+    None
+}
+
+/// The last node at or below `node` that saphyr gave a position. Mirror of
+/// [`first_positioned`].
+fn last_positioned(node: &MarkedYamlOwned) -> Option<&MarkedYamlOwned> {
+    if node.span.start.line() != 0 {
+        return Some(node);
+    }
+    if let Some(seq) = node.data.as_sequence() {
+        return seq.iter().rev().find_map(last_positioned);
+    }
+    if let Some(map) = node.data.as_mapping() {
+        return map
+            .iter()
+            .rev()
+            .find_map(|(k, v)| last_positioned(v).or_else(|| last_positioned(k)));
+    }
+    None
+}
+
+/// The source range of `node` as `(0-based line, UTF-16 start col, UTF-16 end col)`.
+///
+/// Scalars carry their own position and are returned unchanged. Collections
+/// carry none — saphyr reports `(0, 0)..(0, 0)` for every sequence and mapping —
+/// so they borrow the line and start column of their first positioned
+/// descendant and the end column of their last, which puts `- [1, 2]` on the
+/// line its `1` is on rather than on the line of whatever contains it. That
+/// matters: a positional argument whose line is wrong is dropped from
+/// `param_line_map` and gets no signature help.
+///
+/// `enclosing` is the last resort, used for an empty `[]` or `{}` where there is
+/// no descendant to ask.
+fn node_range(node: &MarkedYamlOwned, lines: &[&str], enclosing: u32) -> (u32, u32, u32) {
+    let Some(start_node) = first_positioned(node) else {
+        return (enclosing, 0, 0);
+    };
+    let line = marker_to_line0(start_node.span.start.line(), enclosing);
+    let start = cp_to_utf16_col(lines, line, start_node.span.start.col() as u32);
+
+    // Only extend to the last descendant when it ends on the same line; a
+    // multi-line collection would otherwise produce a backwards range.
+    let end_node = last_positioned(node).unwrap_or(start_node);
+    let end_node = if marker_to_line0(end_node.span.end.line(), enclosing) == line {
+        end_node
+    } else {
+        start_node
+    };
+    let end = cp_to_utf16_col(lines, line, end_node.span.end.col() as u32);
+
+    (line, start, end)
+}
+
 /// Convert a saphyr `MarkedYamlOwned` node to `YamlValue`
 ///
 /// `lines` is the source document pre-split with `str::lines()`, needed to
@@ -573,15 +640,12 @@ fn node_to_yaml_value(node: &MarkedYamlOwned, lines: &[&str], enclosing_line: u3
         YamlValue::Sequence(
             seq.iter()
                 .map(|item| {
-                    // Scalar elements sit on a single line; convert both columns
-                    // against the element's own line. A nested collection has no
-                    // position of its own, so it inherits the enclosing line.
-                    let start_line = marker_to_line0(item.span.start.line(), enclosing_line);
+                    let (line, start, end) = node_range(item, lines, enclosing_line);
                     PositionedValue {
-                        value: node_to_yaml_value(item, lines, start_line),
-                        line: start_line,
-                        start: cp_to_utf16_col(lines, start_line, item.span.start.col() as u32),
-                        end: cp_to_utf16_col(lines, start_line, item.span.end.col() as u32),
+                        value: node_to_yaml_value(item, lines, line),
+                        line,
+                        start,
+                        end,
                     }
                 })
                 .collect(),
@@ -967,13 +1031,10 @@ impl YamlParser {
             let positional_params: Vec<Parameter> = seq
                 .iter()
                 .map(|item| {
-                    // A nested list (`_args_: [[1, 2, 3]]`) carries no position
-                    // of its own; attribute it to the `_args_` key's line.
-                    let arg_line = marker_to_line0(item.span.start.line(), line);
-                    let arg_value_start =
-                        cp_to_utf16_col(lines, arg_line, item.span.start.col() as u32);
-                    let arg_value_end =
-                        cp_to_utf16_col(lines, arg_line, item.span.end.col() as u32);
+                    // A nested list or mapping (`_args_: [[1, 2, 3]]`) carries no
+                    // position of its own; `node_range` borrows one from its
+                    // contents so block-style entries keep their own line.
+                    let (arg_line, arg_value_start, arg_value_end) = node_range(item, lines, line);
                     Parameter::Positional {
                         value: node_to_yaml_value(item, lines, arg_line),
                         line: arg_line,
@@ -3288,9 +3349,15 @@ model:
             .filter(|p| matches!(p, Parameter::Positional { .. }))
             .collect();
         assert_eq!(positional.len(), 2);
-        // Both nested values are attributed to the `_args_` key's line (index 3,
-        // counting the leading blank line) rather than to line 0.
+        // Both nested values borrow a position from their contents, which puts
+        // them on the `_args_` line (index 3, counting the leading blank line)
+        // rather than on line 0.
         assert!(positional.iter().all(|p| p.line() == 3));
+        // The range covers the nested contents, not column 0.
+        assert!(positional.iter().all(|p| match p {
+            Parameter::Positional { value_start, .. } => *value_start > 0,
+            Parameter::Keyword { .. } => false,
+        }));
     }
 
     /// A block-style `_args_` whose entries are themselves lists: each entry
@@ -3306,14 +3373,21 @@ model:
 "#;
         let parsed = YamlParser::parse(content).unwrap();
         let hydra_object = &parsed.hydra_objects[0];
-        assert_eq!(
-            hydra_object
-                .parameters
-                .iter()
-                .filter(|p| matches!(p, Parameter::Positional { .. }))
-                .count(),
-            2
-        );
+        let positional: Vec<_> = hydra_object
+            .parameters
+            .iter()
+            .filter(|p| matches!(p, Parameter::Positional { .. }))
+            .collect();
+        assert_eq!(positional.len(), 2);
+        // Each entry keeps its own line, so signature help can find it. Both
+        // would collapse onto the `_args_` line if the nested lists fell back to
+        // the enclosing position instead of borrowing one from their contents.
+        assert_eq!(positional[0].line(), 4);
+        assert_eq!(positional[1].line(), 5);
+
+        // ...which is what puts them in the parameter line map.
+        assert!(parsed.param_line_map.contains_key(&4));
+        assert!(parsed.param_line_map.contains_key(&5));
     }
 
     #[test]

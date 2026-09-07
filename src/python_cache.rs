@@ -262,13 +262,21 @@ pub fn cached_definition_info<'db>(
 /// is missing.
 #[derive(Clone, Debug)]
 pub struct ClassParentDocs {
-    inner: Arc<(Option<String>, Option<FunctionSignature>)>,
+    inner: Arc<(
+        Option<String>,
+        Option<FunctionSignature>,
+        Option<FunctionSignature>,
+    )>,
 }
 
 impl ClassParentDocs {
-    fn new(docstring: Option<String>, init: Option<FunctionSignature>) -> Self {
+    fn new(
+        docstring: Option<String>,
+        init: Option<FunctionSignature>,
+        new_signature: Option<FunctionSignature>,
+    ) -> Self {
         Self {
-            inner: Arc::new((docstring, init)),
+            inner: Arc::new((docstring, init, new_signature)),
         }
     }
 
@@ -280,6 +288,14 @@ impl ClassParentDocs {
     /// Resolved `__init__` signature — from the class itself or the nearest ancestor.
     pub fn init(&self) -> Option<&FunctionSignature> {
         self.inner.1.as_ref()
+    }
+
+    /// Resolved `__new__` signature — from the class itself or the nearest ancestor.
+    ///
+    /// Only meaningful when [`init`](Self::init) is `None`; see
+    /// [`ClassInfo::new_signature`](crate::python_analyzer::ClassInfo::new_signature).
+    pub fn new_signature(&self) -> Option<&FunctionSignature> {
+        self.inner.2.as_ref()
     }
 }
 
@@ -344,19 +360,22 @@ pub fn class_parent_docs<'db>(
 ) -> ClassParentDocs {
     let key_str = class_key.value(db);
     let Some((file_path_str, class_name)) = key_str.split_once("::") else {
-        return ClassParentDocs::new(None, None);
+        return ClassParentDocs::new(None, None, None);
     };
     let file_path = Path::new(file_path_str);
 
     let Ok(class_info) = PythonAnalyzer::extract_class_info(db, file_path, class_name) else {
-        return ClassParentDocs::new(None, None);
+        return ClassParentDocs::new(None, None, None);
     };
 
     let mut docstring = class_info.docstring;
     let mut init = class_info.init_signature;
+    let mut new_signature = class_info.new_signature;
 
+    // `new_signature` deliberately does not gate the walk: once an `__init__`
+    // is in hand, `__new__` is never consulted, so there is nothing left to find.
     if docstring.is_some() && init.is_some() {
-        return ClassParentDocs::new(docstring, init);
+        return ClassParentDocs::new(docstring, init, new_signature);
     }
 
     let search_paths_vec = search_paths.paths(db);
@@ -387,12 +406,15 @@ pub fn class_parent_docs<'db>(
         if init.is_none() {
             init = parent_docs.init().cloned();
         }
+        if new_signature.is_none() {
+            new_signature = parent_docs.new_signature().cloned();
+        }
         if docstring.is_some() && init.is_some() {
             break;
         }
     }
 
-    ClassParentDocs::new(docstring, init)
+    ClassParentDocs::new(docstring, init, new_signature)
 }
 
 fn class_parent_docs_cycle(
@@ -401,7 +423,7 @@ fn class_parent_docs_cycle(
     _class_key: TargetString,
     _search_paths: InternedSearchPaths,
 ) -> ClassParentDocs {
-    ClassParentDocs::new(None, None)
+    ClassParentDocs::new(None, None, None)
 }
 
 /// Cached class-attribute lookup, walking the MRO when not found directly.
@@ -889,17 +911,20 @@ mod tests {
         // Two independently-allocated results with identical contents must be
         // equal so salsa can backdate. Under the old `Arc::ptr_eq` impl these
         // were always `!=`.
-        let a = ClassParentDocs::new(Some("doc".to_string()), Some(test_sig("__init__", 1)));
-        let b = ClassParentDocs::new(Some("doc".to_string()), Some(test_sig("__init__", 1)));
+        let a = ClassParentDocs::new(Some("doc".to_string()), Some(test_sig("__init__", 1)), None);
+        let b = ClassParentDocs::new(Some("doc".to_string()), Some(test_sig("__init__", 1)), None);
         assert_eq!(a, b, "equal contents must compare equal (value equality)");
 
         // Differing contents must compare unequal — guards against false
         // negatives (failing to invalidate on a real change).
-        let diff_doc =
-            ClassParentDocs::new(Some("other".to_string()), Some(test_sig("__init__", 1)));
+        let diff_doc = ClassParentDocs::new(
+            Some("other".to_string()),
+            Some(test_sig("__init__", 1)),
+            None,
+        );
         assert_ne!(a, diff_doc, "different docstring must compare unequal");
         let diff_init =
-            ClassParentDocs::new(Some("doc".to_string()), Some(test_sig("__init__", 2)));
+            ClassParentDocs::new(Some("doc".to_string()), Some(test_sig("__init__", 2)), None);
         assert_ne!(
             a, diff_init,
             "different __init__ signature must compare unequal"

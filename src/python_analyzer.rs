@@ -156,7 +156,23 @@ pub struct ClassInfo {
     pub name: String,
     pub base_classes: Vec<String>,
     pub docstring: Option<String>,
+    /// The signature Hydra calls when instantiating the class.
+    ///
+    /// Resolved in Python's own order — the class's own `__init__`, then an
+    /// inherited one, then `__new__` — by
+    /// [`PythonAnalyzer::extract_class_info_with_imports`]. Straight out of
+    /// [`PythonAnalyzer::extract_class_info`] it holds only the class's *own*
+    /// `__init__`, with any `__new__` kept aside in `new_signature` until the
+    /// MRO has been given its turn.
     pub init_signature: Option<FunctionSignature>,
+    /// The class's own `__new__`, when it declares one.
+    ///
+    /// Kept separate from `init_signature` so a class that overrides `__new__`
+    /// but inherits its real `__init__` still validates against the inherited
+    /// one. `int`, `str`, `float`, `bool`, `tuple` and `range` declare no
+    /// `__init__` anywhere in their MRO, so for them this is the only
+    /// constructor there is.
+    pub new_signature: Option<FunctionSignature>,
     pub start_line: u32,
     pub start_column: u32,
     pub end_line: u32,
@@ -352,27 +368,44 @@ impl PythonAnalyzer {
             .ok_or_else(|| anyhow::anyhow!("Function '{}' not found", function_name))
     }
 
-    /// Whether `name` is bound at the top level of the module at `path`.
+    /// Whether `name` is bound at module scope in the module at `path`.
     ///
     /// Only module-scope bindings count — a method or a nested class with the
     /// same name does not. Covers `def`, `class` and (annotated) assignment,
     /// which is every shape a stub uses to expose a name.
+    ///
+    /// `if` branches are followed, because typeshed guards a fair number of
+    /// builtins behind `if sys.version_info >= (3, N):` — `aiter`, `anext` and
+    /// `ExceptionGroup` among them. Whether a name is bound on *this*
+    /// interpreter is not the question being asked; whether it is a builtin at
+    /// all is.
     pub fn module_defines_top_level(db: &dyn ruff_db::Db, path: &Path, name: &str) -> bool {
+        fn body_binds(body: &[Stmt], name: &str) -> bool {
+            body.iter().any(|stmt| match stmt {
+                Stmt::FunctionDef(func_def) => func_def.name.as_str() == name,
+                Stmt::ClassDef(class_def) => class_def.name.as_str() == name,
+                Stmt::Assign(assign) => assign
+                    .targets
+                    .iter()
+                    .any(|target| matches!(target, Expr::Name(n) if n.id.as_str() == name)),
+                Stmt::AnnAssign(ann_assign) => {
+                    matches!(ann_assign.target.as_ref(), Expr::Name(n) if n.id.as_str() == name)
+                }
+                Stmt::If(if_stmt) => {
+                    body_binds(&if_stmt.body, name)
+                        || if_stmt
+                            .elif_else_clauses
+                            .iter()
+                            .any(|clause| body_binds(&clause.body, name))
+                }
+                _ => false,
+            })
+        }
+
         let Ok(parsed) = get_parsed_module(db, path) else {
             return false;
         };
-        parsed.suite().iter().any(|stmt| match stmt {
-            Stmt::FunctionDef(func_def) => func_def.name.as_str() == name,
-            Stmt::ClassDef(class_def) => class_def.name.as_str() == name,
-            Stmt::Assign(assign) => assign
-                .targets
-                .iter()
-                .any(|target| matches!(target, Expr::Name(n) if n.id.as_str() == name)),
-            Stmt::AnnAssign(ann_assign) => {
-                matches!(ann_assign.target.as_ref(), Expr::Name(n) if n.id.as_str() == name)
-            }
-            _ => false,
-        })
+        body_binds(parsed.suite(), name)
     }
 
     /// Extract class information from source code via salsa-cached parsing.
@@ -766,6 +799,17 @@ impl PythonAnalyzer {
             if class_info.init_signature.is_none() {
                 class_info.init_signature = parent_docs.init().cloned();
             }
+            if class_info.new_signature.is_none() {
+                class_info.new_signature = parent_docs.new_signature().cloned();
+            }
+        }
+
+        // `__new__` stands in only once no `__init__` has been found anywhere in
+        // the MRO, mirroring how Python resolves the call. A class that
+        // overrides `__new__` but inherits its real `__init__` keeps validating
+        // against the inherited signature.
+        if class_info.init_signature.is_none() {
+            class_info.init_signature = class_info.new_signature.take();
         }
 
         Ok((class_info, resolved_file))
@@ -1450,21 +1494,14 @@ impl<'a> Visitor<'a> for MethodExtractor {
     }
 }
 
-/// The signature Hydra will call when instantiating a class.
-///
-/// `__init__` when the class declares one, otherwise `__new__`. Typeshed
-/// declares no `__init__` at all for `int`, `str`, `float`, `bool`, `tuple` and
-/// `range` — without the fallback, `_target_: builtins.int` would look like a
-/// class that takes no arguments and every argument would be flagged unknown.
-fn find_constructor(body: &[Stmt], source: &str) -> Option<FunctionSignature> {
-    ["__init__", "__new__"].iter().find_map(|name| {
-        body.iter()
-            .find_map(|stmt| match stmt {
-                Stmt::FunctionDef(func_def) if func_def.name.as_str() == *name => Some(func_def),
-                _ => None,
-            })
-            .map(|func_def| extract_signature_with_overloads(body, func_def, source))
-    })
+/// The signature of `name` declared directly in `body`, if there is one.
+fn find_method(body: &[Stmt], name: &str, source: &str) -> Option<FunctionSignature> {
+    body.iter()
+        .find_map(|stmt| match stmt {
+            Stmt::FunctionDef(func_def) if func_def.name.as_str() == name => Some(func_def),
+            _ => None,
+        })
+        .map(|func_def| extract_signature_with_overloads(body, func_def, source))
 }
 
 /// Extract `func_def`'s signature and record whether the name is overloaded in
@@ -1479,24 +1516,22 @@ fn extract_signature_with_overloads(
     signature
 }
 
-/// Whether `name` is overloaded within `body`: declared more than once, or
-/// declared with an `@overload` decorator.
+/// Whether `name` is overloaded within `body`.
+///
+/// Only an explicit `@overload` decorator counts. Merely being declared twice
+/// does not: `@property` with its `@x.setter`, and `@singledispatch` with its
+/// `@f.register`, both declare one name repeatedly without being overload sets,
+/// and treating them as such would disable argument validation for the target
+/// entirely. Nothing is lost by the stricter rule — typing requires `@overload`
+/// on every member of a real overload set, so the first declaration always
+/// carries it.
 fn is_overloaded_in_body(body: &[Stmt], name: &str) -> bool {
-    let mut declarations = 0;
-    for stmt in body {
-        if let Stmt::FunctionDef(func_def) = stmt
-            && func_def.name.as_str() == name
-        {
-            if has_overload_decorator(&func_def.decorator_list) {
-                return true;
-            }
-            declarations += 1;
-            if declarations > 1 {
-                return true;
-            }
+    body.iter().any(|stmt| match stmt {
+        Stmt::FunctionDef(func_def) => {
+            func_def.name.as_str() == name && has_overload_decorator(&func_def.decorator_list)
         }
-    }
-    false
+        _ => false,
+    })
 }
 
 /// Check for `@overload`, however `typing.overload` was imported.
@@ -1580,13 +1615,15 @@ fn extract_class_info_from_def(class_def: &ast::StmtClassDef, source: &str) -> C
     // Extract base classes
     let base_classes: Vec<String> = class_def.bases().iter().map(expr_to_string).collect();
 
-    let init_signature = find_constructor(&class_def.body, source);
+    let init_signature = find_method(&class_def.body, "__init__", source);
+    let new_signature = find_method(&class_def.body, "__new__", source);
 
     ClassInfo {
         name: class_def.name.to_string(),
         base_classes,
         docstring,
         init_signature,
+        new_signature,
         start_line,
         start_column,
         end_line,
@@ -2438,6 +2475,7 @@ mod tests {
             base_classes: vec![],
             docstring: Some("A test class".to_string()),
             init_signature: None,
+            new_signature: None,
             start_line: 0,
             start_column: 0,
             end_line: 5,
@@ -2492,6 +2530,7 @@ mod tests {
                 end_line: 5,
                 end_column: 5,
             }),
+            new_signature: None,
         };
 
         let formatted = PythonAnalyzer::format_class(&class_info);
@@ -2546,6 +2585,7 @@ mod tests {
                 end_line: 5,
                 end_column: 5,
             }),
+            new_signature: None,
         };
 
         let formatted = PythonAnalyzer::format_class(&class_info);
@@ -3747,6 +3787,7 @@ mod tests {
                 end_line: 0,
                 end_column: 0,
             }),
+            new_signature: None,
             start_line: 0,
             start_column: 0,
             end_line: 0,
@@ -3781,6 +3822,7 @@ mod tests {
                 end_line: 0,
                 end_column: 0,
             }),
+            new_signature: None,
             start_line: 0,
             start_column: 0,
             end_line: 0,
@@ -3796,6 +3838,7 @@ mod tests {
             base_classes: vec![],
             docstring: None,
             init_signature: None,
+            new_signature: None,
             start_line: 0,
             start_column: 0,
             end_line: 0,
@@ -3982,7 +4025,11 @@ mod tests {
     #[test]
     fn test_builtin_int_uses_new_as_its_constructor() {
         let db = test_db();
-        let class_info = PythonAnalyzer::extract_class_info(&db, &builtins_stub(), "int").unwrap();
+        // The `__new__` fallback is applied by `extract_class_info_with_imports`,
+        // once the MRO has had its chance to supply an `__init__`.
+        let (class_info, _) =
+            PythonAnalyzer::extract_class_info_with_imports(&db, &builtins_stub(), "int", &[])
+                .unwrap();
 
         let init = class_info
             .init_signature
@@ -3996,6 +4043,37 @@ mod tests {
             "the implicit first parameter of __new__ is cls, not self"
         );
         assert!(PythonAnalyzer::format_class(&class_info).contains("def __new__("));
+    }
+
+    /// `__new__` must not shadow an `__init__` inherited from a base class:
+    /// Python looks the two up independently, and it is `__init__` that
+    /// receives the constructor arguments in the common
+    /// `def __new__(cls, *args, **kwargs)` shape.
+    #[test]
+    fn test_inherited_init_wins_over_own_new() {
+        let db = test_db();
+        let source = r#"
+class Base:
+    def __init__(self, a, b):
+        """Base init."""
+
+class Child(Base):
+    def __new__(cls, *args, **kwargs):
+        return super().__new__(cls)
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("inherit.py");
+        std::fs::write(&path, source).unwrap();
+        let search_paths = vec![dir.path().to_path_buf()];
+
+        let (class_info, _) =
+            PythonAnalyzer::extract_class_info_with_imports(&db, &path, "Child", &search_paths)
+                .unwrap();
+
+        let init = class_info.init_signature.as_ref().unwrap();
+        assert_eq!(init.name, "__init__");
+        let names: Vec<_> = init.parameters.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["self", "a", "b"]);
     }
 
     #[test]
@@ -4014,8 +4092,9 @@ mod tests {
     #[test]
     fn test_builtin_tuple_new_is_not_flagged_overloaded() {
         let db = test_db();
-        let class_info =
-            PythonAnalyzer::extract_class_info(&db, &builtins_stub(), "tuple").unwrap();
+        let (class_info, _) =
+            PythonAnalyzer::extract_class_info_with_imports(&db, &builtins_stub(), "tuple", &[])
+                .unwrap();
 
         let init = class_info.init_signature.as_ref().unwrap();
         assert_eq!(init.name, "__new__");
@@ -4023,6 +4102,32 @@ mod tests {
             !init.is_overloaded,
             "a single undecorated declaration is not an overload set"
         );
+    }
+
+    /// Two declarations of one name are not an overload set. A property and its
+    /// setter are the common shape, and treating them as overloaded would
+    /// silently switch off argument validation for the target.
+    #[test]
+    fn test_property_setter_pair_is_not_an_overload() {
+        let db = test_db();
+        let source = r#"
+class Widget:
+    @property
+    def value(self) -> int:
+        """The value."""
+        return self._value
+
+    @value.setter
+    def value(self, new_value: int) -> None:
+        self._value = new_value
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prop.py");
+        std::fs::write(&path, source).unwrap();
+
+        let method = PythonAnalyzer::extract_method_info(&db, &path, "Widget", "value").unwrap();
+        assert!(!method.signature.is_overloaded);
+        assert!(!PythonAnalyzer::format_method(&method).contains("@overload"));
     }
 
     #[test]
@@ -4041,6 +4146,10 @@ mod tests {
         assert!(
             !PythonAnalyzer::module_defines_top_level(&db, &builtins_stub(), "count"),
             "`count` is a method of `list`, not a builtin"
+        );
+        assert!(
+            PythonAnalyzer::module_defines_top_level(&db, &builtins_stub(), "aiter"),
+            "typeshed guards `aiter` behind `if sys.version_info >= (3, 10):`"
         );
     }
 

@@ -228,12 +228,20 @@ fn validate_parameters(
     // Parameters declared before a `/` cannot be passed by name. They are still
     // "expected" (so no unknown-argument fires), but Hydra can only reach them
     // through `_args_`.
-    let positional_only: HashSet<&str> = signature
-        .parameters
-        .iter()
-        .filter(|p| p.is_positional_only && Some(p.name.as_str()) != implicit_param)
-        .map(|p| p.name.as_str())
-        .collect();
+    //
+    // Unless the function also takes `**kwargs`: `def f(a, /, **kw)` accepts
+    // `a=1` perfectly well — the value lands in `kw` rather than in the
+    // positional slot — so there is nothing to report.
+    let positional_only: HashSet<&str> = if has_kwargs {
+        HashSet::new()
+    } else {
+        signature
+            .parameters
+            .iter()
+            .filter(|p| p.is_positional_only && Some(p.name.as_str()) != implicit_param)
+            .map(|p| p.name.as_str())
+            .collect()
+    };
 
     for param in &hydra_obj.parameters {
         if let Parameter::Keyword { key, line, .. } = param
@@ -290,8 +298,9 @@ fn validate_parameters(
                     .contains(&DiagnosticRule::MissingArgument)
             {
                 // A positional-only parameter has no keyword form, so point at
-                // `_args_` rather than implying a key could be added.
-                let message = if param.is_positional_only {
+                // `_args_` rather than implying a key could be added — unless
+                // `**kwargs` gives the name somewhere to land after all.
+                let message = if param.is_positional_only && !has_kwargs {
                     format!(
                         "Missing required positional-only parameter '{}' for '{}'; pass it via {}",
                         param.name, display_name, ARGS_KEY
@@ -1504,6 +1513,116 @@ mod tests {
         assert_eq!(diagnostics.len(), 1);
         assert!(diagnostics[0].message.contains("unknown_param"));
         assert!(diagnostics[0].message.contains("Unknown parameter"));
+    }
+
+    // ==================== positional-only tests ====================
+
+    /// Build a parameter for a synthetic signature.
+    fn sig_param(name: &str, positional_only: bool, kwargs: bool) -> ParameterInfo {
+        ParameterInfo {
+            name: name.to_string(),
+            type_annotation: None,
+            default_value: None,
+            has_default: false,
+            is_variadic: false,
+            is_variadic_keyword: kwargs,
+            is_keyword_only: false,
+            is_positional_only: positional_only,
+        }
+    }
+
+    fn sig_for(name: &str, parameters: Vec<ParameterInfo>) -> FunctionSignature {
+        FunctionSignature {
+            name: name.to_string(),
+            parameters,
+            return_type: None,
+            docstring: None,
+            is_overloaded: false,
+            start_line: 1,
+            start_column: 1,
+            end_line: 1,
+            end_column: 1,
+        }
+    }
+
+    #[test]
+    fn test_positional_only_passed_by_name_is_reported() {
+        let hydra_obj = build_hydra_object(
+            "mod.f",
+            vec![make_param("a", YamlValue::Integer(1), 1)],
+            0,
+            0,
+            0,
+            false,
+        );
+        let signature = sig_for("f", vec![sig_param("a", true, false)]);
+
+        let diagnostics = validate_parameters(&hydra_obj, &signature, "f", None, &HashSet::new());
+
+        let codes: Vec<_> = diagnostics
+            .iter()
+            .map(|d| match &d.code {
+                Some(tower_lsp::lsp_types::NumberOrString::String(c)) => c.clone(),
+                _ => "none".to_string(),
+            })
+            .collect();
+        assert!(
+            codes.contains(
+                &DiagnosticRule::PositionalOnlyParameter
+                    .as_code()
+                    .to_string()
+            ),
+            "got: {codes:?}"
+        );
+    }
+
+    /// `def f(a, /, **kw)` accepts `a=1` — the value lands in `kw`, so there is
+    /// nothing to report.
+    #[test]
+    fn test_positional_only_with_kwargs_is_not_reported() {
+        let hydra_obj = build_hydra_object(
+            "mod.f",
+            vec![make_param("a", YamlValue::Integer(1), 1)],
+            0,
+            0,
+            0,
+            false,
+        );
+        let signature = sig_for(
+            "f",
+            vec![sig_param("a", true, false), sig_param("kw", false, true)],
+        );
+
+        let diagnostics = validate_parameters(&hydra_obj, &signature, "f", None, &HashSet::new());
+
+        assert!(
+            !diagnostics.iter().any(|d| matches!(
+                &d.code,
+                Some(tower_lsp::lsp_types::NumberOrString::String(c))
+                    if c == DiagnosticRule::PositionalOnlyParameter.as_code()
+            )),
+            "**kwargs gives the name somewhere to land, got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// An overloaded symbol is only represented by its first declaration, so
+    /// nothing about the arguments can be checked against it.
+    #[test]
+    fn test_overloaded_signature_skips_argument_validation() {
+        let hydra_obj = build_hydra_object(
+            "mod.f",
+            vec![make_param("not_a_param", YamlValue::Integer(1), 1)],
+            0,
+            0,
+            0,
+            false,
+        );
+        let mut signature = sig_for("f", vec![sig_param("a", false, false)]);
+        signature.is_overloaded = true;
+
+        let diagnostics = validate_parameters(&hydra_obj, &signature, "f", None, &HashSet::new());
+        assert!(diagnostics.is_empty(), "got: {diagnostics:?}");
     }
 
     // ==================== DiagnosticRule tests ====================

@@ -12,16 +12,25 @@
 //! Module resolution throughout the crate speaks `std::path::Path`, and the
 //! vendored stubs are not on disk. Rather than thread a `FilePath` enum through
 //! every resolver signature, vendored files are addressed by a sentinel path
-//! rooted at [`VENDORED_ROOT`]: `<typeshed>/stdlib/builtins.pyi`. The root is
-//! appended to the search-path list like any other directory, so
-//! `resolve_module_cached` and `ImportResolver::find_module_file` need no
-//! special cases. Only the three functions that actually touch a file —
-//! `path_is_file`, `read_source` and `get_parsed_module` — branch on
-//! [`is_vendored_path`] and go to the `VendoredFileSystem` instead of the OS.
+//! rooted at [`VENDORED_ROOT`]: `<typeshed>/stdlib/builtins.pyi`. Such a path
+//! is built and probed exactly like a real one — `ImportResolver`'s
+//! `find_module_file` walks the same `.pyi`-before-`.py` candidates against
+//! [`stdlib_search_root`] — and only the two functions that actually touch a
+//! file, `path_is_file` and `path_to_file` in `python_analyzer`, branch on
+//! [`is_vendored_path`] to reach the `VendoredFileSystem` instead of the OS.
+//!
+//! The root is *not* a member of the search-path list built by
+//! `build_search_paths`. `resolve_module_cached` consults it as a last resort,
+//! after every real root has missed, and only for a module [`is_vendored_module`]
+//! admits — so a workspace or site-packages `builtins` still shadows the stub,
+//! and the sentinel never leaks into consumers of the search paths such as the
+//! file watcher.
 //!
 //! `<typeshed>` is a relative single-component path containing characters that
 //! are illegal in Windows filenames, so it cannot collide with a real search
-//! root, and `Url::from_file_path` rejects it (see `Backend::goto_definition`).
+//! root. Nothing on disk corresponds to it, so `Backend::goto_definition`
+//! checks [`is_vendored_path`] and returns no location rather than handing the
+//! editor a URI it cannot open.
 
 use ruff_db::vendored::{VendoredPath, VendoredPathBuf};
 use std::path::{Component, Path, PathBuf};
@@ -32,11 +41,12 @@ pub const VENDORED_ROOT: &str = "<typeshed>";
 /// The `builtins` module name. Hydra requires this prefix on a builtin target.
 pub const BUILTINS_MODULE: &str = "builtins";
 
-/// The vendored search root, appended last to the module search-path list.
+/// The root that vendored stdlib stubs are resolved against.
 ///
 /// Typeshed's stdlib stubs live under `stdlib/` inside the archive, so the root
 /// is `<typeshed>/stdlib` and `builtins` resolves to
-/// `<typeshed>/stdlib/builtins.pyi`.
+/// `<typeshed>/stdlib/builtins.pyi`. `resolve_module_cached` probes it after
+/// every real search root has missed.
 pub fn stdlib_search_root() -> PathBuf {
     Path::new(VENDORED_ROOT).join("stdlib")
 }
