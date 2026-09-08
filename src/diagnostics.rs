@@ -3,7 +3,7 @@ use crate::python_cache::{PythonConfig, TargetString, cached_definition_info, is
 use crate::vendored_typeshed::BUILTINS_MODULE;
 use crate::yaml_parser::{
     ARGS_KEY, CONVERT_KEY, ConvertMode, HydraObject, PARTIAL_KEY, Parameter, ParsedContent,
-    RECURSIVE_KEY,
+    RECURSIVE_KEY, utf16_len,
 };
 use std::collections::HashSet;
 use std::fmt;
@@ -274,7 +274,7 @@ fn validate_parameters(
             diagnostics.push(create_diagnostic(
                 *line,
                 *key_start,
-                key.len() as u32 + key_start,
+                key_start + utf16_len(key),
                 DiagnosticSeverity::ERROR,
                 Some(DiagnosticRule::PositionalOnlyParameter),
                 format!(
@@ -305,7 +305,7 @@ fn validate_parameters(
             diagnostics.push(create_diagnostic(
                 *line,
                 *key_start,
-                key.len() as u32 + key_start,
+                key_start + utf16_len(key),
                 DiagnosticSeverity::ERROR,
                 Some(DiagnosticRule::UnknownArgument),
                 format!("Unknown parameter '{}' for '{}'", key, display_name),
@@ -385,7 +385,7 @@ fn validate_parameters(
             diagnostics.push(create_diagnostic(
                     *line,
                     *key_start,
-                    key.len() as u32 + key_start,
+                    key_start + utf16_len(key),
                     DiagnosticSeverity::ERROR,
                     Some(DiagnosticRule::ParameterAlreadyAssigned),
                     format!(
@@ -449,7 +449,7 @@ fn validate_parameters(
                     diagnostics.push(create_diagnostic(
                         *line,
                         *key_start,
-                        key_start + key.len() as u32,
+                        key_start + utf16_len(key),
                         DiagnosticSeverity::HINT,
                         None,
                         format!("Parameter '{}' will be passed via **kwargs", param_name),
@@ -1333,6 +1333,90 @@ mod tests {
         }
     }
 
+    /// The behaviour `constructor_is_uncertain` exists for: when `__new__` only
+    /// stood in because part of the MRO is unreadable, arguments are not
+    /// validated against it — the real `__init__` may be in the ancestor that is
+    /// missing.
+    #[test]
+    fn test_uncertain_constructor_produces_no_argument_diagnostics() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("mod.py"),
+            concat!(
+                "from not_installed import Widget\n",
+                "\n",
+                "class Thing(Widget):\n",
+                "    def __new__(cls):\n",
+                "        pass\n",
+            ),
+        )
+        .unwrap();
+
+        let vs = 10 + "_target_:".len() as u32 + 1;
+        let parsed_content: ParsedContent = ParsedContent {
+            hydra_objects: vec![build_hydra_object(
+                "mod.Thing",
+                vec![make_param("size", YamlValue::Integer(1), 1)],
+                0,
+                10,
+                vs,
+                false,
+            )],
+            target_line_map: HashMap::new(),
+            param_line_map: HashMap::new(),
+            file_suppressions: HashSet::new(),
+        };
+
+        let (db, config) = test_env(Some(dir.path()));
+        let diagnostics = validate_document(&parsed_content, &HashSet::new(), &db, config);
+        assert!(
+            diagnostics.is_empty(),
+            "`__new__(cls)` may not be the constructor Hydra calls, got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// The same shape with a readable MRO: `__new__` is the constructor, and an
+    /// argument it does not declare is reported.
+    #[test]
+    fn test_certain_constructor_is_validated() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("mod.py"),
+            concat!(
+                "class Widget:\n",
+                "    pass\n",
+                "\n",
+                "class Thing(Widget):\n",
+                "    def __new__(cls):\n",
+                "        pass\n",
+            ),
+        )
+        .unwrap();
+
+        let vs = 10 + "_target_:".len() as u32 + 1;
+        let parsed_content: ParsedContent = ParsedContent {
+            hydra_objects: vec![build_hydra_object(
+                "mod.Thing",
+                vec![make_param("size", YamlValue::Integer(1), 1)],
+                0,
+                10,
+                vs,
+                false,
+            )],
+            target_line_map: HashMap::new(),
+            param_line_map: HashMap::new(),
+            file_suppressions: HashSet::new(),
+        };
+
+        let (db, config) = test_env(Some(dir.path()));
+        let diagnostics = validate_document(&parsed_content, &HashSet::new(), &db, config);
+        assert_eq!(
+            codes(&diagnostics),
+            vec![DiagnosticRule::UnknownArgument.as_code().to_string()],
+        );
+    }
+
     /// A target with no signature to validate against must not take the rest
     /// of the checks down with it: `_convert_` is still wrong regardless of
     /// what `SimpleClass`'s constructor looks like.
@@ -1723,6 +1807,29 @@ mod tests {
 
         let diagnostics = validate_parameters(&hydra_obj, &signature, "f", None, &HashSet::new());
         assert!(diagnostics.is_empty(), "got: {:?}", codes(&diagnostics));
+    }
+
+    /// Columns are UTF-16 code units, so the end of a key is its UTF-16 length,
+    /// not its byte length.
+    #[test]
+    fn test_parameter_diagnostic_range_is_utf16() {
+        let hydra_obj = build_hydra_object(
+            "mod.f",
+            vec![make_param("café", YamlValue::Integer(1), 1)],
+            1,
+            2,
+            13,
+            false,
+        );
+        let signature = sig_for("f", vec![sig_param("a", false, false)]);
+
+        let diagnostics = validate_parameters(&hydra_obj, &signature, "f", None, &HashSet::new());
+        let unknown = &diagnostics[0];
+        assert_eq!(
+            unknown.range.end.character - unknown.range.start.character,
+            4,
+            "`café` is four UTF-16 units, five bytes"
+        );
     }
 
     /// A diagnostic anchored to a parameter's line points at that parameter's

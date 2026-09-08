@@ -1015,6 +1015,21 @@ impl YamlParser {
         }
     }
 
+    /// The byte offset of the `[` that opens an inline `_args_` flow sequence on
+    /// `line_text`, or `None` when the value is not written inline.
+    ///
+    /// Only the text after the `_args_:` colon is considered, so
+    /// `_args_: # see [docs]` is correctly read as a block sequence with a
+    /// comment rather than as a flow sequence starting inside the comment.
+    fn value_bracket_byte(line_text: &str) -> Option<usize> {
+        let key = line_text.find(ARGS_KEY)?;
+        let colon = key + line_text[key..].find(':')?;
+        let value = line_text[colon + 1..]
+            .find(|c: char| !c.is_whitespace())
+            .map(|offset| colon + 1 + offset)?;
+        line_text[value..].starts_with('[').then_some(value)
+    }
+
     /// Extract the `_args_` Hydra keyword from a mapping.
     /// Returns the HydraParameter and any positional parameters parsed from the list.
     /// For inline flow sequences (`[a, b]`), the HydraParameter value carries
@@ -1048,24 +1063,21 @@ impl YamlParser {
                 })
                 .collect();
 
-            // Detect inline flow sequence: items share the key line, or the
-            // sequence is empty and valid. For inline sequences, find '['
-            // on the line and capture the text after it.
-            let is_inline =
-                positional_params.is_empty() || positional_params.iter().all(|p| p.line() == line);
-            let inline_info = if is_inline {
-                // Search the key's line for the flow-sequence bracket. The
-                // `_args_` key itself contains no '[', so the first one on the
-                // line opens the sequence. `bracket_col` is reported in UTF-16
-                // units; `text_after_bracket` is the raw remainder of the line.
-                let line_text = lines.get(line as usize).copied().unwrap_or("");
-                line_text.find('[').map(|bracket_byte| InlineArgsText {
+            // Detect an inline flow sequence from the source itself: the value
+            // after `_args_:` opens with `[` on the key's own line. Inferring it
+            // from the entries' lines instead would be forgeable — an entry with
+            // no position of its own borrows the key's line, so a block sequence
+            // of empty collections would look inline — and a `[` anywhere on the
+            // line, a comment's included, would then be read as the sequence.
+            //
+            // `bracket_col` is reported in UTF-16 units; `text_after_bracket` is
+            // the raw remainder of the line.
+            let line_text = lines.get(line as usize).copied().unwrap_or("");
+            let inline_info =
+                Self::value_bracket_byte(line_text).map(|bracket_byte| InlineArgsText {
                     bracket_col: utf16_len(&line_text[..bracket_byte]),
                     text_after_bracket: line_text[bracket_byte + 1..].to_string(),
-                })
-            } else {
-                None
-            };
+                });
 
             Some((
                 HydraParameter {
@@ -3419,6 +3431,49 @@ model:
         assert_eq!(positional[0].line(), 3);
         assert_eq!(positional[1].line(), 5);
         assert!(parsed.param_line_map.contains_key(&5));
+    }
+
+    /// A block sequence whose entries are *all* unpositioned must still be read
+    /// as block style. Inferring that from the entries' lines would call it
+    /// inline, and the comment's bracket would then be mistaken for the
+    /// sequence's opening one.
+    #[test]
+    fn test_block_args_with_a_bracket_in_a_comment_is_not_inline() {
+        let content = r#"
+model:
+  _target_: builtins.max
+  _args_: # see [docs]
+    - []
+"#;
+        let parsed = YamlParser::parse(content).unwrap();
+        let args = parsed.hydra_objects[0]
+            .args
+            .as_ref()
+            .expect("args should be present");
+        assert!(
+            args.value.is_none(),
+            "a comment's bracket is not a flow sequence, got: {:?}",
+            args.value
+        );
+    }
+
+    #[test]
+    fn test_inline_args_detected_from_the_value_not_the_entries() {
+        let content = r#"
+model:
+  _target_: builtins.max
+  _args_: [[1, 2], []] # trailing [comment]
+"#;
+        let parsed = YamlParser::parse(content).unwrap();
+        let args = parsed.hydra_objects[0]
+            .args
+            .as_ref()
+            .expect("args should be present");
+        let inline = args
+            .value
+            .as_ref()
+            .expect("a genuine flow sequence, even with an unpositioned entry");
+        assert!(inline.text_after_bracket.starts_with("[1, 2], []]"));
     }
 
     #[test]
