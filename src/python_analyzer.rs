@@ -1558,11 +1558,6 @@ impl<'a> Visitor<'a> for MethodExtractor {
     }
 }
 
-/// The signature of `name` declared directly in `body`, if there is one.
-fn find_method(body: &[Stmt], name: &str, source: &str) -> Option<FunctionSignature> {
-    extract_declared_signature(body, name, source)
-}
-
 /// The class named by a base-class expression, with any generic subscript
 /// removed: `Sequence[_T_co]` is `Sequence` and `typing.Generic[T]` is
 /// `typing.Generic`.
@@ -1730,8 +1725,8 @@ fn extract_class_info_from_def(class_def: &ast::StmtClassDef, source: &str) -> C
     // Extract base classes
     let base_classes: Vec<String> = class_def.bases().iter().map(expr_to_string).collect();
 
-    let init_signature = find_method(&class_def.body, "__init__", source);
-    let new_signature = find_method(&class_def.body, "__new__", source);
+    let init_signature = extract_declared_signature(&class_def.body, "__init__", source);
+    let new_signature = extract_declared_signature(&class_def.body, "__new__", source);
 
     ClassInfo {
         name: class_def.name.to_string(),

@@ -192,8 +192,6 @@ fn validate_parameters(
         return diagnostics;
     }
 
-    let key_start = hydra_obj.target.key_start;
-
     // Get parameter names from YAML (only keyword params, not positional)
     let param_names: HashSet<String> = hydra_obj
         .parameters
@@ -258,7 +256,12 @@ fn validate_parameters(
     // itself, which is still what tells the already-assigned check below that
     // the keyword and the positional argument are not the same binding.
     for param in &hydra_obj.parameters {
-        if let Parameter::Keyword { key, line, .. } = param
+        if let Parameter::Keyword {
+            key,
+            line,
+            key_start,
+            ..
+        } = param
             && !has_kwargs
             && positional_only.contains(key.as_str())
             && !is_suppressed(
@@ -270,7 +273,7 @@ fn validate_parameters(
         {
             diagnostics.push(create_diagnostic(
                 *line,
-                key_start,
+                *key_start,
                 key.len() as u32 + key_start,
                 DiagnosticSeverity::ERROR,
                 Some(DiagnosticRule::PositionalOnlyParameter),
@@ -284,7 +287,12 @@ fn validate_parameters(
 
     // Check for unknown parameters (only keyword params)
     for param in &hydra_obj.parameters {
-        if let Parameter::Keyword { key, line, .. } = param
+        if let Parameter::Keyword {
+            key,
+            line,
+            key_start,
+            ..
+        } = param
             && !expected_params.contains(key)
             && !has_kwargs
             && !is_suppressed(
@@ -296,7 +304,7 @@ fn validate_parameters(
         {
             diagnostics.push(create_diagnostic(
                 *line,
-                key_start,
+                *key_start,
                 key.len() as u32 + key_start,
                 DiagnosticSeverity::ERROR,
                 Some(DiagnosticRule::UnknownArgument),
@@ -357,18 +365,26 @@ fn validate_parameters(
     for param_name in &positionally_covered {
         if param_names.contains(param_name)
             && !positional_only.contains(param_name.as_str())
-            && let Some(Parameter::Keyword { key, line, .. }) = hydra_obj
+            && let Some(param) = hydra_obj
                 .parameters
                 .iter()
                 .find(|p| matches!(p, Parameter::Keyword { key, .. } if key == param_name))
-            && !file_suppressions.contains(&DiagnosticRule::ParameterAlreadyAssigned)
-            && !hydra_obj
-                .suppressed_rules
-                .contains(&DiagnosticRule::ParameterAlreadyAssigned)
+            && let Parameter::Keyword {
+                key,
+                line,
+                key_start,
+                ..
+            } = param
+            && !is_suppressed(
+                DiagnosticRule::ParameterAlreadyAssigned,
+                param,
+                hydra_obj,
+                file_suppressions,
+            )
         {
             diagnostics.push(create_diagnostic(
                     *line,
-                    key_start,
+                    *key_start,
                     key.len() as u32 + key_start,
                     DiagnosticSeverity::ERROR,
                     Some(DiagnosticRule::ParameterAlreadyAssigned),
@@ -413,18 +429,26 @@ fn validate_parameters(
             });
 
             for param_name in unknown {
-                if let Some(Parameter::Keyword { key, line, .. }) = hydra_obj
+                if let Some(param) = hydra_obj
                     .parameters
                     .iter()
                     .find(|p| matches!(p, Parameter::Keyword { key, .. } if key == param_name))
-                    && !file_suppressions.contains(&DiagnosticRule::UnknownArgument)
-                    && !hydra_obj
-                        .suppressed_rules
-                        .contains(&DiagnosticRule::UnknownArgument)
+                    && let Parameter::Keyword {
+                        key,
+                        line,
+                        key_start,
+                        ..
+                    } = param
+                    && !is_suppressed(
+                        DiagnosticRule::UnknownArgument,
+                        param,
+                        hydra_obj,
+                        file_suppressions,
+                    )
                 {
                     diagnostics.push(create_diagnostic(
                         *line,
-                        key_start,
+                        *key_start,
                         key_start + key.len() as u32,
                         DiagnosticSeverity::HINT,
                         None,
@@ -1699,6 +1723,30 @@ mod tests {
 
         let diagnostics = validate_parameters(&hydra_obj, &signature, "f", None, &HashSet::new());
         assert!(diagnostics.is_empty(), "got: {:?}", codes(&diagnostics));
+    }
+
+    /// A diagnostic anchored to a parameter's line points at that parameter's
+    /// column, not the `_target_` key's — the two only coincide in block style.
+    #[test]
+    fn test_parameter_diagnostics_point_at_the_parameter() {
+        let mut param = make_param("nope", YamlValue::Integer(1), 1);
+        if let Parameter::Keyword { key_start, .. } = &mut param {
+            *key_start = 34;
+        }
+        let hydra_obj = build_hydra_object("mod.f", vec![param], 1, 9, 20, false);
+        let signature = sig_for("f", vec![sig_param("a", false, false)]);
+
+        let diagnostics = validate_parameters(&hydra_obj, &signature, "f", None, &HashSet::new());
+
+        let unknown = diagnostics
+            .iter()
+            .find(|d| {
+                matches!(&d.code, Some(tower_lsp::lsp_types::NumberOrString::String(c))
+                    if c == DiagnosticRule::UnknownArgument.as_code())
+            })
+            .expect("expected an unknown-argument diagnostic");
+        assert_eq!(unknown.range.start.character, 34);
+        assert_eq!(unknown.range.end.character, 34 + "nope".len() as u32);
     }
 
     /// `def f(a, /, **kw)` with `_args_: [1]` and `a: 2` binds `a` positionally

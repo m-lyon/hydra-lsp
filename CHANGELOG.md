@@ -11,7 +11,8 @@
 - A keyword key no longer satisfies a positional-only parameter when the callee also takes `**kwargs`: `f(a=1)` on `def f(a, /, **kw)` puts the value in `kw` and still raises "missing 1 required positional argument".
 - Left argument validation off when a class's constructor came from `__new__` while part of its MRO could not be resolved: the real `__init__` may be in the ancestor that is missing. Hover still shows what was found.
 - Rejected the names the typeshed stub declares but the runtime `builtins` module does not have — its typevars and protocol classes (`_T`, `_SupportsRound1`) and `@type_check_only` placeholders such as `function`. They used to resolve with no diagnostic at all, green-lighting a config that fails with `AttributeError`.
-- An inline `# hydrust: ignore[...]` on a parameter's own line now silences the diagnostics that point at it (`positional-only-parameter`, `unknown-argument`), not just a comment on the file header or the `_target_` line.
+- Diagnostics anchored to a parameter's line now point at that parameter's own column rather than the `_target_` key's; the two only coincide in block-style YAML.
+- An inline `# hydrust: ignore[...]` on a parameter's own line now silences the diagnostics that point at it (`positional-only-parameter`, `unknown-argument`, `parameter-already-assigned`), not just a comment on the file header or the `_target_` line.
 - Improved the bare-name `_target_` error: `len` now reports that it is a builtin and names `builtins.len`, the form Hydra actually accepts.
 - Go-to-definition on a target that resolves into a vendored stub is a no-op rather than an error, since there is no file on disk to open. Hover and diagnostics are unaffected.
 - Signature help now carries the same `/` and `*` markers as hover, and says when it is showing the first of several overloads.

@@ -217,11 +217,19 @@ pub fn vendored_module_exposes<'db>(
     module: TargetString<'db>,
     symbol: TargetString<'db>,
 ) -> bool {
+    let module = module.value(db);
+    // The same gate `resolve_module_cached` applies, so the two cannot disagree
+    // about what the archive exposes. `is_runtime_builtin_name`'s underscore
+    // rule is a builtins convention, and widening the gate must be a deliberate
+    // decision about this check as well.
+    if !is_vendored_module(module) {
+        return false;
+    }
     let symbol = symbol.value(db);
     if symbol.is_empty() || symbol.contains('.') || !is_runtime_builtin_name(symbol) {
         return false;
     }
-    let Some(relative) = join_module_parts(Path::new(""), module.value(db)) else {
+    let Some(relative) = join_module_parts(Path::new(""), module) else {
         return false;
     };
     let Some(stub) = ImportResolver::find_module_file(db, &stdlib_search_root().join(relative))
@@ -546,9 +554,8 @@ pub fn class_parent_attribute<'db>(
     let search_paths_vec = search_paths.paths(db);
 
     for base_class in &class_info.base_classes {
-        // Bases that exist only for the type system contribute no constructor
-        // and no docstring, and never resolve; skipping them keeps them out of
-        // `all_bases_resolved` too.
+        // Bases that exist only for the type system carry no attributes of
+        // their own, and never resolve.
         if matches!(
             base_class_name(base_class),
             "object" | "ABC" | "Protocol" | "Generic"
