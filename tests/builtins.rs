@@ -328,6 +328,100 @@ length:
     );
 }
 
+/// Signature help must show the same `/` marker hover does: without it the
+/// label reads as an invitation to write `obj:`, which the positional-only
+/// diagnostic then rejects.
+#[tokio::test]
+async fn test_signature_help_marks_positional_only_parameters() {
+    let mut ctx = TestContext::new(TestWorkspace::Simple);
+    ctx.initialize().await;
+
+    let content = r#"# @hydra
+length:
+  _target_: builtins.len
+  _args_: [1]
+"#;
+    ctx.open_document("builtin_sig.yaml", content.to_string())
+        .await;
+
+    let res = ctx
+        .request::<request::SignatureHelpRequest>(SignatureHelpParams {
+            context: None,
+            text_document_position_params: TextDocumentPositionParams {
+                position: Position {
+                    line: 3,
+                    character: 12,
+                },
+                text_document: TextDocumentIdentifier {
+                    uri: ctx.doc_uri("builtin_sig.yaml"),
+                },
+            },
+            work_done_progress_params: WorkDoneProgressParams {
+                work_done_token: None,
+            },
+        })
+        .await;
+
+    let sig_help = res.expect("expected signature help");
+    let label = &sig_help.signatures[0].label;
+    assert!(
+        label.contains("obj: Sized, /"),
+        "signature help should mark `obj` positional-only, got: {label}"
+    );
+    // The marker goes into the label only; the parameter list and the active
+    // index still count real parameters.
+    assert_eq!(
+        sig_help.signatures[0].parameters.as_ref().map(|p| p.len()),
+        Some(1)
+    );
+    assert_eq!(sig_help.active_parameter, Some(0));
+}
+
+/// An overloaded target is shown as one signature but validated as accepting
+/// anything, so signature help says which of the two the reader is looking at.
+#[tokio::test]
+async fn test_signature_help_notes_overloads() {
+    let mut ctx = TestContext::new(TestWorkspace::Simple);
+    ctx.initialize().await;
+
+    let content = r#"# @hydra
+handle:
+  _target_: builtins.open
+  file: data.txt
+"#;
+    ctx.open_document("builtin_open_sig.yaml", content.to_string())
+        .await;
+
+    let res = ctx
+        .request::<request::SignatureHelpRequest>(SignatureHelpParams {
+            context: None,
+            text_document_position_params: TextDocumentPositionParams {
+                position: Position {
+                    line: 3,
+                    character: 5,
+                },
+                text_document: TextDocumentIdentifier {
+                    uri: ctx.doc_uri("builtin_open_sig.yaml"),
+                },
+            },
+            work_done_progress_params: WorkDoneProgressParams {
+                work_done_token: None,
+            },
+        })
+        .await;
+
+    let sig_help = res.expect("expected signature help");
+    let documentation = sig_help.signatures[0]
+        .documentation
+        .as_ref()
+        .expect("an overloaded signature should say so");
+    let text = match documentation {
+        Documentation::String(s) => s.clone(),
+        Documentation::MarkupContent(m) => m.value.clone(),
+    };
+    assert!(text.to_lowercase().contains("overload"), "got: {text}");
+}
+
 /// A vendored stub has no file on disk, so there is nowhere to jump to.
 /// Go-to-definition returns nothing rather than a URI the editor cannot open.
 #[tokio::test]

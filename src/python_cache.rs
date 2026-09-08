@@ -6,8 +6,8 @@ use crate::python_analyzer::{
     ClassAttributeInfo, DefinitionInfo, FunctionSignature, PythonAnalyzer, normalize_path_for_key,
 };
 use crate::vendored_typeshed::{
-    BUILTINS_MODULE, is_runtime_builtin_name, is_vendored_module, is_vendored_path,
-    stdlib_search_root,
+    BUILTINS_MODULE, is_runtime_builtin_name, is_vendored_module, stdlib_search_root,
+    vendored_module_name,
 };
 use ruff_db::files::FileRootKind;
 use ruff_db::system::SystemPathBuf;
@@ -201,31 +201,45 @@ pub fn resolve_module_cached<'db>(
     None
 }
 
-/// Whether `name` is a symbol the runtime `builtins` module exposes, according
-/// to the vendored stub.
+/// Whether the runtime module `module` exposes `symbol`, according to its
+/// vendored stub.
 ///
 /// Backs two things: the bare-name `_target_` error, which becomes a message
 /// naming the prefixed form Hydra actually accepts (`len` is rejected,
 /// `builtins.len` works), and the guard in [`cached_definition_info`] that keeps
-/// stub-internal names from resolving as targets. The stub is immutable and
+/// stub-internal names from resolving as targets. The stubs are immutable and
 /// shared by every workspace, so the query takes no search paths and its memo
 /// survives for the life of the database.
 #[salsa::tracked]
-pub fn is_builtin_symbol<'db>(db: &'db dyn ruff_db::Db, name: TargetString<'db>) -> bool {
-    let name = name.value(db);
-    if name.is_empty() || name.contains('.') || !is_runtime_builtin_name(name) {
+pub fn vendored_module_exposes<'db>(
+    db: &'db dyn ruff_db::Db,
+    module: TargetString<'db>,
+    symbol: TargetString<'db>,
+) -> bool {
+    let symbol = symbol.value(db);
+    if symbol.is_empty() || symbol.contains('.') || !is_runtime_builtin_name(symbol) {
         return false;
     }
-    let Some(stub) = ImportResolver::find_module_file(
-        db,
-        &stdlib_search_root().join(Path::new(BUILTINS_MODULE)),
-    ) else {
+    let Some(relative) = join_module_parts(Path::new(""), module.value(db)) else {
+        return false;
+    };
+    let Some(stub) = ImportResolver::find_module_file(db, &stdlib_search_root().join(relative))
+    else {
         return false;
     };
     // Top-level only: the extractors walk nested scopes, so asking them would
     // also match methods such as `list.count` and suggest a `builtins.count`
     // that does not exist.
-    PythonAnalyzer::module_defines_top_level(db, &stub, name)
+    PythonAnalyzer::module_defines_top_level(db, &stub, symbol)
+}
+
+/// Whether `name` is a symbol the runtime `builtins` module exposes.
+///
+/// Thin wrapper over [`vendored_module_exposes`] for the bare-name `_target_`
+/// hint, which is only ever about builtins — Hydra accepts a dotted target for
+/// anything else.
+pub fn is_builtin_symbol<'db>(db: &'db dyn ruff_db::Db, name: TargetString<'db>) -> bool {
+    vendored_module_exposes(db, TargetString::new(db, BUILTINS_MODULE.to_string()), name)
 }
 
 /// Cached extraction of Python definition info for a `_target_` string.
@@ -260,17 +274,27 @@ pub fn cached_definition_info<'db>(
     // `_target_: builtins._SupportsRound1` that fails with `AttributeError` the
     // moment Hydra tries to instantiate it. Only stub resolutions are checked;
     // a workspace's own `builtins.py` is its author's business.
-    if let Ok((_, file_path, module_path, symbol_name)) = &result
-        && is_vendored_path(file_path)
+    if let Ok((_, file_path, _, _)) = &result
+        && let Some(module) = vendored_module_name(file_path)
+        // The name looked up on the module is the segment right after the
+        // module's own name in the target; the rest is an attribute of it.
+        // Taken from the target rather than the returned symbol name, which is
+        // qualified for some resolution paths and bare for others.
+        && let Some(root_symbol) = target_str
+            .strip_prefix(&module)
+            .and_then(|rest| rest.strip_prefix('.'))
+            .and_then(|rest| rest.split('.').next())
+        && !vendored_module_exposes(
+            db,
+            TargetString::new(db, module.clone()),
+            TargetString::new(db, root_symbol.to_string()),
+        )
     {
-        let root_symbol = symbol_name.split('.').next().unwrap_or(symbol_name);
-        if !is_builtin_symbol(db, TargetString::new(db, root_symbol.to_string())) {
-            result = Err(anyhow::anyhow!(
-                "Symbol '{}' not found in module '{}'",
-                root_symbol,
-                module_path
-            ));
-        }
+        result = Err(anyhow::anyhow!(
+            "Symbol '{}' not found in module '{}'",
+            root_symbol,
+            module
+        ));
     }
 
     CachedDefinitionResult::from_result(result)

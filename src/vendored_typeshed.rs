@@ -79,17 +79,7 @@ pub fn to_vendored_path(path: &Path) -> Option<VendoredPathBuf> {
     Some(VendoredPath::new(&vendored).to_path_buf())
 }
 
-/// Whether module resolution may fall through to the vendored search root for
-/// `module_path`.
-///
-/// Wiring in typeshed makes the whole stdlib reachable, but issue #34 is scoped
-/// to builtins: enabling every stdlib module at once widens the blast radius of
-/// stub-shaped constructs (`@overload`, `__new__`, positional-only parameters,
-/// typeshed's `VERSIONS` gating) well beyond what its acceptance criteria
-/// cover. Resolution is therefore gated to `builtins` and its submodules, and
-/// broadening the gate is a one-line change once the rest of the stdlib has
-/// been evaluated on its own.
-/// Whether `name` is one the runtime `builtins` module actually exposes.
+/// Whether `name` is one the runtime module actually exposes.
 ///
 /// The stub declares a fair amount that no `import builtins` can reach: the
 /// typevars and protocol classes its own annotations are written in (`_T`,
@@ -110,6 +100,47 @@ pub fn is_runtime_builtin_name(name: &str) -> bool {
     name.starts_with("__") && name.ends_with("__") && name.len() > 4
 }
 
+/// The dotted module name a vendored stub path stands for —
+/// `<typeshed>/stdlib/builtins.pyi` is `builtins`, and
+/// `<typeshed>/stdlib/os/path.pyi` is `os.path`.
+///
+/// Lets a caller that has only a resolved stub path recover which module it
+/// came from, rather than assuming the target's own prefix names it. Returns
+/// `None` for anything that is not a stub path under [`stdlib_search_root`].
+pub fn vendored_module_name(path: &Path) -> Option<String> {
+    let relative = path.strip_prefix(stdlib_search_root()).ok()?;
+    let mut parts: Vec<&str> = Vec::new();
+    for component in relative.components() {
+        let Component::Normal(part) = component else {
+            return None;
+        };
+        parts.push(part.to_str()?);
+    }
+    // The last component carries the extension, and an `__init__` stub names
+    // the package directory rather than a module of its own.
+    let last = parts.pop()?;
+    let stem = last
+        .strip_suffix(".pyi")
+        .or_else(|| last.strip_suffix(".py"))?;
+    if stem != "__init__" {
+        parts.push(stem);
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(parts.join("."))
+}
+
+/// Whether module resolution may fall through to the vendored search root for
+/// `module_path`.
+///
+/// Wiring in typeshed makes the whole stdlib reachable, but issue #34 is scoped
+/// to builtins: enabling every stdlib module at once widens the blast radius of
+/// stub-shaped constructs (`@overload`, `__new__`, positional-only parameters,
+/// typeshed's `VERSIONS` gating) well beyond what its acceptance criteria
+/// cover. Resolution is therefore gated to `builtins` and its submodules, and
+/// broadening the gate is a one-line change once the rest of the stdlib has
+/// been evaluated on its own.
 pub fn is_vendored_module(module_path: &str) -> bool {
     module_path == BUILTINS_MODULE
         || module_path
@@ -148,6 +179,25 @@ mod tests {
     fn traversal_components_are_rejected() {
         assert!(to_vendored_path(Path::new("<typeshed>/../../etc/passwd")).is_none());
         assert!(to_vendored_path(Path::new(VENDORED_ROOT)).is_none());
+    }
+
+    #[test]
+    fn stub_paths_map_back_to_module_names() {
+        let root = stdlib_search_root();
+        assert_eq!(
+            vendored_module_name(&root.join("builtins.pyi")).as_deref(),
+            Some("builtins")
+        );
+        assert_eq!(
+            vendored_module_name(&root.join("os").join("path.pyi")).as_deref(),
+            Some("os.path")
+        );
+        assert_eq!(
+            vendored_module_name(&root.join("os").join("__init__.pyi")).as_deref(),
+            Some("os"),
+            "an __init__ stub names the package, not a module of its own"
+        );
+        assert_eq!(vendored_module_name(Path::new("/tmp/builtins.pyi")), None);
     }
 
     #[test]
