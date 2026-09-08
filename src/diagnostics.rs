@@ -286,9 +286,19 @@ fn validate_parameters(
 
     if !hydra_obj.is_partial() {
         for param in &signature.parameters {
+            // A keyword key never fills a positional-only slot: `f(a=1)` on
+            // `def f(a, /, **kw)` still raises "missing 1 required positional
+            // argument". Without `**kwargs` the key is reported above as
+            // `positional-only-parameter`, whose message already points at
+            // `_args_`, so repeating it here would be the same mistake twice;
+            // with `**kwargs` there is no report above — the key is legal, it
+            // just lands in the kwargs dict — so the empty slot is reported here.
+            let accounted_for_by_keyword =
+                param_names.contains(&param.name) && !(param.is_positional_only && has_kwargs);
+
             if param.is_required()
                 && Some(param.name.as_str()) != implicit_param
-                && !param_names.contains(&param.name)
+                && !accounted_for_by_keyword
                 && !positionally_covered.contains(&param.name)
                 && !file_suppressions.contains(&DiagnosticRule::MissingArgument)
                 && !hydra_obj
@@ -296,9 +306,8 @@ fn validate_parameters(
                     .contains(&DiagnosticRule::MissingArgument)
             {
                 // A positional-only parameter has no keyword form, so point at
-                // `_args_` rather than implying a key could be added — unless
-                // `**kwargs` gives the name somewhere to land after all.
-                let message = if param.is_positional_only && !has_kwargs {
+                // `_args_` rather than implying a key could be added.
+                let message = if param.is_positional_only {
                     format!(
                         "Missing required positional-only parameter '{}' for '{}'; pass it via {}",
                         param.name, display_name, ARGS_KEY
@@ -519,32 +528,35 @@ pub fn validate_document(
             validate_target(target, db, python_config, &suppressions);
         diagnostics.extend(target_diagnostics);
 
-        // Try to resolve the target and validate parameters
-        if let Some(definition_info) = &definition_info {
-            let implicit_param = definition_info.implicit_param();
-            let (signature, display_name) = match definition_info {
-                DefinitionInfo::Function(sig) => (sig, sig.name.clone()),
+        // Try to resolve the target and validate parameters. `None` here means
+        // there is nothing sound to validate against — never that the rest of
+        // the checks below should be skipped.
+        let callable = definition_info.as_ref().and_then(|definition_info| {
+            let signature_and_name = match definition_info {
+                DefinitionInfo::Function(sig) => Some((sig, sig.name.clone())),
                 DefinitionInfo::Class(class_info) => {
                     // A `__new__` that only stood in because part of the MRO is
                     // unresolvable is not a sound thing to validate against —
                     // the real `__init__` may be in the ancestor we could not
                     // read. Hover still shows it; diagnostics stay quiet.
                     if class_info.constructor_is_uncertain() {
-                        continue;
-                    }
-                    // For classes, use the __init__ signature if available
-                    if let Some(init_sig) = &class_info.init_signature {
-                        (init_sig, format!("{}.{}", class_info.name, init_sig.name))
+                        None
                     } else {
-                        // Class with no __init__, no parameters to validate
-                        continue;
+                        // For classes, use the __init__ signature if available;
+                        // a class with no constructor has no parameters to check.
+                        class_info.init_signature.as_ref().map(|init_sig| {
+                            (init_sig, format!("{}.{}", class_info.name, init_sig.name))
+                        })
                     }
                 }
                 DefinitionInfo::Method(method_info) => {
-                    (&method_info.signature, method_info.signature.name.clone())
+                    Some((&method_info.signature, method_info.signature.name.clone()))
                 }
             };
+            signature_and_name.map(|(sig, name)| (sig, name, definition_info.implicit_param()))
+        });
 
+        if let Some((signature, display_name, implicit_param)) = callable {
             let parameter_diagnostics = validate_parameters(
                 target,
                 signature,
@@ -1276,6 +1288,39 @@ mod tests {
         }
     }
 
+    /// A target with no signature to validate against must not take the rest
+    /// of the checks down with it: `_convert_` is still wrong regardless of
+    /// what `SimpleClass`'s constructor looks like.
+    #[test]
+    fn test_hydra_keywords_validated_for_a_class_with_no_constructor() {
+        let vs = 10 + "_target_:".len() as u32 + 1;
+        let mut target = build_hydra_object("my_module.SimpleClass", Vec::new(), 0, 10, vs, false);
+        target.convert = Some(HydraParameter {
+            value: ConvertMode::None,
+            line: 1,
+            invalid: true,
+            key_start: 2,
+            value_start: 12,
+            value_end: 20,
+        });
+        let parsed_content: ParsedContent = ParsedContent {
+            hydra_objects: vec![target],
+            target_line_map: HashMap::new(),
+            param_line_map: HashMap::new(),
+            file_suppressions: HashSet::new(),
+        };
+
+        let resources_dir = get_simple_test_dir();
+        let (db, config) = test_env(Some(&resources_dir));
+        let diagnostics = validate_document(&parsed_content, &HashSet::new(), &db, config);
+
+        assert!(
+            diagnostics.iter().any(|d| d.message.contains(CONVERT_KEY)),
+            "got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn test_validate_document_with_parameter_validation() {
         let params = vec![make_param("value", YamlValue::Integer(42), 1)];
@@ -1522,7 +1567,18 @@ mod tests {
 
     // ==================== positional-only tests ====================
 
-    /// Build a parameter for a synthetic signature.
+    /// Codes of the diagnostics produced, for readable assertions.
+    fn codes(diagnostics: &[Diagnostic]) -> Vec<String> {
+        diagnostics
+            .iter()
+            .map(|d| match &d.code {
+                Some(tower_lsp::lsp_types::NumberOrString::String(c)) => c.clone(),
+                _ => "none".to_string(),
+            })
+            .collect()
+    }
+
+    /// Build a required parameter for a synthetic signature.
     fn sig_param(name: &str, positional_only: bool, kwargs: bool) -> ParameterInfo {
         ParameterInfo {
             name: name.to_string(),
@@ -1564,27 +1620,24 @@ mod tests {
 
         let diagnostics = validate_parameters(&hydra_obj, &signature, "f", None, &HashSet::new());
 
-        let codes: Vec<_> = diagnostics
-            .iter()
-            .map(|d| match &d.code {
-                Some(tower_lsp::lsp_types::NumberOrString::String(c)) => c.clone(),
-                _ => "none".to_string(),
-            })
-            .collect();
-        assert!(
-            codes.contains(
-                &DiagnosticRule::PositionalOnlyParameter
+        // The one report names the real problem and points at `_args_`; the
+        // parameter is not also reported as missing.
+        assert_eq!(
+            codes(&diagnostics),
+            vec![
+                DiagnosticRule::PositionalOnlyParameter
                     .as_code()
                     .to_string()
-            ),
-            "got: {codes:?}"
+            ],
         );
     }
 
-    /// `def f(a, /, **kw)` accepts `a=1` — the value lands in `kw`, so there is
-    /// nothing to report.
+    /// `def f(a, /, **kw)` accepts the *key* `a=1` — it lands in `kw` — so
+    /// there is no positional-only report. The positional slot is still empty
+    /// though, which `f(a=1)` raises a `TypeError` for, so it is reported as a
+    /// missing argument that `_args_` has to supply.
     #[test]
-    fn test_positional_only_with_kwargs_is_not_reported() {
+    fn test_required_positional_only_with_kwargs_is_still_missing() {
         let hydra_obj = build_hydra_object(
             "mod.f",
             vec![make_param("a", YamlValue::Integer(1), 1)],
@@ -1600,15 +1653,31 @@ mod tests {
 
         let diagnostics = validate_parameters(&hydra_obj, &signature, "f", None, &HashSet::new());
 
-        assert!(
-            !diagnostics.iter().any(|d| matches!(
-                &d.code,
-                Some(tower_lsp::lsp_types::NumberOrString::String(c))
-                    if c == DiagnosticRule::PositionalOnlyParameter.as_code()
-            )),
-            "**kwargs gives the name somewhere to land, got: {:?}",
-            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        assert_eq!(
+            codes(&diagnostics),
+            vec![DiagnosticRule::MissingArgument.as_code().to_string()],
         );
+        assert!(diagnostics[0].message.contains(ARGS_KEY));
+    }
+
+    /// The same shape with a default: nothing is missing and the key is legal,
+    /// so there is nothing at all to report.
+    #[test]
+    fn test_defaulted_positional_only_with_kwargs_is_clean() {
+        let hydra_obj = build_hydra_object(
+            "mod.f",
+            vec![make_param("a", YamlValue::Integer(1), 1)],
+            0,
+            0,
+            0,
+            false,
+        );
+        let mut a = sig_param("a", true, false);
+        a.has_default = true;
+        let signature = sig_for("f", vec![a, sig_param("kw", false, true)]);
+
+        let diagnostics = validate_parameters(&hydra_obj, &signature, "f", None, &HashSet::new());
+        assert!(diagnostics.is_empty(), "got: {:?}", codes(&diagnostics));
     }
 
     /// `def f(a, /, **kw)` with `_args_: [1]` and `a: 2` binds `a` positionally
