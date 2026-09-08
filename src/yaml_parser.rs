@@ -597,7 +597,10 @@ fn last_positioned(node: &MarkedYamlOwned) -> Option<&MarkedYamlOwned> {
 /// `param_line_map` and gets no signature help.
 ///
 /// `enclosing` is the last resort, used for an empty `[]` or `{}` where there is
-/// no descendant to ask.
+/// no descendant to ask. Such an entry lands on the enclosing line with a
+/// degenerate `0..0` range — saphyr records nothing at all about it, so there is
+/// nothing better to report. In a block-style `_args_` that means an empty entry
+/// gets no signature help, which is the one case this cannot place correctly.
 fn node_range(node: &MarkedYamlOwned, lines: &[&str], enclosing: u32) -> (u32, u32, u32) {
     let Some(start_node) = first_positioned(node) else {
         return (enclosing, 0, 0);
@@ -3387,6 +3390,34 @@ model:
 
         // ...which is what puts them in the parameter line map.
         assert!(parsed.param_line_map.contains_key(&4));
+        assert!(parsed.param_line_map.contains_key(&5));
+    }
+
+    /// An empty collection has no descendant to borrow a position from, so it
+    /// falls back to the enclosing line. It is still counted as an argument —
+    /// the documented cost is that it gets no signature help of its own.
+    #[test]
+    fn test_args_with_empty_nested_collections() {
+        let content = r#"
+model:
+  _target_: builtins.max
+  _args_:
+    - []
+    - [3, 4]
+"#;
+        let parsed = YamlParser::parse(content).unwrap();
+        let hydra_object = &parsed.hydra_objects[0];
+        let positional: Vec<_> = hydra_object
+            .parameters
+            .iter()
+            .filter(|p| matches!(p, Parameter::Positional { .. }))
+            .collect();
+
+        assert_eq!(positional.len(), 2, "both entries are still arguments");
+        // The empty one has no position of its own and lands on `_args_`; the
+        // one with contents keeps its own line.
+        assert_eq!(positional[0].line(), 3);
+        assert_eq!(positional[1].line(), 5);
         assert!(parsed.param_line_map.contains_key(&5));
     }
 

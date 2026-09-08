@@ -403,11 +403,22 @@ impl PythonAnalyzer {
     /// `ExceptionGroup` among them. Whether a name is bound on *this*
     /// interpreter is not the question being asked; whether it is a builtin at
     /// all is.
+    ///
+    /// A declaration marked `@type_check_only` does not count: it exists for the
+    /// type checker and has no runtime counterpart. That is how typeshed
+    /// declares `function` and `ellipsis`, neither of which can be reached on
+    /// the real `builtins` module.
     pub fn module_defines_top_level(db: &dyn ruff_db::Db, path: &Path, name: &str) -> bool {
         fn body_binds(body: &[Stmt], name: &str) -> bool {
             body.iter().any(|stmt| match stmt {
-                Stmt::FunctionDef(func_def) => func_def.name.as_str() == name,
-                Stmt::ClassDef(class_def) => class_def.name.as_str() == name,
+                Stmt::FunctionDef(func_def) => {
+                    func_def.name.as_str() == name
+                        && !has_type_check_only_decorator(&func_def.decorator_list)
+                }
+                Stmt::ClassDef(class_def) => {
+                    class_def.name.as_str() == name
+                        && !has_type_check_only_decorator(&class_def.decorator_list)
+                }
                 Stmt::Assign(assign) => assign
                     .targets
                     .iter()
@@ -1142,27 +1153,38 @@ impl PythonAnalyzer {
         s
     }
 
-    /// Render a parameter list with the markers that say how each parameter can
-    /// be passed: the `/` closing a run of positional-only parameters and the
-    /// bare `*` opening a run of keyword-only ones —
+    /// Where the markers that say *how* a parameter may be passed belong in
+    /// `params`, as `(after_positional_only, before_keyword_only)` indexes: the
+    /// `/` is written after the first, the bare `*` before the second —
     /// `def sorted(iterable, /, *, key=None, reverse=False)`.
     ///
-    /// The `*` is only written when no `*args` precedes the keyword-only run,
-    /// since `*args` already opens it.
-    fn format_parameters(params: &[ParameterInfo]) -> Vec<String> {
-        let last_positional_only = params.iter().rposition(|p| p.is_positional_only);
-        let first_keyword_only = params
+    /// The `*` is omitted when a `*args` precedes the keyword-only run, since
+    /// `*args` already opens it and `def f(*args, *, key=1)` is not valid Python.
+    ///
+    /// Shared by hover and signature help so the two cannot disagree about a
+    /// parameter that only `_args_` can reach.
+    pub fn parameter_markers(params: &[&ParameterInfo]) -> (Option<usize>, Option<usize>) {
+        let after_positional_only = params.iter().rposition(|p| p.is_positional_only);
+        let before_keyword_only = params
             .iter()
             .position(|p| p.is_keyword_only)
             .filter(|_| !params.iter().any(|p| p.is_variadic));
+        (after_positional_only, before_keyword_only)
+    }
+
+    /// Render a parameter list with the `/` and `*` markers in place — see
+    /// [`PythonAnalyzer::parameter_markers`].
+    fn format_parameters(params: &[ParameterInfo]) -> Vec<String> {
+        let refs: Vec<&ParameterInfo> = params.iter().collect();
+        let (after_positional_only, before_keyword_only) = Self::parameter_markers(&refs);
 
         let mut result = Vec::with_capacity(params.len() + 2);
         for (index, param) in params.iter().enumerate() {
-            if Some(index) == first_keyword_only {
+            if Some(index) == before_keyword_only {
                 result.push("*".to_string());
             }
             result.push(Self::format_parameter(param));
-            if Some(index) == last_positional_only {
+            if Some(index) == after_positional_only {
                 result.push("/".to_string());
             }
         }
@@ -1574,9 +1596,23 @@ fn is_overloaded_in_body(body: &[Stmt], name: &str) -> bool {
 
 /// Check for `@overload`, however `typing.overload` was imported.
 fn has_overload_decorator(decorators: &[ast::Decorator]) -> bool {
+    has_decorator(decorators, "overload")
+}
+
+/// Check for `@type_check_only`, however `typing.type_check_only` was imported.
+///
+/// It marks a declaration that exists only for type checkers — typeshed uses it
+/// for `builtins.function` and `builtins.ellipsis`, which no runtime `builtins`
+/// module actually has.
+fn has_type_check_only_decorator(decorators: &[ast::Decorator]) -> bool {
+    has_decorator(decorators, "type_check_only")
+}
+
+/// Whether any decorator names `name`, qualified or not.
+fn has_decorator(decorators: &[ast::Decorator], name: &str) -> bool {
     decorators.iter().any(|decorator| {
-        let name = expr_to_string(&decorator.expression);
-        name == "overload" || name.ends_with(".overload")
+        let decorator = expr_to_string(&decorator.expression);
+        decorator == name || decorator.ends_with(&format!(".{name}"))
     })
 }
 
@@ -4146,6 +4182,39 @@ class Child(Base):
         assert!(
             !init.is_overloaded,
             "a single undecorated declaration is not an overload set"
+        );
+    }
+
+    /// `*args` already opens the keyword-only run, so no bare `*` is written
+    /// after it — `def f(*args, *, key=1)` is not valid Python.
+    #[test]
+    fn test_star_marker_is_omitted_after_varargs() {
+        let db = test_db();
+        let source = concat!(
+            "def with_varargs(a, *args, key=1, **kw):\n",
+            "    pass\n",
+            "\n",
+            "def without_varargs(a, *, key=1):\n",
+            "    pass\n",
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("markers.py");
+        std::fs::write(&path, source).unwrap();
+
+        let with_varargs =
+            PythonAnalyzer::extract_function_signature(&db, &path, "with_varargs").unwrap();
+        let rendered = PythonAnalyzer::format_function(&with_varargs);
+        assert!(
+            rendered.contains("with_varargs(a, *args, key = 1, **kw)"),
+            "got:\n{rendered}"
+        );
+
+        let without_varargs =
+            PythonAnalyzer::extract_function_signature(&db, &path, "without_varargs").unwrap();
+        let rendered = PythonAnalyzer::format_function(&without_varargs);
+        assert!(
+            rendered.contains("without_varargs(a, *, key = 1)"),
+            "got:\n{rendered}"
         );
     }
 

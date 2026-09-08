@@ -89,6 +89,27 @@ pub fn to_vendored_path(path: &Path) -> Option<VendoredPathBuf> {
 /// cover. Resolution is therefore gated to `builtins` and its submodules, and
 /// broadening the gate is a one-line change once the rest of the stdlib has
 /// been evaluated on its own.
+/// Whether `name` is one the runtime `builtins` module actually exposes.
+///
+/// The stub declares a fair amount that no `import builtins` can reach: the
+/// typevars and protocol classes its own annotations are written in (`_T`,
+/// `_KT`, `_SupportsRound1`, `_Opener`) and a few placeholders for types Python
+/// has but does not name (`function`, `ellipsis`). Resolving those would let
+/// `_target_: builtins._SupportsRound1` through with no diagnostic at all, and
+/// Hydra would then fail with `AttributeError` at run time.
+///
+/// The `@type_check_only` placeholders are filtered where the stub is scanned
+/// (see [`PythonAnalyzer::module_defines_top_level`](crate::python_analyzer::PythonAnalyzer::module_defines_top_level));
+/// this covers the rest by name. A leading underscore marks a stub-internal
+/// name — except on a dunder, since `__import__` and `__build_class__` are
+/// genuine builtins.
+pub fn is_runtime_builtin_name(name: &str) -> bool {
+    if !name.starts_with('_') {
+        return true;
+    }
+    name.starts_with("__") && name.ends_with("__") && name.len() > 4
+}
+
 pub fn is_vendored_module(module_path: &str) -> bool {
     module_path == BUILTINS_MODULE
         || module_path
@@ -127,6 +148,22 @@ mod tests {
     fn traversal_components_are_rejected() {
         assert!(to_vendored_path(Path::new("<typeshed>/../../etc/passwd")).is_none());
         assert!(to_vendored_path(Path::new(VENDORED_ROOT)).is_none());
+    }
+
+    #[test]
+    fn stub_internal_names_are_not_runtime_builtins() {
+        assert!(is_runtime_builtin_name("len"));
+        assert!(is_runtime_builtin_name("dict"));
+        assert!(
+            is_runtime_builtin_name("__import__"),
+            "dunders are real builtins"
+        );
+        assert!(is_runtime_builtin_name("__build_class__"));
+
+        assert!(!is_runtime_builtin_name("_T"));
+        assert!(!is_runtime_builtin_name("_SupportsRound1"));
+        assert!(!is_runtime_builtin_name("_Opener"));
+        assert!(!is_runtime_builtin_name("__"), "not a dunder name");
     }
 
     #[test]

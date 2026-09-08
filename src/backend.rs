@@ -63,6 +63,12 @@ fn to_parameter_information(p: &ParameterInfo) -> ParameterInformation {
 /// Build signature label and parameter information from a list of parameters.
 /// Returns the label string, the LSP parameter info list, and the filtered
 /// `ParameterInfo` references (needed for active-parameter resolution).
+///
+/// The label carries the same `/` and `*` markers hover shows, so signature help
+/// does not read as an invitation to write `obj:` for a parameter that only
+/// `_args_` can reach. They go into the label string alone — `param_infos` stays
+/// one entry per real parameter, which is what the active-parameter index and
+/// the `ParameterLabel::Simple` name matching are built on.
 fn build_signature_params<'a>(
     params: &'a [ParameterInfo],
     filter_param: Option<&str>,
@@ -71,7 +77,19 @@ fn build_signature_params<'a>(
         .iter()
         .filter(|p| filter_param.is_none_or(|f| p.name != f))
         .collect();
-    let param_strs: Vec<String> = filtered.iter().map(|p| format_param_label(p)).collect();
+    let (after_positional_only, before_keyword_only) = PythonAnalyzer::parameter_markers(&filtered);
+
+    let mut param_strs: Vec<String> = Vec::with_capacity(filtered.len() + 2);
+    for (index, param) in filtered.iter().enumerate() {
+        if Some(index) == before_keyword_only {
+            param_strs.push("*".to_string());
+        }
+        param_strs.push(format_param_label(param));
+        if Some(index) == after_positional_only {
+            param_strs.push("/".to_string());
+        }
+    }
+
     let param_infos: Vec<ParameterInformation> = filtered
         .iter()
         .map(|p| to_parameter_information(p))
@@ -1597,6 +1615,14 @@ impl LanguageServer for HydraLspBackend {
         let result = match extract_result {
             Ok((definition_info, _file_path, _module_path, _symbol_name)) => {
                 let implicit_param = definition_info.implicit_param();
+                let overloaded = match &definition_info {
+                    DefinitionInfo::Function(sig) => sig.is_overloaded,
+                    DefinitionInfo::Class(class_info) => class_info
+                        .init_signature
+                        .as_ref()
+                        .is_some_and(|sig| sig.is_overloaded),
+                    DefinitionInfo::Method(method_info) => method_info.signature.is_overloaded,
+                };
                 let (signature_label, parameters, param_infos) = match &definition_info {
                     DefinitionInfo::Function(sig) => {
                         let (params_str, params, infos) =
@@ -1696,10 +1722,19 @@ impl LanguageServer for HydraLspBackend {
                     }
                 });
 
+                // An overloaded target is shown as one signature but validated
+                // as accepting anything; say which of the two the reader is
+                // looking at rather than presenting it as definitive.
+                let documentation = overloaded.then(|| {
+                    Documentation::String(
+                        "Overloaded: this is the first of several signatures.".to_string(),
+                    )
+                });
+
                 Ok(Some(SignatureHelp {
                     signatures: vec![SignatureInformation {
                         label: signature_label,
-                        documentation: None,
+                        documentation,
                         parameters: if parameters.is_empty() {
                             None
                         } else {

@@ -5,7 +5,10 @@ use crate::import_resolver::{ImportResolver, join_module_parts};
 use crate::python_analyzer::{
     ClassAttributeInfo, DefinitionInfo, FunctionSignature, PythonAnalyzer, normalize_path_for_key,
 };
-use crate::vendored_typeshed::{BUILTINS_MODULE, is_vendored_module, stdlib_search_root};
+use crate::vendored_typeshed::{
+    BUILTINS_MODULE, is_runtime_builtin_name, is_vendored_module, is_vendored_path,
+    stdlib_search_root,
+};
 use ruff_db::files::FileRootKind;
 use ruff_db::system::SystemPathBuf;
 use tracing::debug;
@@ -198,17 +201,19 @@ pub fn resolve_module_cached<'db>(
     None
 }
 
-/// Whether `name` is a symbol defined at the top level of the vendored
-/// `builtins` stub.
+/// Whether `name` is a symbol the runtime `builtins` module exposes, according
+/// to the vendored stub.
 ///
-/// Used to turn the bare-name `_target_` error into a message that names the
-/// prefixed form Hydra actually accepts: `len` is rejected, `builtins.len`
-/// works. The stub is immutable and shared by every workspace, so the query
-/// takes no search paths and its memo survives for the life of the database.
+/// Backs two things: the bare-name `_target_` error, which becomes a message
+/// naming the prefixed form Hydra actually accepts (`len` is rejected,
+/// `builtins.len` works), and the guard in [`cached_definition_info`] that keeps
+/// stub-internal names from resolving as targets. The stub is immutable and
+/// shared by every workspace, so the query takes no search paths and its memo
+/// survives for the life of the database.
 #[salsa::tracked]
 pub fn is_builtin_symbol<'db>(db: &'db dyn ruff_db::Db, name: TargetString<'db>) -> bool {
     let name = name.value(db);
-    if name.is_empty() || name.contains('.') {
+    if name.is_empty() || name.contains('.') || !is_runtime_builtin_name(name) {
         return false;
     }
     let Some(stub) = ImportResolver::find_module_file(
@@ -247,11 +252,28 @@ pub fn cached_definition_info<'db>(
     );
 
     let search_paths = search_paths_for_config(db, config);
-    CachedDefinitionResult::from_result(PythonAnalyzer::extract_definition_info(
-        db,
-        target_str,
-        search_paths,
-    ))
+    let mut result = PythonAnalyzer::extract_definition_info(db, target_str, search_paths);
+
+    // The vendored stub declares names the runtime `builtins` module does not
+    // have — typevars, protocol classes, `@type_check_only` placeholders. They
+    // extract perfectly well, so without this the server would green-light a
+    // `_target_: builtins._SupportsRound1` that fails with `AttributeError` the
+    // moment Hydra tries to instantiate it. Only stub resolutions are checked;
+    // a workspace's own `builtins.py` is its author's business.
+    if let Ok((_, file_path, module_path, symbol_name)) = &result
+        && is_vendored_path(file_path)
+    {
+        let root_symbol = symbol_name.split('.').next().unwrap_or(symbol_name);
+        if !is_builtin_symbol(db, TargetString::new(db, root_symbol.to_string())) {
+            result = Err(anyhow::anyhow!(
+                "Symbol '{}' not found in module '{}'",
+                root_symbol,
+                module_path
+            ));
+        }
+    }
+
+    CachedDefinitionResult::from_result(result)
 }
 
 /// Cached docstring + `__init__` resolution for a class, walking its MRO.

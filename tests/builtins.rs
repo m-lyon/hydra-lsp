@@ -265,6 +265,55 @@ now:
     );
 }
 
+/// The stub declares names no `import builtins` can reach: the typevars and
+/// protocol classes its own annotations are written in, and `@type_check_only`
+/// placeholders such as `function`. Resolving them would green-light a config
+/// that fails with `AttributeError` the moment Hydra instantiates it.
+#[tokio::test]
+async fn test_stub_internal_names_are_not_valid_targets() {
+    let content = r#"# @hydra
+a:
+  _target_: builtins.function
+b:
+  _target_: builtins._SupportsRound1
+c:
+  _target_: builtins._T
+"#;
+    let diagnostics = diagnostics_for("stub_internal.yaml", content).await;
+
+    assert_eq!(
+        diagnostics.len(),
+        3,
+        "each stub-only name should be reported, got: {:?}",
+        summarize(&diagnostics)
+    );
+    assert!(
+        diagnostics.iter().all(|d| d.message.contains("not found")),
+        "got: {:?}",
+        summarize(&diagnostics)
+    );
+}
+
+#[tokio::test]
+async fn test_bare_stub_internal_name_keeps_the_generic_hint() {
+    let content = r#"# @hydra
+thing:
+  _target_: function
+"#;
+    let diagnostics = diagnostics_for("bare_stub_internal.yaml", content).await;
+
+    let invalid: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| extract_code(d) == "invalid-hydra-parameter")
+        .collect();
+    assert_eq!(invalid.len(), 1, "got: {:?}", summarize(&diagnostics));
+    assert!(
+        invalid[0].message.contains("module.path.SymbolName"),
+        "`builtins.function` does not exist, so it must not be suggested, got: {}",
+        invalid[0].message
+    );
+}
+
 #[tokio::test]
 async fn test_suppression_comment_still_silences_a_builtin_diagnostic() {
     let content = r#"# @hydra

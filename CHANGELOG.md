@@ -9,8 +9,10 @@
 - Added `is_positional_only` to parameters, along with a new `positional-only-parameter` diagnostic. Hover now renders the `/` marker (`def len(obj: Sized, /) -> int`), and a positional-only parameter passed by name — or missing entirely — is reported with a message that points at `_args_`.
 - A keyword key no longer satisfies a positional-only parameter when the callee also takes `**kwargs`: `f(a=1)` on `def f(a, /, **kw)` puts the value in `kw` and still raises "missing 1 required positional argument".
 - Left argument validation off when a class's constructor came from `__new__` while part of its MRO could not be resolved: the real `__init__` may be in the ancestor that is missing. Hover still shows what was found.
+- Rejected the names the typeshed stub declares but the runtime `builtins` module does not have — its typevars and protocol classes (`_T`, `_SupportsRound1`) and `@type_check_only` placeholders such as `function`. They used to resolve with no diagnostic at all, green-lighting a config that fails with `AttributeError`.
 - Improved the bare-name `_target_` error: `len` now reports that it is a builtin and names `builtins.len`, the form Hydra actually accepts.
 - Go-to-definition on a target that resolves into a vendored stub is a no-op rather than an error, since there is no file on disk to open. Hover and diagnostics are unaffected.
+- Signature help now carries the same `/` and `*` markers as hover, and says when it is showing the first of several overloads.
 - Hover now renders the bare `*` that opens a run of keyword-only parameters, alongside the `/` — `def sorted(iterable, /, *, key=None, reverse=False)`.
 - Fixed a panic when `_args_` contained a nested list or mapping (`_args_: [[1, 2, 3]]`). saphyr gives collection nodes no position, which underflowed the line conversion. Such a node now borrows its position from its first positioned descendant, so a block-style `- [1, 2]` keeps its own line and still gets signature help.
 
