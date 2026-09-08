@@ -3,7 +3,8 @@ use std::sync::Arc;
 
 use crate::import_resolver::{ImportResolver, join_module_parts};
 use crate::python_analyzer::{
-    ClassAttributeInfo, DefinitionInfo, FunctionSignature, PythonAnalyzer, normalize_path_for_key,
+    ClassAttributeInfo, DefinitionInfo, FunctionSignature, PythonAnalyzer, base_class_name,
+    normalize_path_for_key,
 };
 use crate::vendored_typeshed::{
     BUILTINS_MODULE, is_runtime_builtin_name, is_vendored_module, stdlib_search_root,
@@ -451,7 +452,13 @@ pub fn class_parent_docs<'db>(
     let search_paths_vec = search_paths.paths(db);
 
     for base_class in &class_info.base_classes {
-        if matches!(base_class.as_str(), "object" | "ABC" | "Protocol") {
+        // Bases that exist only for the type system contribute no constructor
+        // and no docstring, and never resolve; skipping them keeps them out of
+        // `all_bases_resolved` too.
+        if matches!(
+            base_class_name(base_class),
+            "object" | "ABC" | "Protocol" | "Generic"
+        ) {
             continue;
         }
         let Some((parent_file, parent_class_name)) =
@@ -539,7 +546,13 @@ pub fn class_parent_attribute<'db>(
     let search_paths_vec = search_paths.paths(db);
 
     for base_class in &class_info.base_classes {
-        if matches!(base_class.as_str(), "object" | "ABC" | "Protocol") {
+        // Bases that exist only for the type system contribute no constructor
+        // and no docstring, and never resolve; skipping them keeps them out of
+        // `all_bases_resolved` too.
+        if matches!(
+            base_class_name(base_class),
+            "object" | "ABC" | "Protocol" | "Generic"
+        ) {
             continue;
         }
         let Some((parent_file, parent_class_name)) =

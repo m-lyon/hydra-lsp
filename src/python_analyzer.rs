@@ -742,6 +742,10 @@ impl PythonAnalyzer {
         current_file: &Path,
         search_paths: &[PathBuf],
     ) -> Option<(PathBuf, String)> {
+        // A generic base is written with its type arguments (`Sequence[_T_co]`,
+        // `typing.Generic[T]`); the class to resolve is the part before them.
+        let base_class_expr = base_class_name(base_class_expr);
+
         // Check if it's a qualified name (contains a dot)
         if let Some(dot_pos) = base_class_expr.rfind('.') {
             // Qualified name like `module.ClassName`
@@ -1388,11 +1392,7 @@ impl<'a> Visitor<'a> for FunctionExtractor {
             if let Stmt::FunctionDef(func_def) = stmt
                 && func_def.name.as_str() == self.target_name
             {
-                self.result = Some(extract_signature_with_overloads(
-                    body,
-                    func_def,
-                    &self.source,
-                ));
+                self.result = extract_declared_signature(body, &self.target_name, &self.source);
                 return;
             }
             self.visit_stmt(stmt);
@@ -1529,13 +1529,17 @@ impl<'a> Visitor<'a> for MethodExtractor {
             for class_stmt in &class_def.body {
                 if let Stmt::FunctionDef(func_def) = class_stmt
                     && func_def.name.as_str() == self.method_name
+                    && let Some((declaration, is_overloaded)) =
+                        resolve_declaration(&class_def.body, &self.method_name)
                 {
-                    let signature =
-                        extract_signature_with_overloads(&class_def.body, func_def, &self.source);
+                    let mut signature =
+                        extract_function_signature_from_def(declaration, &self.source);
+                    signature.is_overloaded = is_overloaded;
 
-                    // Check decorators for @classmethod or @staticmethod
+                    // Check decorators for @classmethod or @staticmethod, on the
+                    // declaration actually chosen rather than on this statement.
                     let (is_classmethod, is_staticmethod) =
-                        check_method_decorators(&func_def.decorator_list);
+                        check_method_decorators(&declaration.decorator_list);
 
                     self.result = Some(MethodInfo {
                         class_name: self.class_name.clone(),
@@ -1556,42 +1560,79 @@ impl<'a> Visitor<'a> for MethodExtractor {
 
 /// The signature of `name` declared directly in `body`, if there is one.
 fn find_method(body: &[Stmt], name: &str, source: &str) -> Option<FunctionSignature> {
-    body.iter()
-        .find_map(|stmt| match stmt {
+    extract_declared_signature(body, name, source)
+}
+
+/// The class named by a base-class expression, with any generic subscript
+/// removed: `Sequence[_T_co]` is `Sequence` and `typing.Generic[T]` is
+/// `typing.Generic`.
+///
+/// Without this, no generic base resolves at all — the resolver would look for a
+/// module or symbol literally called `Sequence[_T_co]` — so an `__init__`
+/// inherited through one would be invisible, and every generic-based class
+/// would look like it had an unreadable MRO.
+pub(crate) fn base_class_name(base_class_expr: &str) -> &str {
+    base_class_expr
+        .split('[')
+        .next()
+        .unwrap_or(base_class_expr)
+        .trim()
+}
+
+/// The declaration of `name` in `body` that describes the callable actually
+/// called, plus whether it is an overload set with no single signature.
+///
+/// Only an explicit `@overload` decorator makes a set: being declared twice does
+/// not, since `@property` with its `@x.setter` and `@singledispatch` with its
+/// `@f.register` both declare one name repeatedly without being overloads, and
+/// treating those as overloads would disable argument validation for the target
+/// entirely. Typing requires `@overload` on every member of a real set, so
+/// nothing is lost by the stricter rule.
+///
+/// A `.py` source ends an overload set with the undecorated implementation,
+/// whose signature is the one Hydra will call — that one is preferred and is
+/// not reported as overloaded. A `.pyi` stub has no implementation, so only the
+/// `@overload` declarations exist and there is no single signature to check
+/// against.
+fn resolve_declaration<'a>(
+    body: &'a [Stmt],
+    name: &str,
+) -> Option<(&'a ast::StmtFunctionDef, bool)> {
+    let declarations: Vec<&ast::StmtFunctionDef> = body
+        .iter()
+        .filter_map(|stmt| match stmt {
             Stmt::FunctionDef(func_def) if func_def.name.as_str() == name => Some(func_def),
             _ => None,
         })
-        .map(|func_def| extract_signature_with_overloads(body, func_def, source))
+        .collect();
+
+    let first = *declarations.first()?;
+    if !declarations
+        .iter()
+        .any(|func_def| has_overload_decorator(&func_def.decorator_list))
+    {
+        return Some((first, false));
+    }
+    match declarations
+        .iter()
+        .find(|func_def| !has_overload_decorator(&func_def.decorator_list))
+    {
+        Some(implementation) => Some((implementation, false)),
+        None => Some((first, true)),
+    }
 }
 
-/// Extract `func_def`'s signature and record whether the name is overloaded in
-/// the body that declares it.
-fn extract_signature_with_overloads(
+/// The signature of `name` as declared in `body`, resolved through any
+/// `@overload` set — see [`resolve_declaration`].
+fn extract_declared_signature(
     body: &[Stmt],
-    func_def: &ast::StmtFunctionDef,
+    name: &str,
     source: &str,
-) -> FunctionSignature {
+) -> Option<FunctionSignature> {
+    let (func_def, is_overloaded) = resolve_declaration(body, name)?;
     let mut signature = extract_function_signature_from_def(func_def, source);
-    signature.is_overloaded = is_overloaded_in_body(body, func_def.name.as_str());
-    signature
-}
-
-/// Whether `name` is overloaded within `body`.
-///
-/// Only an explicit `@overload` decorator counts. Merely being declared twice
-/// does not: `@property` with its `@x.setter`, and `@singledispatch` with its
-/// `@f.register`, both declare one name repeatedly without being overload sets,
-/// and treating them as such would disable argument validation for the target
-/// entirely. Nothing is lost by the stricter rule — typing requires `@overload`
-/// on every member of a real overload set, so the first declaration always
-/// carries it.
-fn is_overloaded_in_body(body: &[Stmt], name: &str) -> bool {
-    body.iter().any(|stmt| match stmt {
-        Stmt::FunctionDef(func_def) => {
-            func_def.name.as_str() == name && has_overload_decorator(&func_def.decorator_list)
-        }
-        _ => false,
-    })
+    signature.is_overloaded = is_overloaded;
+    Some(signature)
 }
 
 /// Check for `@overload`, however `typing.overload` was imported.
@@ -4185,6 +4226,67 @@ class Child(Base):
         );
     }
 
+    /// A stub declares only the `@overload` members — there is no
+    /// implementation to fall back on, so no single signature describes the
+    /// call and the symbol is reported as overloaded.
+    #[test]
+    fn test_overload_without_implementation_is_overloaded() {
+        let db = test_db();
+        let source = concat!(
+            "from typing import overload\n",
+            "\n",
+            "@overload\n",
+            "def render(value: int) -> str: ...\n",
+            "@overload\n",
+            "def render(value: str) -> str: ...\n",
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stub.pyi");
+        std::fs::write(&path, source).unwrap();
+
+        let render = PythonAnalyzer::extract_function_signature(&db, &path, "render").unwrap();
+        assert!(render.is_overloaded);
+    }
+
+    /// A generic base is written with its type arguments, which no resolver can
+    /// look up verbatim. Stripping them is what lets an `__init__` inherited
+    /// through `class Child(Base[T])` be found at all.
+    #[test]
+    fn test_generic_base_class_is_resolved() {
+        let db = test_db();
+        let source = concat!(
+            "from typing import Generic, TypeVar\n",
+            "\n",
+            "T = TypeVar(\"T\")\n",
+            "\n",
+            "class Base(Generic[T]):\n",
+            "    def __init__(self, a, b):\n",
+            "        pass\n",
+            "\n",
+            "class Child(Base[int]):\n",
+            "    pass\n",
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("generic.py");
+        std::fs::write(&path, source).unwrap();
+        let search_paths = vec![dir.path().to_path_buf()];
+
+        let (class_info, _) =
+            PythonAnalyzer::extract_class_info_with_imports(&db, &path, "Child", &search_paths)
+                .unwrap();
+
+        let init = class_info
+            .init_signature
+            .as_ref()
+            .expect("the generic base's __init__ should be inherited");
+        let names: Vec<_> = init.parameters.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["self", "a", "b"]);
+        assert!(
+            !class_info.unresolved_base_classes,
+            "a resolvable generic base is not an unreadable MRO"
+        );
+    }
+
     /// `*args` already opens the keyword-only run, so no bare `*` is written
     /// after it — `def f(*args, *, key=1)` is not valid Python.
     #[test]
@@ -4342,8 +4444,13 @@ def plain(value, /, other, *, flag=False):
         let path = dir.path().join("mod.py");
         std::fs::write(&path, source).unwrap();
 
+        // A `.py` overload set ends with the implementation, whose signature is
+        // the one Hydra will call — so there is something definite to validate
+        // against and the symbol is not reported as overloaded.
         let render = PythonAnalyzer::extract_function_signature(&db, &path, "render").unwrap();
-        assert!(render.is_overloaded);
+        assert!(!render.is_overloaded);
+        assert_eq!(render.docstring.as_deref(), Some("Render a value."));
+        assert!(render.parameters[0].type_annotation.is_none());
 
         let plain = PythonAnalyzer::extract_function_signature(&db, &path, "plain").unwrap();
         assert!(!plain.is_overloaded);

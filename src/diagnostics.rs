@@ -152,6 +152,23 @@ fn target_format_hint(db: &dyn ruff_db::Db, target: TargetString<'_>) -> String 
     }
 }
 
+/// Whether `rule` is silenced for `param`.
+///
+/// Checks all three places a `# hydrust: ignore[...]` comment can sit: the file
+/// header, the `_target_` line, and the parameter's own line. A diagnostic that
+/// points at a parameter is one a user will naturally try to silence from that
+/// parameter's line, so the per-parameter set has to be consulted too.
+fn is_suppressed(
+    rule: DiagnosticRule,
+    param: &Parameter,
+    hydra_obj: &HydraObject,
+    file_suppressions: &HashSet<DiagnosticRule>,
+) -> bool {
+    file_suppressions.contains(&rule)
+        || hydra_obj.suppressed_rules.contains(&rule)
+        || param.suppressed_rules().contains(&rule)
+}
+
 /// Validate parameters against a function signature.
 ///
 /// `implicit_param` is the name of the implicit first parameter (e.g. `self` / `cls`)
@@ -244,10 +261,12 @@ fn validate_parameters(
         if let Parameter::Keyword { key, line, .. } = param
             && !has_kwargs
             && positional_only.contains(key.as_str())
-            && !file_suppressions.contains(&DiagnosticRule::PositionalOnlyParameter)
-            && !hydra_obj
-                .suppressed_rules
-                .contains(&DiagnosticRule::PositionalOnlyParameter)
+            && !is_suppressed(
+                DiagnosticRule::PositionalOnlyParameter,
+                param,
+                hydra_obj,
+                file_suppressions,
+            )
         {
             diagnostics.push(create_diagnostic(
                 *line,
@@ -268,10 +287,12 @@ fn validate_parameters(
         if let Parameter::Keyword { key, line, .. } = param
             && !expected_params.contains(key)
             && !has_kwargs
-            && !file_suppressions.contains(&DiagnosticRule::UnknownArgument)
-            && !hydra_obj
-                .suppressed_rules
-                .contains(&DiagnosticRule::UnknownArgument)
+            && !is_suppressed(
+                DiagnosticRule::UnknownArgument,
+                param,
+                hydra_obj,
+                file_suppressions,
+            )
         {
             diagnostics.push(create_diagnostic(
                 *line,

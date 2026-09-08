@@ -314,6 +314,25 @@ thing:
     );
 }
 
+/// A diagnostic that points at a parameter must be silenceable from that
+/// parameter's own line, which is where a user will put the comment.
+#[tokio::test]
+async fn test_inline_comment_silences_the_positional_only_diagnostic() {
+    let content = r#"# @hydra
+length:
+  _target_: builtins.len
+  obj: [1, 2, 3] # hydrust: ignore[positional-only-parameter]
+"#;
+    let diagnostics = diagnostics_for("builtin_posonly_ignored.yaml", content).await;
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|d| extract_code(d) == "positional-only-parameter"),
+        "got: {:?}",
+        summarize(&diagnostics)
+    );
+}
+
 #[tokio::test]
 async fn test_suppression_comment_still_silences_a_builtin_diagnostic() {
     let content = r#"# @hydra
