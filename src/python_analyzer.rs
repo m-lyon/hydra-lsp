@@ -3,8 +3,9 @@ use crate::python_cache::{
     InternedSearchPaths, TargetString, class_parent_attribute, class_parent_docs,
     resolve_module_cached,
 };
+use crate::vendored_typeshed::{is_vendored_path, to_vendored_path};
 use anyhow::{Context, Result};
-use ruff_db::files::system_path_to_file;
+use ruff_db::files::{File, system_path_to_file, vendored_path_to_file};
 use ruff_db::parsed::{ParsedModuleRef, parsed_module};
 use ruff_db::source::{SourceText, source_text};
 use ruff_db::system::{OsSystem, SystemPath, SystemPathBuf};
@@ -15,6 +16,19 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use ty_python_semantic::{PythonEnvironment, SysPrefixPathOrigin};
 
+/// Intern `path` as a salsa `File`, routing sentinel paths to the vendored
+/// typeshed archive and everything else to the host filesystem.
+///
+/// This is the single place the two file systems are distinguished; every
+/// caller below works in `std::path::Path` terms regardless of where the file
+/// actually lives. See [`crate::vendored_typeshed`] for the sentinel scheme.
+fn path_to_file(db: &dyn ruff_db::Db, path: &Path) -> Option<File> {
+    if is_vendored_path(path) {
+        return vendored_path_to_file(db, to_vendored_path(path)?).ok();
+    }
+    system_path_to_file(db, SystemPath::from_std_path(path)?).ok()
+}
+
 /// Tracked existence probe for a regular file.
 ///
 /// Returns `true` when `path` is an existing regular file. Unlike
@@ -24,9 +38,15 @@ use ty_python_semantic::{PythonEnvironment, SysPrefixPathOrigin};
 /// or deleted and the backend calls `File::sync_path`, every query that probed
 /// the path is invalidated on the next request.
 ///
+/// Vendored typeshed paths are probed against the immutable in-binary archive
+/// instead; they can never change, so no invalidation applies.
+///
 /// Falls back to an untracked `Path::exists()` only for non-UTF-8 paths, which
 /// cannot be represented as a `SystemPath`.
 pub(crate) fn path_is_file(db: &dyn ruff_db::Db, path: &Path) -> bool {
+    if is_vendored_path(path) {
+        return path_to_file(db, path).is_some();
+    }
     match SystemPath::from_std_path(path) {
         Some(sys_path) => system_path_to_file(db, sys_path).is_ok(),
         None => path.exists(),
@@ -43,9 +63,7 @@ pub(crate) fn path_is_file(db: &dyn ruff_db::Db, path: &Path) -> bool {
 /// The returned `SourceText` is `Arc`-backed; callers should bind it to a
 /// local and call `.as_str()` to get a borrowed `&str`.
 pub fn read_source(db: &dyn ruff_db::Db, path: &Path) -> Result<SourceText> {
-    let sys_path = SystemPath::from_std_path(path)
-        .with_context(|| format!("non-utf8 path: {}", path.display()))?;
-    let file = system_path_to_file(db, sys_path)
+    let file = path_to_file(db, path)
         .with_context(|| format!("could not resolve file: {}", path.display()))?;
     let source = source_text(db, file);
     if let Some(err) = source.read_error() {
@@ -60,9 +78,7 @@ pub fn read_source(db: &dyn ruff_db::Db, path: &Path) -> Result<SourceText> {
 /// the raw source text should call `read_source` separately — both are cache hits
 /// for the same revision.
 pub(crate) fn get_parsed_module(db: &dyn ruff_db::Db, path: &Path) -> Result<ParsedModuleRef> {
-    let sys_path = SystemPath::from_std_path(path)
-        .with_context(|| format!("non-utf8 path: {}", path.display()))?;
-    let file = system_path_to_file(db, sys_path)
+    let file = path_to_file(db, path)
         .with_context(|| format!("could not resolve file: {}", path.display()))?;
     Ok(parsed_module(db, file).load(db))
 }
@@ -78,6 +94,12 @@ pub(crate) fn get_parsed_module(db: &dyn ruff_db::Db, path: &Path) -> Result<Par
 /// Falls back to the original path for non-UTF8 paths that cannot be represented
 /// as a `SystemPath`.
 pub(crate) fn normalize_path_for_key(db: &dyn ruff_db::Db, path: &Path) -> PathBuf {
+    // Vendored sentinel paths are already canonical, and absolutizing one would
+    // prepend the cwd and stop `is_vendored_path` from recognising it when the
+    // key is split back apart (see `class_parent_docs`).
+    if is_vendored_path(path) {
+        return path.to_path_buf();
+    }
     match SystemPath::from_std_path(path) {
         Some(sys_path) => {
             SystemPath::absolute(sys_path, db.system().current_directory()).into_std_path_buf()
@@ -92,6 +114,15 @@ pub struct FunctionSignature {
     pub parameters: Vec<ParameterInfo>,
     pub return_type: Option<String>,
     pub docstring: Option<String>,
+    /// Set when the symbol is declared more than once in the same scope, or
+    /// carries an `@overload` decorator.
+    ///
+    /// `parameters` then describes only the *first* declaration, so it is not a
+    /// sound basis for argument diagnostics: typeshed gives `open` eight
+    /// overloads and `dict.__init__` eight more, and first-overload-wins would
+    /// report the wrong names and arity. Consumers should treat an overloaded
+    /// symbol as accepting any arguments rather than validating against it.
+    pub is_overloaded: bool,
     pub start_line: u32,
     pub start_column: u32,
     pub end_line: u32,
@@ -107,6 +138,11 @@ pub struct ParameterInfo {
     pub is_variadic: bool,         // *args
     pub is_variadic_keyword: bool, // **kwargs
     pub is_keyword_only: bool,
+    /// Declared before a `/` marker, so it can never be passed by name.
+    ///
+    /// Most builtins are shaped this way (`def len(obj: Sized, /) -> int`).
+    /// Hydra can only reach such a parameter through `_args_`.
+    pub is_positional_only: bool,
 }
 
 impl ParameterInfo {
@@ -120,11 +156,51 @@ pub struct ClassInfo {
     pub name: String,
     pub base_classes: Vec<String>,
     pub docstring: Option<String>,
+    /// The signature Hydra calls when instantiating the class.
+    ///
+    /// Resolved in Python's own order — the class's own `__init__`, then an
+    /// inherited one, then `__new__` — by
+    /// [`PythonAnalyzer::extract_class_info_with_imports`]. Straight out of
+    /// [`PythonAnalyzer::extract_class_info`] it holds only the class's *own*
+    /// `__init__`, with any `__new__` kept aside in `new_signature` until the
+    /// MRO has been given its turn.
     pub init_signature: Option<FunctionSignature>,
+    /// The class's own `__new__`, when it declares one.
+    ///
+    /// Kept separate from `init_signature` so a class that overrides `__new__`
+    /// but inherits its real `__init__` still validates against the inherited
+    /// one. `int`, `str`, `float`, `bool`, `tuple` and `range` declare no
+    /// `__init__` anywhere in their MRO, so for them this is the only
+    /// constructor there is.
+    pub new_signature: Option<FunctionSignature>,
+    /// At least one base class along the MRO could not be resolved, so an
+    /// `__init__` declared up there is invisible here.
+    ///
+    /// Set by [`PythonAnalyzer::extract_class_info_with_imports`]; always
+    /// `false` straight out of [`PythonAnalyzer::extract_class_info`], which
+    /// does not walk the MRO at all.
+    pub unresolved_base_classes: bool,
     pub start_line: u32,
     pub start_column: u32,
     pub end_line: u32,
     pub end_column: u32,
+}
+
+impl ClassInfo {
+    /// Whether `init_signature` might not be the signature Hydra actually calls.
+    ///
+    /// True only when `__new__` stood in for a missing `__init__` *and* part of
+    /// the MRO could not be resolved: the class may well inherit a real
+    /// `__init__` that this build cannot see, and validating arguments against
+    /// `__new__` would then report the wrong parameters. Hover still shows the
+    /// `__new__` it found, which is better than showing nothing.
+    pub fn constructor_is_uncertain(&self) -> bool {
+        self.unresolved_base_classes
+            && self
+                .init_signature
+                .as_ref()
+                .is_some_and(|sig| sig.name == "__new__")
+    }
 }
 
 /// Represents a method within a class
@@ -314,6 +390,57 @@ impl PythonAnalyzer {
         visitor
             .result
             .ok_or_else(|| anyhow::anyhow!("Function '{}' not found", function_name))
+    }
+
+    /// Whether `name` is bound at module scope in the module at `path`.
+    ///
+    /// Only module-scope bindings count — a method or a nested class with the
+    /// same name does not. Covers `def`, `class` and (annotated) assignment,
+    /// which is every shape a stub uses to expose a name.
+    ///
+    /// `if` branches are followed, because typeshed guards a fair number of
+    /// builtins behind `if sys.version_info >= (3, N):` — `aiter`, `anext` and
+    /// `ExceptionGroup` among them. Whether a name is bound on *this*
+    /// interpreter is not the question being asked; whether it is a builtin at
+    /// all is.
+    ///
+    /// A declaration marked `@type_check_only` does not count: it exists for the
+    /// type checker and has no runtime counterpart. That is how typeshed
+    /// declares `function` and `ellipsis`, neither of which can be reached on
+    /// the real `builtins` module.
+    pub fn module_defines_top_level(db: &dyn ruff_db::Db, path: &Path, name: &str) -> bool {
+        fn body_binds(body: &[Stmt], name: &str) -> bool {
+            body.iter().any(|stmt| match stmt {
+                Stmt::FunctionDef(func_def) => {
+                    func_def.name.as_str() == name
+                        && !has_type_check_only_decorator(&func_def.decorator_list)
+                }
+                Stmt::ClassDef(class_def) => {
+                    class_def.name.as_str() == name
+                        && !has_type_check_only_decorator(&class_def.decorator_list)
+                }
+                Stmt::Assign(assign) => assign
+                    .targets
+                    .iter()
+                    .any(|target| matches!(target, Expr::Name(n) if n.id.as_str() == name)),
+                Stmt::AnnAssign(ann_assign) => {
+                    matches!(ann_assign.target.as_ref(), Expr::Name(n) if n.id.as_str() == name)
+                }
+                Stmt::If(if_stmt) => {
+                    body_binds(&if_stmt.body, name)
+                        || if_stmt
+                            .elif_else_clauses
+                            .iter()
+                            .any(|clause| body_binds(&clause.body, name))
+                }
+                _ => false,
+            })
+        }
+
+        let Ok(parsed) = get_parsed_module(db, path) else {
+            return false;
+        };
+        body_binds(parsed.suite(), name)
     }
 
     /// Extract class information from source code via salsa-cached parsing.
@@ -615,6 +742,10 @@ impl PythonAnalyzer {
         current_file: &Path,
         search_paths: &[PathBuf],
     ) -> Option<(PathBuf, String)> {
+        // A generic base is written with its type arguments (`Sequence[_T_co]`,
+        // `typing.Generic[T]`); the class to resolve is the part before them.
+        let base_class_expr = base_class_name(base_class_expr);
+
         // Check if it's a qualified name (contains a dot)
         if let Some(dot_pos) = base_class_expr.rfind('.') {
             // Qualified name like `module.ClassName`
@@ -707,6 +838,18 @@ impl PythonAnalyzer {
             if class_info.init_signature.is_none() {
                 class_info.init_signature = parent_docs.init().cloned();
             }
+            if class_info.new_signature.is_none() {
+                class_info.new_signature = parent_docs.new_signature().cloned();
+            }
+            class_info.unresolved_base_classes = !parent_docs.all_bases_resolved();
+        }
+
+        // `__new__` stands in only once no `__init__` has been found anywhere in
+        // the MRO, mirroring how Python resolves the call. A class that
+        // overrides `__new__` but inherits its real `__init__` keeps validating
+        // against the inherited signature.
+        if class_info.init_signature.is_none() {
+            class_info.init_signature = class_info.new_signature.take();
         }
 
         Ok((class_info, resolved_file))
@@ -1014,12 +1157,56 @@ impl PythonAnalyzer {
         s
     }
 
+    /// Where the markers that say *how* a parameter may be passed belong in
+    /// `params`, as `(after_positional_only, before_keyword_only)` indexes: the
+    /// `/` is written after the first, the bare `*` before the second —
+    /// `def sorted(iterable, /, *, key=None, reverse=False)`.
+    ///
+    /// The `*` is omitted when a `*args` precedes the keyword-only run, since
+    /// `*args` already opens it and `def f(*args, *, key=1)` is not valid Python.
+    ///
+    /// Shared by hover and signature help so the two cannot disagree about a
+    /// parameter that only `_args_` can reach.
+    pub fn parameter_markers(params: &[&ParameterInfo]) -> (Option<usize>, Option<usize>) {
+        let after_positional_only = params.iter().rposition(|p| p.is_positional_only);
+        let before_keyword_only = params
+            .iter()
+            .position(|p| p.is_keyword_only)
+            .filter(|_| !params.iter().any(|p| p.is_variadic));
+        (after_positional_only, before_keyword_only)
+    }
+
+    /// Render a parameter list with the `/` and `*` markers in place — see
+    /// [`PythonAnalyzer::parameter_markers`].
+    fn format_parameters(params: &[ParameterInfo]) -> Vec<String> {
+        let refs: Vec<&ParameterInfo> = params.iter().collect();
+        let (after_positional_only, before_keyword_only) = Self::parameter_markers(&refs);
+
+        let mut result = Vec::with_capacity(params.len() + 2);
+        for (index, param) in params.iter().enumerate() {
+            if Some(index) == before_keyword_only {
+                result.push("*".to_string());
+            }
+            result.push(Self::format_parameter(param));
+            if Some(index) == after_positional_only {
+                result.push("/".to_string());
+            }
+        }
+        result
+    }
+
     /// Format a function signature for display (e.g., in hover)
     pub fn format_function(sig: &FunctionSignature) -> String {
         let mut result = String::new();
         result.push_str("```python\n");
 
-        let param_strs: Vec<String> = sig.parameters.iter().map(Self::format_parameter).collect();
+        // Only the first overload is shown; say so rather than presenting one
+        // of `open`'s eight signatures as if it were the whole story.
+        if sig.is_overloaded {
+            result.push_str("@overload\n");
+        }
+
+        let param_strs = Self::format_parameters(&sig.parameters);
 
         result.push_str(&Self::format_definition(
             "def",
@@ -1053,19 +1240,20 @@ impl PythonAnalyzer {
             None,
         ));
 
-        // Add __init__ method if present
+        // Add the constructor (`__init__`, or `__new__` when that is all the
+        // class declares) if present
         if let Some(init_sig) = &class.init_signature {
-            let param_strs: Vec<String> = init_sig
-                .parameters
-                .iter()
-                .map(Self::format_parameter)
-                .collect();
+            let param_strs = Self::format_parameters(&init_sig.parameters);
 
             result.push_str("\n\n");
 
+            if init_sig.is_overloaded {
+                result.push_str("    @overload\n");
+            }
+
             result.push_str(&Self::format_definition(
                 "def",
-                "__init__",
+                &init_sig.name,
                 &param_strs,
                 true,
                 init_sig.return_type.as_ref(),
@@ -1092,12 +1280,11 @@ impl PythonAnalyzer {
             result.push_str("@staticmethod\n");
         }
 
-        let param_strs: Vec<String> = method
-            .signature
-            .parameters
-            .iter()
-            .map(Self::format_parameter)
-            .collect();
+        if method.signature.is_overloaded {
+            result.push_str("@overload\n");
+        }
+
+        let param_strs = Self::format_parameters(&method.signature.parameters);
 
         result.push_str(&Self::format_definition(
             "def",
@@ -1192,19 +1379,32 @@ impl FunctionExtractor {
 }
 
 impl<'a> Visitor<'a> for FunctionExtractor {
+    /// Matching is done per *body* rather than per statement so that the
+    /// sibling declarations are in scope: a name declared more than once, or
+    /// decorated with `@overload`, is overloaded, and only the enclosing body
+    /// can tell. Statement order is otherwise unchanged — each statement is
+    /// still tested before descending into it.
+    fn visit_body(&mut self, body: &'a [Stmt]) {
+        for stmt in body {
+            if self.result.is_some() {
+                return; // Already found
+            }
+            if let Stmt::FunctionDef(func_def) = stmt
+                && func_def.name.as_str() == self.target_name
+            {
+                self.result = extract_declared_signature(body, &self.target_name, &self.source);
+                return;
+            }
+            self.visit_stmt(stmt);
+        }
+    }
+
     fn visit_stmt(&mut self, stmt: &'a Stmt) {
         if self.result.is_some() {
             return; // Already found
         }
 
-        if let Stmt::FunctionDef(func_def) = stmt
-            && func_def.name.as_str() == self.target_name
-        {
-            self.result = Some(extract_function_signature_from_def(func_def, &self.source));
-            return;
-        }
-
-        // Continue walking
+        // Matching happens in `visit_body`; this only descends.
         ast::visitor::walk_stmt(self, stmt);
     }
 }
@@ -1329,12 +1529,17 @@ impl<'a> Visitor<'a> for MethodExtractor {
             for class_stmt in &class_def.body {
                 if let Stmt::FunctionDef(func_def) = class_stmt
                     && func_def.name.as_str() == self.method_name
+                    && let Some((declaration, is_overloaded)) =
+                        resolve_declaration(&class_def.body, &self.method_name)
                 {
-                    let signature = extract_function_signature_from_def(func_def, &self.source);
+                    let mut signature =
+                        extract_function_signature_from_def(declaration, &self.source);
+                    signature.is_overloaded = is_overloaded;
 
-                    // Check decorators for @classmethod or @staticmethod
+                    // Check decorators for @classmethod or @staticmethod, on the
+                    // declaration actually chosen rather than on this statement.
                     let (is_classmethod, is_staticmethod) =
-                        check_method_decorators(&func_def.decorator_list);
+                        check_method_decorators(&declaration.decorator_list);
 
                     self.result = Some(MethodInfo {
                         class_name: self.class_name.clone(),
@@ -1351,6 +1556,100 @@ impl<'a> Visitor<'a> for MethodExtractor {
         // Continue walking to find nested classes
         ast::visitor::walk_stmt(self, stmt);
     }
+}
+
+/// The class named by a base-class expression, with any generic subscript
+/// removed: `Sequence[_T_co]` is `Sequence` and `typing.Generic[T]` is
+/// `typing.Generic`.
+///
+/// Without this, no generic base resolves at all — the resolver would look for a
+/// module or symbol literally called `Sequence[_T_co]` — so an `__init__`
+/// inherited through one would be invisible, and every generic-based class
+/// would look like it had an unreadable MRO.
+pub(crate) fn base_class_name(base_class_expr: &str) -> &str {
+    base_class_expr
+        .split('[')
+        .next()
+        .unwrap_or(base_class_expr)
+        .trim()
+}
+
+/// The declaration of `name` in `body` that describes the callable actually
+/// called, plus whether it is an overload set with no single signature.
+///
+/// Only an explicit `@overload` decorator makes a set: being declared twice does
+/// not, since `@property` with its `@x.setter` and `@singledispatch` with its
+/// `@f.register` both declare one name repeatedly without being overloads, and
+/// treating those as overloads would disable argument validation for the target
+/// entirely. Typing requires `@overload` on every member of a real set, so
+/// nothing is lost by the stricter rule.
+///
+/// A `.py` source ends an overload set with the undecorated implementation,
+/// whose signature is the one Hydra will call — that one is preferred and is
+/// not reported as overloaded. A `.pyi` stub has no implementation, so only the
+/// `@overload` declarations exist and there is no single signature to check
+/// against.
+fn resolve_declaration<'a>(
+    body: &'a [Stmt],
+    name: &str,
+) -> Option<(&'a ast::StmtFunctionDef, bool)> {
+    let declarations: Vec<&ast::StmtFunctionDef> = body
+        .iter()
+        .filter_map(|stmt| match stmt {
+            Stmt::FunctionDef(func_def) if func_def.name.as_str() == name => Some(func_def),
+            _ => None,
+        })
+        .collect();
+
+    let first = *declarations.first()?;
+    if !declarations
+        .iter()
+        .any(|func_def| has_overload_decorator(&func_def.decorator_list))
+    {
+        return Some((first, false));
+    }
+    match declarations
+        .iter()
+        .find(|func_def| !has_overload_decorator(&func_def.decorator_list))
+    {
+        Some(implementation) => Some((implementation, false)),
+        None => Some((first, true)),
+    }
+}
+
+/// The signature of `name` as declared in `body`, resolved through any
+/// `@overload` set — see [`resolve_declaration`].
+fn extract_declared_signature(
+    body: &[Stmt],
+    name: &str,
+    source: &str,
+) -> Option<FunctionSignature> {
+    let (func_def, is_overloaded) = resolve_declaration(body, name)?;
+    let mut signature = extract_function_signature_from_def(func_def, source);
+    signature.is_overloaded = is_overloaded;
+    Some(signature)
+}
+
+/// Check for `@overload`, however `typing.overload` was imported.
+fn has_overload_decorator(decorators: &[ast::Decorator]) -> bool {
+    has_decorator(decorators, "overload")
+}
+
+/// Check for `@type_check_only`, however `typing.type_check_only` was imported.
+///
+/// It marks a declaration that exists only for type checkers — typeshed uses it
+/// for `builtins.function` and `builtins.ellipsis`, which no runtime `builtins`
+/// module actually has.
+fn has_type_check_only_decorator(decorators: &[ast::Decorator]) -> bool {
+    has_decorator(decorators, "type_check_only")
+}
+
+/// Whether any decorator names `name`, qualified or not.
+fn has_decorator(decorators: &[ast::Decorator], name: &str) -> bool {
+    decorators.iter().any(|decorator| {
+        let decorator = expr_to_string(&decorator.expression);
+        decorator == name || decorator.ends_with(&format!(".{name}"))
+    })
 }
 
 /// Check if a function has @classmethod or @staticmethod decorators
@@ -1407,6 +1706,9 @@ fn extract_function_signature_from_def(
         parameters,
         return_type,
         docstring,
+        // Overload status depends on the sibling statements, which this node
+        // alone cannot see; `extract_signature_with_overloads` fills it in.
+        is_overloaded: false,
         start_line,
         start_column,
         end_line,
@@ -1423,21 +1725,16 @@ fn extract_class_info_from_def(class_def: &ast::StmtClassDef, source: &str) -> C
     // Extract base classes
     let base_classes: Vec<String> = class_def.bases().iter().map(expr_to_string).collect();
 
-    // Look for __init__ method
-    let init_signature = class_def.body.iter().find_map(|stmt| {
-        if let Stmt::FunctionDef(func_def) = stmt
-            && func_def.name.as_str() == "__init__"
-        {
-            return Some(extract_function_signature_from_def(func_def, source));
-        }
-        None
-    });
+    let init_signature = extract_declared_signature(&class_def.body, "__init__", source);
+    let new_signature = extract_declared_signature(&class_def.body, "__new__", source);
 
     ClassInfo {
         name: class_def.name.to_string(),
         base_classes,
         docstring,
         init_signature,
+        new_signature,
+        unresolved_base_classes: false,
         start_line,
         start_column,
         end_line,
@@ -1450,7 +1747,12 @@ fn extract_parameters(params: &ast::Parameters) -> Vec<ParameterInfo> {
     let mut result = Vec::new();
 
     // Process regular parameters and positional-only
-    for param_with_default in params.posonlyargs.iter().chain(params.args.iter()) {
+    for (param_with_default, is_positional_only) in params
+        .posonlyargs
+        .iter()
+        .map(|p| (p, true))
+        .chain(params.args.iter().map(|p| (p, false)))
+    {
         let param = &param_with_default.parameter;
         result.push(ParameterInfo {
             name: param.name.to_string(),
@@ -1463,6 +1765,7 @@ fn extract_parameters(params: &ast::Parameters) -> Vec<ParameterInfo> {
             is_variadic: false,
             is_variadic_keyword: false,
             is_keyword_only: false,
+            is_positional_only,
         });
     }
 
@@ -1476,6 +1779,7 @@ fn extract_parameters(params: &ast::Parameters) -> Vec<ParameterInfo> {
             is_variadic: true,
             is_variadic_keyword: false,
             is_keyword_only: false,
+            is_positional_only: false,
         });
     }
 
@@ -1493,6 +1797,7 @@ fn extract_parameters(params: &ast::Parameters) -> Vec<ParameterInfo> {
             is_variadic: false,
             is_variadic_keyword: false,
             is_keyword_only: true,
+            is_positional_only: false,
         });
     }
 
@@ -1506,6 +1811,7 @@ fn extract_parameters(params: &ast::Parameters) -> Vec<ParameterInfo> {
             is_variadic: false,
             is_variadic_keyword: true,
             is_keyword_only: false,
+            is_positional_only: false,
         });
     }
 
@@ -2178,6 +2484,7 @@ mod tests {
             parameters: vec![],
             return_type: None,
             docstring: None,
+            is_overloaded: false,
             start_line: 0,
             start_column: 0,
             end_line: 5,
@@ -2203,6 +2510,7 @@ mod tests {
                     is_variadic: false,
                     is_variadic_keyword: false,
                     is_keyword_only: false,
+                    is_positional_only: false,
                 },
                 ParameterInfo {
                     name: "y".to_string(),
@@ -2212,10 +2520,12 @@ mod tests {
                     is_variadic: false,
                     is_variadic_keyword: false,
                     is_keyword_only: false,
+                    is_positional_only: false,
                 },
             ],
             return_type: Some("bool".to_string()),
             docstring: Some("Test docstring".to_string()),
+            is_overloaded: false,
             start_line: 0,
             start_column: 0,
             end_line: 5,
@@ -2240,6 +2550,7 @@ mod tests {
                     is_variadic: true,
                     is_variadic_keyword: false,
                     is_keyword_only: false,
+                    is_positional_only: false,
                 },
                 ParameterInfo {
                     name: "kwargs".to_string(),
@@ -2249,10 +2560,12 @@ mod tests {
                     is_variadic: false,
                     is_variadic_keyword: true,
                     is_keyword_only: false,
+                    is_positional_only: false,
                 },
             ],
             return_type: None,
             docstring: None,
+            is_overloaded: false,
             start_line: 0,
             start_column: 0,
             end_line: 5,
@@ -2273,6 +2586,8 @@ mod tests {
             base_classes: vec![],
             docstring: Some("A test class".to_string()),
             init_signature: None,
+            new_signature: None,
+            unresolved_base_classes: false,
             start_line: 0,
             start_column: 0,
             end_line: 5,
@@ -2306,6 +2621,7 @@ mod tests {
                         is_variadic: false,
                         is_variadic_keyword: false,
                         is_keyword_only: false,
+                        is_positional_only: false,
                     },
                     ParameterInfo {
                         name: "value".to_string(),
@@ -2315,15 +2631,19 @@ mod tests {
                         is_variadic: false,
                         is_variadic_keyword: false,
                         is_keyword_only: false,
+                        is_positional_only: false,
                     },
                 ],
                 return_type: None,
                 docstring: None,
+                is_overloaded: false,
                 start_line: 0,
                 start_column: 0,
                 end_line: 5,
                 end_column: 5,
             }),
+            new_signature: None,
+            unresolved_base_classes: false,
         };
 
         let formatted = PythonAnalyzer::format_class(&class_info);
@@ -2357,6 +2677,7 @@ mod tests {
                         is_variadic: false,
                         is_variadic_keyword: false,
                         is_keyword_only: false,
+                        is_positional_only: false,
                     },
                     ParameterInfo {
                         name: "name".to_string(),
@@ -2366,15 +2687,19 @@ mod tests {
                         is_variadic: false,
                         is_variadic_keyword: false,
                         is_keyword_only: false,
+                        is_positional_only: false,
                     },
                 ],
                 return_type: None,
                 docstring: None,
+                is_overloaded: false,
                 start_line: 0,
                 start_column: 0,
                 end_line: 5,
                 end_column: 5,
             }),
+            new_signature: None,
+            unresolved_base_classes: false,
         };
 
         let formatted = PythonAnalyzer::format_class(&class_info);
@@ -3281,6 +3606,7 @@ mod tests {
                         is_variadic: false,
                         is_variadic_keyword: false,
                         is_keyword_only: false,
+                        is_positional_only: false,
                     },
                     ParameterInfo {
                         name: "config".to_string(),
@@ -3290,10 +3616,12 @@ mod tests {
                         is_variadic: false,
                         is_variadic_keyword: false,
                         is_keyword_only: false,
+                        is_positional_only: false,
                     },
                 ],
                 return_type: Some("MyClass".to_string()),
                 docstring: Some("Create from config".to_string()),
+                is_overloaded: false,
                 start_line: 0,
                 start_column: 0,
                 end_line: 5,
@@ -3324,9 +3652,11 @@ mod tests {
                     is_variadic: false,
                     is_variadic_keyword: false,
                     is_keyword_only: false,
+                    is_positional_only: false,
                 }],
                 return_type: Some("int".to_string()),
                 docstring: None,
+                is_overloaded: false,
                 start_line: 0,
                 start_column: 0,
                 end_line: 5,
@@ -3520,9 +3850,11 @@ mod tests {
                 is_variadic: false,
                 is_variadic_keyword: false,
                 is_keyword_only: false,
+                is_positional_only: false,
             }],
             return_type: None,
             docstring: None,
+            is_overloaded: false,
             start_line: 0,
             start_column: 0,
             end_line: 0,
@@ -3548,6 +3880,7 @@ mod tests {
                         is_variadic: false,
                         is_variadic_keyword: false,
                         is_keyword_only: false,
+                        is_positional_only: false,
                     },
                     ParameterInfo {
                         name: "value".to_string(),
@@ -3557,15 +3890,19 @@ mod tests {
                         is_variadic: false,
                         is_variadic_keyword: false,
                         is_keyword_only: false,
+                        is_positional_only: false,
                     },
                 ],
                 return_type: None,
                 docstring: None,
+                is_overloaded: false,
                 start_line: 0,
                 start_column: 0,
                 end_line: 0,
                 end_column: 0,
             }),
+            new_signature: None,
+            unresolved_base_classes: false,
             start_line: 0,
             start_column: 0,
             end_line: 0,
@@ -3590,14 +3927,18 @@ mod tests {
                     is_variadic: false,
                     is_variadic_keyword: false,
                     is_keyword_only: false,
+                    is_positional_only: false,
                 }],
                 return_type: None,
                 docstring: None,
+                is_overloaded: false,
                 start_line: 0,
                 start_column: 0,
                 end_line: 0,
                 end_column: 0,
             }),
+            new_signature: None,
+            unresolved_base_classes: false,
             start_line: 0,
             start_column: 0,
             end_line: 0,
@@ -3613,6 +3954,8 @@ mod tests {
             base_classes: vec![],
             docstring: None,
             init_signature: None,
+            new_signature: None,
+            unresolved_base_classes: false,
             start_line: 0,
             start_column: 0,
             end_line: 0,
@@ -3636,9 +3979,11 @@ mod tests {
                     is_variadic: false,
                     is_variadic_keyword: false,
                     is_keyword_only: false,
+                    is_positional_only: false,
                 }],
                 return_type: None,
                 docstring: None,
+                is_overloaded: false,
                 start_line: 0,
                 start_column: 0,
                 end_line: 0,
@@ -3665,9 +4010,11 @@ mod tests {
                     is_variadic: false,
                     is_variadic_keyword: false,
                     is_keyword_only: false,
+                    is_positional_only: false,
                 }],
                 return_type: None,
                 docstring: None,
+                is_overloaded: false,
                 start_line: 0,
                 start_column: 0,
                 end_line: 0,
@@ -3694,9 +4041,11 @@ mod tests {
                     is_variadic: false,
                     is_variadic_keyword: false,
                     is_keyword_only: false,
+                    is_positional_only: false,
                 }],
                 return_type: None,
                 docstring: None,
+                is_overloaded: false,
                 start_line: 0,
                 start_column: 0,
                 end_line: 0,
@@ -3723,9 +4072,11 @@ mod tests {
                     is_variadic: false,
                     is_variadic_keyword: false,
                     is_keyword_only: false,
+                    is_positional_only: false,
                 }],
                 return_type: None,
                 docstring: None,
+                is_overloaded: false,
                 start_line: 0,
                 start_column: 0,
                 end_line: 0,
@@ -3735,5 +4086,450 @@ mod tests {
             is_staticmethod: true,
         });
         assert_eq!(def.implicit_param(), None);
+    }
+
+    // ==================== vendored typeshed tests ====================
+    //
+    // These run against the real `builtins.pyi` shipped by `ty_vendored`
+    // rather than a fixture: the constructs that motivated this handling
+    // (`@overload`, `__new__`-only classes, positional-only parameters) are
+    // exactly the ones a hand-written fixture would get subtly wrong.
+
+    use crate::vendored_typeshed::stdlib_search_root;
+
+    fn builtins_stub() -> PathBuf {
+        stdlib_search_root().join("builtins.pyi")
+    }
+
+    #[test]
+    fn test_vendored_builtins_stub_is_readable() {
+        let db = test_db();
+        assert!(path_is_file(&db, &builtins_stub()));
+        let source = read_source(&db, &builtins_stub()).unwrap();
+        assert!(source.as_str().contains("def len("));
+    }
+
+    #[test]
+    fn test_builtin_len_parameter_is_positional_only() {
+        let db = test_db();
+        let sig = PythonAnalyzer::extract_function_signature(&db, &builtins_stub(), "len").unwrap();
+
+        assert!(!sig.is_overloaded);
+        assert_eq!(sig.parameters.len(), 1);
+        assert_eq!(sig.parameters[0].name, "obj");
+        assert!(sig.parameters[0].is_positional_only);
+        assert!(sig.docstring.is_some());
+        assert!(
+            PythonAnalyzer::format_function(&sig).contains("def len(obj: Sized, /) -> int"),
+            "formatted signature should carry the `/` marker"
+        );
+    }
+
+    #[test]
+    fn test_builtin_open_is_overloaded() {
+        let db = test_db();
+        let sig =
+            PythonAnalyzer::extract_function_signature(&db, &builtins_stub(), "open").unwrap();
+
+        assert!(
+            sig.is_overloaded,
+            "typeshed declares `open` eight times; validating against the first \
+             declaration alone would report the wrong arity"
+        );
+        assert!(PythonAnalyzer::format_function(&sig).contains("@overload"));
+    }
+
+    #[test]
+    fn test_builtin_int_uses_new_as_its_constructor() {
+        let db = test_db();
+        // The `__new__` fallback is applied by `extract_class_info_with_imports`,
+        // once the MRO has had its chance to supply an `__init__`.
+        let (class_info, _) =
+            PythonAnalyzer::extract_class_info_with_imports(&db, &builtins_stub(), "int", &[])
+                .unwrap();
+
+        let init = class_info
+            .init_signature
+            .as_ref()
+            .expect("int declares no __init__, so __new__ must stand in");
+        assert_eq!(init.name, "__new__");
+        assert!(init.is_overloaded);
+        assert_eq!(
+            DefinitionInfo::Class(class_info.clone()).implicit_param(),
+            Some("cls"),
+            "the implicit first parameter of __new__ is cls, not self"
+        );
+        assert!(PythonAnalyzer::format_class(&class_info).contains("def __new__("));
+    }
+
+    /// `__new__` must not shadow an `__init__` inherited from a base class:
+    /// Python looks the two up independently, and it is `__init__` that
+    /// receives the constructor arguments in the common
+    /// `def __new__(cls, *args, **kwargs)` shape.
+    #[test]
+    fn test_inherited_init_wins_over_own_new() {
+        let db = test_db();
+        let source = r#"
+class Base:
+    def __init__(self, a, b):
+        """Base init."""
+
+class Child(Base):
+    def __new__(cls, *args, **kwargs):
+        return super().__new__(cls)
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("inherit.py");
+        std::fs::write(&path, source).unwrap();
+        let search_paths = vec![dir.path().to_path_buf()];
+
+        let (class_info, _) =
+            PythonAnalyzer::extract_class_info_with_imports(&db, &path, "Child", &search_paths)
+                .unwrap();
+
+        let init = class_info.init_signature.as_ref().unwrap();
+        assert_eq!(init.name, "__init__");
+        let names: Vec<_> = init.parameters.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["self", "a", "b"]);
+    }
+
+    #[test]
+    fn test_builtin_dict_init_is_overloaded() {
+        let db = test_db();
+        let class_info = PythonAnalyzer::extract_class_info(&db, &builtins_stub(), "dict").unwrap();
+
+        let init = class_info
+            .init_signature
+            .as_ref()
+            .expect("dict declares __init__");
+        assert_eq!(init.name, "__init__");
+        assert!(init.is_overloaded);
+    }
+
+    #[test]
+    fn test_builtin_tuple_new_is_not_flagged_overloaded() {
+        let db = test_db();
+        let (class_info, _) =
+            PythonAnalyzer::extract_class_info_with_imports(&db, &builtins_stub(), "tuple", &[])
+                .unwrap();
+
+        let init = class_info.init_signature.as_ref().unwrap();
+        assert_eq!(init.name, "__new__");
+        assert!(
+            !init.is_overloaded,
+            "a single undecorated declaration is not an overload set"
+        );
+    }
+
+    /// A stub declares only the `@overload` members — there is no
+    /// implementation to fall back on, so no single signature describes the
+    /// call and the symbol is reported as overloaded.
+    #[test]
+    fn test_overload_without_implementation_is_overloaded() {
+        let db = test_db();
+        let source = concat!(
+            "from typing import overload\n",
+            "\n",
+            "@overload\n",
+            "def render(value: int) -> str: ...\n",
+            "@overload\n",
+            "def render(value: str) -> str: ...\n",
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stub.pyi");
+        std::fs::write(&path, source).unwrap();
+
+        let render = PythonAnalyzer::extract_function_signature(&db, &path, "render").unwrap();
+        assert!(render.is_overloaded);
+    }
+
+    /// A generic base is written with its type arguments, which no resolver can
+    /// look up verbatim. Stripping them is what lets an `__init__` inherited
+    /// through `class Child(Base[T])` be found at all.
+    #[test]
+    fn test_generic_base_class_is_resolved() {
+        let db = test_db();
+        let source = concat!(
+            "from typing import Generic, TypeVar\n",
+            "\n",
+            "T = TypeVar(\"T\")\n",
+            "\n",
+            "class Base(Generic[T]):\n",
+            "    def __init__(self, a, b):\n",
+            "        pass\n",
+            "\n",
+            "class Child(Base[int]):\n",
+            "    pass\n",
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("generic.py");
+        std::fs::write(&path, source).unwrap();
+        let search_paths = vec![dir.path().to_path_buf()];
+
+        let (class_info, _) =
+            PythonAnalyzer::extract_class_info_with_imports(&db, &path, "Child", &search_paths)
+                .unwrap();
+
+        let init = class_info
+            .init_signature
+            .as_ref()
+            .expect("the generic base's __init__ should be inherited");
+        let names: Vec<_> = init.parameters.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["self", "a", "b"]);
+        assert!(
+            !class_info.unresolved_base_classes,
+            "a resolvable generic base is not an unreadable MRO"
+        );
+    }
+
+    /// `*args` already opens the keyword-only run, so no bare `*` is written
+    /// after it — `def f(*args, *, key=1)` is not valid Python.
+    #[test]
+    fn test_star_marker_is_omitted_after_varargs() {
+        let db = test_db();
+        let source = concat!(
+            "def with_varargs(a, *args, key=1, **kw):\n",
+            "    pass\n",
+            "\n",
+            "def without_varargs(a, *, key=1):\n",
+            "    pass\n",
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("markers.py");
+        std::fs::write(&path, source).unwrap();
+
+        let with_varargs =
+            PythonAnalyzer::extract_function_signature(&db, &path, "with_varargs").unwrap();
+        let rendered = PythonAnalyzer::format_function(&with_varargs);
+        assert!(
+            rendered.contains("with_varargs(a, *args, key = 1, **kw)"),
+            "got:\n{rendered}"
+        );
+
+        let without_varargs =
+            PythonAnalyzer::extract_function_signature(&db, &path, "without_varargs").unwrap();
+        let rendered = PythonAnalyzer::format_function(&without_varargs);
+        assert!(
+            rendered.contains("without_varargs(a, *, key = 1)"),
+            "got:\n{rendered}"
+        );
+    }
+
+    /// `__new__` may only stand in for a missing `__init__` when the whole MRO
+    /// was readable. An unresolvable base could be hiding the real `__init__`,
+    /// and validating arguments against `__new__` would then be wrong.
+    #[test]
+    fn test_new_fallback_is_uncertain_when_a_base_is_unresolvable() {
+        let db = test_db();
+        let source = r#"
+from not_installed import Widget
+
+class Thing(Widget):
+    def __new__(cls, *args, **kwargs):
+        return super().__new__(cls)
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("uncertain.py");
+        std::fs::write(&path, source).unwrap();
+        let search_paths = vec![dir.path().to_path_buf()];
+
+        let (class_info, _) =
+            PythonAnalyzer::extract_class_info_with_imports(&db, &path, "Thing", &search_paths)
+                .unwrap();
+
+        assert_eq!(class_info.init_signature.as_ref().unwrap().name, "__new__");
+        assert!(class_info.unresolved_base_classes);
+        assert!(class_info.constructor_is_uncertain());
+    }
+
+    /// The same shape with every base readable: the fallback is trustworthy and
+    /// arguments are validated against it.
+    #[test]
+    fn test_new_fallback_is_certain_when_the_mro_resolves() {
+        let db = test_db();
+        let source = r#"
+class Widget:
+    """A widget."""
+
+class Thing(Widget):
+    def __new__(cls, size: int):
+        return super().__new__(cls)
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("certain.py");
+        std::fs::write(&path, source).unwrap();
+        let search_paths = vec![dir.path().to_path_buf()];
+
+        let (class_info, _) =
+            PythonAnalyzer::extract_class_info_with_imports(&db, &path, "Thing", &search_paths)
+                .unwrap();
+
+        assert_eq!(class_info.init_signature.as_ref().unwrap().name, "__new__");
+        assert!(!class_info.unresolved_base_classes);
+        assert!(!class_info.constructor_is_uncertain());
+    }
+
+    /// A qualified base only resolves its *module*, so `pkg.Widget` lands on
+    /// `pkg/__init__.py` even when the class body lives in `pkg/impl.py`. The
+    /// re-export has to be followed or the inherited `__init__` is invisible.
+    #[test]
+    fn test_reexported_qualified_base_class_is_resolved() {
+        let db = test_db();
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("pkg");
+        std::fs::create_dir(&pkg).unwrap();
+        std::fs::write(pkg.join("__init__.py"), "from .impl import Widget\n").unwrap();
+        std::fs::write(
+            pkg.join("impl.py"),
+            "class Widget:\n    def __init__(self, size):\n        pass\n",
+        )
+        .unwrap();
+        let path = dir.path().join("main.py");
+        std::fs::write(
+            &path,
+            "import pkg\n\nclass Thing(pkg.Widget):\n    def __new__(cls):\n        return super().__new__(cls)\n",
+        )
+        .unwrap();
+        let search_paths = vec![dir.path().to_path_buf()];
+
+        let (class_info, _) =
+            PythonAnalyzer::extract_class_info_with_imports(&db, &path, "Thing", &search_paths)
+                .unwrap();
+
+        let init = class_info
+            .init_signature
+            .as_ref()
+            .expect("the re-exported base's __init__ should be inherited");
+        assert_eq!(init.name, "__init__", "got {init:?}");
+        let names: Vec<_> = init.parameters.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["self", "size"]);
+        assert!(!class_info.constructor_is_uncertain());
+    }
+
+    /// A base whose module resolves but whose class body is never read leaves
+    /// the MRO incomplete: the real `__init__` may be up there. Reporting the
+    /// hierarchy as resolved would green-light validating against `__new__`.
+    #[test]
+    fn test_unreadable_base_class_body_leaves_the_mro_uncertain() {
+        let db = test_db();
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("pkg");
+        std::fs::create_dir(&pkg).unwrap();
+        std::fs::write(pkg.join("__init__.py"), "\n").unwrap();
+        let path = dir.path().join("main.py");
+        std::fs::write(
+            &path,
+            "import pkg\n\nclass Thing(pkg.Widget):\n    def __new__(cls, size):\n        return super().__new__(cls)\n",
+        )
+        .unwrap();
+        let search_paths = vec![dir.path().to_path_buf()];
+
+        let (class_info, _) =
+            PythonAnalyzer::extract_class_info_with_imports(&db, &path, "Thing", &search_paths)
+                .unwrap();
+
+        assert_eq!(class_info.init_signature.as_ref().unwrap().name, "__new__");
+        assert!(class_info.unresolved_base_classes);
+        assert!(class_info.constructor_is_uncertain());
+    }
+
+    /// Two declarations of one name are not an overload set. A property and its
+    /// setter are the common shape, and treating them as overloaded would
+    /// silently switch off argument validation for the target.
+    #[test]
+    fn test_property_setter_pair_is_not_an_overload() {
+        let db = test_db();
+        let source = r#"
+class Widget:
+    @property
+    def value(self) -> int:
+        """The value."""
+        return self._value
+
+    @value.setter
+    def value(self, new_value: int) -> None:
+        self._value = new_value
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prop.py");
+        std::fs::write(&path, source).unwrap();
+
+        let method = PythonAnalyzer::extract_method_info(&db, &path, "Widget", "value").unwrap();
+        assert!(!method.signature.is_overloaded);
+        assert!(!PythonAnalyzer::format_method(&method).contains("@overload"));
+    }
+
+    #[test]
+    fn test_module_defines_top_level_ignores_methods() {
+        let db = test_db();
+        assert!(PythonAnalyzer::module_defines_top_level(
+            &db,
+            &builtins_stub(),
+            "len"
+        ));
+        assert!(PythonAnalyzer::module_defines_top_level(
+            &db,
+            &builtins_stub(),
+            "dict"
+        ));
+        assert!(
+            !PythonAnalyzer::module_defines_top_level(&db, &builtins_stub(), "count"),
+            "`count` is a method of `list`, not a builtin"
+        );
+        assert!(
+            PythonAnalyzer::module_defines_top_level(&db, &builtins_stub(), "aiter"),
+            "typeshed guards `aiter` behind `if sys.version_info >= (3, 10):`"
+        );
+    }
+
+    #[test]
+    fn test_overload_detection_on_first_party_source() {
+        let db = test_db();
+        let source = r#"
+from typing import overload
+
+@overload
+def render(value: int) -> str: ...
+@overload
+def render(value: str) -> str: ...
+def render(value):
+    """Render a value."""
+    return str(value)
+
+def plain(value, /, other, *, flag=False):
+    """Not overloaded."""
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mod.py");
+        std::fs::write(&path, source).unwrap();
+
+        // A `.py` overload set ends with the implementation, whose signature is
+        // the one Hydra will call — so there is something definite to validate
+        // against and the symbol is not reported as overloaded.
+        let render = PythonAnalyzer::extract_function_signature(&db, &path, "render").unwrap();
+        assert!(!render.is_overloaded);
+        assert_eq!(render.docstring.as_deref(), Some("Render a value."));
+        assert!(render.parameters[0].type_annotation.is_none());
+
+        let plain = PythonAnalyzer::extract_function_signature(&db, &path, "plain").unwrap();
+        assert!(!plain.is_overloaded);
+        let flags: Vec<_> = plain
+            .parameters
+            .iter()
+            .map(|p| (p.name.as_str(), p.is_positional_only, p.is_keyword_only))
+            .collect();
+        assert_eq!(
+            flags,
+            vec![
+                ("value", true, false),
+                ("other", false, false),
+                ("flag", false, true)
+            ]
+        );
+        assert!(
+            PythonAnalyzer::format_function(&plain)
+                .contains("plain(value, /, other, *, flag = False)"),
+            "both the positional-only `/` and the keyword-only `*` must be shown"
+        );
     }
 }

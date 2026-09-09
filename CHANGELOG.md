@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.5.0]
+
+- Added support for Python builtins as a `_target_`, resolved from the typeshed stubs vendored by `ty_vendored` rather than from disk (fixes #34). `builtins.len`, `builtins.dict`, `builtins.open` and the rest now hover and validate; `builtins` is a C module, so a stub is the only place its signatures and docstrings exist.
+- Scoped stub resolution to `builtins`. Wiring in typeshed makes the whole stdlib reachable, but enabling it is deliberately left to a follow-up — see `vendored_typeshed::is_vendored_module`.
+- Fixed generic base classes never resolving: `class Child(Base[T])` was looked up as a class literally named `Base[T]`, so an `__init__` inherited through one was invisible.
+- Fixed a re-exported base class never resolving: a qualified base resolves only its module, so `class Thing(pkg.Widget)` looked for `Widget` in `pkg/__init__.py` and missed the `from .impl import Widget` that put the class body one hop further on. A base whose body genuinely cannot be read now marks the MRO incomplete rather than reporting it as fully walked.
+- Added handling for `@overload`: an overloaded symbol is now recorded as such and treated as accepting any arguments, instead of validating against whichever declaration came first. Typeshed gives `open` eight overloads and `dict.__init__` another eight. In a `.py` source the undecorated implementation that closes the set is used instead, since that is the signature Hydra calls.
+- Added a `__new__` fallback when a class declares no `__init__`. `int`, `str`, `float`, `bool`, `tuple` and `range` are all shaped that way, and every argument to them was previously reported as unknown.
+- Added `is_positional_only` to parameters, along with a new `positional-only-parameter` diagnostic. Hover now renders the `/` marker (`def len(obj: Sized, /) -> int`), and a positional-only parameter passed by name — or missing entirely — is reported with a message that points at `_args_`.
+- A keyword key no longer satisfies a positional-only parameter when the callee also takes `**kwargs`: `f(a=1)` on `def f(a, /, **kw)` puts the value in `kw` and still raises "missing 1 required positional argument".
+- Left argument validation off when a class's constructor came from `__new__` while part of its MRO could not be resolved: the real `__init__` may be in the ancestor that is missing. Hover still shows what was found.
+- Rejected the names the typeshed stub declares but the runtime `builtins` module does not have — its typevars and protocol classes (`_T`, `_SupportsRound1`) and `@type_check_only` placeholders such as `function`. They used to resolve with no diagnostic at all, green-lighting a config that fails with `AttributeError`.
+- Fixed parameter diagnostic ranges over-extending on a non-ASCII key: columns are UTF-16 code units, and the end was derived from the key's byte length.
+- Diagnostics anchored to a parameter's line now point at that parameter's own column rather than the `_target_` key's; the two only coincide in block-style YAML.
+- An inline `# hydrust: ignore[...]` on a parameter's own line now silences the diagnostics that point at it (`positional-only-parameter`, `unknown-argument`, `parameter-already-assigned`), not just a comment on the file header or the `_target_` line.
+- Improved the bare-name `_target_` error: `len` now reports that it is a builtin and names `builtins.len`, the form Hydra actually accepts.
+- Go-to-definition on a target that resolves into a vendored stub is a no-op rather than an error, since there is no file on disk to open. Hover and diagnostics are unaffected.
+- Signature help now carries the same `/` and `*` markers as hover, and says when it is showing the first of several overloads.
+- Hover now renders the bare `*` that opens a run of keyword-only parameters, alongside the `/` — `def sorted(iterable, /, *, key=None, reverse=False)`.
+- An inline `_args_` flow sequence is now recognised from the value written after the colon rather than inferred from where its entries sit, so `_args_: # see [docs]` above a block sequence is no longer read as a flow sequence starting inside the comment. An anchor or a tag before the bracket (`_args_: &defaults [1, 2]`) is stepped over, so such a sequence still gets signature help.
+- Fixed a panic when `_args_` contained a nested list or mapping (`_args_: [[1, 2, 3]]`). saphyr gives collection nodes no position, which underflowed the line conversion. Such a node now borrows its position from its first positioned descendant, so a block-style `- [1, 2]` keeps its own line and still gets signature help.
+
 ## [0.4.2]
 
 - Fixed lazy package exports declared under `if TYPE_CHECKING:` (or `if typing.TYPE_CHECKING:`) not resolving when combined with a module-level `__getattr__` and `__all__` (fixes #43)

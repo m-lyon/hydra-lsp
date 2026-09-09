@@ -1,6 +1,6 @@
 [package]
 name = "hydra-lsp"
-version = "0.4.2"
+version = "0.5.0"
 edition = "2024"
 authors = ["Matthew Lyon"]
 description = "Language Server for Hydra configuration files"
@@ -47,6 +47,7 @@ ruff_db = { git = "https://github.com/astral-sh/ruff", rev = "fbb5c8aa3c19891f2a
 ruff_source_file = { git = "https://github.com/astral-sh/ruff", rev = "fbb5c8aa3c19891f2a6d78ccf335ae91c94f98ca" }
 ty_module_resolver = { git = "https://github.com/astral-sh/ruff", rev = "fbb5c8aa3c19891f2a6d78ccf335ae91c94f98ca" }
 ty_python_semantic = { git = "https://github.com/astral-sh/ruff", rev = "fbb5c8aa3c19891f2a6d78ccf335ae91c94f98ca" }
+ty_vendored = { git = "https://github.com/astral-sh/ruff", rev = "fbb5c8aa3c19891f2a6d78ccf335ae91c94f98ca" }
 salsa = { git = "https://github.com/salsa-rs/salsa.git", rev = "ce80691fa0b87dc2fd2235a26544e63e5e43d8d3", default-features = false, features = [
     "compact_str",
     "macros",

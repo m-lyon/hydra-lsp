@@ -57,7 +57,8 @@ fn test_capability_block_shape_with_all_features() {
                 "unresolved-import",
                 "invalid-hydra-parameter",
                 "parameter-already-assigned",
-                "too-many-positional-arguments"
+                "too-many-positional-arguments",
+                "positional-only-parameter"
             ],
             "features": ["pullDiagnostics", "watchedFiles", "diagnosticRefresh"]
         })

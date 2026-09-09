@@ -3,7 +3,12 @@ use std::sync::Arc;
 
 use crate::import_resolver::{ImportResolver, join_module_parts};
 use crate::python_analyzer::{
-    ClassAttributeInfo, DefinitionInfo, FunctionSignature, PythonAnalyzer, normalize_path_for_key,
+    ClassAttributeInfo, DefinitionInfo, FunctionSignature, PythonAnalyzer, base_class_name,
+    normalize_path_for_key,
+};
+use crate::vendored_typeshed::{
+    BUILTINS_MODULE, is_runtime_builtin_name, is_vendored_module, stdlib_search_root,
+    vendored_module_name,
 };
 use ruff_db::files::FileRootKind;
 use ruff_db::system::SystemPathBuf;
@@ -158,6 +163,11 @@ pub fn search_paths_for_config(db: &dyn ruff_db::Db, config: PythonConfig) -> Ve
 /// Returns `None` when the module cannot be resolved, including when the name
 /// is empty, has an empty dot-separated part, or is not a plain dotted module name.
 /// Uses `lru = 1024` to bound memory across large workspaces.
+///
+/// When nothing on the real search path matches, resolution falls through to
+/// the vendored typeshed stubs — currently only for `builtins`, see
+/// [`is_vendored_module`]. The fallback is last so a first-party or installed
+/// `builtins.py` still wins, matching how Python itself would import it.
 #[salsa::tracked(returns(ref), lru = 1024)]
 pub fn resolve_module_cached<'db>(
     db: &'db dyn ruff_db::Db,
@@ -185,7 +195,60 @@ pub fn resolve_module_cached<'db>(
         }
     }
 
+    if is_vendored_module(module_path_str) {
+        return ImportResolver::find_module_file(db, &stdlib_search_root().join(&relative_path));
+    }
+
     None
+}
+
+/// Whether the runtime module `module` exposes `symbol`, according to its
+/// vendored stub.
+///
+/// Backs two things: the bare-name `_target_` error, which becomes a message
+/// naming the prefixed form Hydra actually accepts (`len` is rejected,
+/// `builtins.len` works), and the guard in [`cached_definition_info`] that keeps
+/// stub-internal names from resolving as targets. The stubs are immutable and
+/// shared by every workspace, so the query takes no search paths and its memo
+/// survives for the life of the database.
+#[salsa::tracked]
+pub fn vendored_module_exposes<'db>(
+    db: &'db dyn ruff_db::Db,
+    module: TargetString<'db>,
+    symbol: TargetString<'db>,
+) -> bool {
+    let module = module.value(db);
+    // The same gate `resolve_module_cached` applies, so the two cannot disagree
+    // about what the archive exposes. `is_runtime_builtin_name`'s underscore
+    // rule is a builtins convention, and widening the gate must be a deliberate
+    // decision about this check as well.
+    if !is_vendored_module(module) {
+        return false;
+    }
+    let symbol = symbol.value(db);
+    if symbol.is_empty() || symbol.contains('.') || !is_runtime_builtin_name(symbol) {
+        return false;
+    }
+    let Some(relative) = join_module_parts(Path::new(""), module) else {
+        return false;
+    };
+    let Some(stub) = ImportResolver::find_module_file(db, &stdlib_search_root().join(relative))
+    else {
+        return false;
+    };
+    // Top-level only: the extractors walk nested scopes, so asking them would
+    // also match methods such as `list.count` and suggest a `builtins.count`
+    // that does not exist.
+    PythonAnalyzer::module_defines_top_level(db, &stub, symbol)
+}
+
+/// Whether `name` is a symbol the runtime `builtins` module exposes.
+///
+/// Thin wrapper over [`vendored_module_exposes`] for the bare-name `_target_`
+/// hint, which is only ever about builtins — Hydra accepts a dotted target for
+/// anything else.
+pub fn is_builtin_symbol<'db>(db: &'db dyn ruff_db::Db, name: TargetString<'db>) -> bool {
+    vendored_module_exposes(db, TargetString::new(db, BUILTINS_MODULE.to_string()), name)
 }
 
 /// Cached extraction of Python definition info for a `_target_` string.
@@ -212,11 +275,38 @@ pub fn cached_definition_info<'db>(
     );
 
     let search_paths = search_paths_for_config(db, config);
-    CachedDefinitionResult::from_result(PythonAnalyzer::extract_definition_info(
-        db,
-        target_str,
-        search_paths,
-    ))
+    let mut result = PythonAnalyzer::extract_definition_info(db, target_str, search_paths);
+
+    // The vendored stub declares names the runtime `builtins` module does not
+    // have — typevars, protocol classes, `@type_check_only` placeholders. They
+    // extract perfectly well, so without this the server would green-light a
+    // `_target_: builtins._SupportsRound1` that fails with `AttributeError` the
+    // moment Hydra tries to instantiate it. Only stub resolutions are checked;
+    // a workspace's own `builtins.py` is its author's business.
+    if let Ok((_, file_path, _, _)) = &result
+        && let Some(module) = vendored_module_name(file_path)
+        // The name looked up on the module is the segment right after the
+        // module's own name in the target; the rest is an attribute of it.
+        // Taken from the target rather than the returned symbol name, which is
+        // qualified for some resolution paths and bare for others.
+        && let Some(root_symbol) = target_str
+            .strip_prefix(&module)
+            .and_then(|rest| rest.strip_prefix('.'))
+            .and_then(|rest| rest.split('.').next())
+        && !vendored_module_exposes(
+            db,
+            TargetString::new(db, module.clone()),
+            TargetString::new(db, root_symbol.to_string()),
+        )
+    {
+        result = Err(anyhow::anyhow!(
+            "Symbol '{}' not found in module '{}'",
+            root_symbol,
+            module
+        ));
+    }
+
+    CachedDefinitionResult::from_result(result)
 }
 
 /// Cached docstring + `__init__` resolution for a class, walking its MRO.
@@ -225,26 +315,62 @@ pub fn cached_definition_info<'db>(
 /// shared across different child classes are resolved at most once per revision.
 /// The own class properties take priority; parent properties fill in only what
 /// is missing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ResolvedClassDocs {
+    docstring: Option<String>,
+    init: Option<FunctionSignature>,
+    new_signature: Option<FunctionSignature>,
+    all_bases_resolved: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct ClassParentDocs {
-    inner: Arc<(Option<String>, Option<FunctionSignature>)>,
+    inner: Arc<ResolvedClassDocs>,
 }
 
 impl ClassParentDocs {
-    fn new(docstring: Option<String>, init: Option<FunctionSignature>) -> Self {
+    fn new(
+        docstring: Option<String>,
+        init: Option<FunctionSignature>,
+        new_signature: Option<FunctionSignature>,
+        all_bases_resolved: bool,
+    ) -> Self {
         Self {
-            inner: Arc::new((docstring, init)),
+            inner: Arc::new(ResolvedClassDocs {
+                docstring,
+                init,
+                new_signature,
+                all_bases_resolved,
+            }),
         }
     }
 
     /// Resolved docstring — from the class itself or the nearest ancestor that has one.
     pub fn docstring(&self) -> Option<&String> {
-        self.inner.0.as_ref()
+        self.inner.docstring.as_ref()
     }
 
     /// Resolved `__init__` signature — from the class itself or the nearest ancestor.
     pub fn init(&self) -> Option<&FunctionSignature> {
-        self.inner.1.as_ref()
+        self.inner.init.as_ref()
+    }
+
+    /// Resolved `__new__` signature — from the class itself or the nearest ancestor.
+    ///
+    /// Only meaningful when [`init`](Self::init) is `None`; see
+    /// [`ClassInfo::new_signature`](crate::python_analyzer::ClassInfo::new_signature).
+    pub fn new_signature(&self) -> Option<&FunctionSignature> {
+        self.inner.new_signature.as_ref()
+    }
+
+    /// Whether every base class along the walked MRO was found.
+    ///
+    /// `false` means an ancestor could not be resolved — an uninstalled
+    /// dependency, an unresolved re-export — so an `__init__` it declares is
+    /// invisible here, and the absence of one must not be read as proof that
+    /// the class has none.
+    pub fn all_bases_resolved(&self) -> bool {
+        self.inner.all_bases_resolved
     }
 }
 
@@ -309,30 +435,77 @@ pub fn class_parent_docs<'db>(
 ) -> ClassParentDocs {
     let key_str = class_key.value(db);
     let Some((file_path_str, class_name)) = key_str.split_once("::") else {
-        return ClassParentDocs::new(None, None);
+        return ClassParentDocs::new(None, None, None, true);
     };
     let file_path = Path::new(file_path_str);
+    let search_paths_vec = search_paths.paths(db);
 
-    let Ok(class_info) = PythonAnalyzer::extract_class_info(db, file_path, class_name) else {
-        return ClassParentDocs::new(None, None);
+    let class_info = match PythonAnalyzer::extract_class_info(db, file_path, class_name) {
+        Ok(class_info) => class_info,
+        Err(_) => {
+            // The name may be a re-export rather than a definition:
+            // `resolve_base_class` resolves only the *module* of a qualified
+            // base, so `pkg.Widget` lands on `pkg/__init__.py` even when the
+            // class body lives in `pkg/impl.py`. Follow the re-export one hop
+            // and continue the walk there.
+            return match ImportResolver::new(db, &search_paths_vec)
+                .resolve_symbol(file_path, class_name)
+            {
+                Some((resolved_file, resolved_name)) => {
+                    let resolved_name = if resolved_name.is_empty() {
+                        class_name.to_string()
+                    } else {
+                        resolved_name
+                    };
+                    let normalized = normalize_path_for_key(db, &resolved_file);
+                    // A re-export pointing back at this very key would spin;
+                    // treat it as unreadable instead of recursing.
+                    if normalized == file_path && resolved_name == class_name {
+                        return ClassParentDocs::new(None, None, None, false);
+                    }
+                    let resolved_key = TargetString::new(
+                        db,
+                        format!("{}::{}", normalized.display(), resolved_name),
+                    );
+                    class_parent_docs(db, resolved_key, search_paths)
+                }
+                // The class body was never read, so an `__init__` declared here
+                // or further up is invisible. Calling the MRO resolved would
+                // green-light validating against a `__new__` fallback that may
+                // not be the real constructor.
+                None => ClassParentDocs::new(None, None, None, false),
+            };
+        }
     };
 
     let mut docstring = class_info.docstring;
     let mut init = class_info.init_signature;
+    let mut new_signature = class_info.new_signature;
 
+    // `new_signature` deliberately does not gate the walk: once an `__init__`
+    // is in hand, `__new__` is never consulted, so there is nothing left to find.
     if docstring.is_some() && init.is_some() {
-        return ClassParentDocs::new(docstring, init);
+        return ClassParentDocs::new(docstring, init, new_signature, true);
     }
 
-    let search_paths_vec = search_paths.paths(db);
+    // Tracks whether the walk saw the whole hierarchy. Only meaningful when it
+    // finds no `__init__` — see `ClassParentDocs::all_bases_resolved`.
+    let mut all_bases_resolved = true;
 
     for base_class in &class_info.base_classes {
-        if matches!(base_class.as_str(), "object" | "ABC" | "Protocol") {
+        // Bases that exist only for the type system contribute no constructor
+        // and no docstring, and never resolve; skipping them keeps them out of
+        // `all_bases_resolved` too.
+        if matches!(
+            base_class_name(base_class),
+            "object" | "ABC" | "Protocol" | "Generic"
+        ) {
             continue;
         }
         let Some((parent_file, parent_class_name)) =
             PythonAnalyzer::resolve_base_class(db, base_class, file_path, &search_paths_vec)
         else {
+            all_bases_resolved = false;
             continue;
         };
         // Lexical normalization only — no `fs::canonicalize` syscall inside this
@@ -345,6 +518,7 @@ pub fn class_parent_docs<'db>(
             format!("{}::{}", normalized.display(), parent_class_name),
         );
         let parent_docs = class_parent_docs(db, parent_key, search_paths);
+        all_bases_resolved &= parent_docs.all_bases_resolved();
 
         if docstring.is_none() {
             docstring = parent_docs.docstring().cloned();
@@ -352,12 +526,15 @@ pub fn class_parent_docs<'db>(
         if init.is_none() {
             init = parent_docs.init().cloned();
         }
+        if new_signature.is_none() {
+            new_signature = parent_docs.new_signature().cloned();
+        }
         if docstring.is_some() && init.is_some() {
             break;
         }
     }
 
-    ClassParentDocs::new(docstring, init)
+    ClassParentDocs::new(docstring, init, new_signature, all_bases_resolved)
 }
 
 fn class_parent_docs_cycle(
@@ -366,7 +543,9 @@ fn class_parent_docs_cycle(
     _class_key: TargetString,
     _search_paths: InternedSearchPaths,
 ) -> ClassParentDocs {
-    ClassParentDocs::new(None, None)
+    // A circular hierarchy is invalid Python; reporting the bases as resolved
+    // keeps the cycle from also disabling the `__new__` fallback.
+    ClassParentDocs::new(None, None, None, true)
 }
 
 /// Cached class-attribute lookup, walking the MRO when not found directly.
@@ -408,7 +587,12 @@ pub fn class_parent_attribute<'db>(
     let search_paths_vec = search_paths.paths(db);
 
     for base_class in &class_info.base_classes {
-        if matches!(base_class.as_str(), "object" | "ABC" | "Protocol") {
+        // Bases that exist only for the type system carry no attributes of
+        // their own, and never resolve.
+        if matches!(
+            base_class_name(base_class),
+            "object" | "ABC" | "Protocol" | "Generic"
+        ) {
             continue;
         }
         let Some((parent_file, parent_class_name)) =
@@ -836,10 +1020,12 @@ mod tests {
                     is_variadic: false,
                     is_variadic_keyword: false,
                     is_keyword_only: false,
+                    is_positional_only: false,
                 })
                 .collect(),
             return_type: None,
             docstring: None,
+            is_overloaded: false,
             start_line: 1,
             start_column: 1,
             end_line: 2,
@@ -852,17 +1038,35 @@ mod tests {
         // Two independently-allocated results with identical contents must be
         // equal so salsa can backdate. Under the old `Arc::ptr_eq` impl these
         // were always `!=`.
-        let a = ClassParentDocs::new(Some("doc".to_string()), Some(test_sig("__init__", 1)));
-        let b = ClassParentDocs::new(Some("doc".to_string()), Some(test_sig("__init__", 1)));
+        let a = ClassParentDocs::new(
+            Some("doc".to_string()),
+            Some(test_sig("__init__", 1)),
+            None,
+            true,
+        );
+        let b = ClassParentDocs::new(
+            Some("doc".to_string()),
+            Some(test_sig("__init__", 1)),
+            None,
+            true,
+        );
         assert_eq!(a, b, "equal contents must compare equal (value equality)");
 
         // Differing contents must compare unequal — guards against false
         // negatives (failing to invalidate on a real change).
-        let diff_doc =
-            ClassParentDocs::new(Some("other".to_string()), Some(test_sig("__init__", 1)));
+        let diff_doc = ClassParentDocs::new(
+            Some("other".to_string()),
+            Some(test_sig("__init__", 1)),
+            None,
+            true,
+        );
         assert_ne!(a, diff_doc, "different docstring must compare unequal");
-        let diff_init =
-            ClassParentDocs::new(Some("doc".to_string()), Some(test_sig("__init__", 2)));
+        let diff_init = ClassParentDocs::new(
+            Some("doc".to_string()),
+            Some(test_sig("__init__", 2)),
+            None,
+            true,
+        );
         assert_ne!(
             a, diff_init,
             "different __init__ signature must compare unequal"
@@ -1327,5 +1531,63 @@ mod tests {
             None,
             "nor must a name with a doubled dot"
         );
+    }
+
+    // ==================== vendored typeshed resolution ====================
+
+    /// Resolve `module` against `search_paths` on a fresh database.
+    fn resolve_on(db: &TestDb, search_paths: Vec<PathBuf>, module: &str) -> Option<PathBuf> {
+        let mid = TargetString::new(db, module.to_string());
+        let spid = InternedSearchPaths::new(db, search_paths);
+        resolve_module_cached(db, mid, spid).clone()
+    }
+
+    #[test]
+    fn test_builtins_resolves_to_the_vendored_stub() {
+        let db = TestDb::new();
+        assert_eq!(
+            resolve_on(&db, vec![PathBuf::from("/root")], "builtins"),
+            Some(stdlib_search_root().join("builtins.pyi")),
+        );
+    }
+
+    #[test]
+    fn test_vendored_fallback_is_gated_to_builtins() {
+        let db = TestDb::new();
+        // `datetime.pyi` is in the same archive directory as `builtins.pyi`;
+        // only the gate keeps it out of reach.
+        assert_eq!(
+            resolve_on(&db, vec![PathBuf::from("/root")], "datetime"),
+            None,
+        );
+    }
+
+    /// A real `builtins` on the search path is what Python itself would import,
+    /// so it must win over the stub.
+    #[test]
+    fn test_workspace_builtins_shadows_the_vendored_stub() {
+        use ruff_db::system::DbWithWritableSystem;
+
+        let mut db = TestDb::new();
+        db.write_file("/root/builtins.py", "def len(obj):\n    pass\n")
+            .expect("write shadowing builtins");
+
+        assert_eq!(
+            resolve_on(&db, vec![PathBuf::from("/root")], "builtins"),
+            Some(PathBuf::from("/root/builtins.py")),
+        );
+    }
+
+    #[test]
+    fn test_is_builtin_symbol() {
+        let db = TestDb::new();
+        let check = |name: &str| is_builtin_symbol(&db, TargetString::new(&db, name.to_string()));
+
+        assert!(check("len"), "a builtin function");
+        assert!(check("dict"), "a builtin class");
+        assert!(!check("not_a_builtin"));
+        assert!(!check("count"), "a method of `list`, not a builtin");
+        assert!(!check(""));
+        assert!(!check("builtins.len"), "a dotted name is not a bare name");
     }
 }
