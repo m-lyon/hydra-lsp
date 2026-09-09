@@ -438,9 +438,44 @@ pub fn class_parent_docs<'db>(
         return ClassParentDocs::new(None, None, None, true);
     };
     let file_path = Path::new(file_path_str);
+    let search_paths_vec = search_paths.paths(db);
 
-    let Ok(class_info) = PythonAnalyzer::extract_class_info(db, file_path, class_name) else {
-        return ClassParentDocs::new(None, None, None, true);
+    let class_info = match PythonAnalyzer::extract_class_info(db, file_path, class_name) {
+        Ok(class_info) => class_info,
+        Err(_) => {
+            // The name may be a re-export rather than a definition:
+            // `resolve_base_class` resolves only the *module* of a qualified
+            // base, so `pkg.Widget` lands on `pkg/__init__.py` even when the
+            // class body lives in `pkg/impl.py`. Follow the re-export one hop
+            // and continue the walk there.
+            return match ImportResolver::new(db, &search_paths_vec)
+                .resolve_symbol(file_path, class_name)
+            {
+                Some((resolved_file, resolved_name)) => {
+                    let resolved_name = if resolved_name.is_empty() {
+                        class_name.to_string()
+                    } else {
+                        resolved_name
+                    };
+                    let normalized = normalize_path_for_key(db, &resolved_file);
+                    // A re-export pointing back at this very key would spin;
+                    // treat it as unreadable instead of recursing.
+                    if normalized == file_path && resolved_name == class_name {
+                        return ClassParentDocs::new(None, None, None, false);
+                    }
+                    let resolved_key = TargetString::new(
+                        db,
+                        format!("{}::{}", normalized.display(), resolved_name),
+                    );
+                    class_parent_docs(db, resolved_key, search_paths)
+                }
+                // The class body was never read, so an `__init__` declared here
+                // or further up is invisible. Calling the MRO resolved would
+                // green-light validating against a `__new__` fallback that may
+                // not be the real constructor.
+                None => ClassParentDocs::new(None, None, None, false),
+            };
+        }
     };
 
     let mut docstring = class_info.docstring;
@@ -456,8 +491,6 @@ pub fn class_parent_docs<'db>(
     // Tracks whether the walk saw the whole hierarchy. Only meaningful when it
     // finds no `__init__` — see `ClassParentDocs::all_bases_resolved`.
     let mut all_bases_resolved = true;
-
-    let search_paths_vec = search_paths.paths(db);
 
     for base_class in &class_info.base_classes {
         // Bases that exist only for the type system contribute no constructor

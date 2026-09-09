@@ -4369,6 +4369,70 @@ class Thing(Widget):
         assert!(!class_info.constructor_is_uncertain());
     }
 
+    /// A qualified base only resolves its *module*, so `pkg.Widget` lands on
+    /// `pkg/__init__.py` even when the class body lives in `pkg/impl.py`. The
+    /// re-export has to be followed or the inherited `__init__` is invisible.
+    #[test]
+    fn test_reexported_qualified_base_class_is_resolved() {
+        let db = test_db();
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("pkg");
+        std::fs::create_dir(&pkg).unwrap();
+        std::fs::write(pkg.join("__init__.py"), "from .impl import Widget\n").unwrap();
+        std::fs::write(
+            pkg.join("impl.py"),
+            "class Widget:\n    def __init__(self, size):\n        pass\n",
+        )
+        .unwrap();
+        let path = dir.path().join("main.py");
+        std::fs::write(
+            &path,
+            "import pkg\n\nclass Thing(pkg.Widget):\n    def __new__(cls):\n        return super().__new__(cls)\n",
+        )
+        .unwrap();
+        let search_paths = vec![dir.path().to_path_buf()];
+
+        let (class_info, _) =
+            PythonAnalyzer::extract_class_info_with_imports(&db, &path, "Thing", &search_paths)
+                .unwrap();
+
+        let init = class_info
+            .init_signature
+            .as_ref()
+            .expect("the re-exported base's __init__ should be inherited");
+        assert_eq!(init.name, "__init__", "got {init:?}");
+        let names: Vec<_> = init.parameters.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["self", "size"]);
+        assert!(!class_info.constructor_is_uncertain());
+    }
+
+    /// A base whose module resolves but whose class body is never read leaves
+    /// the MRO incomplete: the real `__init__` may be up there. Reporting the
+    /// hierarchy as resolved would green-light validating against `__new__`.
+    #[test]
+    fn test_unreadable_base_class_body_leaves_the_mro_uncertain() {
+        let db = test_db();
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("pkg");
+        std::fs::create_dir(&pkg).unwrap();
+        std::fs::write(pkg.join("__init__.py"), "\n").unwrap();
+        let path = dir.path().join("main.py");
+        std::fs::write(
+            &path,
+            "import pkg\n\nclass Thing(pkg.Widget):\n    def __new__(cls, size):\n        return super().__new__(cls)\n",
+        )
+        .unwrap();
+        let search_paths = vec![dir.path().to_path_buf()];
+
+        let (class_info, _) =
+            PythonAnalyzer::extract_class_info_with_imports(&db, &path, "Thing", &search_paths)
+                .unwrap();
+
+        assert_eq!(class_info.init_signature.as_ref().unwrap().name, "__new__");
+        assert!(class_info.unresolved_base_classes);
+        assert!(class_info.constructor_is_uncertain());
+    }
+
     /// Two declarations of one name are not an overload set. A property and its
     /// setter are the common shape, and treating them as overloaded would
     /// silently switch off argument validation for the target.

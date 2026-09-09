@@ -1021,12 +1021,28 @@ impl YamlParser {
     /// Only the text after the `_args_:` colon is considered, so
     /// `_args_: # see [docs]` is correctly read as a block sequence with a
     /// comment rather than as a flow sequence starting inside the comment.
+    ///
+    /// An anchor or a tag may sit between the colon and the bracket
+    /// (`_args_: &defaults [1, 2]`); neither is part of the sequence, so both
+    /// are stepped over.
     fn value_bracket_byte(line_text: &str) -> Option<usize> {
         let key = line_text.find(ARGS_KEY)?;
         let colon = key + line_text[key..].find(':')?;
-        let value = line_text[colon + 1..]
+        let mut value = line_text[colon + 1..]
             .find(|c: char| !c.is_whitespace())
             .map(|offset| colon + 1 + offset)?;
+
+        // Each pass consumes at least the leading `&` or `!`, so `value` always
+        // advances and the loop terminates.
+        while line_text[value..].starts_with(['&', '!']) {
+            let token_end = line_text[value..]
+                .find(|c: char| c.is_whitespace() || matches!(c, '[' | ']' | '{' | '}' | ','))
+                .map(|offset| value + offset)?;
+            value = line_text[token_end..]
+                .find(|c: char| !c.is_whitespace())
+                .map(|offset| token_end + offset)?;
+        }
+
         line_text[value..].starts_with('[').then_some(value)
     }
 
@@ -3474,6 +3490,39 @@ model:
             .as_ref()
             .expect("a genuine flow sequence, even with an unpositioned entry");
         assert!(inline.text_after_bracket.starts_with("[1, 2], []]"));
+    }
+
+    /// An anchor or a tag between the colon and the bracket does not make the
+    /// sequence block style. Signature help is driven by `bracket_col`, so
+    /// missing the bracket silently switches it off for the line.
+    #[test]
+    fn test_inline_args_with_an_anchor_or_tag_is_still_inline() {
+        for (content, expected_after) in [
+            (
+                "model:\n  _target_: builtins.max\n  _args_: &defaults [1, 2]\n",
+                "1, 2]",
+            ),
+            (
+                "model:\n  _target_: builtins.max\n  _args_: !!seq [3, 4]\n",
+                "3, 4]",
+            ),
+        ] {
+            let parsed = YamlParser::parse(content).unwrap();
+            let args = parsed.hydra_objects[0]
+                .args
+                .as_ref()
+                .expect("args should be present");
+            let inline = args
+                .value
+                .as_ref()
+                .unwrap_or_else(|| panic!("an anchored flow sequence is inline, in:\n{content}"));
+            assert_eq!(inline.text_after_bracket, expected_after);
+            let line = args.line;
+            assert!(
+                parsed.param_line_map.contains_key(&line),
+                "the _args_ line should still get signature help, in:\n{content}"
+            );
+        }
     }
 
     #[test]
