@@ -18,9 +18,15 @@ const BROKEN_CONFIG: &str = "model:\n  _target_: no_such_module.Thing\n  size: 4
 /// Valid YAML with no Hydra markers at all.
 const PLAIN_YAML: &str = "name: not-a-hydra-config\nvalues:\n  - 1\n  - 2\n";
 
+/// Carries a `_target_`, so it is treated as a Hydra file, but is not YAML: the
+/// second document makes it a parse failure rather than a diagnostic.
+const UNPARSEABLE_CONFIG: &str =
+    "model:\n  _target_: pkg.Thing\n---\nother:\n  _target_: pkg.Other\n";
+
 struct CheckOutput {
     code: i32,
     stdout: String,
+    stderr: String,
 }
 
 /// Run `hydrust check` from inside `dir`, so that reported paths are relative
@@ -38,6 +44,7 @@ fn check_in(dir: &Path, args: &[&str]) -> CheckOutput {
     CheckOutput {
         code: output.status.code().unwrap(),
         stdout: String::from_utf8(output.stdout).unwrap(),
+        stderr: String::from_utf8(output.stderr).unwrap(),
     }
 }
 
@@ -205,6 +212,131 @@ fn test_github_format_emits_relative_annotations() {
     );
     assert!(first.contains("line="), "got: {first}");
     assert!(first.contains("title=hydrust("), "got: {first}");
+}
+
+#[test]
+fn test_explicit_non_hydra_file_is_checked_with_a_warning() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("plain.yaml"), PLAIN_YAML).unwrap();
+
+    let result = check_in(dir.path(), &["plain.yaml", "--output-format", "compact"]);
+
+    assert_eq!(result.code, 0, "got: {}", result.stdout);
+    assert!(
+        result.stdout.contains("across 1 file(s)"),
+        "a file named explicitly should still be checked, got: {}",
+        result.stdout
+    );
+    assert!(
+        result.stderr.contains("plain.yaml") && result.stderr.contains("does not contain Hydra"),
+        "expected a warning on stderr, got: {}",
+        result.stderr
+    );
+}
+
+#[test]
+fn test_unparseable_file_is_reported_as_a_github_annotation() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("bad.yaml"), UNPARSEABLE_CONFIG).unwrap();
+
+    let result = check_in(dir.path(), &[".", "--output-format", "github"]);
+
+    assert_eq!(result.code, 1, "got: {}", result.stdout);
+    let annotation = result
+        .stdout
+        .lines()
+        .find(|line| line.starts_with("::error"))
+        .unwrap_or_else(|| panic!("no annotation in: {}", result.stdout));
+
+    assert!(
+        annotation.starts_with("::error file=bad.yaml,line=1,col=1,title=hydrust::"),
+        "got: {annotation}"
+    );
+}
+
+#[test]
+fn test_github_output_escapes_workflow_metacharacters() {
+    let dir = TempDir::new().unwrap();
+    // `,` separates workflow command properties and `%` starts an escape, so
+    // both have to be encoded for GitHub to resolve the annotation's file.
+    fs::write(dir.path().join("a,b%c.yaml"), UNPARSEABLE_CONFIG).unwrap();
+
+    let result = check_in(dir.path(), &[".", "--output-format", "github"]);
+
+    let annotation = result
+        .stdout
+        .lines()
+        .find(|line| line.starts_with("::error"))
+        .unwrap_or_else(|| panic!("no annotation in: {}", result.stdout));
+
+    assert!(
+        annotation.starts_with("::error file=a%2Cb%25c.yaml,"),
+        "got: {annotation}"
+    );
+}
+
+#[test]
+fn test_unparseable_file_is_reported_as_a_json_failure() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("bad.yaml"), UNPARSEABLE_CONFIG).unwrap();
+
+    let result = check_in(dir.path(), &[".", "--output-format", "json"]);
+
+    assert_eq!(result.code, 1, "got: {}", result.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&result.stdout)
+        .unwrap_or_else(|e| panic!("output was not one JSON document ({e}): {}", result.stdout));
+
+    let file = &parsed["files"][0];
+    assert_eq!(file["file"], "bad.yaml", "got: {parsed}");
+    assert!(file["error"].is_string(), "got: {parsed}");
+    assert_eq!(file["diagnostics"].as_array().unwrap().len(), 0);
+
+    // A file that fails to parse produces no diagnostics, so it is counted by
+    // `failed_files` and not by `total`.
+    assert_eq!(parsed["summary"]["failed_files"], 1, "got: {parsed}");
+    assert_eq!(parsed["summary"]["total"], 0, "got: {parsed}");
+}
+
+#[test]
+fn test_json_summary_total_matches_the_diagnostics_reported() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("a.yaml"), BROKEN_CONFIG).unwrap();
+    fs::write(dir.path().join("bad.yaml"), UNPARSEABLE_CONFIG).unwrap();
+
+    let result = check_in(dir.path(), &[".", "--output-format", "json"]);
+    let parsed: serde_json::Value = serde_json::from_str(&result.stdout).unwrap();
+
+    let reported: usize = parsed["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|file| file["diagnostics"].as_array().unwrap().len())
+        .sum();
+    let summary = &parsed["summary"];
+
+    assert_eq!(summary["total"], reported, "got: {parsed}");
+    assert_eq!(
+        summary["total"].as_u64().unwrap(),
+        summary["errors"].as_u64().unwrap()
+            + summary["warnings"].as_u64().unwrap()
+            + summary["other"].as_u64().unwrap(),
+        "got: {parsed}"
+    );
+}
+
+#[test]
+fn test_unknown_disable_rule_is_a_usage_error() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("config.yaml"), BROKEN_CONFIG).unwrap();
+
+    let result = check_in(dir.path(), &[".", "--disable-rule", "no-such-rule"]);
+
+    assert_eq!(result.code, 2, "got: {}", result.stdout);
+    assert!(
+        result.stderr.contains("unresolved-import"),
+        "the usage error should list the valid rules, got: {}",
+        result.stderr
+    );
 }
 
 #[test]

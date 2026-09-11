@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.4.0]
+## [0.5.0]
 
 - Renamed the CLI binary from `hydra-check` to `hydrust`, and moved checking behind a `check` subcommand (`hydrust check config.yaml`).
 - `hydrust check` now accepts multiple files and directories. Directories are walked recursively for `.yaml` and `.yml` files, honouring `.gitignore`; discovered files that carry no Hydra markers are skipped silently
@@ -8,7 +8,15 @@
 - Renamed `--format` to `--output-format`.
 - Gated the `hydra-lsp` binary behind a `server` feature, on by default.
 - JSON output is now a single document covering every checked file, rather than one document per file
-- Fixed the `--disable-rule` help text.
+- The JSON `summary` now counts diagnostics only in `total`, reports `other`, and counts files that could not be read or parsed under a separate `failed_files` field
+- `--disable-rule` now lists the valid rules in `--help` and rejects an unknown rule as a usage error, instead of warning and carrying on
+- Reported paths always use `/` separators, so `--output-format github` annotations attach on Windows runners
+- Directory walks no longer apply the user's global git excludes (`core.excludesFile`), so a local run and a CI run check the same files
+- An unreadable directory or a file that disappears mid-walk is now logged and skipped, rather than aborting the whole run
+- The workspace root falls back to the canonicalized current directory, so it matches the paths reported for each file
+
+## [0.4.0]
+
 - Added an incremental cache built on salsa (`HydraDatabase`), so YAML parses, Python target resolutions, and diagnostics are reused between requests instead of being recomputed on every keystroke
 - Cached YAML parsing per document version through the `DocumentInput`/`ParsedYaml` salsa inputs, replacing the previous `DocumentStore`
 - Cached Python definition lookups in `python_cache`, keyed on the target string and the resolved search paths

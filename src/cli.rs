@@ -42,7 +42,8 @@ enum Command {
 #[derive(Args)]
 struct CheckCommand {
     /// Files or directories to check. Directories are searched recursively for
-    /// `.yaml` and `.yml` files, honouring `.gitignore`.
+    /// `.yaml` and `.yml` files, honouring `.gitignore` and `.ignore` files and
+    /// skipping hidden files and directories.
     #[arg(required = true, value_name = "PATH")]
     paths: Vec<PathBuf>,
 
@@ -71,9 +72,14 @@ struct CheckCommand {
     #[arg(long)]
     trace_resolution: bool,
 
-    /// Disable a diagnostic rule (can be repeated). For valid rules, see
-    /// `diagnostics::DiagnosticRule::all()`
-    #[arg(long = "disable-rule", value_name = "RULE")]
+    /// Disable a diagnostic rule (can be repeated)
+    #[arg(
+        long = "disable-rule",
+        value_name = "RULE",
+        value_parser = clap::builder::PossibleValuesParser::new(
+            DiagnosticRule::all_codes().iter().copied()
+        ),
+    )]
     disable_rules: Vec<String>,
 }
 
@@ -290,21 +296,36 @@ fn collect_targets(paths: &[PathBuf]) -> anyhow::Result<Vec<CheckTarget>> {
 
         // `require_git(false)` so that `.gitignore` is honoured whether or not
         // the tree happens to be a git checkout; otherwise which files get
-        // checked would depend on the presence of `.git`. Sorted so that output
-        // is reproducible across runs and platforms.
+        // checked would depend on the presence of `.git`. `git_global(false)`
+        // so the developer's personal global excludes cannot make a local run
+        // disagree with CI. Sorted so that output is reproducible across runs
+        // and platforms.
         let walk = WalkBuilder::new(path)
             .require_git(false)
+            .git_global(false)
             .sort_by_file_path(|a, b| a.cmp(b))
             .build();
         for entry in walk {
-            let entry = entry?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => {
+                    warn!("Skipping unreadable entry under {}: {e}", path.display());
+                    continue;
+                }
+            };
             if !entry.file_type().is_some_and(|ft| ft.is_file()) {
                 continue;
             }
             if !is_yaml_file(entry.path()) {
                 continue;
             }
-            let canonical = entry.path().canonicalize()?;
+            let canonical = match entry.path().canonicalize() {
+                Ok(canonical) => canonical,
+                Err(e) => {
+                    warn!("Skipping {}: {e}", entry.path().display());
+                    continue;
+                }
+            };
             if seen.insert(canonical.clone()) {
                 targets.push(CheckTarget {
                     display: display_path(&canonical, cwd.as_deref()),
@@ -320,11 +341,23 @@ fn collect_targets(paths: &[PathBuf]) -> anyhow::Result<Vec<CheckTarget>> {
 
 /// Render `path` relative to `base` when it sits underneath it, otherwise as
 /// the absolute path.
+///
+/// Separators are always `/`, including on Windows: GitHub only attaches an
+/// annotation when `file=` is a `/`-separated path relative to the repository
+/// root, so a `\`-separated path is dropped without explanation. The replacement is
+/// skipped where `\` is a legal character in a file name.
 fn display_path(path: &Path, base: Option<&Path>) -> String {
-    base.and_then(|base| path.strip_prefix(base).ok())
+    let rendered = base
+        .and_then(|base| path.strip_prefix(base).ok())
         .unwrap_or(path)
         .display()
-        .to_string()
+        .to_string();
+
+    if std::path::MAIN_SEPARATOR == '\\' {
+        rendered.replace('\\', "/")
+    } else {
+        rendered
+    }
 }
 
 fn is_yaml_file(path: &Path) -> bool {
@@ -354,32 +387,21 @@ fn resolve_workspace_root(
         return Ok(single.path.parent().map(PathBuf::from));
     }
 
-    Ok(Some(std::env::current_dir()?))
+    Ok(Some(std::env::current_dir()?.canonicalize()?))
 }
 
+/// Turn the `--disable-rule` codes into rules.
 fn parse_disabled_rules(rules: &[String]) -> HashSet<DiagnosticRule> {
-    let mut disabled_rules = HashSet::new();
-    for rule_str in rules {
-        match DiagnosticRule::from_code(rule_str) {
-            Some(rule) => {
-                disabled_rules.insert(rule);
+    rules
+        .iter()
+        .filter_map(|code| {
+            let rule = DiagnosticRule::from_code(code);
+            if rule.is_none() {
+                warn!("Unknown diagnostic rule: '{code}', ignoring");
             }
-            None => {
-                warn!("Unknown diagnostic rule: '{}', ignoring", rule_str);
-                eprintln!(
-                    "{}: Unknown diagnostic rule '{}'. Valid rules: {}",
-                    "Warning".yellow().bold(),
-                    rule_str,
-                    DiagnosticRule::all()
-                        .iter()
-                        .map(|r| r.as_code())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-            }
-        }
-    }
-    disabled_rules
+            rule
+        })
+        .collect()
 }
 
 /// Check a single file. Returns `None` when the file was discovered by walking
@@ -601,22 +623,24 @@ fn diagnostic_code(diagnostic: &Diagnostic) -> String {
 /// Totals across every checked file, used by the summary lines.
 struct Totals {
     files: usize,
+    failures: usize,
     errors: usize,
     warnings: usize,
     other: usize,
 }
 
 impl Totals {
-    fn of(reports: &[FileReport]) -> Self {
+    fn from_reports(reports: &[FileReport]) -> Self {
         let mut totals = Totals {
             files: reports.len(),
+            failures: 0,
             errors: 0,
             warnings: 0,
             other: 0,
         };
         for report in reports {
             if report.failure.is_some() {
-                totals.errors += 1;
+                totals.failures += 1;
             }
             for diag in &report.diagnostics {
                 match diag.severity {
@@ -630,7 +654,7 @@ impl Totals {
     }
 
     fn is_clean(&self) -> bool {
-        self.errors == 0 && self.warnings == 0 && self.other == 0
+        self.failures == 0 && self.errors == 0 && self.warnings == 0 && self.other == 0
     }
 }
 
@@ -679,33 +703,45 @@ fn output_pretty(reports: &[FileReport]) {
     }
 
     // Summary
-    let totals = Totals::of(reports);
+    let totals = Totals::from_reports(reports);
 
-    println!("\n{}", "─".repeat(60));
-    print!("{}", "Summary: ".bold());
+    let mut parts = Vec::new();
     if totals.errors > 0 {
-        print!("{} error(s)", totals.errors.to_string().red().bold());
+        parts.push(format!(
+            "{} error(s)",
+            totals.errors.to_string().red().bold()
+        ));
     }
     if totals.warnings > 0 {
-        if totals.errors > 0 {
-            print!(", ");
-        }
-        print!("{} warning(s)", totals.warnings.to_string().yellow().bold());
+        parts.push(format!(
+            "{} warning(s)",
+            totals.warnings.to_string().yellow().bold()
+        ));
     }
     if totals.other > 0 {
-        if totals.errors > 0 || totals.warnings > 0 {
-            print!(", ");
-        }
-        print!("{} other(s)", totals.other.to_string().blue());
+        parts.push(format!("{} other(s)", totals.other.to_string().blue()));
+    }
+    if totals.failures > 0 {
+        parts.push(format!(
+            "{} file(s) that could not be checked",
+            totals.failures.to_string().red().bold()
+        ));
     }
     if totals.is_clean() {
-        print!("{}", "No issues".green());
+        parts.push(format!("{}", "No issues".green()));
     }
-    println!(" across {} file(s)", totals.files);
+
+    println!("\n{}", "─".repeat(60));
+    println!(
+        "{}{} across {} file(s)",
+        "Summary: ".bold(),
+        parts.join(", "),
+        totals.files
+    );
 }
 
 fn output_json(reports: &[FileReport]) -> anyhow::Result<()> {
-    let totals = Totals::of(reports);
+    let totals = Totals::from_reports(reports);
     let output = serde_json::json!({
         "files": reports.iter().map(|report| {
             serde_json::json!({
@@ -726,9 +762,11 @@ fn output_json(reports: &[FileReport]) -> anyhow::Result<()> {
         }).collect::<Vec<_>>(),
         "summary": {
             "files": totals.files,
+            "failed_files": totals.failures,
             "total": totals.errors + totals.warnings + totals.other,
             "errors": totals.errors,
             "warnings": totals.warnings,
+            "other": totals.other,
         }
     });
 
@@ -760,7 +798,7 @@ fn output_compact(reports: &[FileReport]) {
         }
     }
 
-    let totals = Totals::of(reports);
+    let totals = Totals::from_reports(reports);
     if totals.is_clean() {
         println!("OK - no issues found across {} file(s)", totals.files);
     }

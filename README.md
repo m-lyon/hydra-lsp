@@ -61,10 +61,15 @@ hydrust check config.yaml -v debug
 hydrust check config.yaml -f json
 ```
 
-Directories are searched recursively for `.yaml` and `.yml` files, honouring
-`.gitignore`. Files found that way are skipped when they carry no Hydra markers;
-a file named explicitly on the command line is always checked, with a warning if
-it does not look like a Hydra config.
+Directories are searched recursively for `.yaml` and `.yml` files. The walk
+honours `.gitignore` and `.ignore` files (including those in parent
+directories) and `.git/info/exclude`, and skips hidden files and directories
+such as `.github/`. Your personal global git excludes (`core.excludesFile`) are
+deliberately not applied, so a local run and a CI run check the same files.
+
+Files found by walking a directory are skipped when they carry no Hydra
+markers; a file named explicitly on the command line is always checked, with a
+warning if it does not look like a Hydra config.
 
 ### Options
 
