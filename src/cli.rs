@@ -10,6 +10,7 @@ use std::io::stderr;
 use std::path::{Component, Path, PathBuf};
 use std::process;
 
+use anyhow::Context;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use colored::Colorize;
 use ignore::WalkBuilder;
@@ -359,7 +360,9 @@ fn collect_targets(paths: &[PathBuf]) -> anyhow::Result<Vec<CheckTarget>> {
         }
 
         if path.is_file() {
-            let canonical = path.canonicalize()?;
+            let canonical = path
+                .canonicalize()
+                .with_context(|| format!("Failed to resolve path: {}", path.display()))?;
             // An explicit mention always wins, whichever order the arguments
             // arrive in: a file already picked up by a directory walk is
             // promoted rather than dropped as a duplicate.
@@ -491,7 +494,9 @@ fn is_yaml_file(path: &Path) -> bool {
 /// parent directory that is right for every file.
 fn resolve_workspace_root(args: &CheckCommand) -> anyhow::Result<Option<PathBuf>> {
     if let Some(ref ws) = args.workspace {
-        return Ok(Some(ws.canonicalize()?));
+        return Ok(Some(ws.canonicalize().with_context(|| {
+            format!("Workspace not found: {}", ws.display())
+        })?));
     }
 
     // Keyed on what was passed, not on what the walk turned up, so the root
@@ -876,6 +881,7 @@ fn output_json(reports: &[FileReport]) -> anyhow::Result<()> {
             serde_json::json!({
                 "file": report.path.to_string(),
                 "error": report.failure,
+                "error_code": report.failure_code,
                 "diagnostics": report.diagnostics.iter().map(|d| {
                     serde_json::json!({
                         "severity": json_severity_label(d),

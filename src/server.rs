@@ -19,7 +19,8 @@ fn init_tracing() {
         .with_max_level(tracing::Level::INFO)
         .with_writer(std::io::stderr)
         .with_ansi(false)
-        .init();
+        .try_init()
+        .ok();
 }
 
 /// Run the LSP loop to completion.
