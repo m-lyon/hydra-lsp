@@ -14,7 +14,7 @@ The **repository** names do not change; see Decisions.
 | Phase | Repo | Scope | Status |
 | ----- | ---- | ----- | ------ |
 | A | vscode | Version-keyed archive and executable names, `server` arg, PATH candidates | DONE |
-| B | hydra-lsp | `hydrust server`, crate rename, delete the `server` feature | TODO |
+| B | hydra-lsp | `hydrust server`, crate rename, delete the `server` feature | DONE |
 
 Phase A ships first and works against every server released so far, so there is
 no window in which client and server disagree.
@@ -181,9 +181,11 @@ released and adopted before the server changes.
       `DISPLAY_NAME`, `LEGACY_BINARY_NAME`, `BINARY_NAME_CANDIDATES` and
       `SERVER_ARGS`, so nothing about naming lives in `constants.ts` any more
       and the two files do not have to import each other.
-- [ ] `compatTable.ts:39`: the docstring guessed `--version` prints
-      `'hydrust-server 0.4.0'`. The guess is gone, but the real string is still
-      to be filled in once phase B settles it.
+- [x] `compatTable.ts:39`: the docstring guessed `--version` prints
+      `'hydrust-server 0.4.0'`. Settled by phase B: `hydrust --version` prints
+      `hydrust 0.5.0`, clap's default for the renamed crate. The docstring also
+      records that this is the bare binary, never `hydrust server --version` —
+      the subcommand's catch-all swallows `--version` and starts a server.
 - [x] `constants.ts`: retire `BINARY_NAME` per the table above; thread `version`
       through `getArchiveDirectoryName`, `getDownloadUrl`, `getChecksumUrl` and
       `getExecutablePath`; drop `executableName` from `PlatformInfo`. It gains
@@ -216,65 +218,95 @@ released and adopted before the server changes.
 
 ### Subcommand
 
-- [ ] Move `serve()` out of `src/main.rs` into the library (`src/server.rs`,
+- [x] Move `serve()` out of `src/main.rs` into the library (`src/server.rs`,
       re-exported), so a bin is a one-line call. It owns its own
       `tracing_subscriber` init writing to stderr with ANSI off — `hydrust
       check` initialises tracing differently (`src/cli.rs`, ANSI on, verbosity
       from `--verbosity`), and only one init can win per process, so each
       subcommand must do its own.
-- [ ] `src/cli.rs`: add `Server(ServerCommand)` to the `Command` enum.
-- [ ] Preserve today's tolerance of unrecognised arguments
+- [x] `src/cli.rs`: add `Server(ServerCommand)` to the `Command` enum.
+- [x] Preserve today's tolerance of unrecognised arguments
       (`src/main.rs:22-28`: an editor may append its own transport flag such as
       `--stdio`, and refusing to start is worse than ignoring it). A bare clap
       subcommand would exit 2 instead, so `ServerCommand` needs a hidden
       `trailing_var_arg` + `allow_hyphen_values` catch-all that is ignored, and
       the note about it goes to stderr, never stdout.
-- [ ] Delete `[[bin]] hydra-lsp`, `src/main.rs`, `[features]` and
+- [x] Delete `[[bin]] hydra-lsp`, `src/main.rs`, `[features]` and
       `required-features` from `Cargo.toml`, along with the comment at
       `Cargo.toml:14-16`. Replace with a comment recording the PATH invariant
       above.
-- [ ] `src/backend.rs:1037`: `serverInfo.name` → `"hydrust"`.
+- [x] `src/backend.rs:1037`: `serverInfo.name` → `"hydrust"`.
 
 ### Crate rename
 
-- [ ] `Cargo.toml:2`: `name = "hydrust"`. Leave `repository` pointing at
+- [x] `Cargo.toml:2`: `name = "hydrust"`. Leave `repository` pointing at
       `m-lyon/hydra-lsp`.
-- [ ] `Cargo.toml:10-12`: the `[lib]` section can go entirely — with the package
+- [x] `Cargo.toml:10-12`: the `[lib]` section can go entirely — with the package
       named `hydrust`, both `name` and `path = "src/lib.rs"` are the defaults.
       Keep the explicit `[[bin]] name = "hydrust", path = "src/cli.rs"`, since
       the bin source is not `src/main.rs`.
-- [ ] `use hydra_lsp::` → `use hydrust::` — 21 references across
+- [x] `use hydra_lsp::` → `use hydrust::` — 21 references across
       `src/cli.rs` and `tests/{capabilities,semantic_tokens,encoding_failure_modes,
       textrange_conversion,common/mod}.rs`.
-- [ ] Re-run `dist generate` and confirm `.github/workflows/release.yml` still
+- [x] Re-run `dist generate` and confirm `.github/workflows/release.yml` still
       builds; neither workflow currently hardcodes the name.
-- [ ] Confirm the v0.5.0 `dist-manifest.json` lists exactly one executable named
+- [x] Confirm the v0.5.0 `dist-manifest.json` lists exactly one executable named
       `hydrust` per `hydrust-<target>` archive. This is the artefact phase A's
       tables are written against.
 
 ### Tests and docs
 
-- [ ] `tests/server_cli.rs`: `CARGO_BIN_EXE_hydra-lsp` → `CARGO_BIN_EXE_hydrust`
+- [x] `tests/server_cli.rs`: `CARGO_BIN_EXE_hydra-lsp` → `CARGO_BIN_EXE_hydrust`
       with a `server` argument; the assertions at `:33` and `:53` expect
       `hydra-lsp X.Y.Z` and `Usage: hydra-lsp`. Keep the stdout-cleanliness test
       — it is the one that matters most here, since `hydrust check` writes to
       stdout freely and now shares a process with the LSP transport.
-- [ ] New test: `hydrust server --some-unknown-flag` still starts the LSP loop
+- [x] New test: `hydrust server --some-unknown-flag` still starts the LSP loop
       and writes nothing to stdout.
-- [ ] `hydrust --version` must stay parseable by `parseServerVersion`
+- [x] `hydrust --version` must stay parseable by `parseServerVersion`
       (`compatTable.ts:43`) — it matches the first `\d+.\d+(.\d+)?` in the
       output, so any clap default is fine. Decide whether to set
       `propagate_version` and record what `hydrust server --version` prints, for
       phase A's docstring.
-- [ ] In the client repo, flip the candidate order in
+- [x] In the client repo, flip the candidate order in
       `test/oob/contract.test.ts`'s `requireBinary` back to `hydrust` first.
       Phase A left `hydra-lsp` first because until this phase lands `cargo
       build` produces both and only `hydra-lsp` is the server. Afterwards
       nothing builds a `hydra-lsp`, so a leftover one in `target/debug` would
       be picked up silently and the suite would check the wrong binary.
-- [ ] README, CHANGELOG and `.github/copilot-instructions.md`.
-- [ ] CHANGELOG: breaking change note covering both renames, and the
+- [x] README, CHANGELOG and `.github/copilot-instructions.md`.
+- [x] CHANGELOG: breaking change note covering both renames, and the
       `hydrust.serverVersion` pin as the escape hatch.
+
+### Decided during implementation
+
+- **`propagate_version` is not set.** `hydrust server --version` would not have
+  worked anyway: `ServerCommand`'s `trailing_var_arg` + `allow_hyphen_values`
+  catch-all swallows `--version` along with every other unrecognised argument,
+  so the subcommand starts a language server instead of answering. That is the
+  right trade — tolerating an editor's transport flags is what the catch-all is
+  for — and the client only ever probes the bare binary. `hydrust --version`
+  prints `hydrust 0.5.0`.
+- **`--help` and `-h` still reach clap** even inside `server`, because clap
+  resolves them before the positional catch-all. Same behaviour as the old
+  binary, which printed help and exited 0.
+- **The client's `requireBinary` keeps both names, reordered rather than
+  pruned.** Phase A had already replaced the flat ordering with a version gate:
+  a `hydrust` is taken only if `--version` reports >= v0.5.0. That is strictly
+  stronger than the ordering this plan asked for, so the gate stays and
+  `hydrust` simply moves to the front of the candidate list.
+- **Diagnostic `source` and the pull-diagnostics `identifier` still say
+  `hydra-lsp`** (`src/diagnostics.rs:89`, `src/backend.rs:1015`,
+  `src/backend.rs:2037`). Out of scope here: `identifier` correlates pull
+  requests, and "the handshake does not change" covers it. Worth a separate
+  decision, since `source` is what an editor prints next to each diagnostic.
+- **`Makefile`'s `build-vscode` target copies to a path that no longer
+  exists** (`bundled/libs/bin/`; the extension caches under global storage
+  keyed by version now). The binary and directory names were corrected here,
+  but the target is still stale for reasons that predate this plan.
+- **`cargo build` no longer produces a `hydra-lsp`.** `dist plan` confirms one
+  `hydrust` executable per `hydrust-<target>` archive across all six targets,
+  and `dist generate` reproduces `release.yml` byte for byte.
 
 ## Packaging
 

@@ -1,7 +1,8 @@
-//! CLI tool for diagnosing Hydra YAML configuration files.
+//! The `hydrust` binary: `hydrust check` and `hydrust server`.
 //!
-//! This tool parses Hydra YAML files and outputs diagnostics to help debug
-//! issues with `_target_` resolution and parameter validation.
+//! `check` parses Hydra YAML files and outputs diagnostics to help debug
+//! issues with `_target_` resolution and parameter validation. `server` runs
+//! the same analysis as a language server (`server.rs`).
 
 use std::fmt;
 use std::fs;
@@ -15,19 +16,19 @@ use ignore::WalkBuilder;
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
 use tracing::{Level, debug, error, info, warn};
 
-use hydra_lsp::database::HydraDatabase;
-use hydra_lsp::diagnostics::{DiagnosticRule, validate_document};
-use hydra_lsp::python_analyzer::PythonAnalyzer;
-use hydra_lsp::python_cache::PythonConfig;
-use hydra_lsp::yaml_parser::YamlParser;
+use hydrust::database::HydraDatabase;
+use hydrust::diagnostics::{DiagnosticRule, validate_document};
+use hydrust::python_analyzer::PythonAnalyzer;
+use hydrust::python_cache::PythonConfig;
+use hydrust::yaml_parser::YamlParser;
 
 use std::collections::HashSet;
 
-/// CLI tool for diagnosing Hydra YAML configuration files
+/// Tooling for Hydra YAML configuration files
 #[derive(Parser)]
 #[command(name = "hydrust")]
 #[command(author, version, long_about = None)]
-#[command(about = "Check Hydra YAML configuration files for diagnostics")]
+#[command(about = "Diagnostics and language server for Hydra YAML configuration files")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -37,6 +38,29 @@ struct Cli {
 enum Command {
     /// Check Hydra YAML configuration files for diagnostics.
     Check(CheckCommand),
+
+    /// Run the language server, speaking LSP over stdin/stdout.
+    Server(ServerCommand),
+}
+
+/// `hydrust server` — the language server.
+///
+/// Takes no options of its own. The catch-all exists to preserve the tolerance
+/// the standalone server binary had: an editor may append its own transport
+/// flag (`--stdio` is the common one), and refusing to start is worse than
+/// ignoring it. A bare clap subcommand would exit 2 on the first unrecognised
+/// argument, so they are collected here and dropped. The note about them goes
+/// to stderr, never stdout, because stdout is the LSP transport and a stray
+/// byte would corrupt the protocol.
+#[derive(Args)]
+struct ServerCommand {
+    #[arg(
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        hide = true,
+        value_name = "IGNORED"
+    )]
+    ignored: Vec<String>,
 }
 
 #[derive(Args)]
@@ -179,7 +203,17 @@ impl FileReport {
 
 fn main() {
     let cli = Cli::parse();
-    let Command::Check(args) = &cli.command;
+    let args = match &cli.command {
+        Command::Check(args) => args,
+        Command::Server(server) => {
+            if !server.ignored.is_empty() {
+                // stderr, never stdout: stdout is the LSP transport.
+                eprintln!("hydrust: ignoring unrecognised arguments; starting language server");
+            }
+            hydrust::server::serve();
+            return;
+        }
+    };
 
     // Initialize tracing with the specified verbosity
     let level: Level = args.verbosity.into();
@@ -485,7 +519,7 @@ fn check_target(
 
 fn trace_target_resolution(
     index: usize,
-    hydra_object: &hydra_lsp::yaml_parser::HydraObject,
+    hydra_object: &hydrust::yaml_parser::HydraObject,
     db: &HydraDatabase,
     python_config: PythonConfig,
 ) {
@@ -497,7 +531,7 @@ fn trace_target_resolution(
         hydra_object.target.line + 1
     );
 
-    let search_paths = hydra_lsp::python_cache::search_paths_for_config(db, python_config);
+    let search_paths = hydrust::python_cache::search_paths_for_config(db, python_config);
     match PythonAnalyzer::extract_definition_info(db, &hydra_object.target.value, search_paths) {
         Ok((def_info, file_path, module_path, symbol_name)) => {
             println!("  {} {}", "Module:".dimmed(), module_path);
@@ -506,7 +540,7 @@ fn trace_target_resolution(
 
             let implicit_param = def_info.implicit_param();
             match &def_info {
-                hydra_lsp::python_analyzer::DefinitionInfo::Function(sig) => {
+                hydrust::python_analyzer::DefinitionInfo::Function(sig) => {
                     println!("  {} Function", "Type:".dimmed());
                     println!(
                         "  {} {}",
@@ -514,7 +548,7 @@ fn trace_target_resolution(
                         format_signature_brief(sig, implicit_param)
                     );
                 }
-                hydra_lsp::python_analyzer::DefinitionInfo::Class(class_info) => {
+                hydrust::python_analyzer::DefinitionInfo::Class(class_info) => {
                     println!("  {} Class", "Type:".dimmed());
                     if let Some(ref init_sig) = class_info.init_signature {
                         println!(
@@ -526,7 +560,7 @@ fn trace_target_resolution(
                         println!("  {} (no __init__ found)", "__init__:".dimmed());
                     }
                 }
-                hydra_lsp::python_analyzer::DefinitionInfo::Method(method_info) => {
+                hydrust::python_analyzer::DefinitionInfo::Method(method_info) => {
                     let method_type = if method_info.is_classmethod {
                         "classmethod"
                     } else if method_info.is_staticmethod {
@@ -569,10 +603,10 @@ fn trace_target_resolution(
         );
         for param in &hydra_object.parameters {
             match param {
-                hydra_lsp::yaml_parser::Parameter::Keyword { key, line, .. } => {
+                hydrust::yaml_parser::Parameter::Keyword { key, line, .. } => {
                     println!("    - {} (line {})", key.cyan(), line + 1);
                 }
-                hydra_lsp::yaml_parser::Parameter::Positional { line, .. } => {
+                hydrust::yaml_parser::Parameter::Positional { line, .. } => {
                     println!("    - {} (line {})", "<positional>".cyan(), line + 1);
                 }
             }
@@ -581,7 +615,7 @@ fn trace_target_resolution(
 }
 
 fn format_signature_brief(
-    sig: &hydra_lsp::python_analyzer::FunctionSignature,
+    sig: &hydrust::python_analyzer::FunctionSignature,
     implicit_param: Option<&str>,
 ) -> String {
     let params: Vec<String> = sig

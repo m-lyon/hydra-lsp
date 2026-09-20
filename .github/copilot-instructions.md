@@ -6,8 +6,11 @@ This is a **Language Server Protocol (LSP) implementation** for [Hydra](https://
 
 **Monorepo structure:**
 
-- `hydra-lsp/` - Rust LSP server and CLI tool (`hydrust`)
-- `hydra-lsp-vscode/` - TypeScript VS Code extension that wraps the server
+- `hydra-lsp/` - the Rust crate, `hydrust`. One binary with two subcommands:
+  `hydrust check` (CLI, `src/cli.rs`) and `hydrust server` (LSP, `src/server.rs`).
+  There is deliberately no build that omits the server — the extension defaults
+  to finding `hydrust` on PATH and launching it as the server, with no fallback.
+- `hydrust-vscode/` - TypeScript VS Code extension that wraps the server
 
 ## Architecture
 
@@ -37,6 +40,10 @@ cargo test
 cargo test --test hover
 cargo test --test diagnostics
 
+# Run the two entry points
+cargo run -- check conf/
+cargo run -- server   # speaks LSP on stdin/stdout
+
 # Build release and copy to VS Code extension
 make build-vscode
 ```
@@ -64,7 +71,7 @@ Test fixtures in `tests/workspace/` contain YAML configs and Python modules:
 ### VS Code Extension Development
 
 ```bash
-cd hydra-lsp-vscode
+cd hydrust-vscode
 npm install
 npm run watch  # Compile TypeScript in watch mode
 # Press F5 in VS Code to launch Extension Development Host

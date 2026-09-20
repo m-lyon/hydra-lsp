@@ -1,31 +1,24 @@
 [package]
-name = "hydra-lsp"
+name = "hydrust"
 version = "0.5.0"
 edition = "2024"
 authors = ["Matthew Lyon"]
-description = "Language Server for Hydra configuration files"
+description = "Language server and CLI checker for Hydra configuration files"
 license = "MIT"
 repository = "https://github.com/m-lyon/hydra-lsp"
 
-[lib]
-name = "hydra_lsp"
-path = "src/lib.rs"
-
-# Gated behind the `server` feature (on by default) so that `cargo build
-# --no-default-features` produces the CLI alone. The Python wheel ships only
-# the CLI.
-[[bin]]
-name = "hydra-lsp"
-path = "src/main.rs"
-required-features = ["server"]
-
+# One binary, and it always has the `server` subcommand. The VS Code extension
+# defaults to `importStrategy: fromEnvironment`, so a `hydrust` found on PATH is
+# launched as the language server with no fallback — a CLI-only build would be
+# an unrecoverable startup failure, not a degraded mode. Do not reintroduce a
+# feature flag that drops the server.
+#
+# `[lib]` is omitted deliberately: with the package named `hydrust`, both the
+# lib name and `src/lib.rs` are the defaults. The `[[bin]]` stays explicit only
+# because its source is `src/cli.rs` rather than `src/main.rs`.
 [[bin]]
 name = "hydrust"
 path = "src/cli.rs"
-
-[features]
-default = ["server"]
-server = []
 
 [dependencies]
 # LSP framework

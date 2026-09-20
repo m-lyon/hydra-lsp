@@ -2,11 +2,20 @@
 
 ## [0.5.0]
 
-- Renamed the CLI binary from `hydra-check` to `hydrust`, and moved checking behind a `check` subcommand (`hydrust check config.yaml`).
+### Breaking
+
+- **One binary.** The `hydra-lsp` and `hydra-check` binaries are gone. Everything is now `hydrust`, with two subcommands: `hydrust check config.yaml` and `hydrust server`. An editor that used to launch `hydra-lsp` with no arguments must launch `hydrust server`; the VS Code extension does this from v0.1.7 onwards, unconditionally and without checking the server version first.
+- **The crate is renamed `hydra-lsp` → `hydrust`**, so the release archives are now `hydrust-<target>.<ext>` and contain a `hydrust` executable. The GitHub repository keeps its name. A VS Code extension older than v0.1.7 does not recognise the new asset name, so it silently stays on v0.4.2 and keeps working rather than failing — update the extension to pick up this release. `use hydra_lsp::` becomes `use hydrust::` for anything depending on the library.
+- **The `server` feature is gone**, along with `--no-default-features`. It gated no code and saved no dependencies, and the single binary must always be able to serve: the extension defaults to finding `hydrust` on `PATH` and launching it as the language server, with no fallback if it cannot.
+- `serverInfo.name` in the `initialize` response is now `"hydrust"`. Display only — nothing should key off it, and `capabilities.experimental.hydrust` is unchanged (`protocolVersion` is deliberately not bumped, since no field in the block changed meaning). Diagnostic `source` and the pull-diagnostics `identifier` still read `hydra-lsp`.
+- If you need to stay on the old shape, pin `hydrust.serverVersion` to `0.4.2` in the extension settings.
+
+### Other changes
+
+- `hydrust server` ignores arguments it does not recognise, as the old `hydra-lsp` binary did — an editor may append its own transport flag such as `--stdio`, and refusing to start is worse than ignoring it. The note about them goes to stderr; stdout carries only LSP traffic.
 - `hydrust check` now accepts multiple files and directories. Directories are walked recursively for `.yaml` and `.yml` files, honouring `.gitignore`; discovered files that carry no Hydra markers are skipped silently
 - Added `--output-format github`, emitting GitHub Actions workflow commands so diagnostics render as inline annotations.
 - Renamed `--format` to `--output-format`.
-- Gated the `hydra-lsp` binary behind a `server` feature, on by default.
 - JSON output is now a single document covering every checked file, rather than one document per file
 - The JSON `summary` now counts diagnostics only in `total`, reports `other`, and counts files that could not be read or parsed under a separate `failed_files` field
 - `--disable-rule` now lists the valid rules in `--help` and rejects an unknown rule as a usage error, instead of warning and carrying on

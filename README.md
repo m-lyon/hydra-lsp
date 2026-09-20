@@ -27,9 +27,27 @@ A Language Server for [Hydra](https://hydra.cc/) configuration files, written in
 
 For a list of planned features and enhancements, see the [issues](https://github.com/m-lyon/hydra-lsp/issues) page.
 
-## CLI Tool: hydrust
+## The `hydrust` binary
 
-In addition to the language server, this project provides a standalone CLI tool for diagnosing Hydra YAML configuration files. This is useful for:
+Everything ships as one executable with two subcommands:
+
+```bash
+hydrust check conf/   # diagnose configs on the command line
+hydrust server        # speak LSP over stdin/stdout (what your editor runs)
+```
+
+There is no build that omits the server. The VS Code extension looks for
+`hydrust` on `PATH` by default and launches it as the language server, so a
+`hydrust` that could not serve would be a startup failure rather than a
+degraded mode.
+
+`hydrust server` ignores arguments it does not recognise, because an editor may
+append a transport flag of its own; the note about them goes to stderr, never
+stdout.
+
+### `hydrust check`
+
+Diagnosing Hydra YAML configuration files from the command line is useful for:
 
 - Debugging why a `_target_` is not being resolved
 - CI/CD pipeline validation
