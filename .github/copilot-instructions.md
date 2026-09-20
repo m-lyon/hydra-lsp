@@ -10,7 +10,7 @@ This is a **Language Server Protocol (LSP) implementation** for [Hydra](https://
   `hydrust check` (CLI, `src/cli.rs`) and `hydrust server` (LSP, `src/server.rs`).
   There is deliberately no build that omits the server — the extension defaults
   to finding `hydrust` on PATH and launching it as the server, with no fallback.
-- `hydrust-vscode/` - TypeScript VS Code extension that wraps the server
+- `hydra-lsp-vscode/` - TypeScript VS Code extension that wraps the server
 
 ## Architecture
 
@@ -71,7 +71,7 @@ Test fixtures in `tests/workspace/` contain YAML configs and Python modules:
 ### VS Code Extension Development
 
 ```bash
-cd hydrust-vscode
+cd hydra-lsp-vscode
 npm install
 npm run watch  # Compile TypeScript in watch mode
 # Press F5 in VS Code to launch Extension Development Host

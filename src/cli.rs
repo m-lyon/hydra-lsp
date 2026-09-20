@@ -249,6 +249,10 @@ fn run(args: &CheckCommand) -> anyhow::Result<i32> {
             "{}: no YAML files found in the given path(s)",
             "warning".yellow().bold()
         );
+        // Still emit an empty document, so the machine-readable formats keep
+        // their output contract: a consumer parsing stdout must not have to
+        // special-case the empty run.
+        emit(args.format, &[])?;
         return Ok(0);
     }
     info!("Checking {} file(s)", targets.len());
@@ -290,12 +294,7 @@ fn run(args: &CheckCommand) -> anyhow::Result<i32> {
         }
     }
 
-    match args.format {
-        OutputFormat::Pretty => output_pretty(&reports),
-        OutputFormat::Json => output_json(&reports)?,
-        OutputFormat::Compact => output_compact(&reports),
-        OutputFormat::Github => output_github(&reports),
-    }
+    emit(args.format, &reports)?;
 
     // Return exit code: 0 if no errors, 1 if there are errors
     let error_count: usize = reports.iter().map(FileReport::error_count).sum();
@@ -306,6 +305,16 @@ fn run(args: &CheckCommand) -> anyhow::Result<i32> {
         info!("No errors found");
         Ok(0)
     }
+}
+
+fn emit(format: OutputFormat, reports: &[FileReport]) -> anyhow::Result<()> {
+    match format {
+        OutputFormat::Pretty => output_pretty(reports),
+        OutputFormat::Json => output_json(reports)?,
+        OutputFormat::Compact => output_compact(reports),
+        OutputFormat::Github => output_github(reports),
+    }
+    Ok(())
 }
 
 /// Expand the command-line paths into the set of files to check.
@@ -917,6 +926,16 @@ fn escape_workflow_property(value: &str) -> String {
 }
 
 fn output_github(reports: &[FileReport]) {
+    // GitHub silently drops an annotation whose `file=` is not relative to the
+    // repository root, so say so once rather than exiting 1 with nothing shown.
+    if reports.iter().any(|r| Path::new(&r.path).is_absolute()) {
+        eprintln!(
+            "{}: some paths are outside the current directory; GitHub will not \
+             attach their annotations. Run hydrust from the repository root.",
+            "warning".yellow().bold()
+        );
+    }
+
     for report in reports {
         let file = escape_workflow_property(&report.path);
 

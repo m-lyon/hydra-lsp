@@ -2,5 +2,6 @@
 
 build-vscode:
 	cargo build --release
-	cp ./target/release/hydrust ../hydrust-vscode/bundled/libs/bin/
+	mkdir -p ../hydra-lsp-vscode/bundled/libs/bin
+	cp ./target/release/hydrust ../hydra-lsp-vscode/bundled/libs/bin/
 	@echo "✓ Built and copied to VS Code extension"

@@ -65,6 +65,40 @@ fn test_help_flag_prints_usage() {
     }
 }
 
+/// `--help` must reach clap rather than being swallowed by the catch-all
+/// positional, which `trailing_var_arg` + `allow_hyphen_values` can do. If it
+/// were swallowed the server would start and block on stdin, so stdin is closed
+/// and the process is given a deadline: a hang fails the test instead of CI.
+#[test]
+fn test_server_help_flag_exits() {
+    let mut child = Command::new(SERVER)
+        .arg(SERVE)
+        .arg("--help")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let deadline = Instant::now() + EXIT_TIMEOUT;
+    loop {
+        match child.try_wait().unwrap() {
+            Some(_) => break,
+            None if Instant::now() >= deadline => {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("`{SERVE} --help` did not exit; it was taken as a positional value");
+            }
+            None => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
+
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "`{SERVE} --help` should exit 0");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Usage:"), "got: {stdout}");
+}
+
 /// How long the server gets to exit after stdin closes.
 ///
 /// Generous: this is a deadlock detector, not a performance budget. Closing
