@@ -380,12 +380,14 @@ fn collect_targets(paths: &[PathBuf]) -> anyhow::Result<Vec<CheckTarget>> {
         // `require_git(false)` so that `.gitignore` is honoured whether or not
         // the tree happens to be a git checkout; otherwise which files get
         // checked would depend on the presence of `.git`. `git_global(false)`
-        // so the developer's personal global excludes cannot make a local run
-        // disagree with CI. Sorted so that output is reproducible across runs
-        // and platforms.
+        // and `parents(false)` so that nothing outside the walk root - the
+        // developer's personal global excludes, or a stray `~/.gitignore` -
+        // can make a local run disagree with CI. Sorted so that output is
+        // reproducible across runs and platforms.
         let walk = WalkBuilder::new(path)
             .require_git(false)
             .git_global(false)
+            .parents(false)
             .follow_links(true)
             .sort_by_file_path(|a, b| a.cmp(b))
             .build();
@@ -526,10 +528,11 @@ fn check_target(
     let content = match fs::read_to_string(file_path) {
         Ok(content) => content,
         Err(e) => {
-            // Only a file that vanished between the walk and the read is
-            // benign; anything else (permissions, non-UTF-8 content) is a file
-            // that was meant to be checked and was not.
-            if !target.explicit && e.kind() == std::io::ErrorKind::NotFound {
+            // A file that was merely discovered by walking a directory is
+            // skipped when it cannot be read (it vanished, is unreadable or is
+            // not UTF-8); a file named on the command line was meant to be
+            // checked, so failing to read it is an error.
+            if !target.explicit {
                 warn!("Skipping {}: {e}", target.display);
                 return None;
             }
@@ -994,7 +997,7 @@ fn output_github(reports: &[FileReport]) {
                 diag.range.start.line + 1,
                 diag.range.start.character + 1,
                 diag.range.end.line + 1,
-                diag.range.end.character + 1,
+                diag.range.end.character.max(diag.range.start.character + 1),
                 title,
                 escape_workflow_data(&diag.message)
             );

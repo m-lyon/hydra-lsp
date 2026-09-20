@@ -591,3 +591,33 @@ fn test_default_pretty_summary_counts_errors_and_failures() {
     );
     assert!(summary.contains("across 2 file(s)"), "got: {summary}");
 }
+
+#[test]
+fn test_non_utf8_file_found_by_the_walk_is_skipped() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("latin1.yaml"), b"name: caf\xe9\n").unwrap();
+
+    let result = check_in(dir.path(), &["."]);
+
+    assert_eq!(result.code, 0, "got: {}", result.stdout);
+    assert!(
+        !result.stdout.contains("latin1.yaml"),
+        "got: {}",
+        result.stdout
+    );
+}
+
+#[test]
+fn test_non_utf8_file_named_explicitly_is_an_error() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("latin1.yaml"), b"name: caf\xe9\n").unwrap();
+
+    let result = check_in(dir.path(), &["latin1.yaml"]);
+
+    assert_eq!(result.code, 1, "got: {}", result.stdout);
+    assert!(
+        result.stdout.contains("Failed to read file"),
+        "got: {}",
+        result.stdout
+    );
+}
