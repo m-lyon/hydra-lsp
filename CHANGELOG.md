@@ -15,6 +15,14 @@
 - An unreadable directory or a file that disappears mid-walk is now logged and skipped, rather than aborting the whole run
 - The workspace root falls back to the canonicalized current directory, so it matches the paths reported for each file
 
+## [0.4.2]
+
+- Fixed lazy package exports declared under `if TYPE_CHECKING:` (or `if typing.TYPE_CHECKING:`) not resolving when combined with a module-level `__getattr__` and `__all__` (fixes #43)
+
+## [0.4.1]
+
+- Fixed relative re-exports failing to resolve when a package sits under more than one search root, such as a virtual environment stored inside the workspace. The most specific containing root is now used to convert a relative import to an absolute module name.
+
 ## [0.4.0]
 
 - Added an incremental cache built on salsa (`HydraDatabase`), so YAML parses, Python target resolutions, and diagnostics are reused between requests instead of being recomputed on every keystroke
