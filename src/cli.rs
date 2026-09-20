@@ -294,6 +294,18 @@ fn run(args: &CheckCommand) -> anyhow::Result<i32> {
         }
     }
 
+    if reports.is_empty() {
+        // Every discovered file turned out not to be a Hydra config: as
+        // silent as the "no YAML found" case above, so it needs the same
+        // loud warning to keep the README's promise that nothing-to-check
+        // is never a quiet green run.
+        eprintln!(
+            "{}: found {} YAML file(s), but none appear to be Hydra configs",
+            "warning".yellow().bold(),
+            targets.len()
+        );
+    }
+
     emit(args.format, &reports)?;
 
     // Return exit code: 0 if no errors, 1 if there are errors
@@ -504,7 +516,7 @@ fn check_target(
     disabled_rules: &HashSet<DiagnosticRule>,
 ) -> Option<FileReport> {
     let file_path = &target.path;
-    info!("Checking file: {}", target.display);
+    debug!("Checking file: {}", target.display);
 
     let content = match fs::read_to_string(file_path) {
         Ok(content) => content,
@@ -536,7 +548,7 @@ fn check_target(
         );
     }
 
-    info!("Parsing YAML content...");
+    debug!("Parsing YAML content...");
     let parsed_content = match YamlParser::parse(&content) {
         Ok(result) => result,
         Err(e) => {
@@ -549,7 +561,7 @@ fn check_target(
         }
     };
 
-    info!(
+    debug!(
         "Found {} _target_ definitions",
         parsed_content.hydra_objects.len()
     );
@@ -567,7 +579,7 @@ fn check_target(
         eprintln!();
     }
 
-    info!("Running diagnostics...");
+    debug!("Running diagnostics...");
     let diagnostics = validate_document(&parsed_content, disabled_rules, db, python_config);
 
     Some(FileReport {

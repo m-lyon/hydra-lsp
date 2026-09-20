@@ -122,6 +122,21 @@ fn test_directory_walk_finds_nested_configs() {
 }
 
 #[test]
+fn test_directory_of_only_non_hydra_yaml_warns_and_succeeds() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("plain.yaml"), PLAIN_YAML).unwrap();
+
+    let result = check_in(dir.path(), &["."]);
+
+    assert_eq!(result.code, 0, "got: {}", result.stderr);
+    assert!(
+        result.stderr.contains("none appear to be Hydra configs"),
+        "discovering only non-Hydra YAML should warn as loudly as finding none, got: {}",
+        result.stderr
+    );
+}
+
+#[test]
 fn test_directory_walk_skips_non_hydra_yaml() {
     let dir = TempDir::new().unwrap();
     fs::write(dir.path().join("plain.yaml"), PLAIN_YAML).unwrap();
@@ -494,6 +509,44 @@ fn test_symlinked_file_is_reported_under_the_path_given() {
     assert!(
         result.stdout.contains("file=link.yaml"),
         "the reported path should be the one given, got: {}",
+        result.stdout
+    );
+}
+
+#[test]
+fn test_empty_run_still_emits_a_json_document() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("notes.txt"), "nothing to check").unwrap();
+
+    let result = check_in(dir.path(), &[".", "--output-format", "json"]);
+
+    assert_eq!(result.code, 0, "got: {}", result.stderr);
+    let parsed: serde_json::Value = serde_json::from_str(&result.stdout)
+        .unwrap_or_else(|e| panic!("output was not one JSON document ({e}): {}", result.stdout));
+
+    let files = parsed["files"].as_array().unwrap();
+    assert_eq!(files.len(), 0, "got: {parsed}");
+    assert_eq!(parsed["summary"]["files"], 0);
+}
+
+#[test]
+fn test_workspace_override_resolves_module_for_a_directory_argument() {
+    let dir = module_workspace();
+
+    let result = check_in(
+        dir.path(),
+        &[
+            "sub",
+            "-w",
+            "sub",
+            "--output-format",
+            "compact",
+        ],
+    );
+
+    assert_eq!(
+        result.code, 0,
+        "an explicit --workspace should resolve the module even for a directory argument, got: {}",
         result.stdout
     );
 }
