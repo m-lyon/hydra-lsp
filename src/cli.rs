@@ -22,7 +22,7 @@ use hydrust::python_analyzer::PythonAnalyzer;
 use hydrust::python_cache::PythonConfig;
 use hydrust::yaml_parser::YamlParser;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Tooling for Hydra YAML configuration files
 #[derive(Parser)]
@@ -66,8 +66,8 @@ struct ServerCommand {
 #[derive(Args)]
 struct CheckCommand {
     /// Files or directories to check. Directories are searched recursively for
-    /// `.yaml` and `.yml` files, honouring `.gitignore` and `.ignore` files and
-    /// skipping hidden files and directories.
+    /// `.yaml` and `.yml` files, following symlinks, honouring `.gitignore` and
+    /// `.ignore` files and skipping hidden files and directories.
     #[arg(required = true, value_name = "PATH")]
     paths: Vec<PathBuf>,
 
@@ -92,7 +92,8 @@ struct CheckCommand {
     )]
     format: OutputFormat,
 
-    /// Show detailed resolution steps for each target
+    /// Show detailed resolution steps for each target (written to stderr, so
+    /// it does not corrupt machine-readable output on stdout)
     #[arg(long)]
     trace_resolution: bool,
 
@@ -305,8 +306,8 @@ fn run(args: &CheckCommand) -> anyhow::Result<i32> {
 /// `.yml` files, respecting `.gitignore`. Duplicates are dropped, so overlapping
 /// arguments (`config.yaml conf/`) check each file once.
 fn collect_targets(paths: &[PathBuf]) -> anyhow::Result<Vec<CheckTarget>> {
-    let mut targets = Vec::new();
-    let mut seen = HashSet::new();
+    let mut targets: Vec<CheckTarget> = Vec::new();
+    let mut seen: HashMap<PathBuf, usize> = HashMap::new();
     let cwd = std::env::current_dir()
         .and_then(|dir| dir.canonicalize())
         .ok();
@@ -318,12 +319,19 @@ fn collect_targets(paths: &[PathBuf]) -> anyhow::Result<Vec<CheckTarget>> {
 
         if path.is_file() {
             let canonical = path.canonicalize()?;
-            if seen.insert(canonical.clone()) {
-                targets.push(CheckTarget {
-                    display: display_path(&canonical, cwd.as_deref()),
-                    path: canonical,
-                    explicit: true,
-                });
+            // An explicit mention always wins, whichever order the arguments
+            // arrive in: a file already picked up by a directory walk is
+            // promoted rather than dropped as a duplicate.
+            match seen.get(&canonical) {
+                Some(&index) => targets[index].explicit = true,
+                None => {
+                    seen.insert(canonical.clone(), targets.len());
+                    targets.push(CheckTarget {
+                        display: display_path(&canonical, cwd.as_deref()),
+                        path: canonical,
+                        explicit: true,
+                    });
+                }
             }
             continue;
         }
@@ -337,6 +345,7 @@ fn collect_targets(paths: &[PathBuf]) -> anyhow::Result<Vec<CheckTarget>> {
         let walk = WalkBuilder::new(path)
             .require_git(false)
             .git_global(false)
+            .follow_links(true)
             .sort_by_file_path(|a, b| a.cmp(b))
             .build();
         for entry in walk {
@@ -360,7 +369,9 @@ fn collect_targets(paths: &[PathBuf]) -> anyhow::Result<Vec<CheckTarget>> {
                     continue;
                 }
             };
-            if seen.insert(canonical.clone()) {
+            if let std::collections::hash_map::Entry::Vacant(slot) = seen.entry(canonical.clone())
+            {
+                slot.insert(targets.len());
                 targets.push(CheckTarget {
                     display: display_path(&canonical, cwd.as_deref()),
                     path: canonical,
@@ -428,13 +439,7 @@ fn resolve_workspace_root(
 fn parse_disabled_rules(rules: &[String]) -> HashSet<DiagnosticRule> {
     rules
         .iter()
-        .filter_map(|code| {
-            let rule = DiagnosticRule::from_code(code);
-            if rule.is_none() {
-                warn!("Unknown diagnostic rule: '{code}', ignoring");
-            }
-            rule
-        })
+        .map(|code| DiagnosticRule::from_code(code).expect("validated by clap"))
         .collect()
 }
 
@@ -453,6 +458,10 @@ fn check_target(
     let content = match fs::read_to_string(file_path) {
         Ok(content) => content,
         Err(e) => {
+            if !target.explicit {
+                warn!("Skipping {}: {e}", target.display);
+                return None;
+            }
             error!("Failed to read {}: {}", target.display, e);
             return Some(FileReport {
                 path: target.display.clone(),
@@ -496,7 +505,7 @@ fn check_target(
 
     // If trace_resolution is enabled, show detailed info for each target
     if args.trace_resolution {
-        println!(
+        eprintln!(
             "\n{} {}",
             "=== Target Resolution Trace ===".cyan().bold(),
             target.display
@@ -504,7 +513,7 @@ fn check_target(
         for (i, hydra_object) in parsed_content.hydra_objects.iter().enumerate() {
             trace_target_resolution(i, hydra_object, db, python_config);
         }
-        println!();
+        eprintln!();
     }
 
     info!("Running diagnostics...");
@@ -523,7 +532,7 @@ fn trace_target_resolution(
     db: &HydraDatabase,
     python_config: PythonConfig,
 ) {
-    println!(
+    eprintln!(
         "\n{} [{}] {} (line {})",
         "Target".blue().bold(),
         index + 1,
@@ -534,30 +543,30 @@ fn trace_target_resolution(
     let search_paths = hydrust::python_cache::search_paths_for_config(db, python_config);
     match PythonAnalyzer::extract_definition_info(db, &hydra_object.target.value, search_paths) {
         Ok((def_info, file_path, module_path, symbol_name)) => {
-            println!("  {} {}", "Module:".dimmed(), module_path);
-            println!("  {} {}", "Symbol:".dimmed(), symbol_name);
-            println!("  {} {}", "Definition found:".green(), file_path.display());
+            eprintln!("  {} {}", "Module:".dimmed(), module_path);
+            eprintln!("  {} {}", "Symbol:".dimmed(), symbol_name);
+            eprintln!("  {} {}", "Definition found:".green(), file_path.display());
 
             let implicit_param = def_info.implicit_param();
             match &def_info {
                 hydrust::python_analyzer::DefinitionInfo::Function(sig) => {
-                    println!("  {} Function", "Type:".dimmed());
-                    println!(
+                    eprintln!("  {} Function", "Type:".dimmed());
+                    eprintln!(
                         "  {} {}",
                         "Signature:".dimmed(),
                         format_signature_brief(sig, implicit_param)
                     );
                 }
                 hydrust::python_analyzer::DefinitionInfo::Class(class_info) => {
-                    println!("  {} Class", "Type:".dimmed());
+                    eprintln!("  {} Class", "Type:".dimmed());
                     if let Some(ref init_sig) = class_info.init_signature {
-                        println!(
+                        eprintln!(
                             "  {} {}",
                             "__init__:".dimmed(),
                             format_signature_brief(init_sig, implicit_param)
                         );
                     } else {
-                        println!("  {} (no __init__ found)", "__init__:".dimmed());
+                        eprintln!("  {} (no __init__ found)", "__init__:".dimmed());
                     }
                 }
                 hydrust::python_analyzer::DefinitionInfo::Method(method_info) => {
@@ -568,13 +577,13 @@ fn trace_target_resolution(
                     } else {
                         "method"
                     };
-                    println!(
+                    eprintln!(
                         "  {} {} ({})",
                         "Type:".dimmed(),
                         method_type,
                         method_info.class_name
                     );
-                    println!(
+                    eprintln!(
                         "  {} {}",
                         "Signature:".dimmed(),
                         format_signature_brief(&method_info.signature, implicit_param)
@@ -587,16 +596,16 @@ fn trace_target_resolution(
             if error_msg.starts_with("Invalid _target_ format:")
                 || error_msg.starts_with("Could not resolve module:")
             {
-                println!("  {} {}", "Error:".red(), error_msg)
+                eprintln!("  {} {}", "Error:".red(), error_msg)
             } else {
-                println!("  {} {}", "Warning:".yellow(), error_msg);
+                eprintln!("  {} {}", "Warning:".yellow(), error_msg);
             }
         }
     }
 
     // Show parameters
     if !hydra_object.parameters.is_empty() {
-        println!(
+        eprintln!(
             "  {} {} parameters",
             "Parameters:".dimmed(),
             hydra_object.parameters.len()
@@ -604,10 +613,10 @@ fn trace_target_resolution(
         for param in &hydra_object.parameters {
             match param {
                 hydrust::yaml_parser::Parameter::Keyword { key, line, .. } => {
-                    println!("    - {} (line {})", key.cyan(), line + 1);
+                    eprintln!("    - {} (line {})", key.cyan(), line + 1);
                 }
                 hydrust::yaml_parser::Parameter::Positional { line, .. } => {
-                    println!("    - {} (line {})", "<positional>".cyan(), line + 1);
+                    eprintln!("    - {} (line {})", "<positional>".cyan(), line + 1);
                 }
             }
         }

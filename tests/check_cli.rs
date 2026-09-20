@@ -190,6 +190,30 @@ fn test_overlapping_paths_check_each_file_once() {
 }
 
 #[test]
+fn test_explicit_file_wins_when_the_directory_is_listed_first() {
+    let dir = TempDir::new().unwrap();
+    fs::create_dir_all(dir.path().join("conf")).unwrap();
+    fs::write(dir.path().join("conf/plain.yaml"), PLAIN_YAML).unwrap();
+
+    let result = check_in(
+        dir.path(),
+        &["conf", "conf/plain.yaml", "--output-format", "compact"],
+    );
+
+    assert_eq!(result.code, 0, "got: {}", result.stdout);
+    assert!(
+        result.stdout.contains("across 1 file(s)"),
+        "a file named explicitly should still be checked, got: {}",
+        result.stdout
+    );
+    assert!(
+        result.stderr.contains("plain.yaml") && result.stderr.contains("does not contain Hydra"),
+        "expected a warning on stderr, got: {}",
+        result.stderr
+    );
+}
+
+#[test]
 fn test_github_format_emits_relative_annotations() {
     let dir = TempDir::new().unwrap();
     fs::create_dir_all(dir.path().join("conf")).unwrap();
