@@ -337,9 +337,19 @@ fn emit(format: OutputFormat, reports: &[FileReport]) -> anyhow::Result<()> {
 fn collect_targets(paths: &[PathBuf]) -> anyhow::Result<Vec<CheckTarget>> {
     let mut targets: Vec<CheckTarget> = Vec::new();
     let mut seen: HashMap<PathBuf, usize> = HashMap::new();
-    let cwd = std::env::current_dir()
-        .and_then(|dir| dir.canonicalize())
-        .ok();
+    // Both the logical and the canonical cwd are kept as display bases: an
+    // absolute argument is left as the user typed it, so it only strips against
+    // whichever form it was spelled with. They differ whenever the cwd is
+    // reached through a symlink, and always on Windows, where `canonicalize`
+    // returns the verbatim `\\?\C:\...` form.
+    let cwd_bases: Vec<PathBuf> = match std::env::current_dir() {
+        Ok(dir) => {
+            let canonical = dir.canonicalize().ok().filter(|c| *c != dir);
+            std::iter::once(dir).chain(canonical).collect()
+        }
+        Err(_) => Vec::new(),
+    };
+    let cwd = cwd_bases.first().map(PathBuf::as_path);
 
     for path in paths {
         if !path.exists() {
@@ -356,10 +366,7 @@ fn collect_targets(paths: &[PathBuf]) -> anyhow::Result<Vec<CheckTarget>> {
                 None => {
                     seen.insert(canonical.clone(), targets.len());
                     targets.push(CheckTarget {
-                        display: display_path(
-                            &lexical_absolute(path, cwd.as_deref()),
-                            cwd.as_deref(),
-                        ),
+                        display: display_path(&lexical_absolute(path, cwd), &cwd_bases),
                         path: canonical,
                         explicit: true,
                     });
@@ -401,14 +408,10 @@ fn collect_targets(paths: &[PathBuf]) -> anyhow::Result<Vec<CheckTarget>> {
                     continue;
                 }
             };
-            if let std::collections::hash_map::Entry::Vacant(slot) = seen.entry(canonical.clone())
-            {
+            if let std::collections::hash_map::Entry::Vacant(slot) = seen.entry(canonical.clone()) {
                 slot.insert(targets.len());
                 targets.push(CheckTarget {
-                    display: display_path(
-                        &lexical_absolute(entry.path(), cwd.as_deref()),
-                        cwd.as_deref(),
-                    ),
+                    display: display_path(&lexical_absolute(entry.path(), cwd), &cwd_bases),
                     path: canonical,
                     explicit: false,
                 });
@@ -454,9 +457,10 @@ fn lexical_absolute(path: &Path, base: Option<&Path>) -> PathBuf {
 /// annotation when `file=` is a `/`-separated path relative to the repository
 /// root, so a `\`-separated path is dropped without explanation. The replacement is
 /// skipped where `\` is a legal character in a file name.
-fn display_path(path: &Path, base: Option<&Path>) -> String {
-    let rendered = base
-        .and_then(|base| path.strip_prefix(base).ok())
+fn display_path(path: &Path, bases: &[PathBuf]) -> String {
+    let rendered = bases
+        .iter()
+        .find_map(|base| path.strip_prefix(base).ok())
         .unwrap_or(path)
         .display()
         .to_string();

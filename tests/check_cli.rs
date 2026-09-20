@@ -535,18 +535,35 @@ fn test_workspace_override_resolves_module_for_a_directory_argument() {
 
     let result = check_in(
         dir.path(),
-        &[
-            "sub",
-            "-w",
-            "sub",
-            "--output-format",
-            "compact",
-        ],
+        &["sub", "-w", "sub", "--output-format", "compact"],
     );
 
     assert_eq!(
         result.code, 0,
         "an explicit --workspace should resolve the module even for a directory argument, got: {}",
         result.stdout
+    );
+}
+
+#[test]
+fn test_trace_resolution_keeps_json_stdout_parseable() {
+    let dir = module_workspace();
+
+    let result = check_in(
+        dir.path(),
+        &[
+            "sub/config.yaml",
+            "--trace-resolution",
+            "--output-format",
+            "json",
+        ],
+    );
+
+    serde_json::from_str::<serde_json::Value>(&result.stdout)
+        .unwrap_or_else(|e| panic!("trace output leaked into stdout ({e}): {}", result.stdout));
+    assert!(
+        result.stderr.contains("Target Resolution Trace"),
+        "the trace should go to stderr, got: {}",
+        result.stderr
     );
 }
