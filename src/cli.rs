@@ -291,22 +291,35 @@ fn run(args: &CheckCommand) -> anyhow::Result<i32> {
     );
 
     let mut reports = Vec::with_capacity(targets.len());
+    let mut not_hydra = 0usize;
+    let mut vanished = 0usize;
     for target in &targets {
-        if let Some(report) = check_target(target, args, &db, python_config, &disabled_rules) {
-            reports.push(report);
+        match check_target(target, args, &db, python_config, &disabled_rules) {
+            CheckOutcome::Report(report) => reports.push(report),
+            CheckOutcome::NotHydra => not_hydra += 1,
+            CheckOutcome::Vanished => vanished += 1,
         }
     }
 
     if reports.is_empty() {
-        // Every discovered file turned out not to be a Hydra config: as
-        // silent as the "no YAML found" case above, so it needs the same
-        // loud warning to keep the README's promise that nothing-to-check
-        // is never a quiet green run.
-        eprintln!(
-            "{}: found {} YAML file(s), but none appear to be Hydra configs",
-            "warning".yellow().bold(),
-            targets.len()
-        );
+        // Nothing was checked: as silent as the "no YAML found" case above, so
+        // it needs the same loud warning to keep the README's promise that
+        // nothing-to-check is never a quiet green run. The counts are reported
+        // separately so the message is never wrong about why.
+        if not_hydra > 0 {
+            eprintln!(
+                "{}: found {} YAML file(s), but none appear to be Hydra configs",
+                "warning".yellow().bold(),
+                not_hydra
+            );
+        }
+        if vanished > 0 {
+            eprintln!(
+                "{}: {} file(s) disappeared before they could be checked",
+                "warning".yellow().bold(),
+                vanished
+            );
+        }
     }
 
     emit(args.format, &reports)?;
@@ -518,31 +531,40 @@ fn parse_disabled_rules(rules: &[String]) -> HashSet<DiagnosticRule> {
         .collect()
 }
 
-/// Check a single file. Returns `None` when the file was discovered by walking
-/// a directory and turns out not to be a Hydra config.
+/// What checking a single file produced.
+enum CheckOutcome {
+    Report(FileReport),
+    /// Discovered by walking a directory, and not a Hydra config.
+    NotHydra,
+    /// Discovered by walking a directory, and gone by the time it was read.
+    Vanished,
+}
+
+/// Check a single file.
 fn check_target(
     target: &CheckTarget,
     args: &CheckCommand,
     db: &HydraDatabase,
     python_config: PythonConfig,
     disabled_rules: &HashSet<DiagnosticRule>,
-) -> Option<FileReport> {
+) -> CheckOutcome {
     let file_path = &target.path;
     debug!("Checking file: {}", target.display);
 
     let content = match fs::read_to_string(file_path) {
         Ok(content) => content,
         Err(e) => {
-            // A file that was merely discovered by walking a directory is
-            // skipped when it cannot be read (it vanished, is unreadable or is
-            // not UTF-8); a file named on the command line was meant to be
-            // checked, so failing to read it is an error.
-            if !target.explicit {
+            // A file that vanished between the walk and the read is skipped:
+            // it is not there to be checked. Anything else - unreadable, not
+            // UTF-8 - is a file that exists and was meant to be checked, so it
+            // is reported as a failure whether it was named explicitly or
+            // found by walking a directory.
+            if !target.explicit && e.kind() == std::io::ErrorKind::NotFound {
                 warn!("Skipping {}: {e}", target.display);
-                return None;
+                return CheckOutcome::Vanished;
             }
             error!("Failed to read {}: {}", target.display, e);
-            return Some(FileReport {
+            return CheckOutcome::Report(FileReport {
                 path: target.display.clone(),
                 diagnostics: Vec::new(),
                 failure: Some(format!("Failed to read file: {e}")),
@@ -555,7 +577,7 @@ fn check_target(
     if !YamlParser::is_hydra_file(&content) {
         if !target.explicit {
             debug!("Skipping non-Hydra file: {}", target.display);
-            return None;
+            return CheckOutcome::NotHydra;
         }
         warn!("File does not appear to be a Hydra configuration file");
         eprintln!(
@@ -570,7 +592,7 @@ fn check_target(
         Ok(result) => result,
         Err(e) => {
             error!("Failed to parse YAML: {}", e);
-            return Some(FileReport {
+            return CheckOutcome::Report(FileReport {
                 path: target.display.clone(),
                 diagnostics: Vec::new(),
                 failure: Some(format!("Failed to parse YAML: {e}")),
@@ -600,7 +622,7 @@ fn check_target(
     debug!("Running diagnostics...");
     let diagnostics = validate_document(&parsed_content, disabled_rules, db, python_config);
 
-    Some(FileReport {
+    CheckOutcome::Report(FileReport {
         path: target.display.clone(),
         diagnostics,
         failure: None,
@@ -889,7 +911,10 @@ fn output_json(reports: &[FileReport]) -> anyhow::Result<()> {
                         "line": d.range.start.line + 1,
                         "column": d.range.start.character + 1,
                         "end_line": d.range.end.line + 1,
-                        "end_column": d.range.end.character + 1,
+                        // Inclusive 1-based, matching `endColumn` in the
+                        // github format: the LSP end is exclusive 0-based, so
+                        // the last covered column is `end.character`.
+                        "end_column": d.range.end.character.max(d.range.start.character + 1),
                         "message": d.message.clone(),
                     })
                 }).collect::<Vec<_>>(),

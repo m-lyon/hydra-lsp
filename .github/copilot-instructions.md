@@ -43,9 +43,6 @@ cargo test --test diagnostics
 # Run the two entry points
 cargo run -- check conf/
 cargo run -- server   # speaks LSP on stdin/stdout
-
-# Build release and copy to VS Code extension
-make build-vscode
 ```
 
 ### Snapshot Testing

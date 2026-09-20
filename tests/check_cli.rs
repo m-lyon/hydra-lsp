@@ -593,15 +593,18 @@ fn test_default_pretty_summary_counts_errors_and_failures() {
 }
 
 #[test]
-fn test_non_utf8_file_found_by_the_walk_is_skipped() {
+fn test_non_utf8_file_found_by_the_walk_is_an_error() {
+    // It exists and cannot be read, so it fails the run just as it would if
+    // it had been named on the command line: only a file that vanished
+    // between the walk and the read is skipped.
     let dir = TempDir::new().unwrap();
     fs::write(dir.path().join("latin1.yaml"), b"name: caf\xe9\n").unwrap();
 
     let result = check_in(dir.path(), &["."]);
 
-    assert_eq!(result.code, 0, "got: {}", result.stdout);
+    assert_eq!(result.code, 1, "got: {}", result.stdout);
     assert!(
-        !result.stdout.contains("latin1.yaml"),
+        result.stdout.contains("Failed to read file"),
         "got: {}",
         result.stdout
     );
@@ -621,3 +624,24 @@ fn test_non_utf8_file_named_explicitly_is_an_error() {
         result.stdout
     );
 }
+
+#[test]
+fn test_directory_walk_ignores_gitignore_above_the_walk_root() {
+    // `parents(false)` and `git_global(false)`: nothing outside the directory
+    // being walked decides what gets checked, so a local run and a CI run
+    // agree even when the repository ignores the config directory.
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join(".gitignore"), "conf/\n").unwrap();
+    fs::create_dir_all(dir.path().join("conf")).unwrap();
+    fs::write(dir.path().join("conf/config.yaml"), BROKEN_CONFIG).unwrap();
+
+    let result = check_in(dir.path(), &["conf", "--output-format", "compact"]);
+
+    assert_eq!(result.code, 1, "got: {}{}", result.stdout, result.stderr);
+    assert!(
+        result.stdout.contains("conf/config.yaml"),
+        "got: {}",
+        result.stdout
+    );
+}
+
