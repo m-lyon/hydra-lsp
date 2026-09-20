@@ -644,4 +644,3 @@ fn test_directory_walk_ignores_gitignore_above_the_walk_root() {
         result.stdout
     );
 }
-

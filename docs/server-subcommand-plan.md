@@ -300,10 +300,9 @@ released and adopted before the server changes.
   `src/backend.rs:2037`). Out of scope here: `identifier` correlates pull
   requests, and "the handshake does not change" covers it. Worth a separate
   decision, since `source` is what an editor prints next to each diagnostic.
-- **`Makefile`'s `build-vscode` target copies to a path that no longer
-  exists** (`bundled/libs/bin/`; the extension caches under global storage
-  keyed by version now). The binary and directory names were corrected here,
-  but the target is still stale for reasons that predate this plan.
+- **The `Makefile` was removed**, along with its `build-vscode` target: it
+  copied to `bundled/libs/bin/`, a path that no longer exists now that the
+  extension caches the binary under global storage keyed by version.
 - **`cargo build` no longer produces a `hydra-lsp`.** `dist plan` confirms one
   `hydrust` executable per `hydrust-<target>` archive across all six targets,
   and `dist generate` reproduces `release.yml` byte for byte.

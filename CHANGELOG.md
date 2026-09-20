@@ -8,6 +8,7 @@
 - **The crate is renamed `hydra-lsp` → `hydrust`**, so the release archives are now `hydrust-<target>.<ext>` and contain a `hydrust` executable. The GitHub repository keeps its name. A VS Code extension older than v0.1.7 does not recognise the new asset name, so it silently stays on v0.4.2 and keeps working rather than failing — update the extension to pick up this release. `use hydra_lsp::` becomes `use hydrust::` for anything depending on the library.
 - **The `server` feature is gone**, along with `--no-default-features`. It gated no code and saved no dependencies, and the single binary must always be able to serve: the extension defaults to finding `hydrust` on `PATH` and launching it as the language server, with no fallback if it cannot.
 - `serverInfo.name` in the `initialize` response is now `"hydrust"`. Display only — nothing should key off it, and `capabilities.experimental.hydrust` is unchanged (`protocolVersion` is deliberately not bumped, since no field in the block changed meaning). Diagnostic `source` and the pull-diagnostics `identifier` still read `hydra-lsp`.
+- **`hydrust check --disable-rule` rejects an unknown rule** as a usage error (exit 2) instead of warning and continuing. In particular `invalid-target` is not accepted — it was renamed to `invalid-hydra-parameter` in v0.3.0, but the old `--help` text still advertised it. Run `hydrust check --help` for the current list. The LSP `disabledRules` setting is unaffected and still ignores unknown codes.
 - If you need to stay on the old shape, pin `hydrust.serverVersion` to `0.4.2` in the extension settings.
 
 ### Other changes
@@ -18,7 +19,6 @@
 - Renamed `--format` to `--output-format`.
 - JSON output is now a single document covering every checked file, rather than one document per file
 - The JSON `summary` now counts diagnostics only in `total`, reports `other`, and counts files that could not be read or parsed under a separate `failed_files` field
-- `--disable-rule` now lists the valid rules in `--help` and rejects an unknown rule as a usage error, instead of warning and carrying on
 - Reported paths always use `/` separators, so `--output-format github` annotations attach on Windows runners
 - Directory walks no longer apply the user's global git excludes (`core.excludesFile`), so a local run and a CI run check the same files
 - An unreadable directory or a file that disappears mid-walk is now logged and skipped, rather than aborting the whole run; a file that exists but cannot be read is reported as a failure, whether it was named explicitly or found by walking a directory
