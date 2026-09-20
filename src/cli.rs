@@ -7,7 +7,7 @@
 use std::fmt;
 use std::fs;
 use std::io::stderr;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -241,7 +241,15 @@ fn main() {
 fn run(args: &CheckCommand) -> anyhow::Result<i32> {
     let targets = collect_targets(&args.paths)?;
     if targets.is_empty() {
-        anyhow::bail!("No YAML files found in the given path(s)");
+        // Nothing to check is not a failure: it has to agree with the case
+        // where YAML files are found but none of them are Hydra configs, which
+        // is a clean run. Otherwise a renamed config directory turns a build
+        // red with a fatal error instead of a diagnostic.
+        eprintln!(
+            "{}: no YAML files found in the given path(s)",
+            "warning".yellow().bold()
+        );
+        return Ok(0);
     }
     info!("Checking {} file(s)", targets.len());
 
@@ -327,7 +335,10 @@ fn collect_targets(paths: &[PathBuf]) -> anyhow::Result<Vec<CheckTarget>> {
                 None => {
                     seen.insert(canonical.clone(), targets.len());
                     targets.push(CheckTarget {
-                        display: display_path(&canonical, cwd.as_deref()),
+                        display: display_path(
+                            &lexical_absolute(path, cwd.as_deref()),
+                            cwd.as_deref(),
+                        ),
                         path: canonical,
                         explicit: true,
                     });
@@ -373,7 +384,10 @@ fn collect_targets(paths: &[PathBuf]) -> anyhow::Result<Vec<CheckTarget>> {
             {
                 slot.insert(targets.len());
                 targets.push(CheckTarget {
-                    display: display_path(&canonical, cwd.as_deref()),
+                    display: display_path(
+                        &lexical_absolute(entry.path(), cwd.as_deref()),
+                        cwd.as_deref(),
+                    ),
                     path: canonical,
                     explicit: false,
                 });
@@ -382,6 +396,34 @@ fn collect_targets(paths: &[PathBuf]) -> anyhow::Result<Vec<CheckTarget>> {
     }
 
     Ok(targets)
+}
+
+/// Make `path` absolute against `base` and drop `.`/`..` components without
+/// resolving symlinks.
+///
+/// The canonical path is what gets read, but it is the wrong thing to report: a
+/// symlinked config would be named under its link target, which may well sit
+/// outside the directory that was scanned and so be printed as an absolute
+/// path, which GitHub drops without explanation.
+fn lexical_absolute(path: &Path, base: Option<&Path>) -> PathBuf {
+    let joined = match base {
+        Some(base) if path.is_relative() => base.join(path),
+        _ => path.to_path_buf(),
+    };
+
+    let mut normalized = PathBuf::new();
+    for component in joined.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
 }
 
 /// Render `path` relative to `base` when it sits underneath it, otherwise as
@@ -655,6 +697,15 @@ fn severity_label(diagnostic: &Diagnostic) -> &'static str {
     }
 }
 
+/// `severity_label` spells `INFORMATION` as `info` for the compact output; the
+/// JSON field has always been `information` and consumers match on it.
+fn json_severity_label(diagnostic: &Diagnostic) -> &'static str {
+    match severity_label(diagnostic) {
+        "info" => "information",
+        other => other,
+    }
+}
+
 fn diagnostic_code(diagnostic: &Diagnostic) -> String {
     match &diagnostic.code {
         Some(tower_lsp::lsp_types::NumberOrString::String(s)) => s.clone(),
@@ -792,7 +843,7 @@ fn output_json(reports: &[FileReport]) -> anyhow::Result<()> {
                 "error": report.failure,
                 "diagnostics": report.diagnostics.iter().map(|d| {
                     serde_json::json!({
-                        "severity": severity_label(d),
+                        "severity": json_severity_label(d),
                         "code": diagnostic_code(d),
                         "line": d.range.start.line + 1,
                         "column": d.range.start.character + 1,

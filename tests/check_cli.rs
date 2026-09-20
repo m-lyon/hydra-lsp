@@ -66,13 +66,18 @@ fn test_missing_path_is_a_fatal_error() {
 }
 
 #[test]
-fn test_directory_with_no_yaml_is_a_fatal_error() {
+fn test_directory_with_no_yaml_warns_and_succeeds() {
     let dir = TempDir::new().unwrap();
     fs::write(dir.path().join("notes.txt"), "nothing to check").unwrap();
 
     let result = check_in(dir.path(), &["."]);
 
-    assert_eq!(result.code, 2);
+    assert_eq!(result.code, 0, "got: {}", result.stderr);
+    assert!(
+        result.stderr.contains("no YAML files found"),
+        "got: {}",
+        result.stderr
+    );
 }
 
 #[test]
@@ -181,6 +186,11 @@ fn test_overlapping_paths_check_each_file_once() {
         .filter(|line| line.starts_with("::"))
         .collect();
 
+    assert_eq!(
+        annotations, 1,
+        "the file should be annotated exactly once, got: {}",
+        result.stdout
+    );
     assert_eq!(
         annotations,
         unique.len(),
@@ -401,6 +411,89 @@ fn test_clean_run_exits_zero() {
     assert!(
         result.stdout.contains("OK - no issues found"),
         "got: {}",
+        result.stdout
+    );
+}
+
+/// A `_target_` that only resolves when the workspace root is the directory
+/// holding `my_module.py`.
+const MODULE_CONFIG: &str = "model:\n  _target_: my_module.Thing\n  size: 4\n";
+const MODULE_SOURCE: &str =
+    "class Thing:\n    def __init__(self, size: int):\n        self.size = size\n";
+
+/// Lay out `sub/config.yaml` next to `sub/my_module.py`.
+fn module_workspace() -> TempDir {
+    let dir = TempDir::new().unwrap();
+    fs::create_dir_all(dir.path().join("sub")).unwrap();
+    fs::write(dir.path().join("sub/config.yaml"), MODULE_CONFIG).unwrap();
+    fs::write(dir.path().join("sub/my_module.py"), MODULE_SOURCE).unwrap();
+    dir
+}
+
+#[test]
+fn test_single_explicit_file_resolves_against_its_own_directory() {
+    let dir = module_workspace();
+
+    let result = check_in(
+        dir.path(),
+        &["sub/config.yaml", "--output-format", "compact"],
+    );
+
+    assert_eq!(
+        result.code, 0,
+        "the module sitting next to the config should resolve, got: {}",
+        result.stdout
+    );
+}
+
+#[test]
+fn test_directory_argument_resolves_against_the_current_directory() {
+    let dir = module_workspace();
+
+    let result = check_in(dir.path(), &["sub", "--output-format", "compact"]);
+
+    assert_eq!(
+        result.code, 1,
+        "a directory argument resolves from the cwd, so the module is unresolved, got: {}",
+        result.stdout
+    );
+}
+
+#[test]
+fn test_promoted_single_file_resolves_against_its_own_directory() {
+    let dir = module_workspace();
+
+    // The directory walk finds the one config, then the explicit mention
+    // promotes it: a single explicit target, so the root is `sub/`.
+    let result = check_in(
+        dir.path(),
+        &["sub", "sub/config.yaml", "--output-format", "compact"],
+    );
+
+    assert_eq!(
+        result.code, 0,
+        "promoting the only file to explicit picks its own directory, got: {}",
+        result.stdout
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn test_symlinked_file_is_reported_under_the_path_given() {
+    let dir = TempDir::new().unwrap();
+    fs::create_dir_all(dir.path().join("real")).unwrap();
+    fs::write(dir.path().join("real/actual.yaml"), BROKEN_CONFIG).unwrap();
+    std::os::unix::fs::symlink(
+        dir.path().join("real/actual.yaml"),
+        dir.path().join("link.yaml"),
+    )
+    .unwrap();
+
+    let result = check_in(dir.path(), &["link.yaml", "--output-format", "github"]);
+
+    assert!(
+        result.stdout.contains("file=link.yaml"),
+        "the reported path should be the one given, got: {}",
         result.stdout
     );
 }

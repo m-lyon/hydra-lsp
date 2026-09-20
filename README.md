@@ -117,7 +117,11 @@ inline annotations on the pull request:
 
 - `0`: No errors found
 - `1`: One or more errors found
-- `2`: Fatal error (path not found, no YAML files matched, etc.)
+- `2`: Fatal error (path not found, invalid arguments, etc.)
+
+Finding nothing to check is not an error: whether no YAML files matched at all
+or none of the ones found are Hydra configs, `hydrust check` warns on stderr and
+exits `0`.
 
 ## Client Compatibility
 
