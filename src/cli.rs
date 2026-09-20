@@ -188,6 +188,8 @@ struct FileReport {
     diagnostics: Vec<Diagnostic>,
     /// Set when the file could not be read or parsed at all.
     failure: Option<String>,
+    /// Stable code naming the kind of failure, for machine-readable output.
+    failure_code: Option<&'static str>,
 }
 
 impl FileReport {
@@ -257,7 +259,7 @@ fn run(args: &CheckCommand) -> anyhow::Result<i32> {
     }
     info!("Checking {} file(s)", targets.len());
 
-    let workspace_root = resolve_workspace_root(args, &targets)?;
+    let workspace_root = resolve_workspace_root(args)?;
     if let Some(ref ws) = workspace_root {
         info!("Workspace root: {}", ws.display());
     }
@@ -485,18 +487,17 @@ fn is_yaml_file(path: &Path) -> bool {
 /// `hydrust check config.yaml` case working without configuration; anything
 /// broader resolves against the current directory, since there is no one
 /// parent directory that is right for every file.
-fn resolve_workspace_root(
-    args: &CheckCommand,
-    targets: &[CheckTarget],
-) -> anyhow::Result<Option<PathBuf>> {
+fn resolve_workspace_root(args: &CheckCommand) -> anyhow::Result<Option<PathBuf>> {
     if let Some(ref ws) = args.workspace {
         return Ok(Some(ws.canonicalize()?));
     }
 
-    if let [single] = targets
-        && single.explicit
+    // Keyed on what was passed, not on what the walk turned up, so the root
+    // does not depend on how many YAML files happen to sit on disk.
+    if let [single] = args.paths.as_slice()
+        && single.is_file()
     {
-        return Ok(single.path.parent().map(PathBuf::from));
+        return Ok(single.canonicalize()?.parent().map(PathBuf::from));
     }
 
     Ok(Some(std::env::current_dir()?.canonicalize()?))
@@ -525,7 +526,10 @@ fn check_target(
     let content = match fs::read_to_string(file_path) {
         Ok(content) => content,
         Err(e) => {
-            if !target.explicit {
+            // Only a file that vanished between the walk and the read is
+            // benign; anything else (permissions, non-UTF-8 content) is a file
+            // that was meant to be checked and was not.
+            if !target.explicit && e.kind() == std::io::ErrorKind::NotFound {
                 warn!("Skipping {}: {e}", target.display);
                 return None;
             }
@@ -534,6 +538,7 @@ fn check_target(
                 path: target.display.clone(),
                 diagnostics: Vec::new(),
                 failure: Some(format!("Failed to read file: {e}")),
+                failure_code: Some("read-error"),
             });
         }
     };
@@ -561,6 +566,7 @@ fn check_target(
                 path: target.display.clone(),
                 diagnostics: Vec::new(),
                 failure: Some(format!("Failed to parse YAML: {e}")),
+                failure_code: Some("parse-error"),
             });
         }
     };
@@ -590,6 +596,7 @@ fn check_target(
         path: target.display.clone(),
         diagnostics,
         failure: None,
+        failure_code: None,
     })
 }
 
@@ -897,8 +904,9 @@ fn output_compact(reports: &[FileReport]) {
     for report in reports {
         if let Some(ref failure) = report.failure {
             println!(
-                "{}:1:1: error: [] {}",
+                "{}:1:1: error: [{}] {}",
                 report.path,
+                report.failure_code.unwrap_or("check-error"),
                 failure.replace('\n', " ")
             );
             continue;

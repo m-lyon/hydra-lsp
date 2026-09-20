@@ -306,9 +306,9 @@ fn test_unparseable_file_is_reported_as_a_github_annotation() {
 #[test]
 fn test_github_output_escapes_workflow_metacharacters() {
     let dir = TempDir::new().unwrap();
-    // `,` separates workflow command properties and `%` starts an escape, so
-    // both have to be encoded for GitHub to resolve the annotation's file.
-    fs::write(dir.path().join("a,b%c.yaml"), UNPARSEABLE_CONFIG).unwrap();
+    // `%` starts an escape, so it has to be encoded for GitHub to resolve the
+    // annotation's file. Only `%` is portable in a file name across platforms.
+    fs::write(dir.path().join("a%b.yaml"), UNPARSEABLE_CONFIG).unwrap();
 
     let result = check_in(dir.path(), &[".", "--output-format", "github"]);
 
@@ -319,7 +319,7 @@ fn test_github_output_escapes_workflow_metacharacters() {
         .unwrap_or_else(|| panic!("no annotation in: {}", result.stdout));
 
     assert!(
-        annotation.starts_with("::error file=a%2Cb%25c.yaml,"),
+        annotation.starts_with("::error file=a%25b.yaml,"),
         "got: {annotation}"
     );
 }
@@ -475,19 +475,19 @@ fn test_directory_argument_resolves_against_the_current_directory() {
 }
 
 #[test]
-fn test_promoted_single_file_resolves_against_its_own_directory() {
+fn test_several_arguments_resolve_against_the_current_directory() {
     let dir = module_workspace();
 
-    // The directory walk finds the one config, then the explicit mention
-    // promotes it: a single explicit target, so the root is `sub/`.
+    // More than one argument, so the root is the cwd whatever the walk turns
+    // up: it must not depend on how many YAML files sit on disk.
     let result = check_in(
         dir.path(),
         &["sub", "sub/config.yaml", "--output-format", "compact"],
     );
 
     assert_eq!(
-        result.code, 0,
-        "promoting the only file to explicit picks its own directory, got: {}",
+        result.code, 1,
+        "a broader invocation resolves from the cwd, so the module is unresolved, got: {}",
         result.stdout
     );
 }
@@ -566,4 +566,28 @@ fn test_trace_resolution_keeps_json_stdout_parseable() {
         "the trace should go to stderr, got: {}",
         result.stderr
     );
+}
+
+#[test]
+fn test_default_pretty_summary_counts_errors_and_failures() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("broken.yaml"), BROKEN_CONFIG).unwrap();
+    fs::write(dir.path().join("bad.yaml"), UNPARSEABLE_CONFIG).unwrap();
+
+    // No `--output-format`: this exercises the default `pretty` renderer.
+    let result = check_in(dir.path(), &["."]);
+
+    assert_eq!(result.code, 1, "got: {}", result.stdout);
+    let summary = result
+        .stdout
+        .lines()
+        .find(|line| line.contains("Summary:"))
+        .unwrap_or_else(|| panic!("no summary in: {}", result.stdout));
+
+    assert!(summary.contains("1 error(s)"), "got: {summary}");
+    assert!(
+        summary.contains("1 file(s) that could not be checked"),
+        "got: {summary}"
+    );
+    assert!(summary.contains("across 2 file(s)"), "got: {summary}");
 }
