@@ -514,6 +514,26 @@ fn test_symlinked_file_is_reported_under_the_path_given() {
 }
 
 #[test]
+#[cfg(unix)]
+fn test_parent_dir_after_symlinked_directory_names_the_file_read() {
+    // `link/../x.yaml` reads `real/x.yaml`, since `link` points at `real/sub`;
+    // dropping the `..` lexically would name the unrelated `./x.yaml` instead.
+    let dir = TempDir::new().unwrap();
+    fs::create_dir_all(dir.path().join("real/sub")).unwrap();
+    fs::write(dir.path().join("real/x.yaml"), BROKEN_CONFIG).unwrap();
+    fs::write(dir.path().join("x.yaml"), PLAIN_YAML).unwrap();
+    std::os::unix::fs::symlink(dir.path().join("real/sub"), dir.path().join("link")).unwrap();
+
+    let result = check_in(dir.path(), &["link/../x.yaml", "--output-format", "github"]);
+
+    assert!(
+        result.stdout.contains("file=real/x.yaml"),
+        "the reported path should be the file actually read, got: {}",
+        result.stdout
+    );
+}
+
+#[test]
 fn test_empty_run_still_emits_a_json_document() {
     let dir = TempDir::new().unwrap();
     fs::write(dir.path().join("notes.txt"), "nothing to check").unwrap();
@@ -593,18 +613,46 @@ fn test_default_pretty_summary_counts_errors_and_failures() {
 }
 
 #[test]
-fn test_non_utf8_file_found_by_the_walk_is_an_error() {
-    // It exists and cannot be read, so it fails the run just as it would if
-    // it had been named on the command line: only a file that vanished
-    // between the walk and the read is skipped.
+fn test_non_utf8_hydra_file_found_by_the_walk_is_an_error() {
+    // It carries a `_target_` and cannot be read, so it fails the run just as
+    // it would if it had been named on the command line.
     let dir = TempDir::new().unwrap();
-    fs::write(dir.path().join("latin1.yaml"), b"name: caf\xe9\n").unwrap();
+    fs::write(
+        dir.path().join("latin1.yaml"),
+        b"model:\n  _target_: pkg.Thing\n  name: caf\xe9\n",
+    )
+    .unwrap();
 
     let result = check_in(dir.path(), &["."]);
 
     assert_eq!(result.code, 1, "got: {}", result.stdout);
     assert!(
         result.stdout.contains("Failed to read file"),
+        "got: {}",
+        result.stdout
+    );
+}
+
+#[test]
+fn test_non_utf8_non_hydra_file_found_by_the_walk_is_skipped() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("latin1.yaml"), b"name: caf\xe9\n").unwrap();
+    fs::write(dir.path().join("config.yaml"), BROKEN_CONFIG).unwrap();
+
+    let result = check_in(
+        dir.path(),
+        &[
+            ".",
+            "--disable-rule",
+            "unresolved-import",
+            "--output-format",
+            "compact",
+        ],
+    );
+
+    assert_eq!(result.code, 0, "got: {}", result.stdout);
+    assert!(
+        !result.stdout.contains("latin1.yaml"),
         "got: {}",
         result.stdout
     );

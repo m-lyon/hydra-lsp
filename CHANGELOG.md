@@ -21,7 +21,7 @@
 - The JSON `summary` now counts diagnostics only in `total`, reports `other`, and counts files that could not be read or parsed under a separate `failed_files` field
 - Reported paths always use `/` separators, so `--output-format github` annotations attach on Windows runners
 - Directory walks no longer apply the user's global git excludes (`core.excludesFile`), so a local run and a CI run check the same files
-- An unreadable directory or a file that disappears mid-walk is now logged and skipped, rather than aborting the whole run; a file that exists but cannot be read is reported as a failure, whether it was named explicitly or found by walking a directory
+- An unreadable directory or a file that disappears mid-walk is now logged and skipped, rather than aborting the whole run; a file that exists but cannot be read is reported as a failure, whether it was named explicitly or found by walking a directory. A non-UTF-8 file found by walking is only reported if it carries Hydra markers
 - Finding no YAML files to check now warns on stderr and exits 0, rather than being a fatal error (exit 2), so it agrees with the run where YAML files are found but none are Hydra configs
 - The JSON `end_column` is now an inclusive 1-based column, matching `endColumn` in the github format; it was previously exclusive, so single-line values are one lower than before. A multi-line range that ends at the start of a line is reported as ending on the previous line, with `end_column` null (and `endColumn` omitted)
 - The JSON `severity` field is unchanged: `INFORMATION` is still reported as `information`, where the compact and github formats spell it `info`

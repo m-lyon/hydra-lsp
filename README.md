@@ -89,8 +89,10 @@ are deliberately not applied, so a local run and a CI run check the same files.
 Files found by walking a directory are skipped when they carry no Hydra
 markers; a file named explicitly on the command line is always checked, with a
 warning if it does not look like a Hydra config. A file that disappears during
-the walk is logged and skipped, but one that exists and cannot be read
-(unreadable, or not UTF-8) is reported as a failure and fails the run.
+the walk is logged and skipped, but one that exists and cannot be read is
+reported as a failure and fails the run. A file that is not UTF-8 counts as
+unreadable if it was named explicitly or carries Hydra markers; otherwise a
+walk skips it like any other non-Hydra file.
 
 ### Options
 

@@ -577,25 +577,44 @@ fn check_target(
     let file_path = &target.path;
     debug!("Checking file: {}", target.display);
 
-    let content = match fs::read_to_string(file_path) {
-        Ok(content) => content,
+    let read_failure = |e: &dyn std::fmt::Display| {
+        error!("Failed to read {}: {}", target.display, e);
+        CheckOutcome::Report(FileReport {
+            path: target.display.clone(),
+            diagnostics: Vec::new(),
+            failure: Some(format!("Failed to read file: {e}")),
+            failure_code: Some("read-error"),
+        })
+    };
+
+    let bytes = match fs::read(file_path) {
+        Ok(bytes) => bytes,
         Err(e) => {
             // A file that vanished between the walk and the read is skipped:
-            // it is not there to be checked. Anything else - unreadable, not
-            // UTF-8 - is a file that exists and was meant to be checked, so it
-            // is reported as a failure whether it was named explicitly or
-            // found by walking a directory.
+            // it is not there to be checked. Anything else is a file that
+            // exists and was meant to be checked, so it is reported as a
+            // failure whether it was named explicitly or found by walking a
+            // directory.
             if !target.explicit && e.kind() == std::io::ErrorKind::NotFound {
                 warn!("Skipping {}: {e}", target.display);
                 return CheckOutcome::Vanished;
             }
-            error!("Failed to read {}: {}", target.display, e);
-            return CheckOutcome::Report(FileReport {
-                path: target.display.clone(),
-                diagnostics: Vec::new(),
-                failure: Some(format!("Failed to read file: {e}")),
-                failure_code: Some("read-error"),
-            });
+            return read_failure(&e);
+        }
+    };
+    let content = match String::from_utf8(bytes) {
+        Ok(content) => content,
+        Err(e) => {
+            // A file that is not UTF-8 is only a failure if it was named
+            // explicitly or looks like a Hydra config; otherwise a walked
+            // directory would fail on any stray non-UTF-8 YAML file.
+            if !target.explicit
+                && !YamlParser::is_hydra_file(&String::from_utf8_lossy(e.as_bytes()))
+            {
+                debug!("Skipping non-Hydra file: {}", target.display);
+                return CheckOutcome::NotHydra;
+            }
+            return read_failure(&e);
         }
     };
     debug!("File content length: {} bytes", content.len());
