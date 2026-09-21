@@ -1,0 +1,39 @@
+# Publish `hydrust` to PyPI on a release tag.
+#
+# Uses the same tag pattern as dist's `release.yml` but runs independently of
+# it. Authenticates with PyPI trusted publishing, so there is no API token:
+# PyPI must list this repository, this workflow file and the `release`
+# environment as a trusted publisher for `hydrust`.
+name: Publish to PyPI
+
+on:
+  push:
+    tags:
+      - '**[0-9]+.[0-9]+.[0-9]+*'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    uses: ./.github/workflows/build-wheels.yml
+
+  publish:
+    name: Upload to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: release
+      url: https://pypi.org/project/hydrust/
+    permissions:
+      # For PyPI's trusted publishing.
+      id-token: write
+    steps:
+      - uses: astral-sh/setup-uv@v10
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: wheels-*
+          path: wheels
+          merge-multiple: true
+      - name: Publish to PyPI
+        run: uv publish -v wheels/*

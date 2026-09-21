@@ -22,3 +22,5 @@ target
 
 dev-docs/
 code_reference/
+# Python
+__pycache__/

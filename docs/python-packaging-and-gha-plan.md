@@ -9,9 +9,9 @@ supported way to run it in CI. Modelled on how ruff and ty do it
 | Phase | Scope | Status |
 | ----- | ----- | ------ |
 | 1 | CLI rename, `check` subcommand, multi-path, `github` output format | DONE |
-| 2 | `pyproject.toml`, maturin config, `python/hydrust/` shim | TODO |
-| 3 | Wheel build + PyPI publish workflows | TODO |
-| 4 | Documented CI snippet | TODO |
+| 2 | `pyproject.toml`, maturin config, `python/hydrust/` shim | DONE |
+| 3 | Wheel build + PyPI publish workflows | IN PROGRESS |
+| 4 | Documented CI snippet | DONE |
 | 5 | `hydrust-action` (deferred) | TODO |
 
 Phase 2 onward assumes the one-binary change in `server-subcommand-plan.md`,
@@ -140,41 +140,59 @@ blocked the throwaway test. **Resolved by deleting the second binary** —
 the `server` feature, so maturin's single-binary auto-detection applies. The
 feature was an empty marker anyway: no `cfg(feature = "server")` ever existed.
 
-## Phase 2 — Python package
+## Phase 2 — Python package · DONE
 
 Depends on `server-subcommand-plan.md` phase B, which supplies the single
 `hydrust` bin and the crate rename.
 
-- [ ] Root `pyproject.toml`: maturin backend, `name = "hydrust"`,
+- [x] Root `pyproject.toml`: maturin backend, `name = "hydrust"`,
       `dynamic = ["version"]` so the version comes from `Cargo.toml` rather than
       drifting. Ruff hardcodes its version and maintains a bump script; not
       worth it here.
-- [ ] `[tool.maturin]`: `bindings = "bin"`, `python-source = "python"`,
+- [x] `[tool.maturin]`: `bindings = "bin"`, `python-source = "python"`,
       `module-name = "hydrust"`, `strip = true`, and an `exclude` for test
       fixtures.
-- [ ] `python/hydrust/__init__.py`: port `find_ruff_bin()` — the scripts-dir,
+- [x] `python/hydrust/__init__.py`: port `find_ruff_bin()` — the scripts-dir,
       user-scheme, `pip install --target` and pip-build-env lookups — looking
       for `hydrust`. No candidate list: nothing has been published under another
       name, and the `hydra-check` bin never shipped.
-- [ ] `python/hydrust/__main__.py` so `python -m hydrust` works.
-- [ ] Build with default features and confirm the wheel contains exactly one
+- [x] `python/hydrust/__main__.py` so `python -m hydrust` works.
+- [x] Build with default features and confirm the wheel contains exactly one
       script, `hydrust`, which answers both `check` and `server`.
-- [ ] Check the wheel size after stripping. Unstripped the two pre-merge
+- [x] Check the wheel size after stripping. Unstripped the two pre-merge
       binaries were ~16.7 MB and ~20.3 MB, but they overlap almost entirely —
       both link the same salsa/ruff/ty analysis code — so expect roughly the
       larger of the two rather than the sum, and less than that stripped.
 
-## Phase 3 — Build and publish
+Decided during implementation:
 
-- [ ] `build-wheels.yml`: an sdist job that installs the tarball and smoke-tests
+- **Measured size:** a local `x86_64-unknown-linux-gnu` build gives a 6.7 MB
+  wheel whose stripped `hydrust` is 17.8 MB — below the larger pre-merge
+  binary, as expected. The wheel contains `hydrust/{__init__,__main__}.py`,
+  `py.typed` and one script, `hydrust`.
+- **`find_hydrust_bin()`**, not `find_bin()`, mirroring `find_ruff_bin()`.
+  Verified against a venv install, `python -m hydrust` and
+  `pip install --target`.
+- **The sdist also drops `docs/`, `.github/` and `.vscode/`**, not just
+  `tests/`: none of it is needed to compile. `Cargo.toml` has no `[[test]]`
+  entries, so cargo does not miss the tests directory.
+- **`requires-python = ">=3.8"`.** The shim is the only Python and uses nothing
+  newer; the wheel itself is `py3-none`, so this only gates installation.
+
+## Phase 3 — Build and publish · IN PROGRESS
+
+In repo it is done; what remains is the out-of-repo setup below and a first
+green run of the workflows on GitHub's runners.
+
+- [x] `build-wheels.yml`: an sdist job that installs the tarball and smoke-tests
       `hydrust check --help`, `hydrust server --help` and
       `python -m hydrust --help`, plus one `PyO3/maturin-action` job per target
       for the six targets already in `dist-workspace.toml`. The `server` line is
       what pins the invariant above: a wheel whose `hydrust` cannot serve breaks
       the VS Code extension's default configuration.
-- [ ] `publish-pypi.yml`: `uv publish`, `environment: release`,
+- [x] `publish-pypi.yml`: `uv publish`, `environment: release`,
       `id-token: write`, PyPI trusted publishing.
-- [ ] Trigger both on dist's existing tag pattern
+- [x] Trigger both on dist's existing tag pattern
       (`'**[0-9]+.[0-9]+.[0-9]+*'`), independent of the dist workflow.
 - [ ] Out of repo: register `hydrust` on PyPI as a pending trusted publisher,
       and create the `release` GitHub environment.
@@ -188,10 +206,41 @@ per release. Folding the wheel build into dist via `build-local-artifacts =
 false` + `local-artifacts-jobs` fixes that, at the cost of matching dist's
 expected artifact names exactly. Worth doing once the CI cost is measured.
 
-## Phase 4 — Documented CI snippet
+Decided during implementation:
 
-- [ ] README section with a workflow using
+- **`publish-pypi.yml` is the only tag-triggered workflow**; it calls
+  `build-wheels.yml` through `workflow_call` and publishes what that produced.
+  Triggering both on the tag would build every wheel twice and leave publish
+  with no way to consume the other run's artifacts. `build-wheels.yml` also
+  runs on `workflow_dispatch` and on pull requests that touch `pyproject.toml`,
+  `python/`, `Cargo.toml`, `Cargo.lock` or the workflow itself, so a packaging
+  break shows up before a release rather than during one.
+- **`aarch64-unknown-linux-gnu` builds on a native `ubuntu-24.04-arm` runner**
+  from the start, taking the known-risk fallback up front instead of
+  cross-compiling in maturin-action's container. The musl target still builds
+  in the `musllinux_1_2` container on x86_64.
+- **Both macOS targets build on `macos-latest` (ARM).** The x86_64 wheel cannot
+  be pip-installed there, so its smoke test unpacks the wheel and runs the
+  binary under Rosetta. The musllinux wheel is smoke-tested in a
+  `python:alpine` container, since it will not install into the runner's glibc
+  Python.
+- **Every build passes `--locked`**, so a wheel is built from exactly the
+  `Cargo.lock` that CI tested.
+
+## Phase 4 — Documented CI snippet · DONE
+
+- [x] README section with a workflow using
       `uvx hydrust@<version> check --output-format github .`.
+
+Decided during implementation:
+
+- The README gained an **Installation** section (`uv tool install`, `pipx`,
+  `pip`, `uvx`) ahead of the CLI docs, since the CI snippet assumes the package
+  exists.
+- The snippet pins `hydrust@0.5.0` and says why, and adds a second variant for
+  projects whose `_target_`s live in installed packages: `uv sync`, then
+  `--python .venv/bin/python`. Without it, `check` falls back to whichever
+  `python3` is on PATH and reports those targets as unresolved.
 
 ## Phase 5 — `hydrust-action` (deferred)
 
