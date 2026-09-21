@@ -896,6 +896,18 @@ fn output_pretty(reports: &[FileReport]) {
     );
 }
 
+/// Inclusive 1-based end column: the LSP end is exclusive 0-based, so the last
+/// covered column is `end.character`. A single-line range is widened to cover
+/// at least its start column; columns on different lines are not comparable.
+fn end_column(diag: &Diagnostic) -> u32 {
+    let range = diag.range;
+    if range.start.line == range.end.line {
+        range.end.character.max(range.start.character + 1)
+    } else {
+        range.end.character.max(1)
+    }
+}
+
 fn output_json(reports: &[FileReport]) -> anyhow::Result<()> {
     let totals = Totals::from_reports(reports);
     let output = serde_json::json!({
@@ -911,10 +923,7 @@ fn output_json(reports: &[FileReport]) -> anyhow::Result<()> {
                         "line": d.range.start.line + 1,
                         "column": d.range.start.character + 1,
                         "end_line": d.range.end.line + 1,
-                        // Inclusive 1-based, matching `endColumn` in the
-                        // github format: the LSP end is exclusive 0-based, so
-                        // the last covered column is `end.character`.
-                        "end_column": d.range.end.character.max(d.range.start.character + 1),
+                        "end_column": end_column(d),
                         "message": d.message.clone(),
                     })
                 }).collect::<Vec<_>>(),
@@ -1028,10 +1037,35 @@ fn output_github(reports: &[FileReport]) {
                 diag.range.start.line + 1,
                 diag.range.start.character + 1,
                 diag.range.end.line + 1,
-                diag.range.end.character.max(diag.range.start.character + 1),
+                end_column(diag),
                 title,
                 escape_workflow_data(&diag.message)
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tower_lsp::lsp_types::{Position, Range};
+
+    fn diag(start: (u32, u32), end: (u32, u32)) -> Diagnostic {
+        Diagnostic {
+            range: Range::new(Position::new(start.0, start.1), Position::new(end.0, end.1)),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn end_column_single_line() {
+        assert_eq!(end_column(&diag((0, 4), (0, 9))), 9);
+        assert_eq!(end_column(&diag((0, 4), (0, 4))), 5);
+    }
+
+    #[test]
+    fn end_column_multi_line_ignores_start_column() {
+        assert_eq!(end_column(&diag((0, 10), (2, 3))), 3);
+        assert_eq!(end_column(&diag((0, 10), (2, 0))), 1);
     }
 }

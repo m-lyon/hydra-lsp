@@ -23,6 +23,7 @@
 - Directory walks no longer apply the user's global git excludes (`core.excludesFile`), so a local run and a CI run check the same files
 - An unreadable directory or a file that disappears mid-walk is now logged and skipped, rather than aborting the whole run; a file that exists but cannot be read is reported as a failure, whether it was named explicitly or found by walking a directory
 - Finding no YAML files to check now warns on stderr and exits 0, rather than being a fatal error (exit 2), so it agrees with the run where YAML files are found but none are Hydra configs
+- The JSON `end_column` is now an inclusive 1-based column, matching `endColumn` in the github format; it was previously exclusive, so single-line values are one lower than before
 - The JSON `severity` field is unchanged: `INFORMATION` is still reported as `information`, where the compact and github formats spell it `info`
 - The workspace root falls back to the canonicalized current directory, so it matches the paths reported for each file
 
