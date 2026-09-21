@@ -46,7 +46,7 @@ fromEnvironment` sound: a `hydrust` found on PATH is always server-capable.
   after the crate, so v0.5.0 ships `hydrust-<target>.tar.xz`. That is what makes
   the change degrade gracefully for an extension that has not updated: it scans
   for an asset it recognises and skips any release without one
-  (`download.ts:218-229`), so it quietly stays on v0.4.0 and keeps working
+  (`download.ts:218-229`), so it quietly stays on v0.4.2 and keeps working
   instead of failing. It also merges two breaking changes into one — a rename
   was already anticipated (`python-packaging-and-gha-plan.md`, "Naming") — and the
   code cost is small: 21 references to `hydra_lsp` across 7 files, one of which
@@ -320,10 +320,10 @@ Nothing bad, which is the point of the crate rename.
 `getLatestVersion` walks releases newest-first and takes the first one carrying
 an asset named exactly `hydra-lsp-<target>.<ext>`, skipping any release that
 lacks it (`download.ts:218-229`). v0.5.0's assets are `hydrust-<target>.<ext>`,
-so a stale client does not match them, resolves v0.4.0 instead, and downloads
+so a stale client does not match them, resolves v0.4.2 instead, and downloads
 and runs it normally. No error, no fallback path, no cached-binary requirement.
 
-The user stays on v0.4.0 until they update the extension. Worth one line in the
+The user stays on v0.4.2 until they update the extension. Worth one line in the
 phase B release notes so nobody wonders why a new server release did not appear.
 
 Without the crate rename this would instead have been: `ensureServer` throws

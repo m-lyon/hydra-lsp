@@ -384,13 +384,17 @@ fn collect_targets(paths: &[PathBuf]) -> anyhow::Result<Vec<CheckTarget>> {
                 None => {
                     seen.insert(canonical.clone(), targets.len());
                     targets.push(CheckTarget {
-                        display: display_path(&lexical_absolute(path, cwd), &cwd_bases),
+                        display: display_name(path, &canonical, cwd, &cwd_bases),
                         path: canonical,
                         explicit: true,
                     });
                 }
             }
             continue;
+        }
+
+        if !path.is_dir() {
+            anyhow::bail!("Not a regular file or directory: {}", path.display());
         }
 
         // `require_git(false)` so that `.gitignore` is honoured whether or not
@@ -431,7 +435,7 @@ fn collect_targets(paths: &[PathBuf]) -> anyhow::Result<Vec<CheckTarget>> {
             if let std::collections::hash_map::Entry::Vacant(slot) = seen.entry(canonical.clone()) {
                 slot.insert(targets.len());
                 targets.push(CheckTarget {
-                    display: display_path(&lexical_absolute(entry.path(), cwd), &cwd_bases),
+                    display: display_name(entry.path(), &canonical, cwd, &cwd_bases),
                     path: canonical,
                     explicit: false,
                 });
@@ -440,6 +444,24 @@ fn collect_targets(paths: &[PathBuf]) -> anyhow::Result<Vec<CheckTarget>> {
     }
 
     Ok(targets)
+}
+
+/// The name to report `path` under: its lexical form, unless dropping a `..`
+/// that followed a symlink made that name a different file from the one that
+/// is actually read, in which case the canonical path is used instead.
+fn display_name(
+    path: &Path,
+    canonical: &Path,
+    cwd: Option<&Path>,
+    cwd_bases: &[PathBuf],
+) -> String {
+    let lexical = lexical_absolute(path, cwd);
+    let name = if lexical.canonicalize().is_ok_and(|c| c == canonical) {
+        lexical
+    } else {
+        canonical.to_path_buf()
+    };
+    display_path(&name, cwd_bases)
 }
 
 /// Make `path` absolute against `base` and drop `.`/`..` components without
@@ -896,15 +918,23 @@ fn output_pretty(reports: &[FileReport]) {
     );
 }
 
-/// Inclusive 1-based end column: the LSP end is exclusive 0-based, so the last
-/// covered column is `end.character`. A single-line range is widened to cover
-/// at least its start column; columns on different lines are not comparable.
-fn end_column(diag: &Diagnostic) -> u32 {
+/// Inclusive 1-based end line and column: the LSP end is exclusive 0-based, so
+/// the last covered column is `end.character`. A single-line range is widened
+/// to cover at least its start column; columns on different lines are not
+/// comparable. A multi-line range ending at column 0 of a line really ends at
+/// the end of the previous line, whose length is not known here, so the column
+/// is omitted.
+fn inclusive_end(diag: &Diagnostic) -> (u32, Option<u32>) {
     let range = diag.range;
     if range.start.line == range.end.line {
-        range.end.character.max(range.start.character + 1)
+        (
+            range.end.line + 1,
+            Some(range.end.character.max(range.start.character + 1)),
+        )
+    } else if range.end.character == 0 {
+        (range.end.line, None)
     } else {
-        range.end.character.max(1)
+        (range.end.line + 1, Some(range.end.character))
     }
 }
 
@@ -917,13 +947,14 @@ fn output_json(reports: &[FileReport]) -> anyhow::Result<()> {
                 "error": report.failure,
                 "error_code": report.failure_code,
                 "diagnostics": report.diagnostics.iter().map(|d| {
+                    let (end_line, end_column) = inclusive_end(d);
                     serde_json::json!({
                         "severity": json_severity_label(d),
                         "code": diagnostic_code(d),
                         "line": d.range.start.line + 1,
                         "column": d.range.start.character + 1,
-                        "end_line": d.range.end.line + 1,
-                        "end_column": end_column(d),
+                        "end_line": end_line,
+                        "end_column": end_column,
                         "message": d.message.clone(),
                     })
                 }).collect::<Vec<_>>(),
@@ -1030,14 +1061,18 @@ fn output_github(reports: &[FileReport]) {
                 format!("hydrust({})", escape_workflow_property(&code))
             };
 
+            let (end_line, end_column) = inclusive_end(diag);
+            let end_column = end_column
+                .map(|column| format!(",endColumn={column}"))
+                .unwrap_or_default();
             println!(
-                "::{} file={},line={},col={},endLine={},endColumn={},title={}::{}",
+                "::{} file={},line={},col={},endLine={}{},title={}::{}",
                 level,
                 file,
                 diag.range.start.line + 1,
                 diag.range.start.character + 1,
-                diag.range.end.line + 1,
-                end_column(diag),
+                end_line,
+                end_column,
                 title,
                 escape_workflow_data(&diag.message)
             );
@@ -1058,14 +1093,18 @@ mod tests {
     }
 
     #[test]
-    fn end_column_single_line() {
-        assert_eq!(end_column(&diag((0, 4), (0, 9))), 9);
-        assert_eq!(end_column(&diag((0, 4), (0, 4))), 5);
+    fn inclusive_end_single_line() {
+        assert_eq!(inclusive_end(&diag((0, 4), (0, 9))), (1, Some(9)));
+        assert_eq!(inclusive_end(&diag((0, 4), (0, 4))), (1, Some(5)));
     }
 
     #[test]
-    fn end_column_multi_line_ignores_start_column() {
-        assert_eq!(end_column(&diag((0, 10), (2, 3))), 3);
-        assert_eq!(end_column(&diag((0, 10), (2, 0))), 1);
+    fn inclusive_end_multi_line_ignores_start_column() {
+        assert_eq!(inclusive_end(&diag((0, 10), (2, 3))), (3, Some(3)));
+    }
+
+    #[test]
+    fn inclusive_end_multi_line_at_column_zero_is_previous_line() {
+        assert_eq!(inclusive_end(&diag((0, 10), (2, 0))), (2, None));
     }
 }

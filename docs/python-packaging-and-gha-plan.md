@@ -96,11 +96,11 @@ prefix are all one word from the first PyPI release. What still has to hold:
 Prerequisite for everything else.
 
 - [x] `Cargo.toml`: rename `[[bin]] hydra-check` to `hydrust`.
-- [x] `Cargo.toml`: add `[features] default = ["server"]` and
+- [x] ~~`Cargo.toml`: add `[features] default = ["server"]` and
       `required-features = ["server"]` on the `hydra-lsp` bin, so wheels can
-      build the CLI alone via `--no-default-features`. Verified:
-      `cargo build --no-default-features --bins --message-format=json` emits
-      only `hydrust`, the default build emits both.
+      build the CLI alone via `--no-default-features`.~~ Superseded: the two
+      binaries merged into one `hydrust` binary with `check` and `server`
+      subcommands, so there is no feature gate (see `server-subcommand-plan.md`).
 - [x] `src/cli.rs`: `#[command(name = "hydrust")]`, move the existing arguments
       into a `Check` subcommand. Clean break — nothing is published.
 - [x] Accept multiple paths: files and directories. Walk directories with
@@ -111,10 +111,11 @@ Prerequisite for everything else.
 - [x] Adjust the pretty and compact formats for multi-file runs — both currently
       assume a single file.
 - [x] Update the `hydra-check` references across `README.md`, `CHANGELOG.md`,
-      `.github/copilot-instructions.md` and `Cargo.toml`. `tests/server_cli.rs`
-      uses `CARGO_BIN_EXE_hydra-lsp` and is unaffected by the feature gate
-      because `cargo test` builds with default features.
-- [x] `tests/check_cli.rs`: 12 integration tests over the CLI surface CI depends
+      `.github/copilot-instructions.md` and `Cargo.toml`. ~~`tests/server_cli.rs`
+      uses `CARGO_BIN_EXE_hydra-lsp` and is unaffected by the feature gate.~~
+      Superseded: both `tests/server_cli.rs` and `tests/check_cli.rs` now run
+      `CARGO_BIN_EXE_hydrust`.
+- [x] `tests/check_cli.rs`: integration tests over the CLI surface CI depends
       on — exit codes, directory walking, `.gitignore`, path deduplication, the
       `github` annotation shape, and single-document JSON.
 
