@@ -644,3 +644,32 @@ fn test_directory_walk_ignores_gitignore_above_the_walk_root() {
         result.stdout
     );
 }
+
+#[test]
+fn test_directory_walk_ignores_git_info_exclude() {
+    // `.git/info/exclude` belongs to one clone and is never committed, so a
+    // fresh CI checkout would not have it: it must not decide what is checked.
+    let dir = TempDir::new().unwrap();
+    fs::create_dir_all(dir.path().join(".git/info")).unwrap();
+    fs::write(dir.path().join(".git/info/exclude"), "config.yaml\n").unwrap();
+    fs::write(dir.path().join("config.yaml"), BROKEN_CONFIG).unwrap();
+
+    let result = check_in(dir.path(), &[".", "--output-format", "compact"]);
+
+    assert_eq!(result.code, 1, "got: {}{}", result.stdout, result.stderr);
+    assert!(
+        result.stdout.contains("config.yaml"),
+        "got: {}",
+        result.stdout
+    );
+}
+
+#[test]
+fn test_bad_workspace_is_fatal_even_with_no_yaml() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("notes.txt"), "nothing to check").unwrap();
+
+    let result = check_in(dir.path(), &[".", "--workspace", "does-not-exist"]);
+
+    assert_eq!(result.code, 2, "got: {}", result.stderr);
+}

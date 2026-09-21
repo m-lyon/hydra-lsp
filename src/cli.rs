@@ -243,6 +243,9 @@ fn main() {
 
 fn run(args: &CheckCommand) -> anyhow::Result<i32> {
     let targets = collect_targets(&args.paths)?;
+    // Resolved before the empty check so that a bad `--workspace` is a usage
+    // error regardless of what happens to be on disk.
+    let workspace_root = resolve_workspace_root(args)?;
     if targets.is_empty() {
         // Nothing to check is not a failure: it has to agree with the case
         // where YAML files are found but none of them are Hydra configs, which
@@ -260,7 +263,6 @@ fn run(args: &CheckCommand) -> anyhow::Result<i32> {
     }
     info!("Checking {} file(s)", targets.len());
 
-    let workspace_root = resolve_workspace_root(args)?;
     if let Some(ref ws) = workspace_root {
         info!("Workspace root: {}", ws.display());
     }
@@ -399,14 +401,16 @@ fn collect_targets(paths: &[PathBuf]) -> anyhow::Result<Vec<CheckTarget>> {
 
         // `require_git(false)` so that `.gitignore` is honoured whether or not
         // the tree happens to be a git checkout; otherwise which files get
-        // checked would depend on the presence of `.git`. `git_global(false)`
-        // and `parents(false)` so that nothing outside the walk root - the
-        // developer's personal global excludes, or a stray `~/.gitignore` -
-        // can make a local run disagree with CI. Sorted so that output is
+        // checked would depend on the presence of `.git`. `git_global(false)`,
+        // `git_exclude(false)` and `parents(false)` so that nothing that is
+        // not committed inside the walk root - the developer's personal global
+        // excludes, the clone-local `.git/info/exclude`, or a stray
+        // `~/.gitignore` - can make a local run disagree with CI. Sorted so that output is
         // reproducible across runs and platforms.
         let walk = WalkBuilder::new(path)
             .require_git(false)
             .git_global(false)
+            .git_exclude(false)
             .parents(false)
             .follow_links(true)
             .sort_by_file_path(|a, b| a.cmp(b))
