@@ -4,6 +4,12 @@
 # it. Authenticates with PyPI trusted publishing, so there is no API token:
 # PyPI must list this repository, this workflow file and the `release`
 # environment as a trusted publisher for `hydrust`.
+#
+# Neither this workflow nor `release.yml` waits for the other, so one can
+# succeed while the other fails. If this run fails, fix the cause and re-run it
+# on the same tag so PyPI catches up with the GitHub release; do not cut a new
+# tag. Folding this into dist's `publish-jobs` would remove the gap; see
+# `docs/python-packaging-and-gha-plan.md`, phase 3.
 name: Publish to PyPI
 
 on:
