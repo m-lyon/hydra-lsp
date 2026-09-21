@@ -27,7 +27,7 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   PACKAGE_NAME: hydrust
@@ -98,6 +98,15 @@ jobs:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
           args: --release --locked --out dist
+      # Exercises `find_hydrust_bin`'s `--target` lookup (the `bin/` sibling of
+      # the package) against a real wheel. Runs before the normal install so the
+      # scripts-directory lookup cannot find a binary first.
+      - name: Test wheel (pip --target)
+        if: ${{ matrix.manylinux == 'auto' }}
+        run: |
+          pip install --target "$RUNNER_TEMP/target" dist/${PACKAGE_NAME}-*.whl
+          PYTHONPATH="$RUNNER_TEMP/target" python -c 'import os, hydrust; p = hydrust.find_hydrust_bin(); assert p.startswith(os.environ["RUNNER_TEMP"]), p'
+          PYTHONPATH="$RUNNER_TEMP/target" python -m hydrust --help
       - name: Test wheel
         if: ${{ matrix.manylinux == 'auto' }}
         run: |
@@ -106,13 +115,6 @@ jobs:
           hydrust check --help
           hydrust server --help
           python -m hydrust --help
-      # Exercises `find_hydrust_bin`'s `--target` lookup (the `bin/` sibling of
-      # the package) against a real wheel.
-      - name: Test wheel (pip --target)
-        if: ${{ matrix.manylinux == 'auto' }}
-        run: |
-          pip install --target "$RUNNER_TEMP/target" dist/${PACKAGE_NAME}-*.whl
-          PYTHONPATH="$RUNNER_TEMP/target" python -m hydrust --help
       # A musllinux wheel will not install into the runner's glibc Python.
       - name: Test wheel (musl)
         if: ${{ matrix.manylinux != 'auto' }}
