@@ -172,7 +172,8 @@ Decided during implementation:
   `py.typed` and one script, `hydrust`.
 - **`find_hydrust_bin()`**, not `find_bin()`, mirroring `find_ruff_bin()`.
   Verified against a venv install, `python -m hydrust` and
-  `pip install --target`.
+  `pip install --target`; CI smoke-tests the venv and `--target` lookups on
+  the x86_64 and aarch64 glibc wheels.
 - **The sdist also drops `docs/`, `.github/` and `.vscode/`**, not just
   `tests/`: none of it is needed to compile. `Cargo.toml` has no `[[test]]`
   entries, so cargo does not miss the tests directory.
@@ -214,7 +215,9 @@ Decided during implementation:
   with no way to consume the other run's artifacts. `build-wheels.yml` also
   runs on `workflow_dispatch` and on pull requests that touch `pyproject.toml`,
   `python/`, `Cargo.toml`, `Cargo.lock` or the workflow itself, so a packaging
-  break shows up before a release rather than during one.
+  break shows up before a release rather than during one. `src/` is left out
+  on purpose: the regular CI already covers Rust changes, and a full release
+  matrix on every Rust PR is the cost that has yet to be measured.
 - **`aarch64-unknown-linux-gnu` builds on a native `ubuntu-24.04-arm` runner**
   from the start, taking the known-risk fallback up front instead of
   cross-compiling in maturin-action's container. The musl target still builds

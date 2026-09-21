@@ -753,12 +753,15 @@ fn severity_label(diagnostic: &Diagnostic) -> &'static str {
     }
 }
 
-/// `severity_label` spells `INFORMATION` as `info` for the compact output; the
-/// JSON field has always been `information` and consumers match on it.
+/// The JSON severity is a stable contract, kept separate from `severity_label`
+/// (which spells `INFORMATION` as `info` for the compact output).
 fn json_severity_label(diagnostic: &Diagnostic) -> &'static str {
-    match severity_label(diagnostic) {
-        "info" => "information",
-        other => other,
+    match diagnostic.severity {
+        Some(DiagnosticSeverity::ERROR) => "error",
+        Some(DiagnosticSeverity::WARNING) => "warning",
+        Some(DiagnosticSeverity::INFORMATION) => "information",
+        Some(DiagnosticSeverity::HINT) => "hint",
+        _ => "unknown",
     }
 }
 

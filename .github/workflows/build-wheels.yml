@@ -18,7 +18,6 @@ on:
     paths:
       - pyproject.toml
       - python/**
-      - src/**
       - Cargo.toml
       - Cargo.lock
       - .github/workflows/build-wheels.yml
@@ -107,6 +106,13 @@ jobs:
           hydrust check --help
           hydrust server --help
           python -m hydrust --help
+      # Exercises `find_hydrust_bin`'s `--target` lookup (the `bin/` sibling of
+      # the package) against a real wheel.
+      - name: Test wheel (pip --target)
+        if: ${{ matrix.manylinux == 'auto' }}
+        run: |
+          pip install --target "$RUNNER_TEMP/target" dist/${PACKAGE_NAME}-*.whl
+          PYTHONPATH="$RUNNER_TEMP/target" python -m hydrust --help
       # A musllinux wheel will not install into the runner's glibc Python.
       - name: Test wheel (musl)
         if: ${{ matrix.manylinux != 'auto' }}
