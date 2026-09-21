@@ -495,7 +495,7 @@ fn is_yaml_file(path: &Path) -> bool {
 }
 
 /// Pick the root used for Python module resolution: `--workspace` if given,
-/// otherwise the current directory, whatever the paths checked.
+/// otherwise the current directory.
 fn resolve_workspace_root(args: &CheckCommand) -> anyhow::Result<PathBuf> {
     if let Some(ref ws) = args.workspace {
         return ws
