@@ -46,13 +46,8 @@ enum Command {
 
 /// `hydrust server` — the language server.
 ///
-/// Takes no options of its own. The catch-all exists to preserve the tolerance
-/// the standalone server binary had: an editor may append its own transport
-/// flag (`--stdio` is the common one), and refusing to start is worse than
-/// ignoring it. A bare clap subcommand would exit 2 on the first unrecognised
-/// argument, so they are collected here and dropped. The note about them goes
-/// to stderr, never stdout, because stdout is the LSP transport and a stray
-/// byte would corrupt the protocol.
+/// Takes no options of its own. `ignored` is a catch-all to prevent provided arguments
+/// from erroring out.
 #[derive(Args)]
 struct ServerCommand {
     #[arg(
@@ -247,17 +242,10 @@ fn run(args: &CheckCommand) -> anyhow::Result<i32> {
     // error regardless of what happens to be on disk.
     let workspace_root = resolve_workspace_root(args)?;
     if targets.is_empty() {
-        // Nothing to check is not a failure: it has to agree with the case
-        // where YAML files are found but none of them are Hydra configs, which
-        // is a clean run. Otherwise a renamed config directory turns a build
-        // red with a fatal error instead of a diagnostic.
         eprintln!(
             "{}: no YAML files found in the given path(s)",
             "warning".yellow().bold()
         );
-        // Still emit an empty document, so the machine-readable formats keep
-        // their output contract: a consumer parsing stdout must not have to
-        // special-case the empty run.
         emit(args.format, &[])?;
         return Ok(0);
     }
@@ -277,8 +265,6 @@ fn run(args: &CheckCommand) -> anyhow::Result<i32> {
 
     let disabled_rules = parse_disabled_rules(&args.disable_rules);
 
-    // One salsa db + PythonConfig shared across every file, so module
-    // resolution done for the first file is reused by the rest.
     let db_root = workspace_root
         .as_deref()
         .and_then(|p| p.to_str())
@@ -304,10 +290,6 @@ fn run(args: &CheckCommand) -> anyhow::Result<i32> {
     }
 
     if reports.is_empty() {
-        // Nothing was checked: as silent as the "no YAML found" case above, so
-        // it needs the same loud warning to keep the README's promise that
-        // nothing-to-check is never a quiet green run. The counts are reported
-        // separately so the message is never wrong about why.
         if not_hydra > 0 {
             eprintln!(
                 "{}: found {} YAML file(s), but none appear to be Hydra configs",
@@ -470,11 +452,6 @@ fn display_name(
 
 /// Make `path` absolute against `base` and drop `.`/`..` components without
 /// resolving symlinks.
-///
-/// The canonical path is what gets read, but it is the wrong thing to report: a
-/// symlinked config would be named under its link target, which may well sit
-/// outside the directory that was scanned and so be printed as an absolute
-/// path, which GitHub drops without explanation.
 fn lexical_absolute(path: &Path, base: Option<&Path>) -> PathBuf {
     let joined = match base {
         Some(base) if path.is_relative() => base.join(path),
@@ -525,12 +502,6 @@ fn is_yaml_file(path: &Path) -> bool {
 }
 
 /// Pick the root used for Python module resolution.
-///
-/// An explicit `--workspace` always wins. Otherwise a single file argument
-/// resolves against its own directory, which keeps the common
-/// `hydrust check config.yaml` case working without configuration; anything
-/// broader resolves against the current directory, since there is no one
-/// parent directory that is right for every file.
 fn resolve_workspace_root(args: &CheckCommand) -> anyhow::Result<Option<PathBuf>> {
     if let Some(ref ws) = args.workspace {
         return Ok(Some(ws.canonicalize().with_context(|| {
@@ -590,11 +561,6 @@ fn check_target(
     let bytes = match fs::read(file_path) {
         Ok(bytes) => bytes,
         Err(e) => {
-            // A file that vanished between the walk and the read is skipped:
-            // it is not there to be checked. Anything else is a file that
-            // exists and was meant to be checked, so it is reported as a
-            // failure whether it was named explicitly or found by walking a
-            // directory.
             if !target.explicit && e.kind() == std::io::ErrorKind::NotFound {
                 warn!("Skipping {}: {e}", target.display);
                 return CheckOutcome::Vanished;
@@ -605,9 +571,6 @@ fn check_target(
     let content = match String::from_utf8(bytes) {
         Ok(content) => content,
         Err(e) => {
-            // A file that is not UTF-8 is only a failure if it was named
-            // explicitly or looks like a Hydra config; otherwise a walked
-            // directory would fail on any stray non-UTF-8 YAML file.
             if !target.explicit
                 && !YamlParser::is_hydra_file(&String::from_utf8_lossy(e.as_bytes()))
             {

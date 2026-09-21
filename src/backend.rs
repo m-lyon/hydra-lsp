@@ -1034,8 +1034,6 @@ impl LanguageServer for HydraLspBackend {
                 ..Default::default()
             },
             server_info: Some(ServerInfo {
-                // Display only. Nothing may key identity off this string;
-                // identity questions belong to `capabilities.experimental.hydrust`.
                 name: "hydrust".to_string(),
                 version: Some(env!("CARGO_PKG_VERSION").to_string()),
             }),

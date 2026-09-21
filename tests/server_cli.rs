@@ -3,9 +3,7 @@
 //! The VS Code client runs `--version` on a downloaded binary before launching
 //! it, and then launches it as `hydrust server` to speak LSP over stdio. Both
 //! paths are checked here, including that the stdio path never writes anything
-//! to stdout other than protocol traffic. That last one matters more than it
-//! used to: `hydrust check` writes to stdout freely and now shares a process
-//! with the LSP transport.
+//! to stdout other than protocol traffic.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -14,9 +12,6 @@ use std::time::{Duration, Instant};
 const SERVER: &str = env!("CARGO_BIN_EXE_hydrust");
 
 /// The subcommand that starts the language server.
-///
-/// The client passes this unconditionally, without checking the server's
-/// version first, so it has to be the only way in.
 const SERVE: &str = "server";
 
 /// Return the first whitespace-separated token that looks like `X.Y.Z`, which

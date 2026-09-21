@@ -4,28 +4,25 @@
 
 ### Breaking
 
-- **One binary.** The `hydra-lsp` and `hydra-check` binaries are gone. Everything is now `hydrust`, with two subcommands: `hydrust check config.yaml` and `hydrust server`. An editor that used to launch `hydra-lsp` with no arguments must launch `hydrust server`; the VS Code extension does this from v0.1.7 onwards, unconditionally and without checking the server version first.
-- **The crate is renamed `hydra-lsp` → `hydrust`**, so the release archives are now `hydrust-<target>.<ext>` and contain a `hydrust` executable. The GitHub repository keeps its name. A VS Code extension older than v0.1.7 does not recognise the new asset name, so it silently stays on v0.4.2 and keeps working rather than failing — update the extension to pick up this release. `use hydra_lsp::` becomes `use hydrust::` for anything depending on the library.
-- **The `server` feature is gone**, along with `--no-default-features`. It gated no code and saved no dependencies, and the single binary must always be able to serve: the extension defaults to finding `hydrust` on `PATH` and launching it as the language server, with no fallback if it cannot.
-- `serverInfo.name` in the `initialize` response is now `"hydrust"`. Display only — nothing should key off it, and `capabilities.experimental.hydrust` is unchanged (`protocolVersion` is deliberately not bumped, since no field in the block changed meaning). Diagnostic `source` and the pull-diagnostics `identifier` still read `hydra-lsp`.
-- **`hydrust check --disable-rule` rejects an unknown rule** as a usage error (exit 2) instead of warning and continuing. In particular `invalid-target` is not accepted — it was renamed to `invalid-hydra-parameter` in v0.3.0, but the old `--help` text still advertised it. Run `hydrust check --help` for the current list. The LSP `disabledRules` setting is unaffected and still ignores unknown codes.
-- If you need to stay on the old shape, pin `hydrust.serverVersion` to `0.4.2` in the extension settings.
+- **One binary.** The `hydra-lsp` and `hydra-check` binaries are gone. Everything is now `hydrust`, with two subcommands: `hydrust check` and `hydrust server`. An editor that used to launch `hydra-lsp` with no arguments must launch `hydrust server`; the VSCode extension does this from v0.1.7 onwards.
+- **The crate is renamed `hydra-lsp` → `hydrust`**, so the release archives are now `hydrust-<target>.<ext>` and contain a `hydrust` executable. A VSCode extension older than v0.1.7 does not recognise the new asset name and silently stays on v0.4.2. `use hydra_lsp::` becomes `use hydrust::` for anything depending on the library.
+- **Removed `server` cargo feature**, along with `--no-default-features`.
+- `serverInfo.name` in the `initialize` response is now `"hydrust"`.
+- **`hydrust check --disable-rule` rejects an unknown rule** as a usage error (exit 2) instead of warning and continuing.
 
 ### Other changes
 
-- `hydrust server` ignores arguments it does not recognise, as the old `hydra-lsp` binary did — an editor may append its own transport flag such as `--stdio`, and refusing to start is worse than ignoring it. The note about them goes to stderr; stdout carries only LSP traffic.
-- `hydrust check` now accepts multiple files and directories. Directories are walked recursively for `.yaml` and `.yml` files, honouring `.gitignore`; discovered files that carry no Hydra markers are skipped silently
+- `hydrust check` now accepts multiple files and directories. Directories are walked recursively for `.yaml` and `.yml` files, honouring `.gitignore`; discovered files that carry no Hydra markers are skipped silently.
 - Added `--output-format github`, emitting GitHub Actions workflow commands so diagnostics render as inline annotations.
 - Renamed `--format` to `--output-format`.
-- JSON output is now a single document covering every checked file, rather than one document per file
-- The JSON `summary` now counts diagnostics only in `total`, reports `other`, and counts files that could not be read or parsed under a separate `failed_files` field
-- Reported paths always use `/` separators, so `--output-format github` annotations attach on Windows runners
-- Directory walks no longer apply the user's global git excludes (`core.excludesFile`), so a local run and a CI run check the same files
-- An unreadable directory or a file that disappears mid-walk is now logged and skipped, rather than aborting the whole run; a file that exists but cannot be read is reported as a failure, whether it was named explicitly or found by walking a directory. A non-UTF-8 file found by walking is only reported if it carries Hydra markers
-- Finding no YAML files to check now warns on stderr and exits 0, rather than being a fatal error (exit 2), so it agrees with the run where YAML files are found but none are Hydra configs
-- The JSON `end_column` is now an inclusive 1-based column, matching `endColumn` in the github format; it was previously exclusive, so single-line values are one lower than before. A multi-line range that ends at the start of a line is reported as ending on the previous line, with `end_column` null (and `endColumn` omitted)
-- The JSON `severity` field is unchanged: `INFORMATION` is still reported as `information`, where the compact and github formats spell it `info`
-- The workspace root falls back to the canonicalized current directory, so it matches the paths reported for each file
+- JSON output is now a single document covering every checked file, rather than one document per file.
+- The JSON `summary` now counts diagnostics only in `total`, reports `other`, and counts files that could not be read or parsed under a separate `failed_files` field.
+- Reported paths always use `/` separators, so `--output-format github` annotations attach on Windows runners.
+- Directory walks no longer apply the user's global git excludes (`core.excludesFile`), so a local run and a CI run check the same files.
+- An unreadable directory or a file that disappears mid-walk is now logged and skipped, rather than aborting the whole run.
+- Finding no YAML files to check now warns on stderr and exits 0, rather than being a fatal error (exit 2).
+- The JSON `end_column` is now an inclusive 1-based column, matching `endColumn` in the github format; it was previously exclusive, so single-line values are one lower than before. A multi-line range that ends at the start of a line is reported as ending on the previous line, with `end_column` null (and `endColumn` omitted).
+- The workspace root falls back to the canonicalized current directory, so it matches the paths reported for each file.
 
 ## [0.4.2]
 

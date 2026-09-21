@@ -27,33 +27,16 @@ A Language Server for [Hydra](https://hydra.cc/) configuration files, written in
 
 For a list of planned features and enhancements, see the [issues](https://github.com/m-lyon/hydra-lsp/issues) page.
 
-## The `hydrust` binary
+## Usage
 
-Everything ships as one executable with two subcommands:
+`hydrust` provides the `check` subcommand for one-time CLI and CI invocations, as well as an LSP for hydra diagnostics over stdin/stdout:
 
 ```bash
 hydrust check conf/   # diagnose configs on the command line
-hydrust server        # speak LSP over stdin/stdout (what your editor runs)
+hydrust server        # LSP
 ```
 
-There is no build that omits the server. The VS Code extension looks for
-`hydrust` on `PATH` by default and launches it as the language server, so a
-`hydrust` that could not serve would be a startup failure rather than a
-degraded mode.
-
-`hydrust server` ignores arguments it does not recognise, because an editor may
-append a transport flag of its own; the note about them goes to stderr, never
-stdout.
-
 ### `hydrust check`
-
-Diagnosing Hydra YAML configuration files from the command line is useful for:
-
-- Debugging why a `_target_` is not being resolved
-- CI/CD pipeline validation
-- Quick command-line checks without an IDE
-
-### Usage
 
 ```bash
 # Check a single file
@@ -79,22 +62,9 @@ hydrust check config.yaml -v debug
 hydrust check config.yaml -f json
 ```
 
-Directories are searched recursively for `.yaml` and `.yml` files. The walk
-honours `.gitignore` and `.ignore` files within the directory being walked, and
-skips hidden files and directories such as `.github/`. Symlinks are followed.
-Ignore files above the directory you point at, the clone-local
-`.git/info/exclude`, and your personal global git excludes (`core.excludesFile`),
-are deliberately not applied, so a local run and a CI run check the same files.
+Directories are searched recursively for `.yaml` and `.yml` files. The walk honours `.gitignore` and `.ignore` files within the directory being walked, and skips hidden files and directories such as `.github/`. Symlinks are followed.
 
-Files found by walking a directory are skipped when they carry no Hydra
-markers; a file named explicitly on the command line is always checked, with a
-warning if it does not look like a Hydra config. A file that disappears during
-the walk is logged and skipped, but one that exists and cannot be read is
-reported as a failure and fails the run. A file that is not UTF-8 counts as
-unreadable if it was named explicitly or carries Hydra markers; otherwise a
-walk skips it like any other non-Hydra file.
-
-### Options
+#### Options
 
 | Option | Description |
 |--------|-------------|
@@ -105,10 +75,9 @@ walk skips it like any other non-Hydra file.
 | `--trace-resolution` | Show detailed resolution steps for each target (written to stderr) |
 | `--disable-rule <RULE>` | Disable a diagnostic rule; may be repeated |
 
-Without `--workspace`, a single file argument resolves Python modules against
-its own directory; anything broader resolves against the current directory.
+When omitting `--workspace` and providing a single config file argument, `hydrust` resolves the Python modules against the file's directory; anything broader resolves against the current directory.
 
-### Continuous integration
+#### Continuous integration
 
 `-f github` emits GitHub Actions workflow commands, so diagnostics appear as
 inline annotations on the pull request:
@@ -117,7 +86,7 @@ inline annotations on the pull request:
 - run: hydrust check --output-format github conf/
 ```
 
-### Exit Codes
+#### Exit Codes
 
 - `0`: No errors found
 - `1`: One or more errors found
@@ -127,7 +96,9 @@ Finding nothing to check is not an error: whether no YAML files matched at all
 or none of the ones found are Hydra configs, `hydrust check` warns on stderr and
 exits `0`.
 
-## Client Compatibility
+## `hydrust server`
+
+### Client Compatibility
 
 A client can be pointed at any released server binary, and an old server quietly
 ignores settings it was never taught to read. So the server describes itself in
@@ -145,61 +116,6 @@ before v0.4.0 send no block, so clients fall back to a version table keyed on
 `serverInfo.version` or `--version`. The reference client is the VS Code
 extension ([hydra-lsp-vscode](https://github.com/m-lyon/hydra-lsp-vscode)), in
 `src/common/compatTable.ts`.
-
-### Adding a feature
-
-**A settings key** — parse it in `initialize`, then add it to `CORE_SETTINGS` (or
-to the `feature_toggles!` list for an on/off switch, which registers the key for
-you). Update the counts in [tests/capabilities.rs](tests/capabilities.rs). In the
-extension: declare it in `package.json`, send it from `startServer`, add a
-`SETTING_COMPAT` entry.
-
-**A diagnostic rule** — add it to `diagnostic_rules!` in
-[src/diagnostics.rs](src/diagnostics.rs) and it is advertised automatically. In
-the extension, add a `RULE_COMPAT` entry; for a *rename*, record the old code as
-`previousCode` so the client can rewrite it for older servers, as
-`invalid-target` → `invalid-hydra-parameter` did in v0.3.0.
-
-**A behaviour the client must know about** — only needed when it depends on a
-client capability, or the client has to branch on it. Read the client capability
-in `initialize` and store the flag, add a field to `NegotiatedFeatures` and a
-`(name, gate)` pair to `SUPPORTED_FEATURES`, and gate the behaviour on that same
-flag so the advertised name is never a promise the session will not keep. Cover
-it both ways in [tests/capabilities.rs](tests/capabilities.rs). In the extension,
-add a `FEATURE_COMPAT` entry; names become `hydrust.supports.<name>` context keys.
-
-Anything the server always does and can advertise through a standard LSP
-capability field needs none of this.
-
-### Rules
-
-- Bump `HYDRUST_PROTOCOL_VERSION` only when something already in the block
-  changes meaning: a key that starts doing something different, a repurposed
-  feature name, a field that changes type. Additions never need a bump.
-- Never remove or repurpose a name quietly — a client may still send it.
-- Unknown settings keys stay ignored, never rejected.
-- `features` is always an array, even when empty; clients test membership on it.
-- Bump the crate version and add a CHANGELOG entry. The client's fallback table
-  is keyed on release versions.
-
-### Checking it
-
-`cargo test --test capabilities` covers the block's shape. In the extension repo,
-`npm run test:contract` checks the client against a real running binary, and
-`npm run test:table-audit` re-verifies the fallback table against tagged sources.
-
-## Threading
-
-The server runs its analysis on two `rayon` pools — a latency pool for hover,
-completion and semantic tokens, and a worker pool for diagnostics — alongside a
-single-threaded tokio runtime that handles the protocol itself. The `numThreads`
-setting is the total across all three, and defaults to a size the server picks to
-fit the machine.
-
-[docs/threading-model.md](docs/threading-model.md) is the reference for this:
-where each request handler does its work, why the counts are what they are, and
-which alternatives were tried and rejected. Read it before changing a thread
-count, the concurrency level, or where a handler runs.
 
 ## License
 

@@ -7,15 +7,7 @@ description = "Language server and CLI checker for Hydra configuration files"
 license = "MIT"
 repository = "https://github.com/m-lyon/hydra-lsp"
 
-# One binary, and it always has the `server` subcommand. The VS Code extension
-# defaults to `importStrategy: fromEnvironment`, so a `hydrust` found on PATH is
-# launched as the language server with no fallback — a CLI-only build would be
-# an unrecoverable startup failure, not a degraded mode. Do not reintroduce a
-# feature flag that drops the server.
-#
-# `[lib]` is omitted deliberately: with the package named `hydrust`, both the
-# lib name and `src/lib.rs` are the defaults. The `[[bin]]` stays explicit only
-# because its source is `src/cli.rs` rather than `src/main.rs`.
+
 [[bin]]
 name = "hydrust"
 path = "src/cli.rs"

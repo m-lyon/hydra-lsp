@@ -11,9 +11,8 @@ use crate::backend::{HydraLspBackend, MAX_CONCURRENT_REQUESTS};
 /// Initialise tracing for the language server.
 ///
 /// Separate from `hydrust check`'s init (`cli.rs`, ANSI on, level from
-/// `--verbosity`) because only one subscriber can win per process, so each
-/// subcommand installs its own. Here the writer is stderr and ANSI is off:
-/// stdout is the LSP transport, and an editor's log pane is not a terminal.
+/// `--verbosity`) because only one subscriber is allowed per process, so each
+/// subcommand installs its own. Here the writer is stderr and ANSI is off.
 fn init_tracing() {
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
