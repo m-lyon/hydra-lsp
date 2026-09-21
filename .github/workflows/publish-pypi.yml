@@ -15,7 +15,27 @@ permissions:
   contents: read
 
 jobs:
+  # dist's `release.yml` fails on a tag that does not match `Cargo.toml`, but
+  # this workflow runs separately, and a PyPI version cannot be re-uploaded.
+  check-version:
+    name: Check tag matches Cargo.toml
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Compare versions
+        run: |
+          tag_version=$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+.*$' <<< "$GITHUB_REF_NAME")
+          cargo_version=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "hydrust") | .version')
+          if [ "$tag_version" != "$cargo_version" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME ($tag_version) does not match Cargo.toml version $cargo_version"
+            exit 1
+          fi
+
   build:
+    needs: check-version
     uses: ./.github/workflows/build-wheels.yml
 
   publish:
