@@ -9,6 +9,7 @@
 - **Removed `server` cargo feature**, along with `--no-default-features`.
 - `serverInfo.name` in the `initialize` response is now `"hydrust"`.
 - **`hydrust check --disable-rule` rejects an unknown rule** as a usage error (exit 2) instead of warning and continuing.
+- **`hydrust check` without `--workspace` resolves Python modules against the current directory**, even for a single file. `hydra-check` used the file's own directory; pass `--workspace <dir>` to keep that behaviour.
 
 ### Other changes
 

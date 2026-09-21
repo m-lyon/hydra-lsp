@@ -75,7 +75,7 @@ Directories are searched recursively for `.yaml` and `.yml` files. The walk hono
 | `--trace-resolution` | Show detailed resolution steps for each target (written to stderr) |
 | `--disable-rule <RULE>` | Disable a diagnostic rule; may be repeated |
 
-When omitting `--workspace` and providing a single config file argument, `hydrust` resolves the Python modules against the file's directory; anything broader resolves against the current directory.
+When `--workspace` is omitted, `hydrust` resolves Python modules against the current directory, whether it is given one file, several, or a directory.
 
 #### Continuous integration
 

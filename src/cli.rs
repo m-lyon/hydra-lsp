@@ -251,9 +251,7 @@ fn run(args: &CheckCommand) -> anyhow::Result<i32> {
     }
     info!("Checking {} file(s)", targets.len());
 
-    if let Some(ref ws) = workspace_root {
-        info!("Workspace root: {}", ws.display());
-    }
+    info!("Workspace root: {}", workspace_root.display());
 
     let python_interpreter = args
         .python
@@ -265,16 +263,11 @@ fn run(args: &CheckCommand) -> anyhow::Result<i32> {
 
     let disabled_rules = parse_disabled_rules(&args.disable_rules);
 
-    let db_root = workspace_root
-        .as_deref()
-        .and_then(|p| p.to_str())
-        .unwrap_or(".");
+    let db_root = workspace_root.to_str().unwrap_or(".");
     let db = HydraDatabase::new(ruff_db::system::SystemPath::new(db_root));
     let python_config = PythonConfig::new(
         &db,
-        workspace_root
-            .as_ref()
-            .map(|p| p.to_string_lossy().to_string()),
+        Some(workspace_root.to_string_lossy().to_string()),
         python_interpreter.clone(),
     );
 
@@ -501,23 +494,16 @@ fn is_yaml_file(path: &Path) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("yaml") || ext.eq_ignore_ascii_case("yml"))
 }
 
-/// Pick the root used for Python module resolution.
-fn resolve_workspace_root(args: &CheckCommand) -> anyhow::Result<Option<PathBuf>> {
+/// Pick the root used for Python module resolution: `--workspace` if given,
+/// otherwise the current directory, whatever the paths checked.
+fn resolve_workspace_root(args: &CheckCommand) -> anyhow::Result<PathBuf> {
     if let Some(ref ws) = args.workspace {
-        return Ok(Some(ws.canonicalize().with_context(|| {
-            format!("Workspace not found: {}", ws.display())
-        })?));
+        return ws
+            .canonicalize()
+            .with_context(|| format!("Workspace not found: {}", ws.display()));
     }
 
-    // Keyed on what was passed, not on what the walk turned up, so the root
-    // does not depend on how many YAML files happen to sit on disk.
-    if let [single] = args.paths.as_slice()
-        && single.is_file()
-    {
-        return Ok(single.canonicalize()?.parent().map(PathBuf::from));
-    }
-
-    Ok(Some(std::env::current_dir()?.canonicalize()?))
+    Ok(std::env::current_dir()?.canonicalize()?)
 }
 
 /// Turn the `--disable-rule` codes into rules.

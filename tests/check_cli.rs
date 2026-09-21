@@ -446,7 +446,7 @@ fn module_workspace() -> TempDir {
 }
 
 #[test]
-fn test_single_explicit_file_resolves_against_its_own_directory() {
+fn test_single_file_argument_resolves_against_the_current_directory() {
     let dir = module_workspace();
 
     let result = check_in(
@@ -455,8 +455,24 @@ fn test_single_explicit_file_resolves_against_its_own_directory() {
     );
 
     assert_eq!(
+        result.code, 1,
+        "a single file resolves from the cwd like any other invocation, so the module is unresolved, got: {}",
+        result.stdout
+    );
+}
+
+#[test]
+fn test_single_file_argument_resolves_from_its_own_directory_as_cwd() {
+    let dir = module_workspace();
+
+    let result = check_in(
+        &dir.path().join("sub"),
+        &["config.yaml", "--output-format", "compact"],
+    );
+
+    assert_eq!(
         result.code, 0,
-        "the module sitting next to the config should resolve, got: {}",
+        "run from the module's directory, the module should resolve, got: {}",
         result.stdout
     );
 }
@@ -478,8 +494,6 @@ fn test_directory_argument_resolves_against_the_current_directory() {
 fn test_several_arguments_resolve_against_the_current_directory() {
     let dir = module_workspace();
 
-    // More than one argument, so the root is the cwd whatever the walk turns
-    // up: it must not depend on how many YAML files sit on disk.
     let result = check_in(
         dir.path(),
         &["sub", "sub/config.yaml", "--output-format", "compact"],
