@@ -229,6 +229,9 @@ Decided during implementation:
   Python.
 - **Every build passes `--locked`**, so a wheel is built from exactly the
   `Cargo.lock` that CI tested.
+- **Wheels build with `--profile dist`**, not `--release`, so they get the same
+  thin LTO as dist's release archives. Folding the two builds into one is
+  tracked separately in #48.
 
 ## Phase 4 — Documented CI snippet · DONE
 
