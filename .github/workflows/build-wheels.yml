@@ -17,6 +17,9 @@ on:
   # Called by `publish-pypi.yml` on a release tag.
   workflow_call:
   workflow_dispatch:
+  # Packaging changes only. `src/` is left out on purpose: `ci.yml` already
+  # covers Rust changes, and the full release matrix on every Rust PR is not
+  # worth its cost.
   pull_request:
     paths:
       - pyproject.toml
