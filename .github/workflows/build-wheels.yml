@@ -3,7 +3,7 @@
 # Runs independently of dist's `release.yml`, so each target is compiled twice
 # per release. Folding this into dist via `build-local-artifacts = false` and
 # `local-artifacts-jobs` would fix that; see
-# `docs/python-packaging-and-gha-plan.md`, phase 3.
+# https://github.com/m-lyon/hydra-lsp/issues/48.
 #
 # Wheels build with the `dist` profile, as dist's release archives do, so the
 # binary on PyPI and the one on the GitHub Release are compiled the same way.
