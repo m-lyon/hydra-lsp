@@ -15,6 +15,7 @@ on:
   push:
     tags:
       - '**[0-9]+.[0-9]+.[0-9]+*'
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -31,9 +32,13 @@ jobs:
           persist-credentials: false
       - name: Compare versions
         run: |
-          tag_version=$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+.*$' <<< "$GITHUB_REF_NAME")
           cargo_version=$(cargo metadata --no-deps --format-version 1 \
             | jq -r '.packages[] | select(.name == "hydrust") | .version')
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "Publishing version $cargo_version from $GITHUB_REF_NAME"
+            exit 0
+          fi
+          tag_version=$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+.*$' <<< "$GITHUB_REF_NAME")
           if [ "$tag_version" != "$cargo_version" ]; then
             echo "::error::Tag $GITHUB_REF_NAME ($tag_version) does not match Cargo.toml version $cargo_version"
             exit 1
@@ -53,7 +58,7 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.2.0
       - uses: actions/download-artifact@v8
         with:
           pattern: wheels-*
