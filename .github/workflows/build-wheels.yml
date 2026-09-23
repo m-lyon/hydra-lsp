@@ -1,25 +1,18 @@
 # Build the `hydrust` wheels and sdist for PyPI.
 #
-# Runs independently of dist's `release.yml`, so each target is compiled twice
+# Runs independently of `release.yml`, so each target is compiled twice
 # per release. Folding this into dist via `build-local-artifacts = false` and
 # `local-artifacts-jobs` would fix that; see
 # https://github.com/m-lyon/hydra-lsp/issues/48.
 #
-# Wheels build with the `dist` profile, as dist's release archives do, so the
-# binary on PyPI and the one on the GitHub Release are compiled the same way.
-#
-# Every job smoke-tests `hydrust server --help` as well as `check`: the wheel
-# must ship a server-capable binary, because the VS Code extension defaults to
-# launching the `hydrust` it finds on PATH as the language server.
+# Every job smoke-tests `hydrust server --help` as well as `check`.
 name: Build wheels
 
 on:
   # Called by `publish-pypi.yml` on a release tag.
   workflow_call:
   workflow_dispatch:
-  # Packaging changes only. `src/` is left out on purpose: `ci.yml` already
-  # covers Rust changes, and the full release matrix on every Rust PR is not
-  # worth its cost.
+  # Packaging changes only.
   pull_request:
     paths:
       - pyproject.toml
@@ -37,7 +30,7 @@ concurrency:
 
 env:
   PACKAGE_NAME: hydrust
-  PYTHON_VERSION: "3.13"
+  PYTHON_VERSION: '3.13'
   CARGO_INCREMENTAL: 0
   CARGO_NET_RETRY: 10
   CARGO_TERM_COLOR: always

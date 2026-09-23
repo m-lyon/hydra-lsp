@@ -29,17 +29,12 @@ For a list of planned features and enhancements, see the [issues](https://github
 
 ## Installation
 
-`hydrust` is published to PyPI as a prebuilt binary wheel, so no Rust toolchain
-is needed:
+You can install `hydrust` through PyPI:
 
 ```bash
-uv tool install hydrust   # or: pipx install hydrust, pip install hydrust
+uv tool install hydrust   # or: pixi global install hydrust, pip install hydrust
 uvx hydrust check conf/   # run once without installing
 ```
-
-Installing into a project's virtual environment also makes `python -m hydrust`
-work. Standalone archives for each platform are attached to every
-[GitHub release](https://github.com/m-lyon/hydra-lsp/releases).
 
 ## Usage
 
@@ -110,9 +105,6 @@ jobs:
       - uses: astral-sh/setup-uv@v10
       - run: uvx hydrust@0.5.0 check --output-format github .
 ```
-
-Pin the version, so a new release cannot change a passing build into a failing
-one without a commit on your side.
 
 `_target_` resolution needs the Python packages your configs point at. If they
 are not in the checked-out tree, install the project first and point `hydrust`

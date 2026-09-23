@@ -13,7 +13,7 @@
 
 ### Other changes
 
-- **Published to PyPI as `hydrust`.** `pip install hydrust`, `uv tool install hydrust` or `uvx hydrust check .` installs a prebuilt binary wheel for Linux (x86_64 and aarch64 glibc, x86_64 musl), macOS (x86_64 and arm64) and Windows (x86_64). The wheel carries the full binary, language server included, and `python -m hydrust` works too.
+- **Published to PyPI as `hydrust`.** e.g. `pip install hydrust`, `uv tool install hydrust`.
 - `hydrust check` now accepts multiple files and directories. Directories are walked recursively for `.yaml` and `.yml` files, honouring `.gitignore`; discovered files that carry no Hydra markers are skipped silently.
 - Added `--output-format github`, emitting GitHub Actions workflow commands so diagnostics render as inline annotations.
 - Renamed `--format` to `--output-format`.
