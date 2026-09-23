@@ -9,12 +9,18 @@
 # whose name matches an already-uploaded file but whose contents differ.
 # Folding this into `publish-jobs` would remove the gap; see
 # https://github.com/m-lyon/hydra-lsp/issues/48.
+#
+# A failure that is in the workflow file itself cannot be fixed by re-running:
+# the run uses the file as it was at the tag. That is what `workflow_dispatch`
+# is for. Run it from the branch carrying the fix, once that branch has the
+# version being published in `Cargo.toml`.
 name: Publish to PyPI
 
 on:
   push:
     tags:
       - '**[0-9]+.[0-9]+.[0-9]+*'
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -31,9 +37,15 @@ jobs:
           persist-credentials: false
       - name: Compare versions
         run: |
-          tag_version=$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+.*$' <<< "$GITHUB_REF_NAME")
           cargo_version=$(cargo metadata --no-deps --format-version 1 \
             | jq -r '.packages[] | select(.name == "hydrust") | .version')
+          # A manual run has no tag to check against. `Cargo.toml` is what the
+          # wheels are built from either way, so report it and carry on.
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "Publishing version $cargo_version from $GITHUB_REF_NAME"
+            exit 0
+          fi
+          tag_version=$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+.*$' <<< "$GITHUB_REF_NAME")
           if [ "$tag_version" != "$cargo_version" ]; then
             echo "::error::Tag $GITHUB_REF_NAME ($tag_version) does not match Cargo.toml version $cargo_version"
             exit 1
@@ -53,7 +65,10 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - uses: astral-sh/setup-uv@v10
+      # Pinned to an exact version: setup-uv stopped publishing floating major
+      # tags after v7, so `@v10` does not resolve and the job fails before it
+      # runs. Check the tag exists when bumping this.
+      - uses: astral-sh/setup-uv@v10.2.0
       - uses: actions/download-artifact@v8
         with:
           pattern: wheels-*
