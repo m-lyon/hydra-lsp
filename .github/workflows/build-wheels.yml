@@ -1,25 +1,35 @@
-# Build the `hydrust` wheels and sdist for PyPI.
+# Build the `hydrust` wheels and sdist for PyPI, and the GitHub Release archives.
 #
-# Runs independently of `release.yml`, so each target is compiled twice
-# per release. Folding this into dist via `build-local-artifacts = false` and
-# `local-artifacts-jobs` would fix that; see
-# https://github.com/m-lyon/hydra-lsp/issues/48.
+# The only place a release compiles `hydrust`. `release.yml` calls this as
+# dist's `local-artifacts-jobs`, and each target job packs the binary from its
+# wheel into the archive dist would otherwise have built
+# (`.github/scripts/pack_release_archive.py`), so PyPI and the GitHub Release
+# ship the same build. Artifacts named `artifacts-*` are what dist's host job
+# uploads to the release; `wheels-*` are what `publish-pypi.yml` uploads to PyPI.
 #
 # Every job smoke-tests `hydrust server --help` as well as `check`.
 name: Build wheels
 
 on:
-  # Called by `publish-pypi.yml` on a release tag.
+  # Called by `release.yml` on a release tag.
   workflow_call:
+    inputs:
+      # dist's plan manifest. Unused: the targets are listed here.
+      plan:
+        required: true
+        type: string
   workflow_dispatch:
-  # Packaging changes only.
+  # Packaging and release pipeline changes only.
   pull_request:
     paths:
       - pyproject.toml
       - python/**
       - Cargo.toml
       - Cargo.lock
+      - dist-workspace.toml
+      - .github/scripts/pack_release_archive.py
       - .github/workflows/build-wheels.yml
+      - .github/workflows/release.yml
 
 permissions:
   contents: read
@@ -129,6 +139,13 @@ jobs:
         with:
           name: wheels-${{ matrix.target }}
           path: dist
+      - name: Pack release archive
+        shell: bash
+        run: python .github/scripts/pack_release_archive.py dist/${PACKAGE_NAME}-*.whl ${{ matrix.target }} archive
+      - uses: actions/upload-artifact@v7
+        with:
+          name: artifacts-${{ matrix.target }}
+          path: archive
 
   macos:
     name: macos (${{ matrix.target }})
@@ -177,6 +194,13 @@ jobs:
         with:
           name: wheels-${{ matrix.target }}
           path: dist
+      - name: Pack release archive
+        shell: bash
+        run: python .github/scripts/pack_release_archive.py dist/${PACKAGE_NAME}-*.whl ${{ matrix.target }} archive
+      - uses: actions/upload-artifact@v7
+        with:
+          name: artifacts-${{ matrix.target }}
+          path: archive
 
   windows:
     name: windows (${{ matrix.target }})
@@ -211,3 +235,10 @@ jobs:
         with:
           name: wheels-${{ matrix.target }}
           path: dist
+      - name: Pack release archive
+        shell: bash
+        run: python .github/scripts/pack_release_archive.py dist/${PACKAGE_NAME}-*.whl ${{ matrix.target }} archive
+      - uses: actions/upload-artifact@v7
+        with:
+          name: artifacts-${{ matrix.target }}
+          path: archive

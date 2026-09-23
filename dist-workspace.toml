@@ -11,3 +11,11 @@ ci = "github"
 installers = []
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-unknown-linux-musl", "x86_64-pc-windows-msvc"]
+# `build-wheels.yml` compiles each target once, for both the wheels and the
+# release archives, so dist does not compile anything itself.
+build-local-artifacts = false
+local-artifacts-jobs = ["./build-wheels"]
+# Runs after the GitHub Release is created, so PyPI never gets ahead of it.
+publish-jobs = ["./publish-pypi"]
+# Trusted publishing needs an OIDC token; the job inherits nothing else.
+github-custom-job-permissions = { "publish-pypi" = { id-token = "write" } }

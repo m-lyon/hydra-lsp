@@ -1,60 +1,36 @@
-# Publish `hydrust` to PyPI on a release tag.
+# Publish `hydrust` to PyPI.
 #
-# Uses the same tag pattern as `release.yml`.
+# Called by `release.yml` as one of dist's `publish-jobs`, so it runs only after
+# the GitHub Release has been created, and uploads the wheels `build-wheels.yml`
+# built earlier in that same run. dist checks the tag against `Cargo.toml`
+# before anything is built, and skips this job for a prerelease tag.
 #
-# Neither this workflow nor `release.yml` waits for the other, so one can
-# succeed while the other fails. If this run fails, fix the cause and use "Re-run
-# failed jobs" so PyPI catches up with the GitHub release; do not cut a new tag.
-# Re-running all jobs would rebuild the wheels, and PyPI rejects a rebuilt wheel
-# whose name matches an already-uploaded file but whose contents differ.
-# Folding this into `publish-jobs` would remove the gap; see
-# https://github.com/m-lyon/hydra-lsp/issues/48.
+# If this job fails, fix the cause and use "Re-run failed jobs" on the Release
+# run so PyPI catches up with the GitHub release; do not cut a new tag. Re-running
+# all jobs would rebuild the wheels, and PyPI rejects a rebuilt wheel whose name
+# matches an already-uploaded file but whose contents differ.
+#
+# PyPI's trusted publisher is registered against `release.yml`, not this file:
+# PyPI checks the top-level workflow. The `release` environment has to stay on
+# the job that publishes.
 name: Publish to PyPI
 
 on:
-  push:
-    tags:
-      - '**[0-9]+.[0-9]+.[0-9]+*'
-  workflow_dispatch:
-
-permissions:
-  contents: read
+  workflow_call:
+    inputs:
+      # dist's plan manifest. Unused.
+      plan:
+        required: true
+        type: string
 
 jobs:
-  # `release.yml` fails on a tag that does not match `Cargo.toml`, but
-  # this workflow runs separately, and a PyPI version cannot be re-uploaded.
-  check-version:
-    name: Check tag matches Cargo.toml
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-      - name: Compare versions
-        run: |
-          cargo_version=$(cargo metadata --no-deps --format-version 1 \
-            | jq -r '.packages[] | select(.name == "hydrust") | .version')
-          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
-            echo "Publishing version $cargo_version from $GITHUB_REF_NAME"
-            exit 0
-          fi
-          tag_version=$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+.*$' <<< "$GITHUB_REF_NAME")
-          if [ "$tag_version" != "$cargo_version" ]; then
-            echo "::error::Tag $GITHUB_REF_NAME ($tag_version) does not match Cargo.toml version $cargo_version"
-            exit 1
-          fi
-
-  build:
-    needs: check-version
-    uses: ./.github/workflows/build-wheels.yml
-
   publish:
     name: Upload to PyPI
-    needs: build
     runs-on: ubuntu-latest
     environment:
       name: release
       url: https://pypi.org/project/hydrust/
+    # `release.yml` grants only this; asking for anything more fails the run.
     permissions:
       id-token: write
     steps:

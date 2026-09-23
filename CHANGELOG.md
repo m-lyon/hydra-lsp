@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.5.1]
+
+- The release pipeline compiles each target once. The GitHub Release archives now carry the same binary as the PyPI wheels, stripped, so they are smaller. Their names and layout are unchanged (#48)
+- PyPI is published only after the GitHub Release has been created, as part of the same workflow run, so the two can no longer disagree
+- `sha256.sum` on the GitHub Release now lists only `source.tar.gz`; each archive still has its own `.sha256` file
+
 ## [0.5.0]
 
 ### Breaking
