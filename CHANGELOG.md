@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.5.0]
+
+### Breaking
+
+- **One binary.** The `hydra-lsp` and `hydra-check` binaries are gone. Everything is now `hydrust`, with two subcommands: `hydrust check` and `hydrust server`. An editor that used to launch `hydra-lsp` with no arguments must launch `hydrust server`; the VSCode extension does this from v0.1.7 onwards.
+- **The crate is renamed `hydra-lsp` → `hydrust`**, so the release archives are now `hydrust-<target>.<ext>` and contain a `hydrust` executable. A VSCode extension older than v0.1.7 does not recognise the new asset name and silently stays on v0.4.2. `use hydra_lsp::` becomes `use hydrust::` for anything depending on the library.
+- **Removed `server` cargo feature**, along with `--no-default-features`.
+- `serverInfo.name` in the `initialize` response is now `"hydrust"`.
+- **`hydrust check --disable-rule` rejects an unknown rule** as a usage error (exit 2) instead of warning and continuing.
+- **`hydrust check` without `--workspace` resolves Python modules against the current directory**, even for a single file. `hydra-check` previously used the file's own directory.
+
+### Other changes
+
+- **Published to PyPI as `hydrust`.** e.g. `pip install hydrust`, `uv tool install hydrust`.
+- `hydrust check` now accepts multiple files and directories. Directories are walked recursively for `.yaml` and `.yml` files, honouring `.gitignore`; discovered files that carry no Hydra markers are skipped silently.
+- Added `--output-format github`, emitting GitHub Actions workflow commands so diagnostics render as inline annotations.
+- Renamed `--format` to `--output-format`.
+- JSON output is now a single document covering every checked file, rather than one document per file.
+- The JSON `summary` now counts diagnostics only in `total`, reports `other`, and counts files that could not be read or parsed under a separate `failed_files` field.
+- Reported paths always use `/` separators, so `--output-format github` annotations attach on Windows runners.
+- Directory walks no longer apply the user's global git excludes (`core.excludesFile`), so a local run and a CI run check the same files.
+- An unreadable directory or a file that disappears mid-walk is now logged and skipped, rather than aborting the whole run.
+- Finding no YAML files to check now warns on stderr and exits 0, rather than being a fatal error (exit 2).
+- The JSON `end_column` is now an inclusive 1-based column, matching `endColumn` in the github format; it was previously exclusive, so single-line values are one lower than before. A multi-line range that ends at the start of a line is reported as ending on the previous line, with `end_column` null (and `endColumn` omitted).
+- The workspace root falls back to the canonicalized current directory, so it matches the paths reported for each file.
+
 ## [0.4.2]
 
 - Fixed lazy package exports declared under `if TYPE_CHECKING:` (or `if typing.TYPE_CHECKING:`) not resolving when combined with a module-level `__getattr__` and `__all__` (fixes #43)

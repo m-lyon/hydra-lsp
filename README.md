@@ -27,53 +27,107 @@ A Language Server for [Hydra](https://hydra.cc/) configuration files, written in
 
 For a list of planned features and enhancements, see the [issues](https://github.com/m-lyon/hydra-lsp/issues) page.
 
-## CLI Tool: hydra-check
+## Installation
 
-In addition to the language server, this project provides a standalone CLI tool for diagnosing Hydra YAML configuration files. This is useful for:
-
-- Debugging why a `_target_` is not being resolved
-- CI/CD pipeline validation
-- Quick command-line checks without an IDE
-
-### Usage
+You can install `hydrust` through PyPI:
 
 ```bash
-# Basic usage
-hydra-check config.yaml
-
-# Specify workspace root for local module resolution
-hydra-check config.yaml -w /path/to/project
-
-# Specify Python interpreter for site-packages resolution
-hydra-check config.yaml -p /path/to/venv/bin/python
-
-# Enable detailed resolution tracing for debugging
-hydra-check config.yaml --trace-resolution
-
-# Change verbosity level (error, warn, info, debug, trace)
-hydra-check config.yaml -v debug
-
-# Output in different formats (pretty, json, compact)
-hydra-check config.yaml -f json
+uv tool install hydrust   # or: pixi global install hydrust, pip install hydrust
+uvx hydrust check conf/   # run once without installing
 ```
 
-### Options
+## Usage
+
+`hydrust` provides the `check` subcommand for one-time CLI and CI invocations, as well as an LSP for hydra diagnostics over stdin/stdout:
+
+```bash
+hydrust check conf/   # diagnose configs on the command line
+hydrust server        # LSP
+```
+
+### `hydrust check`
+
+```bash
+# Check a single file
+hydrust check config.yaml
+
+# Check several files, or a whole directory tree
+hydrust check config.yaml overrides.yaml
+hydrust check conf/
+
+# Specify workspace root for local module resolution
+hydrust check config.yaml -w /path/to/project
+
+# Specify Python interpreter for site-packages resolution
+hydrust check config.yaml -p /path/to/venv/bin/python
+
+# Enable detailed resolution tracing for debugging
+hydrust check config.yaml --trace-resolution
+
+# Change verbosity level (error, warn, info, debug, trace)
+hydrust check config.yaml -v debug
+
+# Output in different formats (pretty, json, compact, github)
+hydrust check config.yaml -f json
+```
+
+Directories are searched recursively for `.yaml` and `.yml` files. The walk honours `.gitignore` and `.ignore` files within the directory being walked, and skips hidden files and directories such as `.github/`. Symlinks are followed.
+
+#### Options
 
 | Option | Description |
 |--------|-------------|
 | `-w, --workspace <PATH>` | Working directory for resolving Python modules |
 | `-p, --python <PATH>` | Path to Python interpreter for module resolution |
 | `-v, --verbosity <LEVEL>` | Logging verbosity: error, warn, info, debug, trace |
-| `-f, --format <FORMAT>` | Output format: pretty (default), json, compact |
-| `--trace-resolution` | Show detailed resolution steps for each target |
+| `-f, --output-format <FORMAT>` | Output format: pretty (default), json, compact, github |
+| `--trace-resolution` | Show detailed resolution steps for each target (written to stderr) |
+| `--disable-rule <RULE>` | Disable a diagnostic rule; may be repeated |
 
-### Exit Codes
+When `--workspace` is omitted, `hydrust` resolves Python modules against the current directory.
+
+#### Continuous integration
+
+`--output-format github` emits GitHub Actions workflow commands, so
+diagnostics appear as inline annotations on the pull request. A complete
+workflow, run with `uvx` so nothing needs installing beyond uv itself:
+
+```yaml
+name: Hydra configs
+
+on: [push, pull_request]
+
+jobs:
+  hydrust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v10
+      - run: uvx hydrust@0.5.0 check --output-format github .
+```
+
+`_target_` resolution needs the Python packages your configs point at. If they
+are not in the checked-out tree, install the project first and point `hydrust`
+at that interpreter with `--python`:
+
+```yaml
+      - run: uv sync
+      - run: uvx hydrust@0.5.0 check --output-format github --python .venv/bin/python conf/
+```
+
+#### Exit Codes
 
 - `0`: No errors found
 - `1`: One or more errors found
-- `2`: Fatal error (file not found, parse error, etc.)
+- `2`: Fatal error (path not found, invalid arguments, etc.)
 
-## Client Compatibility
+Finding nothing to check is not an error: whether no YAML files matched at all
+or none of the ones found are Hydra configs, `hydrust check` warns on stderr and
+exits `0`.
+
+## `hydrust server`
+
+### Client Compatibility
 
 A client can be pointed at any released server binary, and an old server quietly
 ignores settings it was never taught to read. So the server describes itself in
@@ -91,61 +145,6 @@ before v0.4.0 send no block, so clients fall back to a version table keyed on
 `serverInfo.version` or `--version`. The reference client is the VS Code
 extension ([hydra-lsp-vscode](https://github.com/m-lyon/hydra-lsp-vscode)), in
 `src/common/compatTable.ts`.
-
-### Adding a feature
-
-**A settings key** — parse it in `initialize`, then add it to `CORE_SETTINGS` (or
-to the `feature_toggles!` list for an on/off switch, which registers the key for
-you). Update the counts in [tests/capabilities.rs](tests/capabilities.rs). In the
-extension: declare it in `package.json`, send it from `startServer`, add a
-`SETTING_COMPAT` entry.
-
-**A diagnostic rule** — add it to `diagnostic_rules!` in
-[src/diagnostics.rs](src/diagnostics.rs) and it is advertised automatically. In
-the extension, add a `RULE_COMPAT` entry; for a *rename*, record the old code as
-`previousCode` so the client can rewrite it for older servers, as
-`invalid-target` → `invalid-hydra-parameter` did in v0.3.0.
-
-**A behaviour the client must know about** — only needed when it depends on a
-client capability, or the client has to branch on it. Read the client capability
-in `initialize` and store the flag, add a field to `NegotiatedFeatures` and a
-`(name, gate)` pair to `SUPPORTED_FEATURES`, and gate the behaviour on that same
-flag so the advertised name is never a promise the session will not keep. Cover
-it both ways in [tests/capabilities.rs](tests/capabilities.rs). In the extension,
-add a `FEATURE_COMPAT` entry; names become `hydrust.supports.<name>` context keys.
-
-Anything the server always does and can advertise through a standard LSP
-capability field needs none of this.
-
-### Rules
-
-- Bump `HYDRUST_PROTOCOL_VERSION` only when something already in the block
-  changes meaning: a key that starts doing something different, a repurposed
-  feature name, a field that changes type. Additions never need a bump.
-- Never remove or repurpose a name quietly — a client may still send it.
-- Unknown settings keys stay ignored, never rejected.
-- `features` is always an array, even when empty; clients test membership on it.
-- Bump the crate version and add a CHANGELOG entry. The client's fallback table
-  is keyed on release versions.
-
-### Checking it
-
-`cargo test --test capabilities` covers the block's shape. In the extension repo,
-`npm run test:contract` checks the client against a real running binary, and
-`npm run test:table-audit` re-verifies the fallback table against tagged sources.
-
-## Threading
-
-The server runs its analysis on two `rayon` pools — a latency pool for hover,
-completion and semantic tokens, and a worker pool for diagnostics — alongside a
-single-threaded tokio runtime that handles the protocol itself. The `numThreads`
-setting is the total across all three, and defaults to a size the server picks to
-fit the machine.
-
-[docs/threading-model.md](docs/threading-model.md) is the reference for this:
-where each request handler does its work, why the counts are what they are, and
-which alternatives were tried and rejected. Read it before changing a thread
-count, the concurrency level, or where a handler runs.
 
 ## License
 

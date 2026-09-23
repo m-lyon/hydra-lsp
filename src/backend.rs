@@ -1034,7 +1034,7 @@ impl LanguageServer for HydraLspBackend {
                 ..Default::default()
             },
             server_info: Some(ServerInfo {
-                name: "hydra-lsp".to_string(),
+                name: "hydrust".to_string(),
                 version: Some(env!("CARGO_PKG_VERSION").to_string()),
             }),
         })

@@ -1,0 +1,213 @@
+# Build the `hydrust` wheels and sdist for PyPI.
+#
+# Runs independently of `release.yml`, so each target is compiled twice
+# per release. Folding this into dist via `build-local-artifacts = false` and
+# `local-artifacts-jobs` would fix that; see
+# https://github.com/m-lyon/hydra-lsp/issues/48.
+#
+# Every job smoke-tests `hydrust server --help` as well as `check`.
+name: Build wheels
+
+on:
+  # Called by `publish-pypi.yml` on a release tag.
+  workflow_call:
+  workflow_dispatch:
+  # Packaging changes only.
+  pull_request:
+    paths:
+      - pyproject.toml
+      - python/**
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/build-wheels.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  PACKAGE_NAME: hydrust
+  PYTHON_VERSION: '3.13'
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  CARGO_TERM_COLOR: always
+  RUSTUP_MAX_RETRIES: 10
+
+jobs:
+  sdist:
+    name: sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+      # Installing the sdist compiles it from scratch, which is the point: it
+      # proves the tarball carries everything the build needs.
+      - name: Test sdist
+        run: |
+          pip install dist/${PACKAGE_NAME}-*.tar.gz --force-reinstall
+          hydrust --help
+          hydrust check --help
+          hydrust server --help
+          python -m hydrust --help
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wheels-sdist
+          path: dist
+
+  linux:
+    name: linux (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            manylinux: auto
+          # A native ARM runner rather than cross-compiling the ruff/salsa
+          # dependency tree inside maturin-action's cross container.
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            manylinux: auto
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            manylinux: musllinux_1_2
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --profile dist --locked --out dist
+      # Exercises `find_hydrust_bin`'s `--target` lookup (the `bin/` sibling of
+      # the package) against a real wheel. Runs before the normal install so the
+      # scripts-directory lookup cannot find a binary first.
+      - name: Test wheel (pip --target)
+        if: ${{ matrix.manylinux == 'auto' }}
+        run: |
+          pip install --target "$RUNNER_TEMP/target" dist/${PACKAGE_NAME}-*.whl
+          PYTHONPATH="$RUNNER_TEMP/target" python -c 'import os, hydrust; p = hydrust.find_hydrust_bin(); assert p.startswith(os.environ["RUNNER_TEMP"]), p'
+          PYTHONPATH="$RUNNER_TEMP/target" python -m hydrust --help
+      - name: Test wheel
+        if: ${{ matrix.manylinux == 'auto' }}
+        run: |
+          pip install dist/${PACKAGE_NAME}-*.whl --force-reinstall
+          hydrust --help
+          hydrust check --help
+          hydrust server --help
+          python -m hydrust --help
+      # A musllinux wheel will not install into the runner's glibc Python.
+      - name: Test wheel (musl)
+        if: ${{ matrix.manylinux != 'auto' }}
+        run: |
+          docker run --rm -v "$PWD/dist:/dist" python:${PYTHON_VERSION}-alpine sh -euc '
+            pip install /dist/'"${PACKAGE_NAME}"'-*.whl --force-reinstall
+            hydrust --help
+            hydrust check --help
+            hydrust server --help
+            python -m hydrust --help
+          '
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wheels-${{ matrix.target }}
+          path: dist
+
+  macos:
+    name: macos (${{ matrix.target }})
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-apple-darwin
+          # Cross-compiled from the ARM runner; it runs under Rosetta for the
+          # smoke test.
+          - x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --profile dist --locked --out dist
+      # The ARM runner's Python is arm64, so pip would refuse the x86_64 wheel.
+      # Unpack it instead and run the binary directly.
+      - name: Test wheel
+        if: ${{ matrix.target == 'aarch64-apple-darwin' }}
+        run: |
+          pip install dist/${PACKAGE_NAME}-*.whl --force-reinstall
+          hydrust --help
+          hydrust check --help
+          hydrust server --help
+          python -m hydrust --help
+      - name: Test binary (x86_64)
+        if: ${{ matrix.target == 'x86_64-apple-darwin' }}
+        run: |
+          softwareupdate --install-rosetta --agree-to-license || true
+          python -m zipfile -e dist/${PACKAGE_NAME}-*.whl unpacked
+          bin=$(find unpacked -path '*.data/scripts/hydrust')
+          chmod +x "$bin"
+          arch -x86_64 "$bin" --help
+          arch -x86_64 "$bin" check --help
+          arch -x86_64 "$bin" server --help
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wheels-${{ matrix.target }}
+          path: dist
+
+  windows:
+    name: windows (${{ matrix.target }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          architecture: x64
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --profile dist --locked --out dist
+      - name: Test wheel
+        shell: bash
+        run: |
+          python -m pip install dist/${PACKAGE_NAME}-*.whl --force-reinstall
+          hydrust --help
+          hydrust check --help
+          hydrust server --help
+          python -m hydrust --help
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wheels-${{ matrix.target }}
+          path: dist
