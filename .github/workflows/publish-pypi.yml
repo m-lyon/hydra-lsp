@@ -1,0 +1,63 @@
+# Publish `hydrust` to PyPI on a release tag.
+#
+# Uses the same tag pattern as `release.yml`.
+#
+# Neither this workflow nor `release.yml` waits for the other, so one can
+# succeed while the other fails. If this run fails, fix the cause and use "Re-run
+# failed jobs" so PyPI catches up with the GitHub release; do not cut a new tag.
+# Re-running all jobs would rebuild the wheels, and PyPI rejects a rebuilt wheel
+# whose name matches an already-uploaded file but whose contents differ.
+# Folding this into `publish-jobs` would remove the gap; see
+# https://github.com/m-lyon/hydra-lsp/issues/48.
+name: Publish to PyPI
+
+on:
+  push:
+    tags:
+      - '**[0-9]+.[0-9]+.[0-9]+*'
+
+permissions:
+  contents: read
+
+jobs:
+  # `release.yml` fails on a tag that does not match `Cargo.toml`, but
+  # this workflow runs separately, and a PyPI version cannot be re-uploaded.
+  check-version:
+    name: Check tag matches Cargo.toml
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Compare versions
+        run: |
+          tag_version=$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+.*$' <<< "$GITHUB_REF_NAME")
+          cargo_version=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "hydrust") | .version')
+          if [ "$tag_version" != "$cargo_version" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME ($tag_version) does not match Cargo.toml version $cargo_version"
+            exit 1
+          fi
+
+  build:
+    needs: check-version
+    uses: ./.github/workflows/build-wheels.yml
+
+  publish:
+    name: Upload to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: release
+      url: https://pypi.org/project/hydrust/
+    permissions:
+      id-token: write
+    steps:
+      - uses: astral-sh/setup-uv@v10
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: wheels-*
+          path: wheels
+          merge-multiple: true
+      - name: Publish to PyPI
+        run: uv publish -v wheels/*

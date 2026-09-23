@@ -54,7 +54,9 @@ fn test_help_flag_prints_usage() {
         let stdout = String::from_utf8(output.stdout).unwrap();
         assert!(stdout.contains("Usage: hydrust"), "got: {stdout}");
         assert!(
-            stdout.contains(SERVE),
+            stdout
+                .lines()
+                .any(|line| line.split_whitespace().next() == Some(SERVE)),
             "`server` must be listed as a subcommand, got: {stdout}"
         );
     }

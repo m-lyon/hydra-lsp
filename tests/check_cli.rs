@@ -735,3 +735,43 @@ fn test_bad_workspace_is_fatal_even_with_no_yaml() {
 
     assert_eq!(result.code, 2, "got: {}", result.stderr);
 }
+
+#[test]
+fn test_relative_python_resolves_against_the_current_directory() {
+    // A single file makes its own directory the workspace root, but a relative
+    // `--python` is still the user's path from where the command was run.
+    let dir = TempDir::new().unwrap();
+    let home = dir.path().join("base/bin");
+    fs::create_dir_all(&home).unwrap();
+    let site_packages = dir.path().join("venv/lib/python3.12/site-packages");
+    fs::create_dir_all(&site_packages).unwrap();
+    fs::write(
+        dir.path().join("venv/pyvenv.cfg"),
+        format!("home = {}\nversion = 3.12.0\n", home.display()),
+    )
+    .unwrap();
+    fs::write(site_packages.join("ext_module.py"), MODULE_SOURCE).unwrap();
+    fs::create_dir_all(dir.path().join("conf")).unwrap();
+    fs::write(
+        dir.path().join("conf/config.yaml"),
+        "model:\n  _target_: ext_module.Thing\n  size: 4\n",
+    )
+    .unwrap();
+
+    let result = check_in(
+        dir.path(),
+        &[
+            "conf/config.yaml",
+            "--python",
+            "venv",
+            "--output-format",
+            "compact",
+        ],
+    );
+
+    assert_eq!(
+        result.code, 0,
+        "the module in the venv's site-packages should resolve, got: {}{}",
+        result.stdout, result.stderr
+    );
+}

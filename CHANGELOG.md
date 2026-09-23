@@ -13,6 +13,7 @@
 
 ### Other changes
 
+- **Published to PyPI as `hydrust`.** e.g. `pip install hydrust`, `uv tool install hydrust`.
 - `hydrust check` now accepts multiple files and directories. Directories are walked recursively for `.yaml` and `.yml` files, honouring `.gitignore`; discovered files that carry no Hydra markers are skipped silently.
 - Added `--output-format github`, emitting GitHub Actions workflow commands so diagnostics render as inline annotations.
 - Renamed `--format` to `--output-format`.

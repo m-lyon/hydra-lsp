@@ -27,6 +27,15 @@ A Language Server for [Hydra](https://hydra.cc/) configuration files, written in
 
 For a list of planned features and enhancements, see the [issues](https://github.com/m-lyon/hydra-lsp/issues) page.
 
+## Installation
+
+You can install `hydrust` through PyPI:
+
+```bash
+uv tool install hydrust   # or: pixi global install hydrust, pip install hydrust
+uvx hydrust check conf/   # run once without installing
+```
+
 ## Usage
 
 `hydrust` provides the `check` subcommand for one-time CLI and CI invocations, as well as an LSP for hydra diagnostics over stdin/stdout:
@@ -79,11 +88,31 @@ When `--workspace` is omitted, `hydrust` resolves Python modules against the cur
 
 #### Continuous integration
 
-`-f github` emits GitHub Actions workflow commands, so diagnostics appear as
-inline annotations on the pull request:
+`--output-format github` emits GitHub Actions workflow commands, so
+diagnostics appear as inline annotations on the pull request. A complete
+workflow, run with `uvx` so nothing needs installing beyond uv itself:
 
 ```yaml
-- run: hydrust check --output-format github conf/
+name: Hydra configs
+
+on: [push, pull_request]
+
+jobs:
+  hydrust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v10
+      - run: uvx hydrust@0.5.0 check --output-format github .
+```
+
+`_target_` resolution needs the Python packages your configs point at. If they
+are not in the checked-out tree, install the project first and point `hydrust`
+at that interpreter with `--python`:
+
+```yaml
+      - run: uv sync
+      - run: uvx hydrust@0.5.0 check --output-format github --python .venv/bin/python conf/
 ```
 
 #### Exit Codes

@@ -253,9 +253,15 @@ fn run(args: &CheckCommand) -> anyhow::Result<i32> {
 
     info!("Workspace root: {}", workspace_root.display());
 
+    // Environment discovery resolves relative paths against the workspace
+    // root, which is not the current directory when a single file is checked.
+    // Not canonicalized: a venv's interpreter is a symlink to the base Python.
     let python_interpreter = args
         .python
         .as_ref()
+        .map(std::path::absolute)
+        .transpose()
+        .context("Failed to resolve --python path")?
         .map(|p| p.to_string_lossy().to_string());
     if let Some(ref py) = python_interpreter {
         info!("Python interpreter: {}", py);
@@ -753,12 +759,15 @@ fn severity_label(diagnostic: &Diagnostic) -> &'static str {
     }
 }
 
-/// `severity_label` spells `INFORMATION` as `info` for the compact output; the
-/// JSON field has always been `information` and consumers match on it.
+/// The JSON severity is a stable contract, kept separate from `severity_label`
+/// (which spells `INFORMATION` as `info` for the compact output).
 fn json_severity_label(diagnostic: &Diagnostic) -> &'static str {
-    match severity_label(diagnostic) {
-        "info" => "information",
-        other => other,
+    match diagnostic.severity {
+        Some(DiagnosticSeverity::ERROR) => "error",
+        Some(DiagnosticSeverity::WARNING) => "warning",
+        Some(DiagnosticSeverity::INFORMATION) => "information",
+        Some(DiagnosticSeverity::HINT) => "hint",
+        _ => "unknown",
     }
 }
 
