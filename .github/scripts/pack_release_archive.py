@@ -33,6 +33,13 @@ NAME = "hydrust"
 # licence file (`LICENSE-APACHE`, say) would be picked up by dist, so it has to
 # be added here too.
 EXTRA_FILES = ["README.md", "CHANGELOG.md", "LICENSE"]
+AUTO_INCLUDE_GLOBS = ["README*", "CHANGELOG*", "LICENSE*", "LICENCE*"]
+
+
+def check_extra_files() -> None:
+    found = {p.name for g in AUTO_INCLUDE_GLOBS for p in Path().glob(g)}
+    if found != set(EXTRA_FILES):
+        sys.exit(f"EXTRA_FILES is {sorted(EXTRA_FILES)}, dist would include {sorted(found)}")
 
 
 def binary_from_wheel(wheel: Path, exe: str) -> bytes:
@@ -94,6 +101,7 @@ def main() -> None:
     top = f"{NAME}-{target}"
     archive = out_dir / f"{top}.{'zip' if windows else 'tar.xz'}"
 
+    check_extra_files()
     out_dir.mkdir(parents=True, exist_ok=True)
     binary = binary_from_wheel(wheel, exe)
     if windows:

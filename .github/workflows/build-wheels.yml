@@ -274,6 +274,8 @@ jobs:
         if: ${{ inputs.plan == '' }}
         shell: bash
         run: |
+          # Keep this version in step with `release.yml`'s dist installer, or this
+          # job checks against a plan from a different dist than the release uses.
           curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.30.3/cargo-dist-installer.sh | sh
           dist plan --output-format=json > plan.json
       - name: Compare with the plan
