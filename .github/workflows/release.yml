@@ -94,7 +94,6 @@ jobs:
     uses: ./.github/workflows/build-wheels.yml
     with:
       plan: ${{ needs.plan.outputs.val }}
-    secrets: inherit
 
   # Build and package all the platform-agnostic(ish) things
   build-global-artifacts:
@@ -217,7 +216,6 @@ jobs:
     uses: ./.github/workflows/publish-pypi.yml
     with:
       plan: ${{ needs.plan.outputs.val }}
-    secrets: inherit
     # publish jobs get escalated permissions
     permissions:
       "id-token": "write"

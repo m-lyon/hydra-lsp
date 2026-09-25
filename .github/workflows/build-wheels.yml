@@ -14,7 +14,7 @@ on:
   # Called by `release.yml` on a release tag.
   workflow_call:
     inputs:
-      # dist's plan manifest. Unused: the targets are listed here.
+      # dist's plan manifest; `check-plan` checks the matrices below against it.
       plan:
         required: true
         type: string
@@ -141,11 +141,22 @@ jobs:
           path: dist
       - name: Pack release archive
         shell: bash
-        run: python .github/scripts/pack_release_archive.py dist/${PACKAGE_NAME}-*.whl ${{ matrix.target }} archive
+        run: |
+          wheels=(dist/${PACKAGE_NAME}-*.whl)
+          [ ${#wheels[@]} -eq 1 ] || { echo "::error::expected one wheel, got ${wheels[*]}"; exit 1; }
+          python .github/scripts/pack_release_archive.py "${wheels[0]}" ${{ matrix.target }} archive
+      - name: Verify release archive
+        shell: bash
+        run: |
+          name=${PACKAGE_NAME}-${{ matrix.target }}
+          (cd archive && head -n 1 "$name.tar.xz.sha256" | sha256sum -c -)
+          tar -xf "archive/$name.tar.xz" -C "$RUNNER_TEMP"
+          "$RUNNER_TEMP/$name/$PACKAGE_NAME" --help
       - uses: actions/upload-artifact@v7
         with:
           name: artifacts-${{ matrix.target }}
           path: archive
+          if-no-files-found: error
 
   macos:
     name: macos (${{ matrix.target }})
@@ -196,11 +207,22 @@ jobs:
           path: dist
       - name: Pack release archive
         shell: bash
-        run: python .github/scripts/pack_release_archive.py dist/${PACKAGE_NAME}-*.whl ${{ matrix.target }} archive
+        run: |
+          wheels=(dist/${PACKAGE_NAME}-*.whl)
+          [ ${#wheels[@]} -eq 1 ] || { echo "::error::expected one wheel, got ${wheels[*]}"; exit 1; }
+          python .github/scripts/pack_release_archive.py "${wheels[0]}" ${{ matrix.target }} archive
+      - name: Verify release archive
+        shell: bash
+        run: |
+          name=${PACKAGE_NAME}-${{ matrix.target }}
+          (cd archive && head -n 1 "$name.tar.xz.sha256" | shasum -a 256 -c -)
+          tar -xf "archive/$name.tar.xz" -C "$RUNNER_TEMP"
+          if [ "${{ matrix.target }}" = aarch64-apple-darwin ]; then "$RUNNER_TEMP/$name/$PACKAGE_NAME" --help; fi
       - uses: actions/upload-artifact@v7
         with:
           name: artifacts-${{ matrix.target }}
           path: archive
+          if-no-files-found: error
 
   windows:
     name: windows (${{ matrix.target }})
@@ -237,8 +259,44 @@ jobs:
           path: dist
       - name: Pack release archive
         shell: bash
-        run: python .github/scripts/pack_release_archive.py dist/${PACKAGE_NAME}-*.whl ${{ matrix.target }} archive
+        run: |
+          wheels=(dist/${PACKAGE_NAME}-*.whl)
+          [ ${#wheels[@]} -eq 1 ] || { echo "::error::expected one wheel, got ${wheels[*]}"; exit 1; }
+          python .github/scripts/pack_release_archive.py "${wheels[0]}" ${{ matrix.target }} archive
+      - name: Verify release archive
+        shell: bash
+        run: |
+          name=${PACKAGE_NAME}-${{ matrix.target }}
+          (cd archive && head -n 1 "$name.zip.sha256" | sha256sum -c -)
+          python -m zipfile -e "archive/$name.zip" "$RUNNER_TEMP/$name"
+          "$RUNNER_TEMP/$name/$PACKAGE_NAME.exe" --help
       - uses: actions/upload-artifact@v7
         with:
           name: artifacts-${{ matrix.target }}
           path: archive
+          if-no-files-found: error
+
+  # `dist-workspace.toml`'s target list drives the plan, but the matrices above
+  # decide what is built, and dist's host job uploads whatever turns up. Fail
+  # here instead of shipping a release with a platform's asset missing.
+  check-plan:
+    name: check archives match the plan
+    if: ${{ inputs.plan != '' }}
+    needs:
+      - linux
+      - macos
+      - windows
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: artifacts-*
+          path: archive
+          merge-multiple: true
+      - name: Compare with the plan
+        env:
+          PLAN: ${{ inputs.plan }}
+        run: |
+          jq -r '.artifacts | to_entries[] | select(.value.kind == "executable-zip") | .key' <<< "$PLAN" | sort > expected.txt
+          find archive -maxdepth 1 \( -name '*.tar.xz' -o -name '*.zip' \) -printf '%f\n' | sort > built.txt
+          diff expected.txt built.txt || { echo "::error::built archives do not match the plan"; exit 1; }

@@ -12,12 +12,14 @@ match its output, because the VS Code extension depends on it:
 - A tarball has a top-level `hydrust-<target>/` directory; a zip has none.
 - A `<archive>.sha256` next to it, in `sha256sum --binary` format. dist ends
   the line with a blank one, so this does too.
+- The binary is mode 0755, the other files 0644.
 
 Checked against the dist-built v0.5.0 assets.
 """
 
 import hashlib
 import io
+import re
 import sys
 import tarfile
 import time
@@ -60,20 +62,24 @@ def pack_tar_xz(path: Path, top: str, binary: bytes, exe: str) -> None:
 
 
 def pack_zip(path: Path, binary: bytes, exe: str) -> None:
-    def add(name: str, data: bytes) -> None:
+    def add(name: str, data: bytes, mode: int) -> None:
         info = zipfile.ZipInfo(name, date_time=time.localtime()[:6])
-        info.external_attr = 0o100644 << 16
+        info.external_attr = mode << 16
         info.compress_type = zipfile.ZIP_DEFLATED
         zf.writestr(info, data)
 
     with zipfile.ZipFile(path, "w") as zf:
         for name in EXTRA_FILES:
-            add(name, Path(name).read_bytes())
-        add(exe, binary)
+            add(name, Path(name).read_bytes(), 0o100644)
+        add(exe, binary, 0o100755)
 
 
 def main() -> None:
+    if len(sys.argv) != 4:
+        sys.exit(f"usage: {sys.argv[0]} <wheel> <target> <out-dir>, got {sys.argv[1:]}")
     wheel, target, out_dir = Path(sys.argv[1]), sys.argv[2], Path(sys.argv[3])
+    if not re.fullmatch(r"[\w.]+(-[\w.]+){2,3}", target):
+        sys.exit(f"{target} is not a target triple")
     windows = target.endswith("-windows-msvc")
     exe = f"{NAME}.exe" if windows else NAME
     top = f"{NAME}-{target}"
