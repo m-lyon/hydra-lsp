@@ -33,11 +33,12 @@ NAME = "hydrust"
 # licence file (`LICENSE-APACHE`, say) would be picked up by dist, so it has to
 # be added here too.
 EXTRA_FILES = ["README.md", "CHANGELOG.md", "LICENSE"]
-AUTO_INCLUDE_GLOBS = ["README*", "CHANGELOG*", "LICENSE*", "LICENCE*"]
+# dist matches these case-insensitively.
+AUTO_INCLUDE_PREFIXES = ("README", "CHANGELOG", "RELEASES", "LICENSE", "LICENCE")
 
 
 def check_extra_files() -> None:
-    found = {p.name for g in AUTO_INCLUDE_GLOBS for p in Path().glob(g)}
+    found = {p.name for p in Path().iterdir() if p.name.upper().startswith(AUTO_INCLUDE_PREFIXES)}
     if found != set(EXTRA_FILES):
         sys.exit(f"EXTRA_FILES is {sorted(EXTRA_FILES)}, dist would include {sorted(found)}")
 

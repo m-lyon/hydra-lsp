@@ -274,9 +274,11 @@ jobs:
         if: ${{ inputs.plan == '' }}
         shell: bash
         run: |
-          # Keep this version in step with `release.yml`'s dist installer, or this
-          # job checks against a plan from a different dist than the release uses.
-          curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.30.3/cargo-dist-installer.sh | sh
+          # The version `release.yml` installs, so this job checks against the
+          # plan from the same dist the release uses.
+          version=$(sed -n 's/^cargo-dist-version = "\(.*\)"/\1/p' dist-workspace.toml)
+          [ -n "$version" ] || { echo "::error::no cargo-dist-version in dist-workspace.toml"; exit 1; }
+          curl --proto '=https' --tlsv1.2 -LsSf "https://github.com/axodotdev/cargo-dist/releases/download/v$version/cargo-dist-installer.sh" | sh
           dist plan --output-format=json > plan.json
       - name: Compare with the plan
         env:
