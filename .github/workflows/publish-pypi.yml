@@ -8,7 +8,12 @@
 # If this job fails, fix the cause and use "Re-run failed jobs" on the Release
 # run so PyPI catches up with the GitHub release; do not cut a new tag. Re-running
 # all jobs would rebuild the wheels, and PyPI rejects a rebuilt wheel whose name
-# matches an already-uploaded file but whose contents differ.
+# matches an already-uploaded file but whose contents differ. There is no
+# `workflow_dispatch` here: trusted publishing is bound to this job, and a
+# dispatched run could not download another run's artifacts without `actions:
+# read`, which `release.yml` does not grant. If the re-run cannot see the
+# `wheels-*` artifacts, or they have expired, download them from the Release
+# run and `uv publish` them from a machine with a PyPI token.
 #
 # PyPI's trusted publisher is registered against this file, not `release.yml`:
 # the OIDC token's `job_workflow_ref` names the reusable workflow the publishing

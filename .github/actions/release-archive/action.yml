@@ -20,7 +20,8 @@ runs:
         shopt -s nullglob
         wheels=(dist/hydrust-*.whl)
         [ ${#wheels[@]} -eq 1 ] || { echo "::error::expected one wheel, got ${wheels[*]}"; exit 1; }
-        python .github/scripts/pack_release_archive.py "${wheels[0]}" "$TARGET" archive
+        python .github/scripts/pack_release_archive.py "${wheels[0]}" "$TARGET" archive > packed.txt
+        cat packed.txt
     - name: Verify release archive
       shell: bash
       env:
@@ -32,12 +33,13 @@ runs:
         if command -v sha256sum > /dev/null; then check="sha256sum -c -"; else check="shasum -a 256 -c -"; fi
         (cd archive && head -n 1 "$name.$ext.sha256" | $check)
         # The extension depends on the layout, not just on the binary being there.
+        # The expected list is the packer's own, so this catches a packing
+        # failure; `EXTRA_FILES` there is what tracks dist's auto-includes.
+        sort packed.txt > expected.txt
         if [ "$ext" = zip ]; then
           python -c "import sys, zipfile; print('\n'.join(zipfile.ZipFile(sys.argv[1]).namelist()))" "archive/$name.zip" | sort > members.txt
-          printf '%s\n' README.md CHANGELOG.md LICENSE hydrust.exe | sort > expected.txt
         else
           tar -tf "archive/$name.tar.xz" | sed 's:/$::' | sort > members.txt
-          printf '%s\n' "$name" "$name/README.md" "$name/CHANGELOG.md" "$name/LICENSE" "$name/hydrust" | sort > expected.txt
         fi
         diff expected.txt members.txt || { echo "::error::unexpected archive contents"; exit 1; }
         if [ "$ext" = zip ]; then

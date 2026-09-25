@@ -14,6 +14,8 @@ match its output, because the VS Code extension depends on it:
   the line with a blank one, so this does too.
 - The binary is mode 0755, the other files 0644.
 
+Prints the archive's member list, so the caller can check the archive against it.
+
 Checked against the dist-built v0.5.0 assets.
 """
 
@@ -27,7 +29,9 @@ import zipfile
 from pathlib import Path
 
 NAME = "hydrust"
-# Shipped alongside the binary, as dist does by default.
+# dist auto-includes these alongside the binary. A new top-level readme or
+# licence file (`LICENSE-APACHE`, say) would be picked up by dist, so it has to
+# be added here too.
 EXTRA_FILES = ["README.md", "CHANGELOG.md", "LICENSE"]
 
 
@@ -39,7 +43,7 @@ def binary_from_wheel(wheel: Path, exe: str) -> bytes:
         return zf.read(matches[0])
 
 
-def pack_tar_xz(path: Path, top: str, binary: bytes, exe: str) -> None:
+def pack_tar_xz(path: Path, top: str, binary: bytes, exe: str) -> list[str]:
     def add(name: str, data: bytes, mode: int) -> None:
         info = tarfile.TarInfo(f"{top}/{name}")
         info.size = len(data)
@@ -59,9 +63,10 @@ def pack_tar_xz(path: Path, top: str, binary: bytes, exe: str) -> None:
         for name in EXTRA_FILES:
             add(name, Path(name).read_bytes(), 0o644)
         add(exe, binary, 0o755)
+    return [top, *(f"{top}/{name}" for name in [*EXTRA_FILES, exe])]
 
 
-def pack_zip(path: Path, binary: bytes, exe: str) -> None:
+def pack_zip(path: Path, binary: bytes, exe: str) -> list[str]:
     def add(name: str, data: bytes, mode: int) -> None:
         info = zipfile.ZipInfo(name, date_time=time.localtime()[:6])
         # Packed on Windows, where ZipInfo would claim an MS-DOS host and Unix
@@ -75,6 +80,7 @@ def pack_zip(path: Path, binary: bytes, exe: str) -> None:
         for name in EXTRA_FILES:
             add(name, Path(name).read_bytes(), 0o100644)
         add(exe, binary, 0o100755)
+    return [*EXTRA_FILES, exe]
 
 
 def main() -> None:
@@ -91,14 +97,14 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     binary = binary_from_wheel(wheel, exe)
     if windows:
-        pack_zip(archive, binary, exe)
+        members = pack_zip(archive, binary, exe)
     else:
-        pack_tar_xz(archive, top, binary, exe)
+        members = pack_tar_xz(archive, top, binary, exe)
 
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()
     checksum = archive.with_name(f"{archive.name}.sha256")
     checksum.write_text(f"{digest} *{archive.name}\n\n", newline="\n")
-    print(checksum.read_text().strip())
+    print("\n".join(members))
 
 
 if __name__ == "__main__":

@@ -253,22 +253,34 @@ jobs:
   # here instead of shipping a release with a platform's asset missing.
   check-plan:
     name: check archives match the plan
-    if: ${{ inputs.plan != '' }}
     needs:
       - linux
       - macos
       - windows
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@v8
         with:
           pattern: artifacts-*
           path: archive
           merge-multiple: true
+      # Without a caller (a pull request or a manual run) there is no plan to
+      # compare against, so plan here: the comparison below is then exercised
+      # before a release depends on it.
+      - name: Plan
+        if: ${{ inputs.plan == '' }}
+        shell: bash
+        run: |
+          curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.30.3/cargo-dist-installer.sh | sh
+          dist plan --output-format=json > plan.json
       - name: Compare with the plan
         env:
           PLAN: ${{ inputs.plan }}
         run: |
+          [ -n "$PLAN" ] || PLAN=$(cat plan.json)
           # The archives and their own `.sha256`; the source tarball's and the
           # unified `sha256.sum` are built globally, not here.
           jq -r '.artifacts | to_entries[]
