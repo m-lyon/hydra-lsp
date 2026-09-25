@@ -5,9 +5,6 @@ inputs:
   target:
     description: Rust target triple.
     required: true
-  package-name:
-    description: Package name; the archive's prefix.
-    default: hydrust
   run-binary:
     description: Run the extracted binary. Off where the runner cannot execute it.
     default: 'true'
@@ -18,38 +15,40 @@ runs:
     - name: Pack release archive
       shell: bash
       env:
-        NAME: ${{ inputs.package-name }}
         TARGET: ${{ inputs.target }}
       run: |
         shopt -s nullglob
-        wheels=(dist/$NAME-*.whl)
+        wheels=(dist/hydrust-*.whl)
         [ ${#wheels[@]} -eq 1 ] || { echo "::error::expected one wheel, got ${wheels[*]}"; exit 1; }
         python .github/scripts/pack_release_archive.py "${wheels[0]}" "$TARGET" archive
     - name: Verify release archive
       shell: bash
       env:
-        NAME: ${{ inputs.package-name }}
         TARGET: ${{ inputs.target }}
         RUN_BINARY: ${{ inputs.run-binary }}
       run: |
-        name=$NAME-$TARGET
+        name=hydrust-$TARGET
         case $TARGET in *-windows-msvc) ext=zip ;; *) ext=tar.xz ;; esac
         if command -v sha256sum > /dev/null; then check="sha256sum -c -"; else check="shasum -a 256 -c -"; fi
         (cd archive && head -n 1 "$name.$ext.sha256" | $check)
         # The extension depends on the layout, not just on the binary being there.
         if [ "$ext" = zip ]; then
           python -c "import sys, zipfile; print('\n'.join(zipfile.ZipFile(sys.argv[1]).namelist()))" "archive/$name.zip" | sort > members.txt
-          printf '%s\n' README.md CHANGELOG.md LICENSE "$NAME.exe" | sort > expected.txt
+          printf '%s\n' README.md CHANGELOG.md LICENSE hydrust.exe | sort > expected.txt
         else
           tar -tf "archive/$name.tar.xz" | sed 's:/$::' | sort > members.txt
-          printf '%s\n' "$name" "$name/README.md" "$name/CHANGELOG.md" "$name/LICENSE" "$name/$NAME" | sort > expected.txt
+          printf '%s\n' "$name" "$name/README.md" "$name/CHANGELOG.md" "$name/LICENSE" "$name/hydrust" | sort > expected.txt
         fi
         diff expected.txt members.txt || { echo "::error::unexpected archive contents"; exit 1; }
         if [ "$ext" = zip ]; then
           python -m zipfile -e "archive/$name.zip" "$RUNNER_TEMP/$name"
-          bin="$RUNNER_TEMP/$name/$NAME.exe"
+          bin="$RUNNER_TEMP/$name/hydrust.exe"
         else
           tar -xf "archive/$name.tar.xz" -C "$RUNNER_TEMP"
-          bin="$RUNNER_TEMP/$name/$NAME"
+          bin="$RUNNER_TEMP/$name/hydrust"
         fi
-        if [ "$RUN_BINARY" = true ]; then "$bin" --help; fi
+        case $RUN_BINARY in
+          true) "$bin" --help ;;
+          false) ;;
+          *) echo "::error::run-binary must be true or false, got '$RUN_BINARY'"; exit 1 ;;
+        esac

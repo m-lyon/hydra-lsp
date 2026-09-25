@@ -269,6 +269,11 @@ jobs:
         env:
           PLAN: ${{ inputs.plan }}
         run: |
-          jq -r '.artifacts | to_entries[] | select(.value.kind == "executable-zip") | .key' <<< "$PLAN" | sort > expected.txt
-          find archive -maxdepth 1 \( -name '*.tar.xz' -o -name '*.zip' \) -printf '%f\n' | sort > built.txt
+          # The archives and their own `.sha256`; the source tarball's and the
+          # unified `sha256.sum` are built globally, not here.
+          jq -r '.artifacts | to_entries[]
+            | select(.value.kind == "executable-zip"
+                     or (.value.kind == "checksum" and (.key | test("\\.(tar\\.xz|zip)\\.sha256$"))))
+            | .key' <<< "$PLAN" | sort > expected.txt
+          find archive -maxdepth 1 \( -name '*.tar.xz' -o -name '*.zip' -o -name '*.sha256' \) -printf '%f\n' | sort > built.txt
           diff expected.txt built.txt || { echo "::error::built archives do not match the plan"; exit 1; }
