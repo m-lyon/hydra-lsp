@@ -28,6 +28,7 @@ on:
       - Cargo.lock
       - dist-workspace.toml
       - .github/scripts/pack_release_archive.py
+      - .github/actions/release-archive/action.yml
       - .github/workflows/build-wheels.yml
       - .github/workflows/release.yml
 
@@ -139,19 +140,9 @@ jobs:
         with:
           name: wheels-${{ matrix.target }}
           path: dist
-      - name: Pack release archive
-        shell: bash
-        run: |
-          wheels=(dist/${PACKAGE_NAME}-*.whl)
-          [ ${#wheels[@]} -eq 1 ] || { echo "::error::expected one wheel, got ${wheels[*]}"; exit 1; }
-          python .github/scripts/pack_release_archive.py "${wheels[0]}" ${{ matrix.target }} archive
-      - name: Verify release archive
-        shell: bash
-        run: |
-          name=${PACKAGE_NAME}-${{ matrix.target }}
-          (cd archive && head -n 1 "$name.tar.xz.sha256" | sha256sum -c -)
-          tar -xf "archive/$name.tar.xz" -C "$RUNNER_TEMP"
-          "$RUNNER_TEMP/$name/$PACKAGE_NAME" --help
+      - uses: ./.github/actions/release-archive
+        with:
+          target: ${{ matrix.target }}
       - uses: actions/upload-artifact@v7
         with:
           name: artifacts-${{ matrix.target }}
@@ -205,19 +196,10 @@ jobs:
         with:
           name: wheels-${{ matrix.target }}
           path: dist
-      - name: Pack release archive
-        shell: bash
-        run: |
-          wheels=(dist/${PACKAGE_NAME}-*.whl)
-          [ ${#wheels[@]} -eq 1 ] || { echo "::error::expected one wheel, got ${wheels[*]}"; exit 1; }
-          python .github/scripts/pack_release_archive.py "${wheels[0]}" ${{ matrix.target }} archive
-      - name: Verify release archive
-        shell: bash
-        run: |
-          name=${PACKAGE_NAME}-${{ matrix.target }}
-          (cd archive && head -n 1 "$name.tar.xz.sha256" | shasum -a 256 -c -)
-          tar -xf "archive/$name.tar.xz" -C "$RUNNER_TEMP"
-          if [ "${{ matrix.target }}" = aarch64-apple-darwin ]; then "$RUNNER_TEMP/$name/$PACKAGE_NAME" --help; fi
+      - uses: ./.github/actions/release-archive
+        with:
+          target: ${{ matrix.target }}
+          run-binary: ${{ matrix.target == 'aarch64-apple-darwin' }}
       - uses: actions/upload-artifact@v7
         with:
           name: artifacts-${{ matrix.target }}
@@ -257,19 +239,9 @@ jobs:
         with:
           name: wheels-${{ matrix.target }}
           path: dist
-      - name: Pack release archive
-        shell: bash
-        run: |
-          wheels=(dist/${PACKAGE_NAME}-*.whl)
-          [ ${#wheels[@]} -eq 1 ] || { echo "::error::expected one wheel, got ${wheels[*]}"; exit 1; }
-          python .github/scripts/pack_release_archive.py "${wheels[0]}" ${{ matrix.target }} archive
-      - name: Verify release archive
-        shell: bash
-        run: |
-          name=${PACKAGE_NAME}-${{ matrix.target }}
-          (cd archive && head -n 1 "$name.zip.sha256" | sha256sum -c -)
-          python -m zipfile -e "archive/$name.zip" "$RUNNER_TEMP/$name"
-          "$RUNNER_TEMP/$name/$PACKAGE_NAME.exe" --help
+      - uses: ./.github/actions/release-archive
+        with:
+          target: ${{ matrix.target }}
       - uses: actions/upload-artifact@v7
         with:
           name: artifacts-${{ matrix.target }}

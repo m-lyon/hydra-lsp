@@ -64,6 +64,9 @@ def pack_tar_xz(path: Path, top: str, binary: bytes, exe: str) -> None:
 def pack_zip(path: Path, binary: bytes, exe: str) -> None:
     def add(name: str, data: bytes, mode: int) -> None:
         info = zipfile.ZipInfo(name, date_time=time.localtime()[:6])
+        # Packed on Windows, where ZipInfo would claim an MS-DOS host and Unix
+        # extractors would drop the mode bits.
+        info.create_system = 3
         info.external_attr = mode << 16
         info.compress_type = zipfile.ZIP_DEFLATED
         zf.writestr(info, data)

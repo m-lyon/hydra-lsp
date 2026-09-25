@@ -10,9 +10,9 @@
 # all jobs would rebuild the wheels, and PyPI rejects a rebuilt wheel whose name
 # matches an already-uploaded file but whose contents differ.
 #
-# PyPI's trusted publisher is registered against `release.yml`, not this file:
-# PyPI checks the top-level workflow. The `release` environment has to stay on
-# the job that publishes.
+# PyPI's trusted publisher is registered against this file, not `release.yml`:
+# the OIDC token's `job_workflow_ref` names the reusable workflow the publishing
+# job is defined in. The `release` environment has to stay on that job too.
 name: Publish to PyPI
 
 on:
