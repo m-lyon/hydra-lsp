@@ -8,6 +8,12 @@
 # uploads to the release; `wheels-*` are what `publish-pypi.yml` uploads to PyPI.
 #
 # Every job smoke-tests `hydrust server --help` as well as `check`.
+#
+# A pull request only runs the packing side of this: dist's `pr-run-mode` is
+# `plan`, so the handoff to `release.yml`'s `host` job is never exercised until
+# a tag. Dry-run a pipeline change on a prerelease tag (`0.5.1-rc.1`, say)
+# first: `host` still creates a Release, which can be deleted, and
+# `custom-publish-pypi` is skipped, so PyPI is untouched.
 name: Build wheels
 
 on:

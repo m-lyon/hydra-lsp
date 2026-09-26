@@ -48,6 +48,7 @@ runs:
           tar -xf "archive/$name.tar.xz" -C "$RUNNER_TEMP"
           bin="$RUNNER_TEMP/$name/hydrust"
         fi
+        [ -f "$bin" ] || { echo "::error::$bin missing"; exit 1; }
         case $RUN_BINARY in
           true) "$bin" --help ;;
           false) ;;
