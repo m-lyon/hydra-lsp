@@ -3,18 +3,12 @@
     python .github/scripts/pack_release_archive.py <wheel> <target> <out-dir>
 
 `build-wheels.yml` compiles each target once, and this turns that wheel into
-the GitHub Release asset, so the two ship the same binary. dist no longer
-builds the archives (`build-local-artifacts = false`). The VS Code extension
-downloads them, and depends on:
+the GitHub Release asset. The VSCode extension downloads them, and depends on:
 
 - The names: `hydrust-<target>.zip` on `x86_64-pc-windows-msvc`,
-  `hydrust-<target>.tar.xz` everywhere else. dist's plan lists the same names,
-  and `check-plan` in `build-wheels.yml` holds the two together.
-- A top-level `hydrust-<target>/` directory holding the binary. Released
-  extensions expect it in the zip too, although dist's zips never had it
-  (hydrust-vscode#18).
-- A `<archive>.sha256` next to it whose first token is the hash. This writes
-  `sha256sum --binary` format, so `sha256sum -c` checks it too.
+  `hydrust-<target>.tar.xz` everywhere else.
+- A top-level `hydrust-<target>/` directory holding the binary.
+- A `<archive>.sha256` next to it whose first token is the hash.
 
 Prints the archive's member list, so the caller can check the archive against it.
 """

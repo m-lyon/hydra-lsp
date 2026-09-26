@@ -1,29 +1,14 @@
 # Publish `hydrust` to PyPI.
 #
-# Called by `release.yml` as one of dist's `publish-jobs`, so it runs only after
+# Called by `release.yml` as one of cargo dist's `publish-jobs`, so it runs only after
 # the GitHub Release has been created, and uploads the wheels `build-wheels.yml`
-# built earlier in that same run. dist checks the tag against `Cargo.toml`
-# before anything is built, and skips this job for a prerelease tag.
-#
-# If this job fails, fix the cause and use "Re-run failed jobs" on the Release
-# run so PyPI catches up with the GitHub release; do not cut a new tag. Re-running
-# all jobs would rebuild the wheels, and PyPI rejects a rebuilt wheel whose name
-# matches an already-uploaded file but whose contents differ. There is no
-# `workflow_dispatch` here: trusted publishing is bound to this job, and a
-# dispatched run could not download another run's artifacts without `actions:
-# read`, which `release.yml` does not grant. If the re-run cannot see the
-# `wheels-*` artifacts, or they have expired, download them from the Release
-# run and `uv publish` them from a machine with a PyPI token.
-#
-# PyPI's trusted publisher is registered against this file, not `release.yml`:
-# the OIDC token's `job_workflow_ref` names the reusable workflow the publishing
-# job is defined in. The `release` environment has to stay on that job too.
+# built earlier in that same run. If this job fails, fix the cause and use
+# "Re-run failed jobs".
 name: Publish to PyPI
 
 on:
   workflow_call:
     inputs:
-      # dist's plan manifest. Unused.
       plan:
         required: true
         type: string
@@ -35,7 +20,6 @@ jobs:
     environment:
       name: release
       url: https://pypi.org/project/hydrust/
-    # `release.yml` grants only this; asking for anything more fails the run.
     permissions:
       id-token: write
     steps:

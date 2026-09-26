@@ -1,21 +1,7 @@
-# Build the `hydrust` wheels and sdist for PyPI, and the GitHub Release archives.
+# Build the `hydrust` wheels and sdist for PyPI and GitHub Release archives.
 #
-# The only place a release compiles `hydrust`. `release.yml` calls this as
-# dist's `local-artifacts-jobs`, and each target job packs the binary from its
-# wheel into the release archive (`.github/scripts/pack_release_archive.py`),
-# so PyPI and the GitHub Release
-# ship the same build. Artifacts named `artifacts-*` are what dist's host job
-# uploads to the release; `wheels-*` are what `publish-pypi.yml` uploads to PyPI.
-#
-# Every job smoke-tests `hydrust server --help` as well as `check`.
-#
-# A pull request only runs the packing side of this: dist's `pr-run-mode` is
-# `plan`, so the handoff to `release.yml`'s `host` job is never exercised until
-# a tag. Dry-run a pipeline change on a prerelease tag first: bump `Cargo.toml`
-# to the prerelease version and tag that, since `plan` fails on a tag no
-# package's version matches, then bump to the real version for the release.
-# `host` still creates a Release, which can be deleted, and
-# `custom-publish-pypi` is skipped, so PyPI is untouched.
+# Every job smoke-tests `hydrust server --help` as well as `check`. A pull request only
+# runs the packing side of this, not the publishing side.
 name: Build wheels
 
 on:
