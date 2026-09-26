@@ -12,7 +12,7 @@ use tower_lsp::lsp_types::notification::Notification;
 use tower_lsp::lsp_types::{InitializedParams, Url, WorkspaceFolder};
 use tower_lsp::{LspService, Server, jsonrpc, lsp_types, lsp_types::request::Request};
 
-use hydra_lsp::backend::HydraLspBackend;
+use hydrust::backend::HydraLspBackend;
 
 fn encode_message(content_type: Option<&str>, message: &str) -> String {
     let content_type = content_type

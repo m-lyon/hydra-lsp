@@ -1,0 +1,296 @@
+# Build the `hydrust` wheels and sdist for PyPI and GitHub Release archives.
+#
+# Every job smoke-tests `hydrust server --help` as well as `check`. A pull request only
+# runs the packing side of this, not the publishing side.
+name: Build wheels
+
+on:
+  # Called by `release.yml` on a release tag.
+  workflow_call:
+    inputs:
+      # dist's plan manifest; `check-plan` checks the matrices below against it.
+      plan:
+        required: true
+        type: string
+  workflow_dispatch:
+  # Packaging and release pipeline changes only.
+  pull_request:
+    paths:
+      - pyproject.toml
+      - python/**
+      - Cargo.toml
+      - Cargo.lock
+      - dist-workspace.toml
+      - .github/scripts/pack_release_archive.py
+      - .github/actions/release-archive/action.yml
+      - .github/workflows/build-wheels.yml
+      - .github/workflows/release.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  PACKAGE_NAME: hydrust
+  PYTHON_VERSION: '3.13'
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  CARGO_TERM_COLOR: always
+  RUSTUP_MAX_RETRIES: 10
+
+jobs:
+  sdist:
+    name: sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+      # Installing the sdist compiles it from scratch, which is the point: it
+      # proves the tarball carries everything the build needs.
+      - name: Test sdist
+        run: |
+          pip install dist/${PACKAGE_NAME}-*.tar.gz --force-reinstall
+          hydrust --help
+          hydrust check --help
+          hydrust server --help
+          python -m hydrust --help
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wheels-sdist
+          path: dist
+
+  linux:
+    name: linux (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            manylinux: auto
+          # A native ARM runner rather than cross-compiling the ruff/salsa
+          # dependency tree inside maturin-action's cross container.
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            manylinux: auto
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            manylinux: musllinux_1_2
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --profile dist --locked --out dist
+      # Exercises `find_hydrust_bin`'s `--target` lookup (the `bin/` sibling of
+      # the package) against a real wheel. Runs before the normal install so the
+      # scripts-directory lookup cannot find a binary first.
+      - name: Test wheel (pip --target)
+        if: ${{ matrix.manylinux == 'auto' }}
+        run: |
+          pip install --target "$RUNNER_TEMP/target" dist/${PACKAGE_NAME}-*.whl
+          PYTHONPATH="$RUNNER_TEMP/target" python -c 'import os, hydrust; p = hydrust.find_hydrust_bin(); assert p.startswith(os.environ["RUNNER_TEMP"]), p'
+          PYTHONPATH="$RUNNER_TEMP/target" python -m hydrust --help
+      - name: Test wheel
+        if: ${{ matrix.manylinux == 'auto' }}
+        run: |
+          pip install dist/${PACKAGE_NAME}-*.whl --force-reinstall
+          hydrust --help
+          hydrust check --help
+          hydrust server --help
+          python -m hydrust --help
+      # A musllinux wheel will not install into the runner's glibc Python.
+      - name: Test wheel (musl)
+        if: ${{ matrix.manylinux != 'auto' }}
+        run: |
+          docker run --rm -v "$PWD/dist:/dist" python:${PYTHON_VERSION}-alpine sh -euc '
+            pip install /dist/'"${PACKAGE_NAME}"'-*.whl --force-reinstall
+            hydrust --help
+            hydrust check --help
+            hydrust server --help
+            python -m hydrust --help
+          '
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wheels-${{ matrix.target }}
+          path: dist
+      - uses: ./.github/actions/release-archive
+        with:
+          target: ${{ matrix.target }}
+      # v4, the major `release.yml`'s dist-generated `download-artifact` uses.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: artifacts-${{ matrix.target }}
+          path: archive
+          if-no-files-found: error
+
+  macos:
+    name: macos (${{ matrix.target }})
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-apple-darwin
+          # Cross-compiled from the ARM runner; it runs under Rosetta for the
+          # smoke test.
+          - x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --profile dist --locked --out dist
+      # The ARM runner's Python is arm64, so pip would refuse the x86_64 wheel.
+      # Unpack it instead and run the binary directly.
+      - name: Test wheel
+        if: ${{ matrix.target == 'aarch64-apple-darwin' }}
+        run: |
+          pip install dist/${PACKAGE_NAME}-*.whl --force-reinstall
+          hydrust --help
+          hydrust check --help
+          hydrust server --help
+          python -m hydrust --help
+      - name: Test binary (x86_64)
+        if: ${{ matrix.target == 'x86_64-apple-darwin' }}
+        run: |
+          softwareupdate --install-rosetta --agree-to-license || true
+          python -m zipfile -e dist/${PACKAGE_NAME}-*.whl unpacked
+          bin=$(find unpacked -path '*.data/scripts/hydrust')
+          chmod +x "$bin"
+          arch -x86_64 "$bin" --help
+          arch -x86_64 "$bin" check --help
+          arch -x86_64 "$bin" server --help
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wheels-${{ matrix.target }}
+          path: dist
+      - uses: ./.github/actions/release-archive
+        with:
+          target: ${{ matrix.target }}
+          run-binary: ${{ matrix.target == 'aarch64-apple-darwin' }}
+      # v4, the major `release.yml`'s dist-generated `download-artifact` uses.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: artifacts-${{ matrix.target }}
+          path: archive
+          if-no-files-found: error
+
+  windows:
+    name: windows (${{ matrix.target }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          architecture: x64
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --profile dist --locked --out dist
+      - name: Test wheel
+        shell: bash
+        run: |
+          python -m pip install dist/${PACKAGE_NAME}-*.whl --force-reinstall
+          hydrust --help
+          hydrust check --help
+          hydrust server --help
+          python -m hydrust --help
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wheels-${{ matrix.target }}
+          path: dist
+      - uses: ./.github/actions/release-archive
+        with:
+          target: ${{ matrix.target }}
+      # v4, the major `release.yml`'s dist-generated `download-artifact` uses.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: artifacts-${{ matrix.target }}
+          path: archive
+          if-no-files-found: error
+
+  # `dist-workspace.toml`'s target list drives the plan, but the matrices above
+  # decide what is built, and dist's host job uploads whatever turns up without
+  # checking it against the plan. The release notes still link every planned
+  # archive. Fail here instead of shipping a release with a platform's asset
+  # missing or misnamed.
+  check-plan:
+    name: check archives match the plan
+    needs:
+      - linux
+      - macos
+      - windows
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: artifacts-*
+          path: archive
+          merge-multiple: true
+      # Without a caller (a pull request or a manual run) there is no plan to
+      # compare against, so plan here: the comparison below is then exercised
+      # before a release depends on it.
+      - name: Plan
+        if: ${{ inputs.plan == '' }}
+        shell: bash
+        run: |
+          # The version `release.yml` installs, so this job checks against the
+          # plan from the same dist the release uses.
+          version=$(sed -n 's/^cargo-dist-version = "\(.*\)"/\1/p' dist-workspace.toml)
+          [ -n "$version" ] || { echo "::error::no cargo-dist-version in dist-workspace.toml"; exit 1; }
+          curl --proto '=https' --tlsv1.2 -LsSf "https://github.com/axodotdev/cargo-dist/releases/download/v$version/cargo-dist-installer.sh" | sh
+          dist plan --output-format=json > plan.json
+      - name: Compare with the plan
+        shell: bash
+        env:
+          PLAN: ${{ inputs.plan }}
+        run: |
+          [ -n "$PLAN" ] || PLAN=$(cat plan.json)
+          # The archives and their own `.sha256`; the source tarball's and the
+          # unified `sha256.sum` are built globally, not here.
+          jq -r '.artifacts | to_entries[]
+            | select(.value.kind == "executable-zip"
+                     or (.value.kind == "checksum" and (.key | test("\\.(tar\\.xz|zip)\\.sha256$"))))
+            | .key' <<< "$PLAN" | sort > expected.txt
+          find archive -maxdepth 1 \( -name '*.tar.xz' -o -name '*.zip' -o -name '*.sha256' \) -printf '%f\n' | sort > built.txt
+          [ -s expected.txt ] || { echo "::error::no archives in the plan"; exit 1; }
+          diff expected.txt built.txt || { echo "::error::built archives do not match the plan"; exit 1; }

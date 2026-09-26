@@ -1,0 +1,33 @@
+# Publish `hydrust` to PyPI.
+#
+# Called by `release.yml` as one of cargo dist's `publish-jobs`, so it runs only after
+# the GitHub Release has been created, and uploads the wheels `build-wheels.yml`
+# built earlier in that same run. If this job fails, fix the cause and use
+# "Re-run failed jobs".
+name: Publish to PyPI
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+
+jobs:
+  publish:
+    name: Upload to PyPI
+    runs-on: ubuntu-latest
+    environment:
+      name: release
+      url: https://pypi.org/project/hydrust/
+    permissions:
+      id-token: write
+    steps:
+      - uses: astral-sh/setup-uv@v10.2.0
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: wheels-*
+          path: wheels
+          merge-multiple: true
+      - name: Publish to PyPI
+        run: uv publish -v wheels/*

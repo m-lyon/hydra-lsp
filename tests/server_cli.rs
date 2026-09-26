@@ -1,7 +1,7 @@
-//! Tests for the language server binary's command line handling.
+//! Tests for the language server's command line handling.
 //!
 //! The VS Code client runs `--version` on a downloaded binary before launching
-//! it, and then launches it with no arguments to speak LSP over stdio. Both
+//! it, and then launches it as `hydrust server` to speak LSP over stdio. Both
 //! paths are checked here, including that the stdio path never writes anything
 //! to stdout other than protocol traffic.
 
@@ -9,7 +9,10 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-const SERVER: &str = env!("CARGO_BIN_EXE_hydra-lsp");
+const SERVER: &str = env!("CARGO_BIN_EXE_hydrust");
+
+/// The subcommand that starts the language server.
+const SERVE: &str = "server";
 
 /// Return the first whitespace-separated token that looks like `X.Y.Z`, which
 /// is what the client scans stdout for.
@@ -32,7 +35,7 @@ fn test_version_flag_prints_name_and_version() {
         let stdout = String::from_utf8(output.stdout).unwrap();
         assert_eq!(
             stdout.trim(),
-            format!("hydra-lsp {}", env!("CARGO_PKG_VERSION"))
+            format!("hydrust {}", env!("CARGO_PKG_VERSION"))
         );
         assert_eq!(
             first_semver_token(&stdout),
@@ -49,8 +52,48 @@ fn test_help_flag_prints_usage() {
         assert!(output.status.success(), "{flag} should exit 0");
 
         let stdout = String::from_utf8(output.stdout).unwrap();
-        assert!(stdout.contains("Usage: hydra-lsp"), "got: {stdout}");
+        assert!(stdout.contains("Usage: hydrust"), "got: {stdout}");
+        assert!(
+            stdout
+                .lines()
+                .any(|line| line.split_whitespace().next() == Some(SERVE)),
+            "`server` must be listed as a subcommand, got: {stdout}"
+        );
     }
+}
+
+/// `--help` must reach clap rather than being swallowed by the catch-all
+/// positional, which `trailing_var_arg` + `allow_hyphen_values` can do. If it
+/// were swallowed the server would start and block on stdin, so stdin is closed
+/// and the process is given a deadline: a hang fails the test instead of CI.
+#[test]
+fn test_server_help_flag_exits() {
+    let mut child = Command::new(SERVER)
+        .arg(SERVE)
+        .arg("--help")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let deadline = Instant::now() + EXIT_TIMEOUT;
+    loop {
+        match child.try_wait().unwrap() {
+            Some(_) => break,
+            None if Instant::now() >= deadline => {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("`{SERVE} --help` did not exit; it was taken as a positional value");
+            }
+            None => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
+
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "`{SERVE} --help` should exit 0");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Usage:"), "got: {stdout}");
 }
 
 /// How long the server gets to exit after stdin closes.
@@ -72,6 +115,7 @@ fn run_lsp_exchange(args: &[&str]) -> String {
     let message = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
 
     let mut child = Command::new(SERVER)
+        .arg(SERVE)
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -106,7 +150,7 @@ fn run_lsp_exchange(args: &[&str]) -> String {
 }
 
 #[test]
-fn test_no_arguments_speaks_lsp_on_stdout() {
+fn test_server_subcommand_speaks_lsp_on_stdout() {
     let stdout = run_lsp_exchange(&[]);
 
     // Nothing may precede the first LSP header: stdout is the transport.
@@ -117,12 +161,32 @@ fn test_no_arguments_speaks_lsp_on_stdout() {
     assert!(stdout.contains(r#""id":1"#), "no response to initialize");
 }
 
+/// An editor may append a transport flag of its own. Ignoring it beats
+/// refusing to start, and the note about it must not reach stdout.
 #[test]
 fn test_unknown_arguments_still_start_the_server() {
-    let stdout = run_lsp_exchange(&["--stdio"]);
+    for args in [
+        &["--stdio"][..],
+        &["--some-unknown-flag"][..],
+        &["positional"][..],
+    ] {
+        let stdout = run_lsp_exchange(args);
+
+        assert!(
+            stdout.starts_with("Content-Length: "),
+            "{args:?} must not stop the server starting, got: {stdout:?}"
+        );
+        assert!(stdout.contains(r#""id":1"#), "no response to initialize");
+    }
+}
+
+/// `serverInfo.name` is what an editor shows in its language-server list.
+#[test]
+fn test_initialize_reports_the_unified_name() {
+    let stdout = run_lsp_exchange(&[]);
 
     assert!(
-        stdout.starts_with("Content-Length: "),
-        "an unknown flag must not stop the server starting, got: {stdout:?}"
+        stdout.contains(r#""name":"hydrust""#),
+        "serverInfo.name must be `hydrust`, got: {stdout:?}"
     );
 }

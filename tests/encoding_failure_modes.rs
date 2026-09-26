@@ -8,7 +8,7 @@
 //! These diverge for any non-ASCII char (bytes) and for astral chars
 //! (codepoints vs UTF-16).
 
-use hydra_lsp::yaml_parser::{CompletionContext, Parameter, YamlParser};
+use hydrust::yaml_parser::{CompletionContext, Parameter, YamlParser};
 use tower_lsp::lsp_types::Position;
 
 /// FM1 (Group C) — cursor column vs byte slicing on a `_target_` value line.

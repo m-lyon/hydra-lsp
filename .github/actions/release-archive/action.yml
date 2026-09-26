@@ -1,0 +1,57 @@
+name: Release archive
+description: Pack the built wheel into the GitHub Release archive, and verify it.
+
+inputs:
+  target:
+    description: Rust target triple.
+    required: true
+  run-binary:
+    description: Run the extracted binary. Off where the runner cannot execute it.
+    default: 'true'
+
+runs:
+  using: composite
+  steps:
+    - name: Pack release archive
+      shell: bash
+      env:
+        TARGET: ${{ inputs.target }}
+      run: |
+        shopt -s nullglob
+        wheels=(dist/hydrust-*.whl)
+        [ ${#wheels[@]} -eq 1 ] || { echo "::error::expected one wheel, got ${wheels[*]}"; exit 1; }
+        python .github/scripts/pack_release_archive.py "${wheels[0]}" "$TARGET" archive > packed.txt
+        cat packed.txt
+    - name: Verify release archive
+      shell: bash
+      env:
+        TARGET: ${{ inputs.target }}
+        RUN_BINARY: ${{ inputs.run-binary }}
+      run: |
+        name=hydrust-$TARGET
+        case $TARGET in *-windows-msvc) ext=zip ;; *) ext=tar.xz ;; esac
+        if command -v sha256sum > /dev/null; then check="sha256sum -c -"; else check="shasum -a 256 -c -"; fi
+        (cd archive && $check < "$name.$ext.sha256")
+        # The extension depends on the layout, not just on the binary being there.
+        # The expected list is the packer's own, so this catches a packing failure.
+        # Both listings come from python, whose stdout adds a CR per line on Windows.
+        tr -d '\r' < packed.txt | sort > expected.txt
+        if [ "$ext" = zip ]; then
+          python -c "import sys, zipfile; print('\n'.join(zipfile.ZipFile(sys.argv[1]).namelist()))" "archive/$name.zip" | tr -d '\r' | sed 's:/$::' | sort > members.txt
+        else
+          tar -tf "archive/$name.tar.xz" | sed 's:/$::' | sort > members.txt
+        fi
+        diff expected.txt members.txt || { echo "::error::unexpected archive contents"; exit 1; }
+        if [ "$ext" = zip ]; then
+          python -m zipfile -e "archive/$name.zip" "$RUNNER_TEMP"
+          bin="$RUNNER_TEMP/$name/hydrust.exe"
+        else
+          tar -xf "archive/$name.tar.xz" -C "$RUNNER_TEMP"
+          bin="$RUNNER_TEMP/$name/hydrust"
+        fi
+        [ -f "$bin" ] || { echo "::error::$bin missing"; exit 1; }
+        case $RUN_BINARY in
+          true) "$bin" --help ;;
+          false) ;;
+          *) echo "::error::run-binary must be true or false, got '$RUN_BINARY'"; exit 1 ;;
+        esac

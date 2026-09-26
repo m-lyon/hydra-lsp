@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.5.0]
+## [0.6.0]
 
 - Added support for Python builtins as a `_target_`, resolved from the typeshed stubs vendored by `ty_vendored` rather than from disk (fixes #34). `builtins.len`, `builtins.dict`, `builtins.open` and the rest now hover and validate; `builtins` is a C module, so a stub is the only place its signatures and docstrings exist.
 - Scoped stub resolution to `builtins`. Wiring in typeshed makes the whole stdlib reachable, but enabling it is deliberately left to a follow-up — see `vendored_typeshed::is_vendored_module`.
@@ -21,6 +21,38 @@
 - Hover now renders the bare `*` that opens a run of keyword-only parameters, alongside the `/` — `def sorted(iterable, /, *, key=None, reverse=False)`.
 - An inline `_args_` flow sequence is now recognised from the value written after the colon rather than inferred from where its entries sit, so `_args_: # see [docs]` above a block sequence is no longer read as a flow sequence starting inside the comment. An anchor or a tag before the bracket (`_args_: &defaults [1, 2]`) is stepped over, so such a sequence still gets signature help.
 - Fixed a panic when `_args_` contained a nested list or mapping (`_args_: [[1, 2, 3]]`). saphyr gives collection nodes no position, which underflowed the line conversion. Such a node now borrows its position from its first positioned descendant, so a block-style `- [1, 2]` keeps its own line and still gets signature help.
+
+## [0.5.1]
+
+- Consolidate the release pipeline to compile each target once.
+- The Windows zip now has a top-level `hydrust-x86_64-pc-windows-msvc/` directory, as the tarballs do.
+- PyPI is published from the same workflow run as the GitHub Release.
+
+## [0.5.0]
+
+### Breaking
+
+- **One binary.** The `hydra-lsp` and `hydra-check` binaries are gone. Everything is now `hydrust`, with two subcommands: `hydrust check` and `hydrust server`. An editor that used to launch `hydra-lsp` with no arguments must launch `hydrust server`; the VSCode extension does this from v0.1.7 onwards.
+- **The crate is renamed `hydra-lsp` → `hydrust`**, so the release archives are now `hydrust-<target>.<ext>` and contain a `hydrust` executable. A VSCode extension older than v0.1.7 does not recognise the new asset name and silently stays on v0.4.2. `use hydra_lsp::` becomes `use hydrust::` for anything depending on the library.
+- **Removed `server` cargo feature**, along with `--no-default-features`.
+- `serverInfo.name` in the `initialize` response is now `"hydrust"`.
+- **`hydrust check --disable-rule` rejects an unknown rule** as a usage error (exit 2) instead of warning and continuing.
+- **`hydrust check` without `--workspace` resolves Python modules against the current directory**, even for a single file. `hydra-check` previously used the file's own directory.
+
+### Other changes
+
+- **Published to PyPI as `hydrust`.** e.g. `pip install hydrust`, `uv tool install hydrust`.
+- `hydrust check` now accepts multiple files and directories. Directories are walked recursively for `.yaml` and `.yml` files, honouring `.gitignore`; discovered files that carry no Hydra markers are skipped silently.
+- Added `--output-format github`, emitting GitHub Actions workflow commands so diagnostics render as inline annotations.
+- Renamed `--format` to `--output-format`.
+- JSON output is now a single document covering every checked file, rather than one document per file.
+- The JSON `summary` now counts diagnostics only in `total`, reports `other`, and counts files that could not be read or parsed under a separate `failed_files` field.
+- Reported paths always use `/` separators, so `--output-format github` annotations attach on Windows runners.
+- Directory walks no longer apply the user's global git excludes (`core.excludesFile`), so a local run and a CI run check the same files.
+- An unreadable directory or a file that disappears mid-walk is now logged and skipped, rather than aborting the whole run.
+- Finding no YAML files to check now warns on stderr and exits 0, rather than being a fatal error (exit 2).
+- The JSON `end_column` is now an inclusive 1-based column, matching `endColumn` in the github format; it was previously exclusive, so single-line values are one lower than before. A multi-line range that ends at the start of a line is reported as ending on the previous line, with `end_column` null (and `endColumn` omitted).
+- The workspace root falls back to the canonicalized current directory, so it matches the paths reported for each file.
 
 ## [0.4.2]
 

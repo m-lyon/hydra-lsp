@@ -1,5 +1,5 @@
-use hydra_lsp::database::HydraDatabase;
-use hydra_lsp::python_analyzer::{DefinitionInfo, PythonAnalyzer};
+use hydrust::database::HydraDatabase;
+use hydrust::python_analyzer::{DefinitionInfo, PythonAnalyzer};
 use ruff_db::system::SystemPath;
 use std::fs;
 use std::io::Write;
