@@ -36,7 +36,7 @@ runs:
         # The expected list is the packer's own, so this catches a packing failure.
         sort packed.txt > expected.txt
         if [ "$ext" = zip ]; then
-          python -c "import sys, zipfile; print('\n'.join(zipfile.ZipFile(sys.argv[1]).namelist()))" "archive/$name.zip" | sort > members.txt
+          python -c "import sys, zipfile; print('\n'.join(zipfile.ZipFile(sys.argv[1]).namelist()))" "archive/$name.zip" | sed 's:/$::' | sort > members.txt
         else
           tar -tf "archive/$name.tar.xz" | sed 's:/$::' | sort > members.txt
         fi

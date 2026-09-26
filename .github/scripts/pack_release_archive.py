@@ -76,10 +76,14 @@ def pack_zip(path: Path, top: str, binary: bytes, exe: str) -> list[str]:
         zf.writestr(info, data)
 
     with zipfile.ZipFile(path, "w") as zf:
+        info = zipfile.ZipInfo(f"{top}/", date_time=time.localtime()[:6])
+        info.create_system = 3
+        info.external_attr = (0o40755 << 16) | 0x10
+        zf.writestr(info, b"")
         for name in EXTRA_FILES:
             add(name, Path(name).read_bytes(), 0o100644)
         add(exe, binary, 0o100755)
-    return [f"{top}/{name}" for name in [*EXTRA_FILES, exe]]
+    return [top, *(f"{top}/{name}" for name in [*EXTRA_FILES, exe])]
 
 
 def main() -> None:
