@@ -1,25 +1,30 @@
-# Build the `hydrust` wheels and sdist for PyPI.
+# Build the `hydrust` wheels and sdist for PyPI and GitHub Release archives.
 #
-# Runs independently of `release.yml`, so each target is compiled twice
-# per release. Folding this into dist via `build-local-artifacts = false` and
-# `local-artifacts-jobs` would fix that; see
-# https://github.com/m-lyon/hydra-lsp/issues/48.
-#
-# Every job smoke-tests `hydrust server --help` as well as `check`.
+# Every job smoke-tests `hydrust server --help` as well as `check`. A pull request only
+# runs the packing side of this, not the publishing side.
 name: Build wheels
 
 on:
-  # Called by `publish-pypi.yml` on a release tag.
+  # Called by `release.yml` on a release tag.
   workflow_call:
+    inputs:
+      # dist's plan manifest; `check-plan` checks the matrices below against it.
+      plan:
+        required: true
+        type: string
   workflow_dispatch:
-  # Packaging changes only.
+  # Packaging and release pipeline changes only.
   pull_request:
     paths:
       - pyproject.toml
       - python/**
       - Cargo.toml
       - Cargo.lock
+      - dist-workspace.toml
+      - .github/scripts/pack_release_archive.py
+      - .github/actions/release-archive/action.yml
       - .github/workflows/build-wheels.yml
+      - .github/workflows/release.yml
 
 permissions:
   contents: read
@@ -129,6 +134,15 @@ jobs:
         with:
           name: wheels-${{ matrix.target }}
           path: dist
+      - uses: ./.github/actions/release-archive
+        with:
+          target: ${{ matrix.target }}
+      # v4, the major `release.yml`'s dist-generated `download-artifact` uses.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: artifacts-${{ matrix.target }}
+          path: archive
+          if-no-files-found: error
 
   macos:
     name: macos (${{ matrix.target }})
@@ -177,6 +191,16 @@ jobs:
         with:
           name: wheels-${{ matrix.target }}
           path: dist
+      - uses: ./.github/actions/release-archive
+        with:
+          target: ${{ matrix.target }}
+          run-binary: ${{ matrix.target == 'aarch64-apple-darwin' }}
+      # v4, the major `release.yml`'s dist-generated `download-artifact` uses.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: artifacts-${{ matrix.target }}
+          path: archive
+          if-no-files-found: error
 
   windows:
     name: windows (${{ matrix.target }})
@@ -211,3 +235,62 @@ jobs:
         with:
           name: wheels-${{ matrix.target }}
           path: dist
+      - uses: ./.github/actions/release-archive
+        with:
+          target: ${{ matrix.target }}
+      # v4, the major `release.yml`'s dist-generated `download-artifact` uses.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: artifacts-${{ matrix.target }}
+          path: archive
+          if-no-files-found: error
+
+  # `dist-workspace.toml`'s target list drives the plan, but the matrices above
+  # decide what is built, and dist's host job uploads whatever turns up without
+  # checking it against the plan. The release notes still link every planned
+  # archive. Fail here instead of shipping a release with a platform's asset
+  # missing or misnamed.
+  check-plan:
+    name: check archives match the plan
+    needs:
+      - linux
+      - macos
+      - windows
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: artifacts-*
+          path: archive
+          merge-multiple: true
+      # Without a caller (a pull request or a manual run) there is no plan to
+      # compare against, so plan here: the comparison below is then exercised
+      # before a release depends on it.
+      - name: Plan
+        if: ${{ inputs.plan == '' }}
+        shell: bash
+        run: |
+          # The version `release.yml` installs, so this job checks against the
+          # plan from the same dist the release uses.
+          version=$(sed -n 's/^cargo-dist-version = "\(.*\)"/\1/p' dist-workspace.toml)
+          [ -n "$version" ] || { echo "::error::no cargo-dist-version in dist-workspace.toml"; exit 1; }
+          curl --proto '=https' --tlsv1.2 -LsSf "https://github.com/axodotdev/cargo-dist/releases/download/v$version/cargo-dist-installer.sh" | sh
+          dist plan --output-format=json > plan.json
+      - name: Compare with the plan
+        shell: bash
+        env:
+          PLAN: ${{ inputs.plan }}
+        run: |
+          [ -n "$PLAN" ] || PLAN=$(cat plan.json)
+          # The archives and their own `.sha256`; the source tarball's and the
+          # unified `sha256.sum` are built globally, not here.
+          jq -r '.artifacts | to_entries[]
+            | select(.value.kind == "executable-zip"
+                     or (.value.kind == "checksum" and (.key | test("\\.(tar\\.xz|zip)\\.sha256$"))))
+            | .key' <<< "$PLAN" | sort > expected.txt
+          find archive -maxdepth 1 \( -name '*.tar.xz' -o -name '*.zip' -o -name '*.sha256' \) -printf '%f\n' | sort > built.txt
+          [ -s expected.txt ] || { echo "::error::no archives in the plan"; exit 1; }
+          diff expected.txt built.txt || { echo "::error::built archives do not match the plan"; exit 1; }

@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.5.1]
+
+- Consolidate the release pipeline to compile each target once.
+- The Windows zip now has a top-level `hydrust-x86_64-pc-windows-msvc/` directory, as the tarballs do.
+- PyPI is published from the same workflow run as the GitHub Release.
+
 ## [0.5.0]
 
 ### Breaking
