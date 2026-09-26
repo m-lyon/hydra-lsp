@@ -1,22 +1,22 @@
-"""Pack the binary from a built wheel into the archive dist would have made.
+"""Pack the binary from a built wheel into a GitHub Release archive.
 
     python .github/scripts/pack_release_archive.py <wheel> <target> <out-dir>
 
 `build-wheels.yml` compiles each target once, and this turns that wheel into
 the GitHub Release asset, so the two ship the same binary. dist no longer
-builds the archives (`build-local-artifacts = false`), so this script has to
-match its output, because the VS Code extension depends on it:
+builds the archives (`build-local-artifacts = false`). The VS Code extension
+downloads them, and depends on:
 
-- `hydrust-<target>.zip` on `x86_64-pc-windows-msvc`, `hydrust-<target>.tar.xz`
-  everywhere else.
-- A tarball has a top-level `hydrust-<target>/` directory; a zip has none.
-- A `<archive>.sha256` next to it, in `sha256sum --binary` format. dist ends
-  the line with a blank one, so this does too.
-- The binary is mode 0755, the other files 0644.
+- The names: `hydrust-<target>.zip` on `x86_64-pc-windows-msvc`,
+  `hydrust-<target>.tar.xz` everywhere else. dist's plan lists the same names,
+  and `check-plan` in `build-wheels.yml` holds the two together.
+- A top-level `hydrust-<target>/` directory holding the binary. Released
+  extensions expect it in the zip too, although dist's zips never had it
+  (hydrust-vscode#18).
+- A `<archive>.sha256` next to it whose first token is the hash. This writes
+  `sha256sum --binary` format, so `sha256sum -c` checks it too.
 
 Prints the archive's member list, so the caller can check the archive against it.
-
-Checked against the dist-built v0.5.0 assets.
 """
 
 import hashlib
@@ -29,18 +29,9 @@ import zipfile
 from pathlib import Path
 
 NAME = "hydrust"
-# dist auto-includes these alongside the binary. A new top-level readme or
-# licence file (`LICENSE-APACHE`, say) would be picked up by dist, so it has to
-# be added here too.
+# Shipped alongside the binary, as dist-built releases did. The extension reads
+# none of them, but the licence has to travel with the binary.
 EXTRA_FILES = ["README.md", "CHANGELOG.md", "LICENSE"]
-# dist matches these case-insensitively.
-AUTO_INCLUDE_PREFIXES = ("README", "CHANGELOG", "RELEASES", "LICENSE", "LICENCE")
-
-
-def check_extra_files() -> None:
-    found = {p.name for p in Path().iterdir() if p.name.upper().startswith(AUTO_INCLUDE_PREFIXES)}
-    if found != set(EXTRA_FILES):
-        sys.exit(f"EXTRA_FILES is {sorted(EXTRA_FILES)}, dist would include {sorted(found)}")
 
 
 def binary_from_wheel(wheel: Path, exe: str) -> bytes:
@@ -60,7 +51,7 @@ def pack_tar_xz(path: Path, top: str, binary: bytes, exe: str) -> list[str]:
         tf.addfile(info, io.BytesIO(data))
 
     # Extraction keeps these, and a 1970 mtime looks stale to anything that ages
-    # files, so use the build time as dist does.
+    # files, so use the build time.
     now = int(time.time())
     with tarfile.open(path, "w:xz", format=tarfile.GNU_FORMAT) as tf:
         info = tarfile.TarInfo(top)
@@ -74,9 +65,9 @@ def pack_tar_xz(path: Path, top: str, binary: bytes, exe: str) -> list[str]:
     return [top, *(f"{top}/{name}" for name in [*EXTRA_FILES, exe])]
 
 
-def pack_zip(path: Path, binary: bytes, exe: str) -> list[str]:
+def pack_zip(path: Path, top: str, binary: bytes, exe: str) -> list[str]:
     def add(name: str, data: bytes, mode: int) -> None:
-        info = zipfile.ZipInfo(name, date_time=time.localtime()[:6])
+        info = zipfile.ZipInfo(f"{top}/{name}", date_time=time.localtime()[:6])
         # Packed on Windows, where ZipInfo would claim an MS-DOS host and Unix
         # extractors would drop the mode bits.
         info.create_system = 3
@@ -88,7 +79,7 @@ def pack_zip(path: Path, binary: bytes, exe: str) -> list[str]:
         for name in EXTRA_FILES:
             add(name, Path(name).read_bytes(), 0o100644)
         add(exe, binary, 0o100755)
-    return [*EXTRA_FILES, exe]
+    return [f"{top}/{name}" for name in [*EXTRA_FILES, exe]]
 
 
 def main() -> None:
@@ -102,17 +93,16 @@ def main() -> None:
     top = f"{NAME}-{target}"
     archive = out_dir / f"{top}.{'zip' if windows else 'tar.xz'}"
 
-    check_extra_files()
     out_dir.mkdir(parents=True, exist_ok=True)
     binary = binary_from_wheel(wheel, exe)
     if windows:
-        members = pack_zip(archive, binary, exe)
+        members = pack_zip(archive, top, binary, exe)
     else:
         members = pack_tar_xz(archive, top, binary, exe)
 
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()
     checksum = archive.with_name(f"{archive.name}.sha256")
-    checksum.write_text(f"{digest} *{archive.name}\n\n", newline="\n")
+    checksum.write_text(f"{digest} *{archive.name}\n", newline="\n")
     print("\n".join(members))
 
 

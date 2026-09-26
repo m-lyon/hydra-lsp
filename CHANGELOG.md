@@ -2,7 +2,8 @@
 
 ## [0.5.1]
 
-- The release pipeline compiles each target once. The GitHub Release archives now carry the same binary as the PyPI wheels, stripped, so they are smaller. Their names and layout are unchanged (#48)
+- The release pipeline compiles each target once. The GitHub Release archives now carry the same binary as the PyPI wheels, stripped, so they are smaller. Their names are unchanged (#48)
+- The Windows zip now has a top-level `hydrust-x86_64-pc-windows-msvc/` directory, as the tarballs do, so the VS Code extension can install from it (m-lyon/hydrust-vscode#18)
 - PyPI is published from the same workflow run as the GitHub Release, and only after it, so PyPI can no longer get ahead of the release
 - Each GitHub Release archive still carries its own `.sha256` file
 

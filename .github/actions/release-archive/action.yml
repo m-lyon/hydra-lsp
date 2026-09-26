@@ -1,5 +1,5 @@
 name: Release archive
-description: Pack the built wheel into the archive dist would have made, and verify it.
+description: Pack the built wheel into the GitHub Release archive, and verify it.
 
 inputs:
   target:
@@ -31,10 +31,9 @@ runs:
         name=hydrust-$TARGET
         case $TARGET in *-windows-msvc) ext=zip ;; *) ext=tar.xz ;; esac
         if command -v sha256sum > /dev/null; then check="sha256sum -c -"; else check="shasum -a 256 -c -"; fi
-        (cd archive && head -n 1 "$name.$ext.sha256" | $check)
+        (cd archive && $check < "$name.$ext.sha256")
         # The extension depends on the layout, not just on the binary being there.
-        # The expected list is the packer's own, so this catches a packing
-        # failure; `EXTRA_FILES` there is what tracks dist's auto-includes.
+        # The expected list is the packer's own, so this catches a packing failure.
         sort packed.txt > expected.txt
         if [ "$ext" = zip ]; then
           python -c "import sys, zipfile; print('\n'.join(zipfile.ZipFile(sys.argv[1]).namelist()))" "archive/$name.zip" | sort > members.txt
@@ -43,7 +42,7 @@ runs:
         fi
         diff expected.txt members.txt || { echo "::error::unexpected archive contents"; exit 1; }
         if [ "$ext" = zip ]; then
-          python -m zipfile -e "archive/$name.zip" "$RUNNER_TEMP/$name"
+          python -m zipfile -e "archive/$name.zip" "$RUNNER_TEMP"
           bin="$RUNNER_TEMP/$name/hydrust.exe"
         else
           tar -xf "archive/$name.tar.xz" -C "$RUNNER_TEMP"

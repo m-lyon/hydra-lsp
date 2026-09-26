@@ -2,8 +2,8 @@
 #
 # The only place a release compiles `hydrust`. `release.yml` calls this as
 # dist's `local-artifacts-jobs`, and each target job packs the binary from its
-# wheel into the archive dist would otherwise have built
-# (`.github/scripts/pack_release_archive.py`), so PyPI and the GitHub Release
+# wheel into the release archive (`.github/scripts/pack_release_archive.py`),
+# so PyPI and the GitHub Release
 # ship the same build. Artifacts named `artifacts-*` are what dist's host job
 # uploads to the release; `wheels-*` are what `publish-pypi.yml` uploads to PyPI.
 #
@@ -252,8 +252,10 @@ jobs:
           if-no-files-found: error
 
   # `dist-workspace.toml`'s target list drives the plan, but the matrices above
-  # decide what is built, and dist's host job uploads whatever turns up. Fail
-  # here instead of shipping a release with a platform's asset missing.
+  # decide what is built, and dist's host job uploads whatever turns up without
+  # checking it against the plan. The release notes still link every planned
+  # archive. Fail here instead of shipping a release with a platform's asset
+  # missing or misnamed.
   check-plan:
     name: check archives match the plan
     needs:
