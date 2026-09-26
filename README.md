@@ -15,7 +15,11 @@ A Language Server for [Hydra](https://hydra.cc/) configuration files, written in
 - ✅ **Diagnostics**: Parameter validation including:
   - Unknown parameters (unless `**kwargs` present)
   - Missing required parameters
+  - Positional-only parameters passed by name instead of through `_args_`
   - Basic `_target_` format validation
+- ✅ **Builtins**: `_target_: builtins.len` and friends resolve against the
+  vendored typeshed stubs, so builtins hover and validate like any other target.
+  Other stdlib modules are not yet resolved.
 - ✅ **Semantic Tokens**: Rich syntax highlighting for Hydra configurations:
   - Module path components (namespace tokens)
   - Class and function names

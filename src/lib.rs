@@ -6,5 +6,6 @@ pub mod outbox;
 pub mod python_analyzer;
 pub mod python_cache;
 pub mod server;
+pub mod vendored_typeshed;
 pub mod yaml_cache;
 pub mod yaml_parser;

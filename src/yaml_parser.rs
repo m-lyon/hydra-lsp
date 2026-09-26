@@ -538,11 +538,96 @@ impl ParsedContent {
     }
 }
 
+/// Convert saphyr's 1-based marker line to the 0-based line the LSP wants.
+///
+/// saphyr leaves the span unset on every collection node: a sequence or mapping
+/// reports `(0, 0)..(0, 0)`, including the inner list of `_args_: [[1, 2], 3]`.
+/// Subtracting one from an unset marker underflows, so it falls back to
+/// `enclosing` — the line of the nearest node that does carry a position.
+pub(crate) fn marker_to_line0(marker_line: usize, enclosing: u32) -> u32 {
+    match marker_line.checked_sub(1) {
+        Some(line) => line as u32,
+        None => enclosing,
+    }
+}
+
+/// The first node at or below `node` that saphyr gave a position, in document
+/// order. `None` only for an empty collection, which has nothing to borrow from.
+fn first_positioned(node: &MarkedYamlOwned) -> Option<&MarkedYamlOwned> {
+    if node.span.start.line() != 0 {
+        return Some(node);
+    }
+    if let Some(seq) = node.data.as_sequence() {
+        return seq.iter().find_map(first_positioned);
+    }
+    if let Some(map) = node.data.as_mapping() {
+        return map
+            .iter()
+            .find_map(|(k, v)| first_positioned(k).or_else(|| first_positioned(v)));
+    }
+    None
+}
+
+/// The last node at or below `node` that saphyr gave a position. Mirror of
+/// [`first_positioned`].
+fn last_positioned(node: &MarkedYamlOwned) -> Option<&MarkedYamlOwned> {
+    if node.span.start.line() != 0 {
+        return Some(node);
+    }
+    if let Some(seq) = node.data.as_sequence() {
+        return seq.iter().rev().find_map(last_positioned);
+    }
+    if let Some(map) = node.data.as_mapping() {
+        return map
+            .iter()
+            .rev()
+            .find_map(|(k, v)| last_positioned(v).or_else(|| last_positioned(k)));
+    }
+    None
+}
+
+/// The source range of `node` as `(0-based line, UTF-16 start col, UTF-16 end col)`.
+///
+/// Scalars carry their own position and are returned unchanged. Collections
+/// carry none — saphyr reports `(0, 0)..(0, 0)` for every sequence and mapping —
+/// so they borrow the line and start column of their first positioned
+/// descendant and the end column of their last, which puts `- [1, 2]` on the
+/// line its `1` is on rather than on the line of whatever contains it. That
+/// matters: a positional argument whose line is wrong is dropped from
+/// `param_line_map` and gets no signature help.
+///
+/// `enclosing` is the last resort, used for an empty `[]` or `{}` where there is
+/// no descendant to ask. Such an entry lands on the enclosing line with a
+/// degenerate `0..0` range — saphyr records nothing at all about it, so there is
+/// nothing better to report. In a block-style `_args_` that means an empty entry
+/// gets no signature help, which is the one case this cannot place correctly.
+fn node_range(node: &MarkedYamlOwned, lines: &[&str], enclosing: u32) -> (u32, u32, u32) {
+    let Some(start_node) = first_positioned(node) else {
+        return (enclosing, 0, 0);
+    };
+    let line = marker_to_line0(start_node.span.start.line(), enclosing);
+    let start = cp_to_utf16_col(lines, line, start_node.span.start.col() as u32);
+
+    // Only extend to the last descendant when it ends on the same line; a
+    // multi-line collection would otherwise produce a backwards range.
+    let end_node = last_positioned(node).unwrap_or(start_node);
+    let end_node = if marker_to_line0(end_node.span.end.line(), enclosing) == line {
+        end_node
+    } else {
+        start_node
+    };
+    let end = cp_to_utf16_col(lines, line, end_node.span.end.col() as u32);
+
+    (line, start, end)
+}
+
 /// Convert a saphyr `MarkedYamlOwned` node to `YamlValue`
 ///
 /// `lines` is the source document pre-split with `str::lines()`, needed to
 /// convert saphyr's codepoint columns into the UTF-16 columns the LSP expects.
-fn node_to_yaml_value(node: &MarkedYamlOwned, lines: &[&str]) -> YamlValue {
+/// `enclosing_line` is the 0-based line to attribute nested values to when
+/// saphyr gives them no position of their own — see [`marker_to_line0`].
+fn node_to_yaml_value(node: &MarkedYamlOwned, lines: &[&str], enclosing_line: u32) -> YamlValue {
     let data = &node.data;
     if data.is_null() {
         YamlValue::Null
@@ -558,14 +643,12 @@ fn node_to_yaml_value(node: &MarkedYamlOwned, lines: &[&str]) -> YamlValue {
         YamlValue::Sequence(
             seq.iter()
                 .map(|item| {
-                    // Sequence elements are scalars on a single line; convert
-                    // both columns against the element's own line.
-                    let start_line = (item.span.start.line() - 1) as u32;
+                    let (line, start, end) = node_range(item, lines, enclosing_line);
                     PositionedValue {
-                        value: node_to_yaml_value(item, lines),
-                        line: start_line,
-                        start: cp_to_utf16_col(lines, start_line, item.span.start.col() as u32),
-                        end: cp_to_utf16_col(lines, start_line, item.span.end.col() as u32),
+                        value: node_to_yaml_value(item, lines, line),
+                        line,
+                        start,
+                        end,
                     }
                 })
                 .collect(),
@@ -575,7 +658,8 @@ fn node_to_yaml_value(node: &MarkedYamlOwned, lines: &[&str]) -> YamlValue {
             .iter()
             .filter_map(|(k, v)| {
                 let key_str = k.data.as_str()?.to_string();
-                Some((key_str, node_to_yaml_value(v, lines)))
+                let key_line = marker_to_line0(k.span.start.line(), enclosing_line);
+                Some((key_str, node_to_yaml_value(v, lines, key_line)))
             })
             .collect();
         YamlValue::Mapping(entries)
@@ -931,6 +1015,37 @@ impl YamlParser {
         }
     }
 
+    /// The byte offset of the `[` that opens an inline `_args_` flow sequence on
+    /// `line_text`, or `None` when the value is not written inline.
+    ///
+    /// Only the text after the `_args_:` colon is considered, so
+    /// `_args_: # see [docs]` is correctly read as a block sequence with a
+    /// comment rather than as a flow sequence starting inside the comment.
+    ///
+    /// An anchor or a tag may sit between the colon and the bracket
+    /// (`_args_: &defaults [1, 2]`); neither is part of the sequence, so both
+    /// are stepped over.
+    fn value_bracket_byte(line_text: &str) -> Option<usize> {
+        let key = line_text.find(ARGS_KEY)?;
+        let colon = key + line_text[key..].find(':')?;
+        let mut value = line_text[colon + 1..]
+            .find(|c: char| !c.is_whitespace())
+            .map(|offset| colon + 1 + offset)?;
+
+        // Each pass consumes at least the leading `&` or `!`, so `value` always
+        // advances and the loop terminates.
+        while line_text[value..].starts_with(['&', '!']) {
+            let token_end = line_text[value..]
+                .find(|c: char| c.is_whitespace() || matches!(c, '[' | ']' | '{' | '}' | ','))
+                .map(|offset| value + offset)?;
+            value = line_text[token_end..]
+                .find(|c: char| !c.is_whitespace())
+                .map(|offset| token_end + offset)?;
+        }
+
+        line_text[value..].starts_with('[').then_some(value)
+    }
+
     /// Extract the `_args_` Hydra keyword from a mapping.
     /// Returns the HydraParameter and any positional parameters parsed from the list.
     /// For inline flow sequences (`[a, b]`), the HydraParameter value carries
@@ -950,13 +1065,12 @@ impl YamlParser {
             let positional_params: Vec<Parameter> = seq
                 .iter()
                 .map(|item| {
-                    let arg_line = (item.span.start.line() - 1) as u32;
-                    let arg_value_start =
-                        cp_to_utf16_col(lines, arg_line, item.span.start.col() as u32);
-                    let arg_value_end =
-                        cp_to_utf16_col(lines, arg_line, item.span.end.col() as u32);
+                    // A nested list or mapping (`_args_: [[1, 2, 3]]`) carries no
+                    // position of its own; `node_range` borrows one from its
+                    // contents so block-style entries keep their own line.
+                    let (arg_line, arg_value_start, arg_value_end) = node_range(item, lines, line);
                     Parameter::Positional {
-                        value: node_to_yaml_value(item, lines),
+                        value: node_to_yaml_value(item, lines, arg_line),
                         line: arg_line,
                         value_start: arg_value_start,
                         value_end: arg_value_end,
@@ -965,24 +1079,21 @@ impl YamlParser {
                 })
                 .collect();
 
-            // Detect inline flow sequence: items share the key line, or the
-            // sequence is empty and valid. For inline sequences, find '['
-            // on the line and capture the text after it.
-            let is_inline =
-                positional_params.is_empty() || positional_params.iter().all(|p| p.line() == line);
-            let inline_info = if is_inline {
-                // Search the key's line for the flow-sequence bracket. The
-                // `_args_` key itself contains no '[', so the first one on the
-                // line opens the sequence. `bracket_col` is reported in UTF-16
-                // units; `text_after_bracket` is the raw remainder of the line.
-                let line_text = lines.get(line as usize).copied().unwrap_or("");
-                line_text.find('[').map(|bracket_byte| InlineArgsText {
+            // Detect an inline flow sequence from the source itself: the value
+            // after `_args_:` opens with `[` on the key's own line. Inferring it
+            // from the entries' lines instead would be forgeable — an entry with
+            // no position of its own borrows the key's line, so a block sequence
+            // of empty collections would look inline — and a `[` anywhere on the
+            // line, a comment's included, would then be read as the sequence.
+            //
+            // `bracket_col` is reported in UTF-16 units; `text_after_bracket` is
+            // the raw remainder of the line.
+            let line_text = lines.get(line as usize).copied().unwrap_or("");
+            let inline_info =
+                Self::value_bracket_byte(line_text).map(|bracket_byte| InlineArgsText {
                     bracket_col: utf16_len(&line_text[..bracket_byte]),
                     text_after_bracket: line_text[bracket_byte + 1..].to_string(),
-                })
-            } else {
-                None
-            };
+                });
 
             Some((
                 HydraParameter {
@@ -1117,7 +1228,7 @@ impl YamlParser {
                 let key_start = cp_to_utf16_col(lines, line, key_node.span.start.col() as u32);
                 let value_start = cp_to_utf16_col(lines, line, val_node.span.start.col() as u32);
                 let value_end = cp_to_utf16_col(lines, line, val_node.span.end.col() as u32);
-                let value = node_to_yaml_value(val_node, lines);
+                let value = node_to_yaml_value(val_node, lines, line);
                 parameters.push(Parameter::Keyword {
                     key: key_str.to_string(),
                     value,
@@ -3247,6 +3358,171 @@ model:
                 .iter()
                 .all(|p| p.key() != Some("_args_"))
         );
+    }
+
+    /// saphyr gives collection nodes no position at all, so a list nested
+    /// inside `_args_` used to underflow the 1-based line conversion and panic.
+    /// Passing a list as a single positional argument is exactly what
+    /// `_target_: builtins.len` with `_args_: [[1, 2, 3]]` needs.
+    #[test]
+    fn test_args_with_nested_collections() {
+        let content = r#"
+model:
+  _target_: builtins.len
+  _args_: [[1, 2, 3], {a: 1}]
+"#;
+        let parsed = YamlParser::parse(content).unwrap();
+        let hydra_object = &parsed.hydra_objects[0];
+
+        let positional: Vec<_> = hydra_object
+            .parameters
+            .iter()
+            .filter(|p| matches!(p, Parameter::Positional { .. }))
+            .collect();
+        assert_eq!(positional.len(), 2);
+        // Both nested values borrow a position from their contents, which puts
+        // them on the `_args_` line (index 3, counting the leading blank line)
+        // rather than on line 0.
+        assert!(positional.iter().all(|p| p.line() == 3));
+        // The range covers the nested contents, not column 0.
+        assert!(positional.iter().all(|p| match p {
+            Parameter::Positional { value_start, .. } => *value_start > 0,
+            Parameter::Keyword { .. } => false,
+        }));
+    }
+
+    /// A block-style `_args_` whose entries are themselves lists: each entry
+    /// has no position, so it inherits the `_args_` line.
+    #[test]
+    fn test_args_block_style_with_nested_collections() {
+        let content = r#"
+model:
+  _target_: builtins.max
+  _args_:
+    - [1, 2]
+    - [3, 4]
+"#;
+        let parsed = YamlParser::parse(content).unwrap();
+        let hydra_object = &parsed.hydra_objects[0];
+        let positional: Vec<_> = hydra_object
+            .parameters
+            .iter()
+            .filter(|p| matches!(p, Parameter::Positional { .. }))
+            .collect();
+        assert_eq!(positional.len(), 2);
+        // Each entry keeps its own line, so signature help can find it. Both
+        // would collapse onto the `_args_` line if the nested lists fell back to
+        // the enclosing position instead of borrowing one from their contents.
+        assert_eq!(positional[0].line(), 4);
+        assert_eq!(positional[1].line(), 5);
+
+        // ...which is what puts them in the parameter line map.
+        assert!(parsed.param_line_map.contains_key(&4));
+        assert!(parsed.param_line_map.contains_key(&5));
+    }
+
+    /// An empty collection has no descendant to borrow a position from, so it
+    /// falls back to the enclosing line. It is still counted as an argument —
+    /// the documented cost is that it gets no signature help of its own.
+    #[test]
+    fn test_args_with_empty_nested_collections() {
+        let content = r#"
+model:
+  _target_: builtins.max
+  _args_:
+    - []
+    - [3, 4]
+"#;
+        let parsed = YamlParser::parse(content).unwrap();
+        let hydra_object = &parsed.hydra_objects[0];
+        let positional: Vec<_> = hydra_object
+            .parameters
+            .iter()
+            .filter(|p| matches!(p, Parameter::Positional { .. }))
+            .collect();
+
+        assert_eq!(positional.len(), 2, "both entries are still arguments");
+        // The empty one has no position of its own and lands on `_args_`; the
+        // one with contents keeps its own line.
+        assert_eq!(positional[0].line(), 3);
+        assert_eq!(positional[1].line(), 5);
+        assert!(parsed.param_line_map.contains_key(&5));
+    }
+
+    /// A block sequence whose entries are *all* unpositioned must still be read
+    /// as block style. Inferring that from the entries' lines would call it
+    /// inline, and the comment's bracket would then be mistaken for the
+    /// sequence's opening one.
+    #[test]
+    fn test_block_args_with_a_bracket_in_a_comment_is_not_inline() {
+        let content = r#"
+model:
+  _target_: builtins.max
+  _args_: # see [docs]
+    - []
+"#;
+        let parsed = YamlParser::parse(content).unwrap();
+        let args = parsed.hydra_objects[0]
+            .args
+            .as_ref()
+            .expect("args should be present");
+        assert!(
+            args.value.is_none(),
+            "a comment's bracket is not a flow sequence, got: {:?}",
+            args.value
+        );
+    }
+
+    #[test]
+    fn test_inline_args_detected_from_the_value_not_the_entries() {
+        let content = r#"
+model:
+  _target_: builtins.max
+  _args_: [[1, 2], []] # trailing [comment]
+"#;
+        let parsed = YamlParser::parse(content).unwrap();
+        let args = parsed.hydra_objects[0]
+            .args
+            .as_ref()
+            .expect("args should be present");
+        let inline = args
+            .value
+            .as_ref()
+            .expect("a genuine flow sequence, even with an unpositioned entry");
+        assert!(inline.text_after_bracket.starts_with("[1, 2], []]"));
+    }
+
+    /// An anchor or a tag between the colon and the bracket does not make the
+    /// sequence block style. Signature help is driven by `bracket_col`, so
+    /// missing the bracket silently switches it off for the line.
+    #[test]
+    fn test_inline_args_with_an_anchor_or_tag_is_still_inline() {
+        for (content, expected_after) in [
+            (
+                "model:\n  _target_: builtins.max\n  _args_: &defaults [1, 2]\n",
+                "1, 2]",
+            ),
+            (
+                "model:\n  _target_: builtins.max\n  _args_: !!seq [3, 4]\n",
+                "3, 4]",
+            ),
+        ] {
+            let parsed = YamlParser::parse(content).unwrap();
+            let args = parsed.hydra_objects[0]
+                .args
+                .as_ref()
+                .expect("args should be present");
+            let inline = args
+                .value
+                .as_ref()
+                .unwrap_or_else(|| panic!("an anchored flow sequence is inline, in:\n{content}"));
+            assert_eq!(inline.text_after_bracket, expected_after);
+            let line = args.line;
+            assert!(
+                parsed.param_line_map.contains_key(&line),
+                "the _args_ line should still get signature help, in:\n{content}"
+            );
+        }
     }
 
     #[test]

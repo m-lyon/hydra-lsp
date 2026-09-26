@@ -30,9 +30,18 @@ impl HydraDatabase {
             storage: salsa::Storage::default(),
             files: Files::default(),
             system: OsSystem::new(cwd),
-            vendored: VendoredFileSystem::default(),
+            vendored: vendored_typeshed(),
         }
     }
+}
+
+/// The vendored typeshed stubs, shared by every database instance.
+///
+/// `ty_vendored` keeps the zip archive in a `LazyLock` and `VendoredFileSystem`
+/// is `Arc`-backed, so cloning it per database is a refcount bump, not a copy.
+/// See [`crate::vendored_typeshed`] for how these stubs are addressed.
+fn vendored_typeshed() -> VendoredFileSystem {
+    ty_vendored::file_system().clone()
 }
 
 #[salsa::db]
@@ -107,12 +116,26 @@ pub mod tests {
 
     /// Test database using an in-memory filesystem.
     #[salsa::db]
-    #[derive(Default, Clone)]
+    #[derive(Clone)]
     pub struct TestDb {
         storage: salsa::Storage<Self>,
         files: Files,
         system: TestSystem,
         vendored: VendoredFileSystem,
+    }
+
+    impl Default for TestDb {
+        /// Mirrors `HydraDatabase`: the vendored typeshed must be present or
+        /// every `builtins.*` target would resolve differently under test than
+        /// in the server.
+        fn default() -> Self {
+            Self {
+                storage: salsa::Storage::default(),
+                files: Files::default(),
+                system: TestSystem::default(),
+                vendored: super::vendored_typeshed(),
+            }
+        }
     }
 
     impl TestDb {

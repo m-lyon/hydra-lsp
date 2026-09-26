@@ -1,8 +1,9 @@
 use crate::python_analyzer::{DefinitionInfo, FunctionSignature, ParameterInfo};
-use crate::python_cache::{PythonConfig, TargetString, cached_definition_info};
+use crate::python_cache::{PythonConfig, TargetString, cached_definition_info, is_builtin_symbol};
+use crate::vendored_typeshed::BUILTINS_MODULE;
 use crate::yaml_parser::{
     ARGS_KEY, CONVERT_KEY, ConvertMode, HydraObject, PARTIAL_KEY, Parameter, ParsedContent,
-    RECURSIVE_KEY,
+    RECURSIVE_KEY, utf16_len,
 };
 use std::collections::HashSet;
 use std::fmt;
@@ -57,6 +58,7 @@ diagnostic_rules! {
     InvalidHydraParameter => "invalid-hydra-parameter",
     ParameterAlreadyAssigned => "parameter-already-assigned",
     TooManyPositionalArguments => "too-many-positional-arguments",
+    PositionalOnlyParameter => "positional-only-parameter",
 }
 
 impl fmt::Display for DiagnosticRule {
@@ -115,7 +117,7 @@ fn validate_target(
             } else if error_msg.starts_with("Invalid _target_ format:") {
                 (
                     DiagnosticRule::InvalidHydraParameter,
-                    format!("{}. Expected format: 'module.path.SymbolName'", error_msg),
+                    format!("{}. {}", error_msg, target_format_hint(db, target)),
                 )
             } else {
                 (DiagnosticRule::UnresolvedReference, error_msg)
@@ -135,6 +137,38 @@ fn validate_target(
     }
 }
 
+/// The advice that follows an `Invalid _target_ format` error.
+///
+/// A bare name that happens to be a builtin gets the prefixed form instead of
+/// the generic shape: Hydra rejects `{"_target_": "len"}` and instantiates
+/// `{"_target_": "builtins.len"}`, so naming that is far more useful than
+/// telling the user a target needs a dot in it.
+fn target_format_hint(db: &dyn ruff_db::Db, target: TargetString<'_>) -> String {
+    let name = target.value(db);
+    if is_builtin_symbol(db, target) {
+        format!("'{name}' is a Python builtin; use '{BUILTINS_MODULE}.{name}'")
+    } else {
+        "Expected format: 'module.path.SymbolName'".to_string()
+    }
+}
+
+/// Whether `rule` is silenced for `param`.
+///
+/// Checks all three places a `# hydrust: ignore[...]` comment can sit: the file
+/// header, the `_target_` line, and the parameter's own line. A diagnostic that
+/// points at a parameter is one a user will naturally try to silence from that
+/// parameter's line, so the per-parameter set has to be consulted too.
+fn is_suppressed(
+    rule: DiagnosticRule,
+    param: &Parameter,
+    hydra_obj: &HydraObject,
+    file_suppressions: &HashSet<DiagnosticRule>,
+) -> bool {
+    file_suppressions.contains(&rule)
+        || hydra_obj.suppressed_rules.contains(&rule)
+        || param.suppressed_rules().contains(&rule)
+}
+
 /// Validate parameters against a function signature.
 ///
 /// `implicit_param` is the name of the implicit first parameter (e.g. `self` / `cls`)
@@ -149,7 +183,14 @@ fn validate_parameters(
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
 
-    let key_start = hydra_obj.target.key_start;
+    // An overloaded symbol is only represented here by its first declaration,
+    // so its parameter names and arity describe one of several call shapes.
+    // Validating against it would flag arguments that a later overload accepts
+    // — typeshed's `open` has eight, `dict.__init__` another eight — so an
+    // overloaded target is treated as accepting any arguments.
+    if signature.is_overloaded {
+        return diagnostics;
+    }
 
     // Get parameter names from YAML (only keyword params, not positional)
     let param_names: HashSet<String> = hydra_obj
@@ -199,20 +240,72 @@ fn validate_parameters(
     let has_variadic = signature.parameters.iter().any(|p| p.is_variadic);
     let has_kwargs = signature.parameters.iter().any(|p| p.is_variadic_keyword);
 
-    // Check for unknown parameters (only keyword params)
+    // Parameters declared before a `/` cannot be passed by name. They are still
+    // "expected" (so no unknown-argument fires), but Hydra can only reach them
+    // through `_args_`.
+    let positional_only: HashSet<&str> = signature
+        .parameters
+        .iter()
+        .filter(|p| p.is_positional_only && Some(p.name.as_str()) != implicit_param)
+        .map(|p| p.name.as_str())
+        .collect();
+
+    // ...unless the function also takes `**kwargs`, in which case `a=1` on
+    // `def f(a, /, **kw)` is perfectly legal — the value lands in `kw` rather
+    // than in the positional slot. Only the report is suppressed, not the set
+    // itself, which is still what tells the already-assigned check below that
+    // the keyword and the positional argument are not the same binding.
     for param in &hydra_obj.parameters {
-        if let Parameter::Keyword { key, line, .. } = param
-            && !expected_params.contains(key)
+        if let Parameter::Keyword {
+            key,
+            line,
+            key_start,
+            ..
+        } = param
             && !has_kwargs
-            && !file_suppressions.contains(&DiagnosticRule::UnknownArgument)
-            && !hydra_obj
-                .suppressed_rules
-                .contains(&DiagnosticRule::UnknownArgument)
+            && positional_only.contains(key.as_str())
+            && !is_suppressed(
+                DiagnosticRule::PositionalOnlyParameter,
+                param,
+                hydra_obj,
+                file_suppressions,
+            )
         {
             diagnostics.push(create_diagnostic(
                 *line,
-                key_start,
-                key.len() as u32 + key_start,
+                *key_start,
+                key_start + utf16_len(key),
+                DiagnosticSeverity::ERROR,
+                Some(DiagnosticRule::PositionalOnlyParameter),
+                format!(
+                    "Parameter '{}' of '{}' is positional-only; pass it via {}",
+                    key, display_name, ARGS_KEY
+                ),
+            ));
+        }
+    }
+
+    // Check for unknown parameters (only keyword params)
+    for param in &hydra_obj.parameters {
+        if let Parameter::Keyword {
+            key,
+            line,
+            key_start,
+            ..
+        } = param
+            && !expected_params.contains(key)
+            && !has_kwargs
+            && !is_suppressed(
+                DiagnosticRule::UnknownArgument,
+                param,
+                hydra_obj,
+                file_suppressions,
+            )
+        {
+            diagnostics.push(create_diagnostic(
+                *line,
+                *key_start,
+                key_start + utf16_len(key),
                 DiagnosticSeverity::ERROR,
                 Some(DiagnosticRule::UnknownArgument),
                 format!("Unknown parameter '{}' for '{}'", key, display_name),
@@ -222,46 +315,77 @@ fn validate_parameters(
 
     if !hydra_obj.is_partial() {
         for param in &signature.parameters {
+            // A keyword key never fills a positional-only slot: `f(a=1)` on
+            // `def f(a, /, **kw)` still raises "missing 1 required positional
+            // argument". Without `**kwargs` the key is reported above as
+            // `positional-only-parameter`, whose message already points at
+            // `_args_`, so repeating it here would be the same mistake twice;
+            // with `**kwargs` there is no report above — the key is legal, it
+            // just lands in the kwargs dict — so the empty slot is reported here.
+            let accounted_for_by_keyword =
+                param_names.contains(&param.name) && !(param.is_positional_only && has_kwargs);
+
             if param.is_required()
                 && Some(param.name.as_str()) != implicit_param
-                && !param_names.contains(&param.name)
+                && !accounted_for_by_keyword
                 && !positionally_covered.contains(&param.name)
                 && !file_suppressions.contains(&DiagnosticRule::MissingArgument)
                 && !hydra_obj
                     .suppressed_rules
                     .contains(&DiagnosticRule::MissingArgument)
             {
+                // A positional-only parameter has no keyword form, so point at
+                // `_args_` rather than implying a key could be added.
+                let message = if param.is_positional_only {
+                    format!(
+                        "Missing required positional-only parameter '{}' for '{}'; pass it via {}",
+                        param.name, display_name, ARGS_KEY
+                    )
+                } else {
+                    format!(
+                        "Missing required parameter '{}' for '{}'",
+                        param.name, display_name
+                    )
+                };
                 diagnostics.push(create_diagnostic(
                     hydra_obj.target.line,
                     hydra_obj.target.value_start,
                     hydra_obj.target_value_end(),
                     DiagnosticSeverity::ERROR,
                     Some(DiagnosticRule::MissingArgument),
-                    format!(
-                        "Missing required parameter '{}' for '{}'",
-                        param.name, display_name
-                    ),
+                    message,
                 ));
             }
         }
     }
 
-    // Check for parameters provided both positionally via _args_ and as keyword args
+    // Check for parameters provided both positionally via _args_ and as keyword args.
+    // Positional-only names are skipped: they have no keyword form at all, which
+    // the positional-only diagnostic above already says more precisely.
     for param_name in &positionally_covered {
         if param_names.contains(param_name)
-            && let Some(Parameter::Keyword { key, line, .. }) = hydra_obj
+            && !positional_only.contains(param_name.as_str())
+            && let Some(param) = hydra_obj
                 .parameters
                 .iter()
                 .find(|p| matches!(p, Parameter::Keyword { key, .. } if key == param_name))
-            && !file_suppressions.contains(&DiagnosticRule::ParameterAlreadyAssigned)
-            && !hydra_obj
-                .suppressed_rules
-                .contains(&DiagnosticRule::ParameterAlreadyAssigned)
+            && let Parameter::Keyword {
+                key,
+                line,
+                key_start,
+                ..
+            } = param
+            && !is_suppressed(
+                DiagnosticRule::ParameterAlreadyAssigned,
+                param,
+                hydra_obj,
+                file_suppressions,
+            )
         {
             diagnostics.push(create_diagnostic(
                     *line,
-                    key_start,
-                    key.len() as u32 + key_start,
+                    *key_start,
+                    key_start + utf16_len(key),
                     DiagnosticSeverity::ERROR,
                     Some(DiagnosticRule::ParameterAlreadyAssigned),
                     format!(
@@ -305,19 +429,27 @@ fn validate_parameters(
             });
 
             for param_name in unknown {
-                if let Some(Parameter::Keyword { key, line, .. }) = hydra_obj
+                if let Some(param) = hydra_obj
                     .parameters
                     .iter()
                     .find(|p| matches!(p, Parameter::Keyword { key, .. } if key == param_name))
-                    && !file_suppressions.contains(&DiagnosticRule::UnknownArgument)
-                    && !hydra_obj
-                        .suppressed_rules
-                        .contains(&DiagnosticRule::UnknownArgument)
+                    && let Parameter::Keyword {
+                        key,
+                        line,
+                        key_start,
+                        ..
+                    } = param
+                    && !is_suppressed(
+                        DiagnosticRule::UnknownArgument,
+                        param,
+                        hydra_obj,
+                        file_suppressions,
+                    )
                 {
                     diagnostics.push(create_diagnostic(
                         *line,
-                        key_start,
-                        key_start + key.len() as u32,
+                        *key_start,
+                        key_start + utf16_len(key),
                         DiagnosticSeverity::HINT,
                         None,
                         format!("Parameter '{}' will be passed via **kwargs", param_name),
@@ -441,25 +573,35 @@ pub fn validate_document(
             validate_target(target, db, python_config, &suppressions);
         diagnostics.extend(target_diagnostics);
 
-        // Try to resolve the target and validate parameters
-        if let Some(definition_info) = &definition_info {
-            let implicit_param = definition_info.implicit_param();
-            let (signature, display_name) = match definition_info {
-                DefinitionInfo::Function(sig) => (sig, sig.name.clone()),
+        // Try to resolve the target and validate parameters. `None` here means
+        // there is nothing sound to validate against — never that the rest of
+        // the checks below should be skipped.
+        let callable = definition_info.as_ref().and_then(|definition_info| {
+            let signature_and_name = match definition_info {
+                DefinitionInfo::Function(sig) => Some((sig, sig.name.clone())),
                 DefinitionInfo::Class(class_info) => {
-                    // For classes, use the __init__ signature if available
-                    if let Some(init_sig) = &class_info.init_signature {
-                        (init_sig, format!("{}.{}", class_info.name, init_sig.name))
+                    // A `__new__` that only stood in because part of the MRO is
+                    // unresolvable is not a sound thing to validate against —
+                    // the real `__init__` may be in the ancestor we could not
+                    // read. Hover still shows it; diagnostics stay quiet.
+                    if class_info.constructor_is_uncertain() {
+                        None
                     } else {
-                        // Class with no __init__, no parameters to validate
-                        continue;
+                        // For classes, use the __init__ signature if available;
+                        // a class with no constructor has no parameters to check.
+                        class_info.init_signature.as_ref().map(|init_sig| {
+                            (init_sig, format!("{}.{}", class_info.name, init_sig.name))
+                        })
                     }
                 }
                 DefinitionInfo::Method(method_info) => {
-                    (&method_info.signature, method_info.signature.name.clone())
+                    Some((&method_info.signature, method_info.signature.name.clone()))
                 }
             };
+            signature_and_name.map(|(sig, name)| (sig, name, definition_info.implicit_param()))
+        });
 
+        if let Some((signature, display_name, implicit_param)) = callable {
             let parameter_diagnostics = validate_parameters(
                 target,
                 signature,
@@ -583,6 +725,7 @@ mod tests {
                     is_variadic: false,
                     is_variadic_keyword: false,
                     is_keyword_only: false,
+                    is_positional_only: false,
                 },
                 ParameterInfo {
                     name: "required_param".to_string(),
@@ -592,10 +735,12 @@ mod tests {
                     is_variadic: false,
                     is_variadic_keyword: false,
                     is_keyword_only: false,
+                    is_positional_only: false,
                 },
             ],
             return_type: None,
             docstring: None,
+            is_overloaded: false,
             start_line: 1,
             start_column: 1,
             end_line: 1,
@@ -638,9 +783,11 @@ mod tests {
                 is_variadic: false,
                 is_variadic_keyword: false,
                 is_keyword_only: false,
+                is_positional_only: false,
             }],
             return_type: None,
             docstring: None,
+            is_overloaded: false,
             start_line: 1,
             start_column: 1,
             end_line: 1,
@@ -680,6 +827,7 @@ mod tests {
                     is_variadic: false,
                     is_variadic_keyword: false,
                     is_keyword_only: false,
+                    is_positional_only: false,
                 },
                 ParameterInfo {
                     name: "**kwargs".to_string(),
@@ -689,10 +837,12 @@ mod tests {
                     is_variadic: false,
                     is_variadic_keyword: true,
                     is_keyword_only: false,
+                    is_positional_only: false,
                 },
             ],
             return_type: None,
             docstring: None,
+            is_overloaded: false,
             start_line: 1,
             start_column: 1,
             end_line: 1,
@@ -731,6 +881,7 @@ mod tests {
                     is_variadic: false,
                     is_variadic_keyword: false,
                     is_keyword_only: false,
+                    is_positional_only: false,
                 },
                 ParameterInfo {
                     name: "config_path".to_string(),
@@ -740,10 +891,12 @@ mod tests {
                     is_variadic: false,
                     is_variadic_keyword: false,
                     is_keyword_only: false,
+                    is_positional_only: false,
                 },
             ],
             return_type: None,
             docstring: None,
+            is_overloaded: false,
             start_line: 1,
             start_column: 1,
             end_line: 1,
@@ -798,6 +951,7 @@ mod tests {
                     is_variadic: false,
                     is_variadic_keyword: false,
                     is_keyword_only: false,
+                    is_positional_only: false,
                 },
                 ParameterInfo {
                     name: "config_path".to_string(),
@@ -807,10 +961,12 @@ mod tests {
                     is_variadic: false,
                     is_variadic_keyword: false,
                     is_keyword_only: false,
+                    is_positional_only: false,
                 },
             ],
             return_type: None,
             docstring: None,
+            is_overloaded: false,
             start_line: 1,
             start_column: 1,
             end_line: 1,
@@ -847,6 +1003,7 @@ mod tests {
                     is_variadic: false,
                     is_variadic_keyword: false,
                     is_keyword_only: false,
+                    is_positional_only: false,
                 },
                 ParameterInfo {
                     name: "value".to_string(),
@@ -856,10 +1013,12 @@ mod tests {
                     is_variadic: false,
                     is_variadic_keyword: false,
                     is_keyword_only: false,
+                    is_positional_only: false,
                 },
             ],
             return_type: None,
             docstring: None,
+            is_overloaded: false,
             start_line: 1,
             start_column: 1,
             end_line: 1,
@@ -913,6 +1072,7 @@ mod tests {
                     is_variadic: false,
                     is_variadic_keyword: false,
                     is_keyword_only: false,
+                    is_positional_only: false,
                 },
                 ParameterInfo {
                     name: "config_path".to_string(),
@@ -922,10 +1082,12 @@ mod tests {
                     is_variadic: false,
                     is_variadic_keyword: false,
                     is_keyword_only: false,
+                    is_positional_only: false,
                 },
             ],
             return_type: None,
             docstring: None,
+            is_overloaded: false,
             start_line: 1,
             start_column: 1,
             end_line: 1,
@@ -962,9 +1124,11 @@ mod tests {
                 is_variadic: false,
                 is_variadic_keyword: false,
                 is_keyword_only: false,
+                is_positional_only: false,
             }],
             return_type: None,
             docstring: None,
+            is_overloaded: false,
             start_line: 1,
             start_column: 1,
             end_line: 1,
@@ -1169,6 +1333,123 @@ mod tests {
         }
     }
 
+    /// The behaviour `constructor_is_uncertain` exists for: when `__new__` only
+    /// stood in because part of the MRO is unreadable, arguments are not
+    /// validated against it — the real `__init__` may be in the ancestor that is
+    /// missing.
+    #[test]
+    fn test_uncertain_constructor_produces_no_argument_diagnostics() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("mod.py"),
+            concat!(
+                "from not_installed import Widget\n",
+                "\n",
+                "class Thing(Widget):\n",
+                "    def __new__(cls):\n",
+                "        pass\n",
+            ),
+        )
+        .unwrap();
+
+        let vs = 10 + "_target_:".len() as u32 + 1;
+        let parsed_content: ParsedContent = ParsedContent {
+            hydra_objects: vec![build_hydra_object(
+                "mod.Thing",
+                vec![make_param("size", YamlValue::Integer(1), 1)],
+                0,
+                10,
+                vs,
+                false,
+            )],
+            target_line_map: HashMap::new(),
+            param_line_map: HashMap::new(),
+            file_suppressions: HashSet::new(),
+        };
+
+        let (db, config) = test_env(Some(dir.path()));
+        let diagnostics = validate_document(&parsed_content, &HashSet::new(), &db, config);
+        assert!(
+            diagnostics.is_empty(),
+            "`__new__(cls)` may not be the constructor Hydra calls, got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// The same shape with a readable MRO: `__new__` is the constructor, and an
+    /// argument it does not declare is reported.
+    #[test]
+    fn test_certain_constructor_is_validated() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("mod.py"),
+            concat!(
+                "class Widget:\n",
+                "    pass\n",
+                "\n",
+                "class Thing(Widget):\n",
+                "    def __new__(cls):\n",
+                "        pass\n",
+            ),
+        )
+        .unwrap();
+
+        let vs = 10 + "_target_:".len() as u32 + 1;
+        let parsed_content: ParsedContent = ParsedContent {
+            hydra_objects: vec![build_hydra_object(
+                "mod.Thing",
+                vec![make_param("size", YamlValue::Integer(1), 1)],
+                0,
+                10,
+                vs,
+                false,
+            )],
+            target_line_map: HashMap::new(),
+            param_line_map: HashMap::new(),
+            file_suppressions: HashSet::new(),
+        };
+
+        let (db, config) = test_env(Some(dir.path()));
+        let diagnostics = validate_document(&parsed_content, &HashSet::new(), &db, config);
+        assert_eq!(
+            codes(&diagnostics),
+            vec![DiagnosticRule::UnknownArgument.as_code().to_string()],
+        );
+    }
+
+    /// A target with no signature to validate against must not take the rest
+    /// of the checks down with it: `_convert_` is still wrong regardless of
+    /// what `SimpleClass`'s constructor looks like.
+    #[test]
+    fn test_hydra_keywords_validated_for_a_class_with_no_constructor() {
+        let vs = 10 + "_target_:".len() as u32 + 1;
+        let mut target = build_hydra_object("my_module.SimpleClass", Vec::new(), 0, 10, vs, false);
+        target.convert = Some(HydraParameter {
+            value: ConvertMode::None,
+            line: 1,
+            invalid: true,
+            key_start: 2,
+            value_start: 12,
+            value_end: 20,
+        });
+        let parsed_content: ParsedContent = ParsedContent {
+            hydra_objects: vec![target],
+            target_line_map: HashMap::new(),
+            param_line_map: HashMap::new(),
+            file_suppressions: HashSet::new(),
+        };
+
+        let resources_dir = get_simple_test_dir();
+        let (db, config) = test_env(Some(&resources_dir));
+        let diagnostics = validate_document(&parsed_content, &HashSet::new(), &db, config);
+
+        assert!(
+            diagnostics.iter().any(|d| d.message.contains(CONVERT_KEY)),
+            "got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn test_validate_document_with_parameter_validation() {
         let params = vec![make_param("value", YamlValue::Integer(42), 1)];
@@ -1262,6 +1543,7 @@ mod tests {
                     is_variadic: false,
                     is_variadic_keyword: false,
                     is_keyword_only: false,
+                    is_positional_only: false,
                 },
                 ParameterInfo {
                     name: "required_param".to_string(),
@@ -1271,10 +1553,12 @@ mod tests {
                     is_variadic: false,
                     is_variadic_keyword: false,
                     is_keyword_only: false,
+                    is_positional_only: false,
                 },
             ],
             return_type: None,
             docstring: None,
+            is_overloaded: false,
             start_line: 1,
             start_column: 1,
             end_line: 1,
@@ -1310,6 +1594,7 @@ mod tests {
                     is_variadic: false,
                     is_variadic_keyword: false,
                     is_keyword_only: false,
+                    is_positional_only: false,
                 },
                 ParameterInfo {
                     name: "required_param".to_string(),
@@ -1319,10 +1604,12 @@ mod tests {
                     is_variadic: false,
                     is_variadic_keyword: false,
                     is_keyword_only: false,
+                    is_positional_only: false,
                 },
             ],
             return_type: None,
             docstring: None,
+            is_overloaded: false,
             start_line: 1,
             start_column: 1,
             end_line: 1,
@@ -1363,6 +1650,7 @@ mod tests {
                     is_variadic: false,
                     is_variadic_keyword: false,
                     is_keyword_only: false,
+                    is_positional_only: false,
                 },
                 ParameterInfo {
                     name: "required_param".to_string(),
@@ -1372,6 +1660,7 @@ mod tests {
                     is_variadic: false,
                     is_variadic_keyword: false,
                     is_keyword_only: false,
+                    is_positional_only: false,
                 },
                 ParameterInfo {
                     name: "valid_param".to_string(),
@@ -1381,10 +1670,12 @@ mod tests {
                     is_variadic: false,
                     is_variadic_keyword: false,
                     is_keyword_only: false,
+                    is_positional_only: false,
                 },
             ],
             return_type: None,
             docstring: None,
+            is_overloaded: false,
             start_line: 1,
             start_column: 1,
             end_line: 1,
@@ -1401,6 +1692,233 @@ mod tests {
         assert_eq!(diagnostics.len(), 1);
         assert!(diagnostics[0].message.contains("unknown_param"));
         assert!(diagnostics[0].message.contains("Unknown parameter"));
+    }
+
+    // ==================== positional-only tests ====================
+
+    /// Codes of the diagnostics produced, for readable assertions.
+    fn codes(diagnostics: &[Diagnostic]) -> Vec<String> {
+        diagnostics
+            .iter()
+            .map(|d| match &d.code {
+                Some(tower_lsp::lsp_types::NumberOrString::String(c)) => c.clone(),
+                _ => "none".to_string(),
+            })
+            .collect()
+    }
+
+    /// Build a required parameter for a synthetic signature.
+    fn sig_param(name: &str, positional_only: bool, kwargs: bool) -> ParameterInfo {
+        ParameterInfo {
+            name: name.to_string(),
+            type_annotation: None,
+            default_value: None,
+            has_default: false,
+            is_variadic: false,
+            is_variadic_keyword: kwargs,
+            is_keyword_only: false,
+            is_positional_only: positional_only,
+        }
+    }
+
+    fn sig_for(name: &str, parameters: Vec<ParameterInfo>) -> FunctionSignature {
+        FunctionSignature {
+            name: name.to_string(),
+            parameters,
+            return_type: None,
+            docstring: None,
+            is_overloaded: false,
+            start_line: 1,
+            start_column: 1,
+            end_line: 1,
+            end_column: 1,
+        }
+    }
+
+    #[test]
+    fn test_positional_only_passed_by_name_is_reported() {
+        let hydra_obj = build_hydra_object(
+            "mod.f",
+            vec![make_param("a", YamlValue::Integer(1), 1)],
+            0,
+            0,
+            0,
+            false,
+        );
+        let signature = sig_for("f", vec![sig_param("a", true, false)]);
+
+        let diagnostics = validate_parameters(&hydra_obj, &signature, "f", None, &HashSet::new());
+
+        // The one report names the real problem and points at `_args_`; the
+        // parameter is not also reported as missing.
+        assert_eq!(
+            codes(&diagnostics),
+            vec![
+                DiagnosticRule::PositionalOnlyParameter
+                    .as_code()
+                    .to_string()
+            ],
+        );
+    }
+
+    /// `def f(a, /, **kw)` accepts the *key* `a=1` — it lands in `kw` — so
+    /// there is no positional-only report. The positional slot is still empty
+    /// though, which `f(a=1)` raises a `TypeError` for, so it is reported as a
+    /// missing argument that `_args_` has to supply.
+    #[test]
+    fn test_required_positional_only_with_kwargs_is_still_missing() {
+        let hydra_obj = build_hydra_object(
+            "mod.f",
+            vec![make_param("a", YamlValue::Integer(1), 1)],
+            0,
+            0,
+            0,
+            false,
+        );
+        let signature = sig_for(
+            "f",
+            vec![sig_param("a", true, false), sig_param("kw", false, true)],
+        );
+
+        let diagnostics = validate_parameters(&hydra_obj, &signature, "f", None, &HashSet::new());
+
+        assert_eq!(
+            codes(&diagnostics),
+            vec![DiagnosticRule::MissingArgument.as_code().to_string()],
+        );
+        assert!(diagnostics[0].message.contains(ARGS_KEY));
+    }
+
+    /// The same shape with a default: nothing is missing and the key is legal,
+    /// so there is nothing at all to report.
+    #[test]
+    fn test_defaulted_positional_only_with_kwargs_is_clean() {
+        let hydra_obj = build_hydra_object(
+            "mod.f",
+            vec![make_param("a", YamlValue::Integer(1), 1)],
+            0,
+            0,
+            0,
+            false,
+        );
+        let mut a = sig_param("a", true, false);
+        a.has_default = true;
+        let signature = sig_for("f", vec![a, sig_param("kw", false, true)]);
+
+        let diagnostics = validate_parameters(&hydra_obj, &signature, "f", None, &HashSet::new());
+        assert!(diagnostics.is_empty(), "got: {:?}", codes(&diagnostics));
+    }
+
+    /// Columns are UTF-16 code units, so the end of a key is its UTF-16 length,
+    /// not its byte length.
+    #[test]
+    fn test_parameter_diagnostic_range_is_utf16() {
+        let hydra_obj = build_hydra_object(
+            "mod.f",
+            vec![make_param("café", YamlValue::Integer(1), 1)],
+            1,
+            2,
+            13,
+            false,
+        );
+        let signature = sig_for("f", vec![sig_param("a", false, false)]);
+
+        let diagnostics = validate_parameters(&hydra_obj, &signature, "f", None, &HashSet::new());
+        let unknown = &diagnostics[0];
+        assert_eq!(
+            unknown.range.end.character - unknown.range.start.character,
+            4,
+            "`café` is four UTF-16 units, five bytes"
+        );
+    }
+
+    /// A diagnostic anchored to a parameter's line points at that parameter's
+    /// column, not the `_target_` key's — the two only coincide in block style.
+    #[test]
+    fn test_parameter_diagnostics_point_at_the_parameter() {
+        let mut param = make_param("nope", YamlValue::Integer(1), 1);
+        if let Parameter::Keyword { key_start, .. } = &mut param {
+            *key_start = 34;
+        }
+        let hydra_obj = build_hydra_object("mod.f", vec![param], 1, 9, 20, false);
+        let signature = sig_for("f", vec![sig_param("a", false, false)]);
+
+        let diagnostics = validate_parameters(&hydra_obj, &signature, "f", None, &HashSet::new());
+
+        let unknown = diagnostics
+            .iter()
+            .find(|d| {
+                matches!(&d.code, Some(tower_lsp::lsp_types::NumberOrString::String(c))
+                    if c == DiagnosticRule::UnknownArgument.as_code())
+            })
+            .expect("expected an unknown-argument diagnostic");
+        assert_eq!(unknown.range.start.character, 34);
+        assert_eq!(unknown.range.end.character, 34 + "nope".len() as u32);
+    }
+
+    /// `def f(a, /, **kw)` with `_args_: [1]` and `a: 2` binds `a` positionally
+    /// and puts `{'a': 2}` in `kw` — two different bindings, not a conflict.
+    #[test]
+    fn test_positional_only_with_kwargs_is_not_already_assigned() {
+        let mut hydra_obj = build_hydra_object(
+            "mod.f",
+            vec![
+                make_param("a", YamlValue::Integer(2), 1),
+                Parameter::Positional {
+                    value: YamlValue::Integer(1),
+                    line: 2,
+                    value_start: 0,
+                    value_end: 0,
+                    suppressed_rules: HashSet::new(),
+                },
+            ],
+            0,
+            0,
+            0,
+            false,
+        );
+        hydra_obj.args = Some(HydraParameter {
+            value: None,
+            line: 2,
+            invalid: false,
+            key_start: 0,
+            value_start: 0,
+            value_end: 0,
+        });
+        let signature = sig_for(
+            "f",
+            vec![sig_param("a", true, false), sig_param("kw", false, true)],
+        );
+
+        let diagnostics = validate_parameters(&hydra_obj, &signature, "f", None, &HashSet::new());
+        assert!(
+            !diagnostics.iter().any(|d| matches!(
+                &d.code,
+                Some(tower_lsp::lsp_types::NumberOrString::String(c))
+                    if c == DiagnosticRule::ParameterAlreadyAssigned.as_code()
+            )),
+            "got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// An overloaded symbol is only represented by its first declaration, so
+    /// nothing about the arguments can be checked against it.
+    #[test]
+    fn test_overloaded_signature_skips_argument_validation() {
+        let hydra_obj = build_hydra_object(
+            "mod.f",
+            vec![make_param("not_a_param", YamlValue::Integer(1), 1)],
+            0,
+            0,
+            0,
+            false,
+        );
+        let mut signature = sig_for("f", vec![sig_param("a", false, false)]);
+        signature.is_overloaded = true;
+
+        let diagnostics = validate_parameters(&hydra_obj, &signature, "f", None, &HashSet::new());
+        assert!(diagnostics.is_empty(), "got: {diagnostics:?}");
     }
 
     // ==================== DiagnosticRule tests ====================
