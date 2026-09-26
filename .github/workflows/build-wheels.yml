@@ -292,6 +292,7 @@ jobs:
           curl --proto '=https' --tlsv1.2 -LsSf "https://github.com/axodotdev/cargo-dist/releases/download/v$version/cargo-dist-installer.sh" | sh
           dist plan --output-format=json > plan.json
       - name: Compare with the plan
+        shell: bash
         env:
           PLAN: ${{ inputs.plan }}
         run: |
@@ -303,4 +304,5 @@ jobs:
                      or (.value.kind == "checksum" and (.key | test("\\.(tar\\.xz|zip)\\.sha256$"))))
             | .key' <<< "$PLAN" | sort > expected.txt
           find archive -maxdepth 1 \( -name '*.tar.xz' -o -name '*.zip' -o -name '*.sha256' \) -printf '%f\n' | sort > built.txt
+          [ -s expected.txt ] || { echo "::error::no archives in the plan"; exit 1; }
           diff expected.txt built.txt || { echo "::error::built archives do not match the plan"; exit 1; }

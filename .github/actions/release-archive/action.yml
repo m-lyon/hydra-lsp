@@ -34,9 +34,10 @@ runs:
         (cd archive && $check < "$name.$ext.sha256")
         # The extension depends on the layout, not just on the binary being there.
         # The expected list is the packer's own, so this catches a packing failure.
-        sort packed.txt > expected.txt
+        # Both listings come from python, whose stdout adds a CR per line on Windows.
+        tr -d '\r' < packed.txt | sort > expected.txt
         if [ "$ext" = zip ]; then
-          python -c "import sys, zipfile; print('\n'.join(zipfile.ZipFile(sys.argv[1]).namelist()))" "archive/$name.zip" | sed 's:/$::' | sort > members.txt
+          python -c "import sys, zipfile; print('\n'.join(zipfile.ZipFile(sys.argv[1]).namelist()))" "archive/$name.zip" | tr -d '\r' | sed 's:/$::' | sort > members.txt
         else
           tar -tf "archive/$name.tar.xz" | sed 's:/$::' | sort > members.txt
         fi
