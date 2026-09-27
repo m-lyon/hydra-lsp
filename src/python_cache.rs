@@ -508,8 +508,10 @@ pub fn class_parent_docs<'db>(
             all_bases_resolved = false;
             continue;
         };
-        // Lexical normalization only — no `fs::canonicalize` syscall inside this
-        // tracked body (keeps the memo key a pure function of salsa inputs).
+        // Lexical normalization only — the recursive key is derived without a
+        // `fs::canonicalize` syscall, so it stays a pure function of salsa
+        // inputs. (The re-export fallback above does canonicalize, but only for
+        // the resolver's local cycle set; it never feeds the memoised value.)
         // Symlink resolution already happened at root construction; see
         // `normalize_path_for_key`.
         let normalized = normalize_path_for_key(db, &parent_file);
@@ -600,8 +602,10 @@ pub fn class_parent_attribute<'db>(
         else {
             continue;
         };
-        // Lexical normalization only — no `fs::canonicalize` syscall inside this
-        // tracked body (keeps the memo key a pure function of salsa inputs).
+        // Lexical normalization only — the recursive key is derived without a
+        // `fs::canonicalize` syscall, so it stays a pure function of salsa
+        // inputs. (The re-export fallback above does canonicalize, but only for
+        // the resolver's local cycle set; it never feeds the memoised value.)
         // Symlink resolution already happened at root construction; see
         // `normalize_path_for_key`.
         let normalized = normalize_path_for_key(db, &parent_file);

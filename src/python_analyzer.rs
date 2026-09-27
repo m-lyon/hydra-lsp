@@ -1708,7 +1708,7 @@ fn extract_function_signature_from_def(
         return_type,
         docstring,
         // Overload status depends on the sibling statements, which this node
-        // alone cannot see; `extract_signature_with_overloads` fills it in.
+        // alone cannot see; `extract_declared_signature` fills it in.
         is_overloaded: false,
         start_line,
         start_column,
