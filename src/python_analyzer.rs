@@ -1388,6 +1388,9 @@ impl<'a> Visitor<'a> for FunctionExtractor {
     /// descending into any statement, so an enclosing scope wins over a
     /// method of the same name declared earlier in a nested class.
     fn visit_body(&mut self, body: &'a [Stmt]) {
+        if self.result.is_some() {
+            return; // Already found
+        }
         if body.iter().any(|stmt| {
             matches!(stmt, Stmt::FunctionDef(func_def) if func_def.name.as_str() == self.target_name)
         }) {

@@ -21,7 +21,10 @@ A Language Server for [Hydra](https://hydra.cc/) configuration files, written in
   vendored typeshed stubs, so builtins resolve, hover and report unresolved
   targets like any other target. Argument checking is skipped for overloaded
   builtins such as `dict`, `open` and `sorted`, which typeshed declares as
-  several signatures. Other stdlib modules are not yet resolved.
+  several signatures, and for builtin classes whose typeshed bases live outside
+  the vendored gate — `str`, `tuple` and `range` inherit from `typing.Sequence`,
+  which is not resolved, so they hover but stay quiet. Other stdlib modules are
+  not yet resolved.
 - ✅ **Semantic Tokens**: Rich syntax highlighting for Hydra configurations:
   - Module path components (namespace tokens)
   - Class and function names
