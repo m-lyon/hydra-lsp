@@ -77,18 +77,7 @@ fn build_signature_params<'a>(
         .iter()
         .filter(|p| filter_param.is_none_or(|f| p.name != f))
         .collect();
-    let (after_positional_only, before_keyword_only) = PythonAnalyzer::parameter_markers(&filtered);
-
-    let mut param_strs: Vec<String> = Vec::with_capacity(filtered.len() + 2);
-    for (index, param) in filtered.iter().enumerate() {
-        if Some(index) == before_keyword_only {
-            param_strs.push("*".to_string());
-        }
-        param_strs.push(format_param_label(param));
-        if Some(index) == after_positional_only {
-            param_strs.push("/".to_string());
-        }
-    }
+    let param_strs = PythonAnalyzer::render_params(&filtered, format_param_label);
 
     let param_infos: Vec<ParameterInformation> = filtered
         .iter()

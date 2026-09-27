@@ -1179,22 +1179,31 @@ impl PythonAnalyzer {
     }
 
     /// Render a parameter list with the `/` and `*` markers in place — see
-    /// [`PythonAnalyzer::parameter_markers`].
-    fn format_parameters(params: &[ParameterInfo]) -> Vec<String> {
-        let refs: Vec<&ParameterInfo> = params.iter().collect();
-        let (after_positional_only, before_keyword_only) = Self::parameter_markers(&refs);
+    /// [`PythonAnalyzer::parameter_markers`]. Each caller supplies its own
+    /// per-parameter rendering, so marker splicing lives in one place.
+    pub fn render_params(
+        params: &[&ParameterInfo],
+        format_param: impl Fn(&ParameterInfo) -> String,
+    ) -> Vec<String> {
+        let (after_positional_only, before_keyword_only) = Self::parameter_markers(params);
 
         let mut result = Vec::with_capacity(params.len() + 2);
         for (index, param) in params.iter().enumerate() {
             if Some(index) == before_keyword_only {
                 result.push("*".to_string());
             }
-            result.push(Self::format_parameter(param));
+            result.push(format_param(param));
             if Some(index) == after_positional_only {
                 result.push("/".to_string());
             }
         }
         result
+    }
+
+    /// Render a parameter list for hover, with the `/` and `*` markers in place.
+    fn format_parameters(params: &[ParameterInfo]) -> Vec<String> {
+        let refs: Vec<&ParameterInfo> = params.iter().collect();
+        Self::render_params(&refs, Self::format_parameter)
     }
 
     /// Format a function signature for display (e.g., in hover)

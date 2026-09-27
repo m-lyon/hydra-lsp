@@ -744,14 +744,7 @@ fn format_signature_brief(
         .iter()
         .filter(|p| Some(p.name.as_str()) != implicit_param)
         .collect();
-    let (after_positional_only, before_keyword_only) =
-        PythonAnalyzer::parameter_markers(&filtered);
-
-    let mut params: Vec<String> = Vec::with_capacity(filtered.len() + 2);
-    for (index, p) in filtered.iter().enumerate() {
-        if Some(index) == before_keyword_only {
-            params.push("*".to_string());
-        }
+    let params = PythonAnalyzer::render_params(&filtered, |p| {
         let mut s = p.name.clone();
         if let Some(ref ty) = p.type_annotation {
             s.push_str(&format!(": {}", ty));
@@ -759,11 +752,8 @@ fn format_signature_brief(
         if p.has_default {
             s.push_str(" = ...");
         }
-        params.push(s);
-        if Some(index) == after_positional_only {
-            params.push("/".to_string());
-        }
-    }
+        s
+    });
     format!("({})", params.join(", "))
 }
 
