@@ -19,8 +19,10 @@ A Language Server for [Hydra](https://hydra.cc/) configuration files, written in
   - Basic `_target_` format validation
 - ✅ **Builtins**: `_target_: builtins.len` and friends resolve against the
   vendored typeshed stubs, so builtins resolve, hover and report unresolved
-  targets like any other target. Argument checking is skipped for overloaded
-  builtins such as `dict`, `open`, `sorted`, `str` and `range`, which typeshed
+  targets like any other target. Go to Definition does nothing for a builtin
+  target, since the stub has no file on disk to open; hover and diagnostics are
+  unaffected. Argument checking is skipped for overloaded builtins such as
+  `dict`, `open`, `sorted`, `str` and `range`, which typeshed
   declares as several signatures, and for builtin classes whose typeshed bases
   live outside the vendored gate — `tuple` inherits from `typing.Sequence`,
   which is not resolved, so it hovers but stays quiet. Other stdlib modules are
