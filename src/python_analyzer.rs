@@ -1384,18 +1384,19 @@ impl<'a> Visitor<'a> for FunctionExtractor {
     /// Matching is done per *body* rather than per statement so that the
     /// sibling declarations are in scope: a name declared more than once, or
     /// decorated with `@overload`, is overloaded, and only the enclosing body
-    /// can tell. Statement order is otherwise unchanged — each statement is
-    /// still tested before descending into it.
+    /// can tell. The whole body is checked for a direct match before
+    /// descending into any statement, so an enclosing scope wins over a
+    /// method of the same name declared earlier in a nested class.
     fn visit_body(&mut self, body: &'a [Stmt]) {
+        if body.iter().any(|stmt| {
+            matches!(stmt, Stmt::FunctionDef(func_def) if func_def.name.as_str() == self.target_name)
+        }) {
+            self.result = extract_declared_signature(body, &self.target_name, &self.source);
+            return;
+        }
         for stmt in body {
             if self.result.is_some() {
                 return; // Already found
-            }
-            if let Stmt::FunctionDef(func_def) = stmt
-                && func_def.name.as_str() == self.target_name
-            {
-                self.result = extract_declared_signature(body, &self.target_name, &self.source);
-                return;
             }
             self.visit_stmt(stmt);
         }

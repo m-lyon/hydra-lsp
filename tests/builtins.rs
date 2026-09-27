@@ -481,3 +481,29 @@ length:
         "expected no location for a vendored stub, got {res:?}"
     );
 }
+
+#[tokio::test]
+async fn test_module_level_function_wins_over_same_named_method() {
+    // `float.hex` and `str.format` are declared earlier in `builtins.pyi` than
+    // the module-level functions of the same name; the module-level one must win.
+    let content = r#"# @hydra
+a:
+  _target_: builtins.hex
+  _args_: [255]
+b:
+  _target_: builtins.format
+  _args_: ["x"]
+"#;
+    let diagnostics = diagnostics_for("builtin_shadowed.yaml", content).await;
+    assert!(
+        diagnostics.is_empty(),
+        "module-level hex/format should be clean, got: {:?}",
+        summarize(&diagnostics)
+    );
+
+    let hover = hover_for("builtin_hex_hover.yaml", content, 2).await;
+    assert!(
+        hover.contains("number"),
+        "hover should show the module-level hex signature, got: {hover}"
+    );
+}
