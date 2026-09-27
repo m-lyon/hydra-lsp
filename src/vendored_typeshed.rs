@@ -83,8 +83,8 @@ pub fn to_vendored_path(path: &Path) -> Option<VendoredPathBuf> {
 ///
 /// The stub declares a fair amount that no `import builtins` can reach: the
 /// typevars and protocol classes its own annotations are written in (`_T`,
-/// `_KT`, `_SupportsRound1`, `_Opener`) and a few placeholders for types Python
-/// has but does not name (`function`, `ellipsis`). Resolving those would let
+/// `_KT`, `_SupportsRound1`, `_Opener`) and a placeholder for a type Python has
+/// but does not name (`function`). Resolving those would let
 /// `_target_: builtins._SupportsRound1` through with no diagnostic at all, and
 /// Hydra would then fail with `AttributeError` at run time.
 ///

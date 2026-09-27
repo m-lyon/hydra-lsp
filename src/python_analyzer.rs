@@ -114,8 +114,8 @@ pub struct FunctionSignature {
     pub parameters: Vec<ParameterInfo>,
     pub return_type: Option<String>,
     pub docstring: Option<String>,
-    /// Set when the symbol is declared more than once in the same scope, or
-    /// carries an `@overload` decorator.
+    /// Set when the symbol is an `@overload` set with no single implementation
+    /// to validate against (see `resolve_declaration`).
     ///
     /// `parameters` then describes only the *first* declaration, so it is not a
     /// sound basis for argument diagnostics: typeshed gives `open` eight
@@ -406,8 +406,10 @@ impl PythonAnalyzer {
     ///
     /// A declaration marked `@type_check_only` does not count: it exists for the
     /// type checker and has no runtime counterpart. That is how typeshed
-    /// declares `function` and `ellipsis`, neither of which can be reached on
-    /// the real `builtins` module.
+    /// declares `function`, which cannot be reached on the real `builtins`
+    /// module. A stub name re-bound by a plain assignment can still slip
+    /// through, since an assignment carries no decorator to filter on —
+    /// `ellipsis = EllipsisType` is one such case.
     pub fn module_defines_top_level(db: &dyn ruff_db::Db, path: &Path, name: &str) -> bool {
         fn body_binds(body: &[Stmt], name: &str) -> bool {
             body.iter().any(|stmt| match stmt {
@@ -1638,8 +1640,7 @@ fn has_overload_decorator(decorators: &[ast::Decorator]) -> bool {
 /// Check for `@type_check_only`, however `typing.type_check_only` was imported.
 ///
 /// It marks a declaration that exists only for type checkers — typeshed uses it
-/// for `builtins.function` and `builtins.ellipsis`, which no runtime `builtins`
-/// module actually has.
+/// for `builtins.function`, which no runtime `builtins` module actually has.
 fn has_type_check_only_decorator(decorators: &[ast::Decorator]) -> bool {
     has_decorator(decorators, "type_check_only")
 }
