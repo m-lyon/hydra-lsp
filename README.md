@@ -18,8 +18,10 @@ A Language Server for [Hydra](https://hydra.cc/) configuration files, written in
   - Positional-only parameters passed by name instead of through `_args_`
   - Basic `_target_` format validation
 - ✅ **Builtins**: `_target_: builtins.len` and friends resolve against the
-  vendored typeshed stubs, so builtins hover and validate like any other target.
-  Other stdlib modules are not yet resolved.
+  vendored typeshed stubs, so builtins resolve, hover and report unresolved
+  targets like any other target. Argument checking is skipped for overloaded
+  builtins such as `dict`, `open` and `sorted`, which typeshed declares as
+  several signatures. Other stdlib modules are not yet resolved.
 - ✅ **Semantic Tokens**: Rich syntax highlighting for Hydra configurations:
   - Module path components (namespace tokens)
   - Class and function names
