@@ -644,15 +644,22 @@ fn trace_target_resolution(
         hydra_object.target.line + 1
     );
 
-    let search_paths = hydrust::python_cache::search_paths_for_config(db, python_config);
-    match PythonAnalyzer::extract_definition_info(db, &hydra_object.target.value, search_paths) {
-        Ok((def_info, file_path, module_path, symbol_name)) => {
+    let target = hydrust::python_cache::TargetString::new(db, hydra_object.target.value.clone());
+    let cached = hydrust::python_cache::cached_definition_info(db, python_config, target);
+    match cached.get() {
+        Ok(def) => {
+            let (def_info, file_path, module_path, symbol_name) = (
+                &def.definition_info,
+                &def.file_path,
+                &def.module_path,
+                &def.symbol_name,
+            );
             eprintln!("  {} {}", "Module:".dimmed(), module_path);
             eprintln!("  {} {}", "Symbol:".dimmed(), symbol_name);
             eprintln!("  {} {}", "Definition found:".green(), file_path.display());
 
             let implicit_param = def_info.implicit_param();
-            match &def_info {
+            match def_info {
                 hydrust::python_analyzer::DefinitionInfo::Function(sig) => {
                     eprintln!("  {} Function", "Type:".dimmed());
                     eprintln!(
@@ -666,7 +673,7 @@ fn trace_target_resolution(
                     if let Some(ref init_sig) = class_info.init_signature {
                         eprintln!(
                             "  {} {}",
-                            "__init__:".dimmed(),
+                            format!("{}:", init_sig.name).dimmed(),
                             format_signature_brief(init_sig, implicit_param)
                         );
                     } else {
@@ -695,8 +702,7 @@ fn trace_target_resolution(
                 }
             }
         }
-        Err(e) => {
-            let error_msg = e.to_string();
+        Err(error_msg) => {
             if error_msg.starts_with("Invalid _target_ format:")
                 || error_msg.starts_with("Could not resolve module:")
             {
@@ -731,21 +737,21 @@ fn format_signature_brief(
     sig: &hydrust::python_analyzer::FunctionSignature,
     implicit_param: Option<&str>,
 ) -> String {
-    let params: Vec<String> = sig
+    let filtered: Vec<&hydrust::python_analyzer::ParameterInfo> = sig
         .parameters
         .iter()
         .filter(|p| Some(p.name.as_str()) != implicit_param)
-        .map(|p| {
-            let mut s = p.name.clone();
-            if let Some(ref ty) = p.type_annotation {
-                s.push_str(&format!(": {}", ty));
-            }
-            if p.has_default {
-                s.push_str(" = ...");
-            }
-            s
-        })
         .collect();
+    let params = PythonAnalyzer::render_params(&filtered, |p| {
+        let mut s = p.name.clone();
+        if let Some(ref ty) = p.type_annotation {
+            s.push_str(&format!(": {}", ty));
+        }
+        if p.has_default {
+            s.push_str(" = ...");
+        }
+        s
+    });
     format!("({})", params.join(", "))
 }
 

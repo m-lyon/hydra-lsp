@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.6.0]
+
+- Added support for Python builtins as a `_target_`, resolved from the typeshed stubs vendored by `ty_vendored`.
+- Fixed issue where generic base classes didn't resolve, and where re-exported base classes didn't resolve.
+- Added handling for `@overload` decorators: an overloaded symbol is now recorded as such and treated as accepting any arguments.
+- Added support for `__new__` fallback when a class declares no `__init__`.
+- Added `is_positional_only` to parameters, along with a new `positional-only-parameter` diagnostic. Hover now renders the `/` marker (`def len(obj: Sized, /) -> int`), and a positional-only parameter passed by name, or missing entirely, is reported with a message that points at `_args_`.
+- A keyword key no longer satisfies a positional-only parameter when the callee also takes `**kwargs`: `f(a=1)` on `def f(a, /, **kw)` puts the value in `kw` and still raises "missing 1 required positional argument".
+- Fixed parameter diagnostic ranges over-extending on a non-ASCII key.
+- Diagnostics anchored to a parameter's line now point at that parameter's own column rather than the `_target_` key's.
+- An inline `# hydrust: ignore[...]` on a parameter's own line now silences the diagnostics that point at it (`positional-only-parameter`, `unknown-argument`, `parameter-already-assigned`), not just a comment on the file header or the `_target_` line.
+- Signature help now carries the same `/` and `*` markers as hover, and says when it is showing the first of several overloads.
+- Hover now renders the bare `*` that opens a run of keyword-only parameters, alongside the `/` — `def sorted(iterable, /, *, key=None, reverse=False)`.
+- An inline `_args_` flow sequence is now recognised from the value written after the colon rather than inferred from where its entries sit, so `_args_: # see [docs]` above a block sequence is no longer read as a flow sequence starting inside the comment.
+- Fixed a panic when `_args_` contained a nested list or mapping (`_args_: [[1, 2, 3]]`).
+
 ## [0.5.1]
 
 - Consolidate the release pipeline to compile each target once.

@@ -15,6 +15,7 @@ A Language Server for [Hydra](https://hydra.cc/) configuration files, written in
 - ✅ **Diagnostics**: Parameter validation including:
   - Unknown parameters (unless `**kwargs` present)
   - Missing required parameters
+  - Positional-only parameters passed by name instead of through `_args_`
   - Basic `_target_` format validation
 - ✅ **Semantic Tokens**: Rich syntax highlighting for Hydra configurations:
   - Module path components (namespace tokens)

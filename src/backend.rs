@@ -71,7 +71,8 @@ fn build_signature_params<'a>(
         .iter()
         .filter(|p| filter_param.is_none_or(|f| p.name != f))
         .collect();
-    let param_strs: Vec<String> = filtered.iter().map(|p| format_param_label(p)).collect();
+    let param_strs = PythonAnalyzer::render_params(&filtered, format_param_label);
+
     let param_infos: Vec<ParameterInformation> = filtered
         .iter()
         .map(|p| to_parameter_information(p))
@@ -1597,6 +1598,14 @@ impl LanguageServer for HydraLspBackend {
         let result = match extract_result {
             Ok((definition_info, _file_path, _module_path, _symbol_name)) => {
                 let implicit_param = definition_info.implicit_param();
+                let overloaded = match &definition_info {
+                    DefinitionInfo::Function(sig) => sig.is_overloaded,
+                    DefinitionInfo::Class(class_info) => class_info
+                        .init_signature
+                        .as_ref()
+                        .is_some_and(|sig| sig.is_overloaded),
+                    DefinitionInfo::Method(method_info) => method_info.signature.is_overloaded,
+                };
                 let (signature_label, parameters, param_infos) = match &definition_info {
                     DefinitionInfo::Function(sig) => {
                         let (params_str, params, infos) =
@@ -1696,10 +1705,19 @@ impl LanguageServer for HydraLspBackend {
                     }
                 });
 
+                // An overloaded target is shown as one signature but validated
+                // as accepting anything; say which of the two the reader is
+                // looking at rather than presenting it as definitive.
+                let documentation = overloaded.then(|| {
+                    Documentation::String(
+                        "Overloaded: this is the first of several signatures.".to_string(),
+                    )
+                });
+
                 Ok(Some(SignatureHelp {
                     signatures: vec![SignatureInformation {
                         label: signature_label,
-                        documentation: None,
+                        documentation,
                         parameters: if parameters.is_empty() {
                             None
                         } else {
@@ -1771,6 +1789,17 @@ impl LanguageServer for HydraLspBackend {
                 return Ok(None);
             }
         };
+
+        // A definition inside the vendored typeshed archive has no file on disk
+        // to jump to. Hover and diagnostics still work; go-to-definition is a
+        // silent no-op rather than an error the user cannot act on.
+        if crate::vendored_typeshed::is_vendored_path(&file_path) {
+            tracing::debug!(
+                path = %file_path.display(),
+                "goto_definition: target is a vendored stub; nothing to open"
+            );
+            return Ok(None);
+        }
 
         // Convert file path to URI
         let target_uri = match Url::from_file_path(&file_path) {
