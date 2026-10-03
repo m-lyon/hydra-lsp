@@ -1028,6 +1028,7 @@ mod tests {
             return_type: None,
             docstring: None,
             is_overloaded: false,
+            overloads: Vec::new(),
             start_line: 1,
             start_column: 1,
             end_line: 2,
