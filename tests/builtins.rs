@@ -396,10 +396,10 @@ length:
     assert_eq!(sig_help.active_parameter, Some(0));
 }
 
-/// An overloaded target is shown as one signature but validated as accepting
-/// anything, so signature help says which of the two the reader is looking at.
+/// An overloaded target lists every overload, as `ty` does for a call, rather
+/// than presenting the first as if it were the whole story.
 #[tokio::test]
-async fn test_signature_help_notes_overloads() {
+async fn test_signature_help_lists_overloads() {
     let mut ctx = TestContext::new(TestWorkspace::Simple);
     ctx.initialize().await;
 
@@ -430,15 +430,22 @@ handle:
         .await;
 
     let sig_help = res.expect("expected signature help");
-    let documentation = sig_help.signatures[0]
-        .documentation
-        .as_ref()
-        .expect("an overloaded signature should say so");
-    let text = match documentation {
-        Documentation::String(s) => s.clone(),
-        Documentation::MarkupContent(m) => m.value.clone(),
-    };
-    assert!(text.to_lowercase().contains("overload"), "got: {text}");
+    assert!(
+        sig_help.signatures.len() > 1,
+        "every overload of `open` should be listed, got {:?}",
+        sig_help.signatures
+    );
+    assert!(
+        sig_help
+            .signatures
+            .iter()
+            .all(|sig| sig.label.starts_with("open(file: ")),
+        "got: {:?}",
+        sig_help.signatures
+    );
+    // Only the text-mode overload leaves `mode` optional, so it is the one a
+    // bare `file` matches.
+    assert_eq!(sig_help.active_signature, Some(0));
 }
 
 /// A vendored stub has no file on disk, so there is nowhere to jump to.

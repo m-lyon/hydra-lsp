@@ -17,7 +17,7 @@ use salsa::Setter;
 use crate::database::HydraDatabase;
 use crate::diagnostics::{self, DiagnosticRule};
 use crate::outbox::ClientOutbox;
-use crate::python_analyzer::{DefinitionInfo, ParameterInfo, PythonAnalyzer};
+use crate::python_analyzer::{DefinitionInfo, FunctionSignature, ParameterInfo, PythonAnalyzer};
 use crate::python_cache::{self, PythonConfig, TargetString};
 use crate::yaml_cache::{self, DocumentInput, ParsedYaml};
 use crate::yaml_parser::{
@@ -78,6 +78,105 @@ fn build_signature_params<'a>(
         .map(|p| to_parameter_information(p))
         .collect();
     (param_strs.join(", "), param_infos, filtered)
+}
+
+/// Where go-to-definition lands for a target, as
+/// `(start_line, start_col, end_line, end_col)` ranges in one file.
+///
+/// An overloaded function or method lands on each of its (already narrowed)
+/// overloads, and then on the implementation when a `.py` source has one —
+/// the same set `ty` offers for a call. A class always lands on the class
+/// itself, not its constructor.
+fn definition_positions(definition_info: &DefinitionInfo) -> Vec<(u32, u32, u32, u32)> {
+    let signature = match definition_info {
+        DefinitionInfo::Function(sig) => sig,
+        DefinitionInfo::Method(method_info) => &method_info.signature,
+        DefinitionInfo::Class(_) => return vec![definition_info.position()],
+    };
+    if signature.overloads.is_empty() {
+        return vec![definition_info.position()];
+    }
+    let position = |sig: &FunctionSignature| {
+        (
+            sig.start_line,
+            sig.start_column,
+            sig.end_line,
+            sig.end_column,
+        )
+    };
+    let mut positions: Vec<_> = signature.overloads.iter().map(position).collect();
+    if !signature.is_overloaded {
+        positions.push(position(signature));
+    }
+    positions
+}
+
+/// One signature for signature help: `sig` labelled as `label_prefix(...)`,
+/// with the parameter under the cursor active, or a bare `label_prefix()` when
+/// there is no signature (a class with no constructor).
+///
+/// The active index is out of bounds when the cursor's key matches no
+/// parameter, so the client does not default to highlighting the first one.
+fn signature_information(
+    label_prefix: &str,
+    sig: Option<&FunctionSignature>,
+    implicit_param: Option<&str>,
+    param_context: &ResolvedParameterContext,
+    keyword_keys: &[String],
+) -> SignatureInformation {
+    let (params_str, parameters, param_infos) = match sig {
+        Some(sig) => build_signature_params(&sig.parameters, implicit_param),
+        None => (String::new(), vec![], vec![]),
+    };
+
+    let active_parameter = match param_context {
+        ResolvedParameterContext::Keyword(key) => {
+            // Try exact match first, then fall back to **kwargs
+            param_infos
+                .iter()
+                .position(|p| p.name == *key && !p.is_variadic && !p.is_variadic_keyword)
+                .or_else(|| {
+                    // Unknown keyword: highlight **kwargs if present
+                    param_infos.iter().position(|p| p.is_variadic_keyword)
+                })
+                .unwrap_or(parameters.len())
+        }
+        ResolvedParameterContext::Positional(index, num_args_in_yaml) => {
+            // _args_ entries map to positional parameters in order: the idx-th
+            // parameter that can be passed positionally, overflowing into
+            // *args if present.
+            let pos = param_infos
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| !p.is_variadic && !p.is_variadic_keyword && !p.is_keyword_only)
+                .nth(*index as usize)
+                .map(|(i, _)| i)
+                .or_else(|| param_infos.iter().position(|p| p.is_variadic))
+                .unwrap_or(parameters.len());
+            // Don't highlight any parameter when the _args_ list is empty —
+            // there are no actual arguments being passed. Also suppress when
+            // the positional parameter is already specified as a keyword
+            // argument.
+            if *num_args_in_yaml == 0
+                || (pos < param_infos.len() && keyword_keys.contains(&param_infos[pos].name))
+            {
+                parameters.len()
+            } else {
+                pos
+            }
+        }
+    };
+
+    SignatureInformation {
+        label: format!("{label_prefix}({params_str})"),
+        documentation: None,
+        parameters: if parameters.is_empty() {
+            None
+        } else {
+            Some(parameters)
+        },
+        active_parameter: Some(active_parameter as u32),
+    }
 }
 
 /// Declare the per-capability feature toggles once, as
@@ -1384,7 +1483,8 @@ impl LanguageServer for HydraLspBackend {
             .await;
 
         let result = match extract_result {
-            Ok((definition_info, _file_path, _module_path, _symbol_name)) => {
+            Ok((mut definition_info, _file_path, _module_path, _symbol_name)) => {
+                diagnostics::narrow_overloads(&mut definition_info, hydra_object);
                 let hover_content = match definition_info {
                     DefinitionInfo::Function(sig) => PythonAnalyzer::format_function(&sig),
                     DefinitionInfo::Class(class_info) => PythonAnalyzer::format_class(&class_info),
@@ -1591,6 +1691,9 @@ impl LanguageServer for HydraLspBackend {
         else {
             return Ok(None);
         };
+        let Some(hydra_object) = content.hydra_object_for_parameter_line(position) else {
+            return Ok(None);
+        };
 
         // Extract Python definition info on a blocking thread (cached + non-blocking)
         let extract_result = self.spawn_definition_lookup(target_value.clone()).await;
@@ -1598,134 +1701,48 @@ impl LanguageServer for HydraLspBackend {
         let result = match extract_result {
             Ok((definition_info, _file_path, _module_path, _symbol_name)) => {
                 let implicit_param = definition_info.implicit_param();
-                let overloaded = match &definition_info {
-                    DefinitionInfo::Function(sig) => sig.is_overloaded,
-                    DefinitionInfo::Class(class_info) => class_info
-                        .init_signature
-                        .as_ref()
-                        .is_some_and(|sig| sig.is_overloaded),
-                    DefinitionInfo::Method(method_info) => method_info.signature.is_overloaded,
-                };
-                let (signature_label, parameters, param_infos) = match &definition_info {
-                    DefinitionInfo::Function(sig) => {
-                        let (params_str, params, infos) =
-                            build_signature_params(&sig.parameters, implicit_param);
-                        let label = format!("{}({})", sig.name, params_str);
-                        (label, params, infos)
-                    }
-                    DefinitionInfo::Class(class_info) => {
-                        if let Some(init_sig) = &class_info.init_signature {
-                            let (params_str, params, infos) =
-                                build_signature_params(&init_sig.parameters, implicit_param);
-                            let label = format!("{}({})", class_info.name, params_str);
-                            (label, params, infos)
-                        } else {
-                            let label = format!("{}()", class_info.name);
-                            (label, vec![], vec![])
-                        }
-                    }
+                let label_prefix = match &definition_info {
+                    DefinitionInfo::Function(sig) => sig.name.clone(),
+                    DefinitionInfo::Class(class_info) => class_info.name.clone(),
                     DefinitionInfo::Method(method_info) => {
-                        let sig = &method_info.signature;
-                        let (params_str, params, infos) =
-                            build_signature_params(&sig.parameters, implicit_param);
-                        let label =
-                            format!("{}.{}({})", method_info.class_name, sig.name, params_str);
-                        (label, params, infos)
+                        format!("{}.{}", method_info.class_name, method_info.signature.name)
                     }
                 };
+                let call_signature = definition_info.call_signature();
 
-                // Use an out-of-bounds index when the YAML key doesn't match any
-                // parameter, so the client doesn't default to highlighting index 0.
-                let active_parameter = Some(match &param_context {
-                    ResolvedParameterContext::Keyword(key) => {
-                        // Try exact match first, then fall back to **kwargs
-                        parameters
-                            .iter()
-                            .position(|p| match &p.label {
-                                ParameterLabel::Simple(name) => {
-                                    let param_name = name.split(':').next().unwrap_or(name).trim();
-                                    param_name == key.as_str()
-                                }
-                                ParameterLabel::LabelOffsets(_) => false,
-                            })
-                            .or_else(|| {
-                                // Unknown keyword: highlight **kwargs if present
-                                param_infos.iter().position(|p| p.is_variadic_keyword)
-                            })
-                            .unwrap_or(parameters.len()) as u32
-                    }
-                    ResolvedParameterContext::Positional(index, num_args_in_yaml) => {
-                        // _args_ entries map to positional parameters in order.
-                        // Count regular (non-keyword-only, non-variadic) params
-                        // that can be passed positionally.
-                        let positional_count = param_infos
-                            .iter()
-                            .filter(|p| {
-                                !p.is_variadic && !p.is_variadic_keyword && !p.is_keyword_only
-                            })
-                            .count();
-                        let idx = *index as usize;
-                        let pos = if idx < positional_count {
-                            // Map to the idx-th positional parameter
-                            let mut seen = 0usize;
-                            param_infos
-                                .iter()
-                                .position(|p| {
-                                    if !p.is_variadic
-                                        && !p.is_variadic_keyword
-                                        && !p.is_keyword_only
-                                    {
-                                        if seen == idx {
-                                            return true;
-                                        }
-                                        seen += 1;
-                                    }
-                                    false
-                                })
-                                .unwrap_or(parameters.len())
-                        } else {
-                            // Overflow into *args if present
-                            param_infos
-                                .iter()
-                                .position(|p| p.is_variadic)
-                                .unwrap_or(parameters.len())
-                        };
-                        // Don't highlight any parameter when the _args_ list
-                        // is empty — there are no actual arguments being passed.
-                        // Also suppress when the positional parameter is already
-                        // specified as a keyword argument.
-                        (if *num_args_in_yaml == 0
-                            || (pos < param_infos.len()
-                                && keyword_keys.contains(&param_infos[pos].name))
-                        {
-                            parameters.len()
-                        } else {
-                            pos
-                        }) as u32
-                    }
-                });
+                // An overloaded target lists every overload, with the first one
+                // the YAML node's arguments match made active — the shape `ty`
+                // gives a call. Otherwise there is just the one signature, or
+                // a bare `Name()` for a class with no constructor at all.
+                let (shown, active_signature): (Vec<Option<&FunctionSignature>>, usize) =
+                    match call_signature {
+                        Some(sig) if !sig.overloads.is_empty() => (
+                            sig.overloads.iter().map(Some).collect(),
+                            diagnostics::matching_overloads(hydra_object, sig, implicit_param)
+                                .first()
+                                .copied()
+                                .unwrap_or(0),
+                        ),
+                        other => (vec![other], 0),
+                    };
 
-                // An overloaded target is shown as one signature but validated
-                // as accepting anything; say which of the two the reader is
-                // looking at rather than presenting it as definitive.
-                let documentation = overloaded.then(|| {
-                    Documentation::String(
-                        "Overloaded: this is the first of several signatures.".to_string(),
-                    )
-                });
+                let signatures: Vec<SignatureInformation> = shown
+                    .into_iter()
+                    .map(|sig| {
+                        signature_information(
+                            &label_prefix,
+                            sig,
+                            implicit_param,
+                            &param_context,
+                            &keyword_keys,
+                        )
+                    })
+                    .collect();
+                let active_parameter = signatures[active_signature].active_parameter;
 
                 Ok(Some(SignatureHelp {
-                    signatures: vec![SignatureInformation {
-                        label: signature_label,
-                        documentation,
-                        parameters: if parameters.is_empty() {
-                            None
-                        } else {
-                            Some(parameters)
-                        },
-                        active_parameter: None,
-                    }],
-                    active_signature: Some(0),
+                    signatures,
+                    active_signature: Some(active_signature as u32),
                     active_parameter,
                 }))
             }
@@ -1774,10 +1791,10 @@ impl LanguageServer for HydraLspBackend {
         let extract_result = self
             .spawn_definition_lookup(target_info.target.value.clone())
             .await;
-        let (file_path, start_line, start_col, end_line, end_col) = match extract_result {
-            Ok((definition_info, file_path, _module_path, _symbol_name)) => {
-                let (start_line, start_col, end_line, end_col) = definition_info.position();
-                (file_path, start_line, start_col, end_line, end_col)
+        let (file_path, positions) = match extract_result {
+            Ok((mut definition_info, file_path, _module_path, _symbol_name)) => {
+                diagnostics::narrow_overloads(&mut definition_info, &target_info);
+                (file_path, definition_positions(&definition_info))
             }
             Err(e) => {
                 let error_msg = e.to_string();
@@ -1813,19 +1830,27 @@ impl LanguageServer for HydraLspBackend {
             }
         };
 
-        let result = Ok(Some(GotoDefinitionResponse::Scalar(Location {
-            uri: target_uri,
-            range: Range {
-                start: Position {
-                    line: start_line,
-                    character: start_col,
+        let mut locations: Vec<Location> = positions
+            .into_iter()
+            .map(|(start_line, start_col, end_line, end_col)| Location {
+                uri: target_uri.clone(),
+                range: Range {
+                    start: Position {
+                        line: start_line,
+                        character: start_col,
+                    },
+                    end: Position {
+                        line: end_line,
+                        character: end_col,
+                    },
                 },
-                end: Position {
-                    line: end_line,
-                    character: end_col,
-                },
-            },
-        })));
+            })
+            .collect();
+        let result = Ok(Some(if locations.len() == 1 {
+            GotoDefinitionResponse::Scalar(locations.remove(0))
+        } else {
+            GotoDefinitionResponse::Array(locations)
+        }));
         tracing::debug!(
             elapsed_ms = start.elapsed().as_millis() as u64,
             "goto_definition"

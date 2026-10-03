@@ -1,0 +1,9 @@
+---
+source: tests/overloads.rs
+expression: text
+---
+```python
+@overload
+def load(path: str) -> str:
+    """Load a file as text, or as bytes when `binary` is set."""
+```
