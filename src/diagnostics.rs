@@ -137,12 +137,6 @@ fn validate_target(
     }
 }
 
-/// The advice that follows an `Invalid _target_ format` error.
-///
-/// A bare name that happens to be a builtin gets the prefixed form instead of
-/// the generic shape: Hydra rejects `{"_target_": "len"}` and instantiates
-/// `{"_target_": "builtins.len"}`, so naming that is far more useful than
-/// telling the user a target needs a dot in it.
 fn target_format_hint(db: &dyn ruff_db::Db, target: TargetString<'_>) -> String {
     let name = target.value(db);
     if is_builtin_symbol(db, target) {
@@ -152,12 +146,6 @@ fn target_format_hint(db: &dyn ruff_db::Db, target: TargetString<'_>) -> String 
     }
 }
 
-/// Whether `rule` is silenced for `param`.
-///
-/// Checks all three places a `# hydrust: ignore[...]` comment can sit: the file
-/// header, the `_target_` line, and the parameter's own line. A diagnostic that
-/// points at a parameter is one a user will naturally try to silence from that
-/// parameter's line, so the per-parameter set has to be consulted too.
 fn is_suppressed(
     rule: DiagnosticRule,
     param: &Parameter,
@@ -184,10 +172,7 @@ fn validate_parameters(
     let mut diagnostics = Vec::new();
 
     // An overloaded symbol is only represented here by its first declaration,
-    // so its parameter names and arity describe one of several call shapes.
-    // Validating against it would flag arguments that a later overload accepts
-    // — typeshed's `open` has eight, `dict.__init__` another eight — so an
-    // overloaded target is treated as accepting any arguments.
+    // so parameter validation is not correct.
     if signature.is_overloaded {
         return diagnostics;
     }
@@ -239,10 +224,6 @@ fn validate_parameters(
     // Check if function accepts *args or **kwargs
     let has_variadic = signature.parameters.iter().any(|p| p.is_variadic);
     let has_kwargs = signature.parameters.iter().any(|p| p.is_variadic_keyword);
-
-    // Parameters declared before a `/` cannot be passed by name. They are still
-    // "expected" (so no unknown-argument fires), but Hydra can only reach them
-    // through `_args_`.
     let positional_only: HashSet<&str> = signature
         .parameters
         .iter()
@@ -250,11 +231,6 @@ fn validate_parameters(
         .map(|p| p.name.as_str())
         .collect();
 
-    // ...unless the function also takes `**kwargs`, in which case `a=1` on
-    // `def f(a, /, **kw)` is perfectly legal — the value lands in `kw` rather
-    // than in the positional slot. Only the report is suppressed, not the set
-    // itself, which is still what tells the already-assigned check below that
-    // the keyword and the positional argument are not the same binding.
     for param in &hydra_obj.parameters {
         if let Parameter::Keyword {
             key,
@@ -315,13 +291,6 @@ fn validate_parameters(
 
     if !hydra_obj.is_partial() {
         for param in &signature.parameters {
-            // A keyword key never fills a positional-only slot: `f(a=1)` on
-            // `def f(a, /, **kw)` still raises "missing 1 required positional
-            // argument". Without `**kwargs` the key is reported above as
-            // `positional-only-parameter`, whose message already points at
-            // `_args_`, so repeating it here would be the same mistake twice;
-            // with `**kwargs` there is no report above — the key is legal, it
-            // just lands in the kwargs dict — so the empty slot is reported here.
             let accounted_for_by_keyword =
                 param_names.contains(&param.name) && !(param.is_positional_only && has_kwargs);
 
@@ -334,8 +303,6 @@ fn validate_parameters(
                     .suppressed_rules
                     .contains(&DiagnosticRule::MissingArgument)
             {
-                // A positional-only parameter has no keyword form, so point at
-                // `_args_` rather than implying a key could be added.
                 let message = if param.is_positional_only {
                     format!(
                         "Missing required positional-only parameter '{}' for '{}'; pass it via {}",
@@ -360,8 +327,7 @@ fn validate_parameters(
     }
 
     // Check for parameters provided both positionally via _args_ and as keyword args.
-    // Positional-only names are skipped: they have no keyword form at all, which
-    // the positional-only diagnostic above already says more precisely.
+    // Positional-only names are skipped as they have no keyword form at all.
     for param_name in &positionally_covered {
         if param_names.contains(param_name)
             && !positional_only.contains(param_name.as_str())
@@ -574,16 +540,11 @@ pub fn validate_document(
         diagnostics.extend(target_diagnostics);
 
         // Try to resolve the target and validate parameters. `None` here means
-        // there is nothing sound to validate against — never that the rest of
-        // the checks below should be skipped.
+        // there is nothing sound to validate against.
         let callable = definition_info.as_ref().and_then(|definition_info| {
             let signature_and_name = match definition_info {
                 DefinitionInfo::Function(sig) => Some((sig, sig.name.clone())),
                 DefinitionInfo::Class(class_info) => {
-                    // A `__new__` that only stood in because part of the MRO is
-                    // unresolvable is not a sound thing to validate against —
-                    // the real `__init__` may be in the ancestor we could not
-                    // read. Hover still shows it; diagnostics stay quiet.
                     if class_info.constructor_is_uncertain() {
                         None
                     } else {

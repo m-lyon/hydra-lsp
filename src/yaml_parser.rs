@@ -592,15 +592,7 @@ fn last_positioned(node: &MarkedYamlOwned) -> Option<&MarkedYamlOwned> {
 /// carry none — saphyr reports `(0, 0)..(0, 0)` for every sequence and mapping —
 /// so they borrow the line and start column of their first positioned
 /// descendant and the end column of their last, which puts `- [1, 2]` on the
-/// line its `1` is on rather than on the line of whatever contains it. That
-/// matters: a positional argument whose line is wrong is dropped from
-/// `param_line_map` and gets no signature help.
-///
-/// `enclosing` is the last resort, used for an empty `[]` or `{}` where there is
-/// no descendant to ask. Such an entry lands on the enclosing line with a
-/// degenerate `0..0` range — saphyr records nothing at all about it, so there is
-/// nothing better to report. In a block-style `_args_` that means an empty entry
-/// gets no signature help, which is the one case this cannot place correctly.
+/// line its `1` is on rather than on the line of whatever contains it.
 fn node_range(node: &MarkedYamlOwned, lines: &[&str], enclosing: u32) -> (u32, u32, u32) {
     let Some(start_node) = first_positioned(node) else {
         return (enclosing, 0, 0);

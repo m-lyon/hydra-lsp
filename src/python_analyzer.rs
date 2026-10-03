@@ -18,10 +18,6 @@ use ty_python_semantic::{PythonEnvironment, SysPrefixPathOrigin};
 
 /// Intern `path` as a salsa `File`, routing sentinel paths to the vendored
 /// typeshed archive and everything else to the host filesystem.
-///
-/// This is the single place the two file systems are distinguished; every
-/// caller below works in `std::path::Path` terms regardless of where the file
-/// actually lives. See [`crate::vendored_typeshed`] for the sentinel scheme.
 fn path_to_file(db: &dyn ruff_db::Db, path: &Path) -> Option<File> {
     if is_vendored_path(path) {
         return vendored_path_to_file(db, to_vendored_path(path)?).ok();
@@ -39,7 +35,7 @@ fn path_to_file(db: &dyn ruff_db::Db, path: &Path) -> Option<File> {
 /// the path is invalidated on the next request.
 ///
 /// Vendored typeshed paths are probed against the immutable in-binary archive
-/// instead; they can never change, so no invalidation applies.
+/// instead.
 ///
 /// Falls back to an untracked `Path::exists()` only for non-UTF-8 paths, which
 /// cannot be represented as a `SystemPath`.
@@ -94,9 +90,7 @@ pub(crate) fn get_parsed_module(db: &dyn ruff_db::Db, path: &Path) -> Result<Par
 /// Falls back to the original path for non-UTF8 paths that cannot be represented
 /// as a `SystemPath`.
 pub(crate) fn normalize_path_for_key(db: &dyn ruff_db::Db, path: &Path) -> PathBuf {
-    // Vendored sentinel paths are already canonical, and absolutizing one would
-    // prepend the cwd and stop `is_vendored_path` from recognising it when the
-    // key is split back apart (see `class_parent_docs`).
+    // Vendored sentinel paths are already canonical.
     if is_vendored_path(path) {
         return path.to_path_buf();
     }
@@ -114,14 +108,8 @@ pub struct FunctionSignature {
     pub parameters: Vec<ParameterInfo>,
     pub return_type: Option<String>,
     pub docstring: Option<String>,
-    /// Set when the symbol is an `@overload` set with no single implementation
-    /// to validate against (see `resolve_declaration`).
-    ///
-    /// `parameters` then describes only the *first* declaration, so it is not a
-    /// sound basis for argument diagnostics: typeshed gives `open` eight
-    /// overloads and `dict.__init__` eight more, and first-overload-wins would
-    /// report the wrong names and arity. Consumers should treat an overloaded
-    /// symbol as accepting any arguments rather than validating against it.
+    /// Set when the symbol is `@overload`ed - `parameters` then describes only the
+    /// first declaration, so it is not a sound basis for argument diagnostics.
     pub is_overloaded: bool,
     pub start_line: u32,
     pub start_column: u32,
@@ -138,10 +126,6 @@ pub struct ParameterInfo {
     pub is_variadic: bool,         // *args
     pub is_variadic_keyword: bool, // **kwargs
     pub is_keyword_only: bool,
-    /// Declared before a `/` marker, so it can never be passed by name.
-    ///
-    /// Most builtins are shaped this way (`def len(obj: Sized, /) -> int`).
-    /// Hydra can only reach such a parameter through `_args_`.
     pub is_positional_only: bool,
 }
 
@@ -157,28 +141,9 @@ pub struct ClassInfo {
     pub base_classes: Vec<String>,
     pub docstring: Option<String>,
     /// The signature Hydra calls when instantiating the class.
-    ///
-    /// Resolved in Python's own order — the class's own `__init__`, then an
-    /// inherited one, then `__new__` — by
-    /// [`PythonAnalyzer::extract_class_info_with_imports`]. Straight out of
-    /// [`PythonAnalyzer::extract_class_info`] it holds only the class's *own*
-    /// `__init__`, with any `__new__` kept aside in `new_signature` until the
-    /// MRO has been given its turn.
     pub init_signature: Option<FunctionSignature>,
     /// The class's own `__new__`, when it declares one.
-    ///
-    /// Kept separate from `init_signature` so a class that overrides `__new__`
-    /// but inherits its real `__init__` still validates against the inherited
-    /// one. `int`, `str`, `float`, `bool`, `tuple` and `range` declare no
-    /// `__init__` anywhere in their MRO, so for them this is the only
-    /// constructor there is.
     pub new_signature: Option<FunctionSignature>,
-    /// At least one base class along the MRO could not be resolved, so an
-    /// `__init__` declared up there is invisible here.
-    ///
-    /// Set by [`PythonAnalyzer::extract_class_info_with_imports`]; always
-    /// `false` straight out of [`PythonAnalyzer::extract_class_info`], which
-    /// does not walk the MRO at all.
     pub unresolved_base_classes: bool,
     pub start_line: u32,
     pub start_column: u32,
@@ -190,10 +155,7 @@ impl ClassInfo {
     /// Whether `init_signature` might not be the signature Hydra actually calls.
     ///
     /// True only when `__new__` stood in for a missing `__init__` *and* part of
-    /// the MRO could not be resolved: the class may well inherit a real
-    /// `__init__` that this build cannot see, and validating arguments against
-    /// `__new__` would then report the wrong parameters. Hover still shows the
-    /// `__new__` it found, which is better than showing nothing.
+    /// the MRO could not be resolved.
     pub fn constructor_is_uncertain(&self) -> bool {
         self.unresolved_base_classes
             && self
@@ -393,23 +355,6 @@ impl PythonAnalyzer {
     }
 
     /// Whether `name` is bound at module scope in the module at `path`.
-    ///
-    /// Only module-scope bindings count — a method or a nested class with the
-    /// same name does not. Covers `def`, `class` and (annotated) assignment,
-    /// which is every shape a stub uses to expose a name.
-    ///
-    /// `if` branches are followed, because typeshed guards a fair number of
-    /// builtins behind `if sys.version_info >= (3, N):` — `aiter`, `anext` and
-    /// `ExceptionGroup` among them. Whether a name is bound on *this*
-    /// interpreter is not the question being asked; whether it is a builtin at
-    /// all is.
-    ///
-    /// A declaration marked `@type_check_only` does not count: it exists for the
-    /// type checker and has no runtime counterpart. That is how typeshed
-    /// declares `function`, which cannot be reached on the real `builtins`
-    /// module. A stub name re-bound by a plain assignment can still slip
-    /// through, since an assignment carries no decorator to filter on —
-    /// `ellipsis = EllipsisType` is one such case.
     pub fn module_defines_top_level(db: &dyn ruff_db::Db, path: &Path, name: &str) -> bool {
         fn body_binds(body: &[Stmt], name: &str) -> bool {
             body.iter().any(|stmt| match stmt {
@@ -744,8 +689,6 @@ impl PythonAnalyzer {
         current_file: &Path,
         search_paths: &[PathBuf],
     ) -> Option<(PathBuf, String)> {
-        // A generic base is written with its type arguments (`Sequence[_T_co]`,
-        // `typing.Generic[T]`); the class to resolve is the part before them.
         let base_class_expr = base_class_name(base_class_expr);
 
         // Check if it's a qualified name (contains a dot)
@@ -846,10 +789,6 @@ impl PythonAnalyzer {
             class_info.unresolved_base_classes = !parent_docs.all_bases_resolved();
         }
 
-        // `__new__` stands in only once no `__init__` has been found anywhere in
-        // the MRO, mirroring how Python resolves the call. A class that
-        // overrides `__new__` but inherits its real `__init__` keeps validating
-        // against the inherited signature.
         if class_info.init_signature.is_none() {
             class_info.init_signature = class_info.new_signature.take();
         }
@@ -1160,15 +1099,7 @@ impl PythonAnalyzer {
     }
 
     /// Where the markers that say *how* a parameter may be passed belong in
-    /// `params`, as `(after_positional_only, before_keyword_only)` indexes: the
-    /// `/` is written after the first, the bare `*` before the second —
-    /// `def sorted(iterable, /, *, key=None, reverse=False)`.
-    ///
-    /// The `*` is omitted when a `*args` precedes the keyword-only run, since
-    /// `*args` already opens it and `def f(*args, *, key=1)` is not valid Python.
-    ///
-    /// Shared by hover and signature help so the two cannot disagree about a
-    /// parameter that only `_args_` can reach.
+    /// `params`, as `(after_positional_only, before_keyword_only)` indexes.
     pub fn parameter_markers(params: &[&ParameterInfo]) -> (Option<usize>, Option<usize>) {
         let after_positional_only = params.iter().rposition(|p| p.is_positional_only);
         let before_keyword_only = params
@@ -1178,9 +1109,7 @@ impl PythonAnalyzer {
         (after_positional_only, before_keyword_only)
     }
 
-    /// Render a parameter list with the `/` and `*` markers in place — see
-    /// [`PythonAnalyzer::parameter_markers`]. Each caller supplies its own
-    /// per-parameter rendering, so marker splicing lives in one place.
+    /// Render a parameter list with the `/` and `*` markers in place.
     pub fn render_params(
         params: &[&ParameterInfo],
         format_param: impl Fn(&ParameterInfo) -> String,
@@ -1212,7 +1141,7 @@ impl PythonAnalyzer {
         result.push_str("```python\n");
 
         // Only the first overload is shown; say so rather than presenting one
-        // of `open`'s eight signatures as if it were the whole story.
+        // of many signatures as if it were the only one.
         if sig.is_overloaded {
             result.push_str("@overload\n");
         }
@@ -1392,10 +1321,8 @@ impl FunctionExtractor {
 impl<'a> Visitor<'a> for FunctionExtractor {
     /// Matching is done per *body* rather than per statement so that the
     /// sibling declarations are in scope: a name declared more than once, or
-    /// decorated with `@overload`, is overloaded, and only the enclosing body
-    /// can tell. The whole body is checked for a direct match before
-    /// descending into any statement, so an enclosing scope wins over a
-    /// method of the same name declared earlier in a nested class.
+    /// decorated with `@overload`, is overloaded, and this is only discernible through
+    /// the enclosing body.
     fn visit_body(&mut self, body: &'a [Stmt]) {
         if self.result.is_some() {
             return; // Already found
@@ -1576,11 +1503,6 @@ impl<'a> Visitor<'a> for MethodExtractor {
 /// The class named by a base-class expression, with any generic subscript
 /// removed: `Sequence[_T_co]` is `Sequence` and `typing.Generic[T]` is
 /// `typing.Generic`.
-///
-/// Without this, no generic base resolves at all — the resolver would look for a
-/// module or symbol literally called `Sequence[_T_co]` — so an `__init__`
-/// inherited through one would be invisible, and every generic-based class
-/// would look like it had an unreadable MRO.
 pub(crate) fn base_class_name(base_class_expr: &str) -> &str {
     base_class_expr
         .split('[')
@@ -1591,19 +1513,6 @@ pub(crate) fn base_class_name(base_class_expr: &str) -> &str {
 
 /// The declaration of `name` in `body` that describes the callable actually
 /// called, plus whether it is an overload set with no single signature.
-///
-/// Only an explicit `@overload` decorator makes a set: being declared twice does
-/// not, since `@property` with its `@x.setter` and `@singledispatch` with its
-/// `@f.register` both declare one name repeatedly without being overloads, and
-/// treating those as overloads would disable argument validation for the target
-/// entirely. Typing requires `@overload` on every member of a real set, so
-/// nothing is lost by the stricter rule.
-///
-/// A `.py` source ends an overload set with the undecorated implementation,
-/// whose signature is the one Hydra will call — that one is preferred and is
-/// not reported as overloaded. A `.pyi` stub has no implementation, so only the
-/// `@overload` declarations exist and there is no single signature to check
-/// against.
 fn resolve_declaration<'a>(
     body: &'a [Stmt],
     name: &str,
@@ -1633,7 +1542,7 @@ fn resolve_declaration<'a>(
 }
 
 /// The signature of `name` as declared in `body`, resolved through any
-/// `@overload` set — see [`resolve_declaration`].
+/// `@overload` set.
 fn extract_declared_signature(
     body: &[Stmt],
     name: &str,
@@ -1651,9 +1560,6 @@ fn has_overload_decorator(decorators: &[ast::Decorator]) -> bool {
 }
 
 /// Check for `@type_check_only`, however `typing.type_check_only` was imported.
-///
-/// It marks a declaration that exists only for type checkers — typeshed uses it
-/// for `builtins.function`, which no runtime `builtins` module actually has.
 fn has_type_check_only_decorator(decorators: &[ast::Decorator]) -> bool {
     has_decorator(decorators, "type_check_only")
 }
@@ -1720,8 +1626,6 @@ fn extract_function_signature_from_def(
         parameters,
         return_type,
         docstring,
-        // Overload status depends on the sibling statements, which this node
-        // alone cannot see; `extract_declared_signature` fills it in.
         is_overloaded: false,
         start_line,
         start_column,

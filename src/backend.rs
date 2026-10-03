@@ -63,12 +63,6 @@ fn to_parameter_information(p: &ParameterInfo) -> ParameterInformation {
 /// Build signature label and parameter information from a list of parameters.
 /// Returns the label string, the LSP parameter info list, and the filtered
 /// `ParameterInfo` references (needed for active-parameter resolution).
-///
-/// The label carries the same `/` and `*` markers hover shows, so signature help
-/// does not read as an invitation to write `obj:` for a parameter that only
-/// `_args_` can reach. They go into the label string alone — `param_infos` stays
-/// one entry per real parameter, which is what the active-parameter index and
-/// the `ParameterLabel::Simple` name matching are built on.
 fn build_signature_params<'a>(
     params: &'a [ParameterInfo],
     filter_param: Option<&str>,

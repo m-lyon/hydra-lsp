@@ -9,7 +9,7 @@
 //!
 //! # Sentinel paths
 //!
-//! Module resolution throughout the crate speaks `std::path::Path`, and the
+//! Module resolution throughout the crate uses `std::path::Path`, however the
 //! vendored stubs are not on disk. Rather than thread a `FilePath` enum through
 //! every resolver signature, vendored files are addressed by a sentinel path
 //! rooted at [`VENDORED_ROOT`]: `<typeshed>/stdlib/builtins.pyi`. Such a path
@@ -87,12 +87,6 @@ pub fn to_vendored_path(path: &Path) -> Option<VendoredPathBuf> {
 /// but does not name (`function`). Resolving those would let
 /// `_target_: builtins._SupportsRound1` through with no diagnostic at all, and
 /// Hydra would then fail with `AttributeError` at run time.
-///
-/// The `@type_check_only` placeholders are filtered where the stub is scanned
-/// (see [`PythonAnalyzer::module_defines_top_level`](crate::python_analyzer::PythonAnalyzer::module_defines_top_level));
-/// this covers the rest by name. A leading underscore marks a stub-internal
-/// name — except on a dunder, since `__import__` and `__build_class__` are
-/// genuine builtins.
 pub fn is_runtime_builtin_name(name: &str) -> bool {
     if !name.starts_with('_') {
         return true;
@@ -134,13 +128,8 @@ pub fn vendored_module_name(path: &Path) -> Option<String> {
 /// Whether module resolution may fall through to the vendored search root for
 /// `module_path`.
 ///
-/// Wiring in typeshed makes the whole stdlib reachable, but issue #34 is scoped
-/// to builtins: enabling every stdlib module at once widens the blast radius of
-/// stub-shaped constructs (`@overload`, `__new__`, positional-only parameters,
-/// typeshed's `VERSIONS` gating) well beyond what its acceptance criteria
-/// cover. Resolution is therefore gated to `builtins` and its submodules, and
-/// broadening the gate is a one-line change once the rest of the stdlib has
-/// been evaluated on its own.
+/// Wiring in typeshed makes the whole stdlib reachable, but only builtins is relevant
+/// for hydra, therefore only `builtins` and its submodules are admitted.
 pub fn is_vendored_module(module_path: &str) -> bool {
     module_path == BUILTINS_MODULE
         || module_path

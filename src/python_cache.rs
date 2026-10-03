@@ -165,9 +165,7 @@ pub fn search_paths_for_config(db: &dyn ruff_db::Db, config: PythonConfig) -> Ve
 /// Uses `lru = 1024` to bound memory across large workspaces.
 ///
 /// When nothing on the real search path matches, resolution falls through to
-/// the vendored typeshed stubs — currently only for `builtins`, see
-/// [`is_vendored_module`]. The fallback is last so a first-party or installed
-/// `builtins.py` still wins, matching how Python itself would import it.
+/// the vendored typeshed stubs for `builtins`, see [`is_vendored_module`].
 #[salsa::tracked(returns(ref), lru = 1024)]
 pub fn resolve_module_cached<'db>(
     db: &'db dyn ruff_db::Db,
@@ -204,13 +202,6 @@ pub fn resolve_module_cached<'db>(
 
 /// Whether the runtime module `module` exposes `symbol`, according to its
 /// vendored stub.
-///
-/// Backs two things: the bare-name `_target_` error, which becomes a message
-/// naming the prefixed form Hydra actually accepts (`len` is rejected,
-/// `builtins.len` works), and the guard in [`cached_definition_info`] that keeps
-/// stub-internal names from resolving as targets. The stubs are immutable and
-/// shared by every workspace, so the query takes no search paths and its memo
-/// survives for the life of the database.
 #[salsa::tracked]
 pub fn vendored_module_exposes<'db>(
     db: &'db dyn ruff_db::Db,
@@ -218,10 +209,8 @@ pub fn vendored_module_exposes<'db>(
     symbol: TargetString<'db>,
 ) -> bool {
     let module = module.value(db);
-    // The same gate `resolve_module_cached` applies, so the two cannot disagree
-    // about what the archive exposes. `is_runtime_builtin_name`'s underscore
-    // rule is a builtins convention, and widening the gate must be a deliberate
-    // decision about this check as well.
+    // The same gate `resolve_module_cached` applies, so the two don't disagree
+    // about what the archive exposes.
     if !is_vendored_module(module) {
         return false;
     }
@@ -236,17 +225,11 @@ pub fn vendored_module_exposes<'db>(
     else {
         return false;
     };
-    // Top-level only: the extractors walk nested scopes, so asking them would
-    // also match methods such as `list.count` and suggest a `builtins.count`
-    // that does not exist.
+
     PythonAnalyzer::module_defines_top_level(db, &stub, symbol)
 }
 
 /// Whether `name` is a symbol the runtime `builtins` module exposes.
-///
-/// Thin wrapper over [`vendored_module_exposes`] for the bare-name `_target_`
-/// hint, which is only ever about builtins — Hydra accepts a dotted target for
-/// anything else.
 pub fn is_builtin_symbol<'db>(db: &'db dyn ruff_db::Db, name: TargetString<'db>) -> bool {
     vendored_module_exposes(db, TargetString::new(db, BUILTINS_MODULE.to_string()), name)
 }
@@ -277,18 +260,8 @@ pub fn cached_definition_info<'db>(
     let search_paths = search_paths_for_config(db, config);
     let mut result = PythonAnalyzer::extract_definition_info(db, target_str, search_paths);
 
-    // The vendored stub declares names the runtime `builtins` module does not
-    // have — typevars, protocol classes, `@type_check_only` placeholders. They
-    // extract perfectly well, so without this the server would green-light a
-    // `_target_: builtins._SupportsRound1` that fails with `AttributeError` the
-    // moment Hydra tries to instantiate it. Only stub resolutions are checked;
-    // a workspace's own `builtins.py` is its author's business.
     if let Ok((_, file_path, _, _)) = &result
         && let Some(module) = vendored_module_name(file_path)
-        // The name looked up on the module is the segment right after the
-        // module's own name in the target; the rest is an attribute of it.
-        // Taken from the target rather than the returned symbol name, which is
-        // qualified for some resolution paths and bare for others.
         && let Some(root_symbol) = target_str
             .strip_prefix(&module)
             .and_then(|rest| rest.strip_prefix('.'))
@@ -364,11 +337,6 @@ impl ClassParentDocs {
     }
 
     /// Whether every base class along the walked MRO was found.
-    ///
-    /// `false` means an ancestor could not be resolved — an uninstalled
-    /// dependency, an unresolved re-export — so an `__init__` it declares is
-    /// invisible here, and the absence of one must not be read as proof that
-    /// the class has none.
     pub fn all_bases_resolved(&self) -> bool {
         self.inner.all_bases_resolved
     }
@@ -443,11 +411,6 @@ pub fn class_parent_docs<'db>(
     let class_info = match PythonAnalyzer::extract_class_info(db, file_path, class_name) {
         Ok(class_info) => class_info,
         Err(_) => {
-            // The name may be a re-export rather than a definition:
-            // `resolve_base_class` resolves only the *module* of a qualified
-            // base, so `pkg.Widget` lands on `pkg/__init__.py` even when the
-            // class body lives in `pkg/impl.py`. Follow the re-export one hop
-            // and continue the walk there.
             return match ImportResolver::new(db, &search_paths_vec)
                 .resolve_symbol(file_path, class_name)
             {
@@ -458,8 +421,6 @@ pub fn class_parent_docs<'db>(
                         resolved_name
                     };
                     let normalized = normalize_path_for_key(db, &resolved_file);
-                    // A re-export pointing back at this very key would spin;
-                    // treat it as unreadable instead of recursing.
                     if normalized == file_path && resolved_name == class_name {
                         return ClassParentDocs::new(None, None, None, false);
                     }
@@ -469,10 +430,6 @@ pub fn class_parent_docs<'db>(
                     );
                     class_parent_docs(db, resolved_key, search_paths)
                 }
-                // The class body was never read, so an `__init__` declared here
-                // or further up is invisible. Calling the MRO resolved would
-                // green-light validating against a `__new__` fallback that may
-                // not be the real constructor.
                 None => ClassParentDocs::new(None, None, None, false),
             };
         }
@@ -482,20 +439,17 @@ pub fn class_parent_docs<'db>(
     let mut init = class_info.init_signature;
     let mut new_signature = class_info.new_signature;
 
-    // `new_signature` deliberately does not gate the walk: once an `__init__`
-    // is in hand, `__new__` is never consulted, so there is nothing left to find.
     if docstring.is_some() && init.is_some() {
         return ClassParentDocs::new(docstring, init, new_signature, true);
     }
 
     // Tracks whether the walk saw the whole hierarchy. Only meaningful when it
-    // finds no `__init__` — see `ClassParentDocs::all_bases_resolved`.
+    // finds no `__init__`.
     let mut all_bases_resolved = true;
 
     for base_class in &class_info.base_classes {
         // Bases that exist only for the type system contribute no constructor
-        // and no docstring, and never resolve; skipping them keeps them out of
-        // `all_bases_resolved` too.
+        // and no docstring.
         if matches!(
             base_class_name(base_class),
             "object" | "ABC" | "Protocol" | "Generic"
@@ -511,7 +465,7 @@ pub fn class_parent_docs<'db>(
         // Lexical normalization only — the recursive key is derived without a
         // `fs::canonicalize` syscall, so it stays a pure function of salsa
         // inputs. (The re-export fallback above does canonicalize, but only for
-        // the resolver's local cycle set; it never feeds the memoised value.)
+        // the resolver's local cycle set; it does not feed the memoised value.)
         // Symlink resolution already happened at root construction; see
         // `normalize_path_for_key`.
         let normalized = normalize_path_for_key(db, &parent_file);
@@ -545,8 +499,6 @@ fn class_parent_docs_cycle(
     _class_key: TargetString,
     _search_paths: InternedSearchPaths,
 ) -> ClassParentDocs {
-    // A circular hierarchy is invalid Python; reporting the bases as resolved
-    // keeps the cycle from also disabling the `__new__` fallback.
     ClassParentDocs::new(None, None, None, true)
 }
 

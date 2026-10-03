@@ -644,8 +644,6 @@ fn trace_target_resolution(
         hydra_object.target.line + 1
     );
 
-    // Share one source of truth with the diagnostics printed for the same run:
-    // this routes through the stub-internal-name guard and the salsa memo.
     let target = hydrust::python_cache::TargetString::new(db, hydra_object.target.value.clone());
     let cached = hydrust::python_cache::cached_definition_info(db, python_config, target);
     match cached.get() {
