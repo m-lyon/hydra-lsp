@@ -462,6 +462,61 @@ fn validate_parameters(
     diagnostics
 }
 
+/// Whether `signature` accepts the arguments `hydra_obj` passes: its keys,
+/// its `_args_` count and, unless it is `_partial_`, every required parameter.
+///
+/// This is [`validate_parameters`] with no suppressions, so an overload is
+/// matched by exactly the rules a non-overloaded target is validated by. Only
+/// the call shape is compared, not argument types — ty narrows on those too,
+/// but YAML values carry too little type information for it (see #14).
+fn accepts_arguments(
+    hydra_obj: &HydraObject,
+    signature: &FunctionSignature,
+    implicit_param: Option<&str>,
+) -> bool {
+    validate_parameters(hydra_obj, signature, "", implicit_param, &HashSet::new())
+        .iter()
+        .all(|d| d.severity != Some(DiagnosticSeverity::ERROR))
+}
+
+/// The indices into `signature.overloads` of the overloads `hydra_obj`'s
+/// arguments match, in source order.
+pub fn matching_overloads(
+    hydra_obj: &HydraObject,
+    signature: &FunctionSignature,
+    implicit_param: Option<&str>,
+) -> Vec<usize> {
+    signature
+        .overloads
+        .iter()
+        .enumerate()
+        .filter(|(_, overload)| accepts_arguments(hydra_obj, overload, implicit_param))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Narrow the overloads of `definition`'s call signature to those matching
+/// `hydra_obj`, the way `ty` narrows them to a call's arguments.
+///
+/// When none match — mid-edit, say, before a required key is typed — every
+/// overload is kept, so the reader still sees what the target accepts.
+pub fn narrow_overloads(definition: &mut DefinitionInfo, hydra_obj: &HydraObject) {
+    let implicit_param = definition.implicit_param().map(str::to_owned);
+    let Some(signature) = definition.call_signature_mut() else {
+        return;
+    };
+    let matching = matching_overloads(hydra_obj, signature, implicit_param.as_deref());
+    if matching.is_empty() {
+        return;
+    }
+    let mut index = 0;
+    signature.overloads.retain(|_| {
+        let keep = matching.contains(&index);
+        index += 1;
+        keep
+    });
+}
+
 /// Validate Hydra keyword values (_partial_, _recursive_, _convert_, _args_).
 fn validate_hydra_keywords(
     hydra_obj: &HydraObject,
@@ -741,6 +796,7 @@ mod tests {
             return_type: None,
             docstring: None,
             is_overloaded: false,
+            overloads: Vec::new(),
             start_line: 1,
             start_column: 1,
             end_line: 1,
@@ -788,6 +844,7 @@ mod tests {
             return_type: None,
             docstring: None,
             is_overloaded: false,
+            overloads: Vec::new(),
             start_line: 1,
             start_column: 1,
             end_line: 1,
@@ -843,6 +900,7 @@ mod tests {
             return_type: None,
             docstring: None,
             is_overloaded: false,
+            overloads: Vec::new(),
             start_line: 1,
             start_column: 1,
             end_line: 1,
@@ -897,6 +955,7 @@ mod tests {
             return_type: None,
             docstring: None,
             is_overloaded: false,
+            overloads: Vec::new(),
             start_line: 1,
             start_column: 1,
             end_line: 1,
@@ -967,6 +1026,7 @@ mod tests {
             return_type: None,
             docstring: None,
             is_overloaded: false,
+            overloads: Vec::new(),
             start_line: 1,
             start_column: 1,
             end_line: 1,
@@ -1019,6 +1079,7 @@ mod tests {
             return_type: None,
             docstring: None,
             is_overloaded: false,
+            overloads: Vec::new(),
             start_line: 1,
             start_column: 1,
             end_line: 1,
@@ -1088,6 +1149,7 @@ mod tests {
             return_type: None,
             docstring: None,
             is_overloaded: false,
+            overloads: Vec::new(),
             start_line: 1,
             start_column: 1,
             end_line: 1,
@@ -1129,6 +1191,7 @@ mod tests {
             return_type: None,
             docstring: None,
             is_overloaded: false,
+            overloads: Vec::new(),
             start_line: 1,
             start_column: 1,
             end_line: 1,
@@ -1559,6 +1622,7 @@ mod tests {
             return_type: None,
             docstring: None,
             is_overloaded: false,
+            overloads: Vec::new(),
             start_line: 1,
             start_column: 1,
             end_line: 1,
@@ -1610,6 +1674,7 @@ mod tests {
             return_type: None,
             docstring: None,
             is_overloaded: false,
+            overloads: Vec::new(),
             start_line: 1,
             start_column: 1,
             end_line: 1,
@@ -1676,6 +1741,7 @@ mod tests {
             return_type: None,
             docstring: None,
             is_overloaded: false,
+            overloads: Vec::new(),
             start_line: 1,
             start_column: 1,
             end_line: 1,
@@ -1728,6 +1794,7 @@ mod tests {
             return_type: None,
             docstring: None,
             is_overloaded: false,
+            overloads: Vec::new(),
             start_line: 1,
             start_column: 1,
             end_line: 1,
