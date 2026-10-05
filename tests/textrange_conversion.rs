@@ -232,13 +232,13 @@ def test_function(x: int) -> int:
 
     let db = HydraDatabase::new(SystemPath::new("/"));
     let search_paths = vec![workspace_root.to_path_buf(), PathBuf::from(".")];
-    let (def_info, _file_path, _module_path, _symbol_name) =
-        PythonAnalyzer::extract_definition_info(
-            &db,
-            "workspace.test_module.test_function",
-            &search_paths,
-        )
-        .unwrap();
+    let def_info = PythonAnalyzer::extract_definition_info(
+        &db,
+        "workspace.test_module.test_function",
+        &search_paths,
+    )
+    .unwrap()
+    .definition_info;
 
     match def_info {
         DefinitionInfo::Function(sig) => {
@@ -274,13 +274,13 @@ class TestClass:
 
     let db = HydraDatabase::new(SystemPath::new("/"));
     let search_paths = vec![workspace_root.to_path_buf(), PathBuf::from(".")];
-    let (def_info, _file_path, _module_path, _symbol_name) =
-        PythonAnalyzer::extract_definition_info(
-            &db,
-            "workspace.test_class_module.TestClass",
-            &search_paths,
-        )
-        .unwrap();
+    let def_info = PythonAnalyzer::extract_definition_info(
+        &db,
+        "workspace.test_class_module.TestClass",
+        &search_paths,
+    )
+    .unwrap()
+    .definition_info;
 
     match def_info {
         DefinitionInfo::Class(class_info) => {

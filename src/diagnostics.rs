@@ -1,4 +1,4 @@
-use crate::python_analyzer::{DefinitionInfo, FunctionSignature, ParameterInfo};
+use crate::python_analyzer::{DefinitionInfo, FunctionSignature, ParameterInfo, ResolveError};
 use crate::python_cache::{PythonConfig, TargetString, cached_definition_info, is_builtin_symbol};
 use crate::vendored_typeshed::BUILTINS_MODULE;
 use crate::yaml_parser::{
@@ -110,17 +110,13 @@ fn validate_target(
     let cached = cached_definition_info(db, python_config, target);
     match cached.get() {
         Ok(def) => (diagnostics, Some(def.definition_info.clone())),
-        Err(error_msg) => {
-            let error_msg = error_msg.to_string();
-            let (rule, msg) = if error_msg.starts_with("Could not resolve module:") {
-                (DiagnosticRule::UnresolvedImport, error_msg)
-            } else if error_msg.starts_with("Invalid _target_ format:") {
-                (
-                    DiagnosticRule::InvalidHydraParameter,
-                    format!("{}. {}", error_msg, target_format_hint(db, target)),
-                )
-            } else {
-                (DiagnosticRule::UnresolvedReference, error_msg)
+        Err(err) => {
+            let rule = err.rule();
+            let msg = match err {
+                ResolveError::InvalidFormat(_) => {
+                    format!("{}. {}", err, target_format_hint(db, target))
+                }
+                ResolveError::UnresolvedModule(_) | ResolveError::Other(_) => err.to_string(),
             };
             if !file_suppressions.contains(&rule) && !hydra_obj.suppressed_rules.contains(&rule) {
                 diagnostics.push(create_diagnostic(
@@ -133,6 +129,20 @@ fn validate_target(
                 ));
             }
             (diagnostics, None)
+        }
+    }
+}
+
+impl ResolveError {
+    /// The diagnostic rule a failed `_target_` lookup is reported under.
+    ///
+    /// Lives here rather than beside `ResolveError` so `python_analyzer` does
+    /// not depend on `diagnostics`.
+    pub fn rule(&self) -> DiagnosticRule {
+        match self {
+            ResolveError::InvalidFormat(_) => DiagnosticRule::InvalidHydraParameter,
+            ResolveError::UnresolvedModule(_) => DiagnosticRule::UnresolvedImport,
+            ResolveError::Other(_) => DiagnosticRule::UnresolvedReference,
         }
     }
 }
@@ -667,6 +677,32 @@ mod tests {
             value_end: 0,
             suppressed_rules: HashSet::new(),
         }
+    }
+
+    // ==================== ResolveError::rule tests ====================
+
+    #[test]
+    fn test_resolve_error_rule_invalid_format() {
+        assert_eq!(
+            ResolveError::InvalidFormat("Foo".to_string()).rule(),
+            DiagnosticRule::InvalidHydraParameter
+        );
+    }
+
+    #[test]
+    fn test_resolve_error_rule_unresolved_module() {
+        assert_eq!(
+            ResolveError::UnresolvedModule("no_such".to_string()).rule(),
+            DiagnosticRule::UnresolvedImport
+        );
+    }
+
+    #[test]
+    fn test_resolve_error_rule_other() {
+        assert_eq!(
+            ResolveError::Other("Symbol 'X' not found in module 'm'".to_string()).rule(),
+            DiagnosticRule::UnresolvedReference
+        );
     }
 
     // ==================== validate_parameters tests ====================

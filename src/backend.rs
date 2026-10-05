@@ -17,8 +17,8 @@ use salsa::Setter;
 use crate::database::HydraDatabase;
 use crate::diagnostics::{self, DiagnosticRule};
 use crate::outbox::ClientOutbox;
-use crate::python_analyzer::{DefinitionInfo, ParameterInfo, PythonAnalyzer};
-use crate::python_cache::{self, PythonConfig, TargetString};
+use crate::python_analyzer::{DefinitionInfo, ParameterInfo, PythonAnalyzer, ResolveError};
+use crate::python_cache::{self, PythonConfig, ResolvedDefinition, TargetString};
 use crate::yaml_cache::{self, DocumentInput, ParsedYaml};
 use crate::yaml_parser::{
     ARGS_KEY, CONVERT_KEY, CompletionContext, ConvertMode, HydraSemanticToken, PARTIAL_KEY,
@@ -673,12 +673,17 @@ impl HydraLspBackend {
     ///
     /// On cache hits the blocking thread returns almost immediately; on misses
     /// it performs the full analysis without holding any locks.
+    ///
+    /// Failures that are not about the target itself (no session yet, a
+    /// superseded or panicked lookup) come back as `ResolveError::Other`.
     async fn spawn_definition_lookup(
         &self,
         target_value: String,
-    ) -> anyhow::Result<(DefinitionInfo, std::path::PathBuf, String, String)> {
+    ) -> std::result::Result<ResolvedDefinition, ResolveError> {
+        let superseded =
+            || ResolveError::Other("definition lookup superseded by a newer edit".to_string());
         let Some(snapshot) = self.snapshot() else {
-            anyhow::bail!("session not initialized")
+            return Err(ResolveError::Other("session not initialized".to_string()));
         };
         let SessionSnapshot { db, python_config } = snapshot;
 
@@ -686,15 +691,7 @@ impl HydraLspBackend {
             let start = Instant::now();
             let target = TargetString::new(&db, target_value);
             let cached = python_cache::cached_definition_info(&db, python_config, target);
-            let result = match cached.get() {
-                Ok(def) => Ok((
-                    def.definition_info.clone(),
-                    def.file_path.clone(),
-                    def.module_path.clone(),
-                    def.symbol_name.clone(),
-                )),
-                Err(e) => Err(anyhow::anyhow!("{}", e)),
-            };
+            let result = cached.get().cloned().map_err(Clone::clone);
             tracing::debug!(
                 elapsed_us = start.elapsed().as_micros() as u64,
                 target = target.value(&db),
@@ -707,18 +704,33 @@ impl HydraLspBackend {
         .map_or_else(
             // Sender dropped without sending (e.g. pool shutdown); treat like
             // cancellation — the request is stale.
-            |_| anyhow::bail!("definition lookup superseded by a newer edit"),
+            |_| Err(superseded()),
             |outcome| match outcome {
                 PoolOutcome::Completed(result) => result,
-                PoolOutcome::Cancelled => {
-                    anyhow::bail!("definition lookup superseded by a newer edit")
-                }
+                PoolOutcome::Cancelled => Err(superseded()),
                 PoolOutcome::Panicked(msg) => {
                     tracing::error!(%msg, "definition lookup panicked");
-                    anyhow::bail!("definition lookup panicked: {msg}")
+                    Err(ResolveError::Other(format!(
+                        "definition lookup panicked: {msg}"
+                    )))
                 }
             },
         )
+    }
+
+    /// Log a failed `spawn_definition_lookup` for hover, signature help or
+    /// go-to-definition, which then return no result.
+    ///
+    /// A malformed `_target_` is logged as an error; every other failure as a
+    /// warning, prefixed with `context` when one is given.
+    fn log_lookup_failure(&self, err: &ResolveError, context: Option<&str>) {
+        match (err, context) {
+            (ResolveError::InvalidFormat(_), _) => self.outbox.log(MessageType::ERROR, err),
+            (_, Some(context)) => self
+                .outbox
+                .log(MessageType::WARNING, format!("{context}: {err}")),
+            (_, None) => self.outbox.log(MessageType::WARNING, err),
+        }
     }
 
     /// Look up the cached `parsed_yaml` result for a URI, but only if the
@@ -1384,7 +1396,9 @@ impl LanguageServer for HydraLspBackend {
             .await;
 
         let result = match extract_result {
-            Ok((definition_info, _file_path, _module_path, _symbol_name)) => {
+            Ok(ResolvedDefinition {
+                definition_info, ..
+            }) => {
                 let hover_content = match definition_info {
                     DefinitionInfo::Function(sig) => PythonAnalyzer::format_function(&sig),
                     DefinitionInfo::Class(class_info) => PythonAnalyzer::format_class(&class_info),
@@ -1412,13 +1426,8 @@ impl LanguageServer for HydraLspBackend {
                 }))
             }
             Err(e) => {
-                // If Python analysis fails, don't show any hover, but log a warning
-                let err_msg = e.to_string();
-                if err_msg.starts_with("Invalid _target_ format:") {
-                    self.outbox.log(MessageType::ERROR, err_msg);
-                } else {
-                    self.outbox.log(MessageType::WARNING, err_msg);
-                }
+                // If Python analysis fails, don't show any hover, but log it
+                self.log_lookup_failure(&e, None);
                 Ok(None)
             }
         };
@@ -1596,7 +1605,9 @@ impl LanguageServer for HydraLspBackend {
         let extract_result = self.spawn_definition_lookup(target_value.clone()).await;
 
         let result = match extract_result {
-            Ok((definition_info, _file_path, _module_path, _symbol_name)) => {
+            Ok(ResolvedDefinition {
+                definition_info, ..
+            }) => {
                 let implicit_param = definition_info.implicit_param();
                 let overloaded = match &definition_info {
                     DefinitionInfo::Function(sig) => sig.is_overloaded,
@@ -1730,15 +1741,7 @@ impl LanguageServer for HydraLspBackend {
                 }))
             }
             Err(e) => {
-                let err_msg = e.to_string();
-                if err_msg.starts_with("Invalid _target_ format:") {
-                    self.outbox.log(MessageType::ERROR, err_msg);
-                } else {
-                    self.outbox.log(
-                        MessageType::WARNING,
-                        format!("Python analysis failed for signature help: {}", e),
-                    );
-                }
+                self.log_lookup_failure(&e, Some("Python analysis failed for signature help"));
                 Ok(None)
             }
         };
@@ -1775,17 +1778,16 @@ impl LanguageServer for HydraLspBackend {
             .spawn_definition_lookup(target_info.target.value.clone())
             .await;
         let (file_path, start_line, start_col, end_line, end_col) = match extract_result {
-            Ok((definition_info, file_path, _module_path, _symbol_name)) => {
+            Ok(ResolvedDefinition {
+                definition_info,
+                file_path,
+                ..
+            }) => {
                 let (start_line, start_col, end_line, end_col) = definition_info.position();
                 (file_path, start_line, start_col, end_line, end_col)
             }
             Err(e) => {
-                let error_msg = e.to_string();
-                if error_msg.starts_with("Invalid _target_ format:") {
-                    self.outbox.log(MessageType::ERROR, error_msg);
-                } else {
-                    self.outbox.log(MessageType::WARNING, error_msg);
-                }
+                self.log_lookup_failure(&e, None);
                 return Ok(None);
             }
         };

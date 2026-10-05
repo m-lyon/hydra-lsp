@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use crate::import_resolver::{ImportResolver, join_module_parts};
 use crate::python_analyzer::{
-    ClassAttributeInfo, DefinitionInfo, FunctionSignature, PythonAnalyzer, base_class_name,
-    normalize_path_for_key,
+    ClassAttributeInfo, DefinitionInfo, FunctionSignature, PythonAnalyzer, ResolveError,
+    base_class_name, normalize_path_for_key,
 };
 use crate::vendored_typeshed::{
     BUILTINS_MODULE, is_runtime_builtin_name, is_vendored_module, stdlib_search_root,
@@ -62,7 +62,7 @@ pub struct InternedSearchPaths {
 
 /// Successfully resolved Python definition data.
 #[derive(Clone)]
-pub struct CachedDefinition {
+pub struct ResolvedDefinition {
     pub definition_info: DefinitionInfo,
     pub file_path: PathBuf,
     pub module_path: String,
@@ -75,28 +75,19 @@ pub struct CachedDefinition {
 /// to satisfy salsa's Update requirements without expensive deep comparison.
 #[derive(Clone)]
 pub struct CachedDefinitionResult {
-    inner: Arc<Result<CachedDefinition, String>>,
+    inner: Arc<Result<ResolvedDefinition, ResolveError>>,
 }
 
 impl CachedDefinitionResult {
-    fn from_result(result: anyhow::Result<(DefinitionInfo, PathBuf, String, String)>) -> Self {
+    fn from_result(result: Result<ResolvedDefinition, ResolveError>) -> Self {
         Self {
-            inner: Arc::new(
-                result
-                    .map(|(def, path, module, symbol)| CachedDefinition {
-                        definition_info: def,
-                        file_path: path,
-                        module_path: module,
-                        symbol_name: symbol,
-                    })
-                    .map_err(|e| e.to_string()),
-            ),
+            inner: Arc::new(result),
         }
     }
 
     /// Get the cached result.
-    pub fn get(&self) -> Result<&CachedDefinition, &str> {
-        self.inner.as_ref().as_ref().map_err(|e| e.as_str())
+    pub fn get(&self) -> Result<&ResolvedDefinition, &ResolveError> {
+        self.inner.as_ref().as_ref()
     }
 }
 
@@ -260,8 +251,8 @@ pub fn cached_definition_info<'db>(
     let search_paths = search_paths_for_config(db, config);
     let mut result = PythonAnalyzer::extract_definition_info(db, target_str, search_paths);
 
-    if let Ok((_, file_path, _, _)) = &result
-        && let Some(module) = vendored_module_name(file_path)
+    if let Ok(def) = &result
+        && let Some(module) = vendored_module_name(&def.file_path)
         && let Some(root_symbol) = target_str
             .strip_prefix(&module)
             .and_then(|rest| rest.strip_prefix('.'))
@@ -272,11 +263,10 @@ pub fn cached_definition_info<'db>(
             TargetString::new(db, root_symbol.to_string()),
         )
     {
-        result = Err(anyhow::anyhow!(
+        result = Err(ResolveError::Other(format!(
             "Symbol '{}' not found in module '{}'",
-            root_symbol,
-            module
-        ));
+            root_symbol, module
+        )));
     }
 
     CachedDefinitionResult::from_result(result)
@@ -944,8 +934,8 @@ mod tests {
     #[test]
     fn test_cached_definition_result_equality() {
         // Two separately-created results should not be pointer-equal
-        let r1 = CachedDefinitionResult::from_result(Err(anyhow::anyhow!("err")));
-        let r2 = CachedDefinitionResult::from_result(Err(anyhow::anyhow!("err")));
+        let r1 = CachedDefinitionResult::from_result(Err(ResolveError::Other("err".into())));
+        let r2 = CachedDefinitionResult::from_result(Err(ResolveError::Other("err".into())));
         assert!(r1 != r2);
 
         // Cloned result should be pointer-equal
