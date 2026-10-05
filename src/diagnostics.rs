@@ -431,8 +431,10 @@ fn validate_parameters(
 /// Whether `signature` accepts the arguments `hydra_obj` passes: its keys,
 /// its `_args_` count and, unless it is `_partial_`, every required parameter.
 ///
-/// This is [`validate_parameters`] with no suppressions, so an overload is
-/// matched by exactly the rules a non-overloaded target is validated by. Only
+/// This is [`validate_parameters`] with no file-level suppressions, so an
+/// overload is matched by exactly the rules a non-overloaded target is
+/// validated by. Suppressions on the node or a parameter line still apply, so
+/// an overload whose only error is silenced there counts as a match. Only
 /// the call shape is compared, not argument types — ty narrows on those too,
 /// but YAML values carry too little type information for it (see #14).
 fn accepts_arguments(
