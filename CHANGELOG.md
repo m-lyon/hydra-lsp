@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.7.0]
+
+- Internal refactor of the analysis and server code, with no change to diagnostics, rule codes or settings. Unused dependencies were removed.
+
 ## [0.6.0]
 
 - Added support for Python builtins as a `_target_`, resolved from the typeshed stubs vendored by `ty_vendored`.
