@@ -1485,44 +1485,12 @@ impl LanguageServer for HydraLspBackend {
                 // TODO: Implement module/class completion
                 tracing::debug!(%partial, "target completion requested");
 
-                // Ok(Some(CompletionResponse::Array(vec![
-                //     CompletionItem {
-                //         label: "example.module.Class".to_string(),
-                //         kind: Some(CompletionItemKind::CLASS),
-                //         detail: Some("Example class (placeholder)".to_string()),
-                //         ..Default::default()
-                //     },
-                //     CompletionItem {
-                //         label: "example.module.function".to_string(),
-                //         kind: Some(CompletionItemKind::FUNCTION),
-                //         detail: Some("Example function (placeholder)".to_string()),
-                //         ..Default::default()
-                //     },
-                // ])))
                 Ok(None) // Placeholder: no completions yet
             }
             CompletionContext::ParameterKey { target, partial } => {
                 // TODO: Resolve target and get parameter completions
                 tracing::debug!(%target, %partial, "parameter completion requested");
 
-                // For demonstration, return some placeholder parameters
-                // Ok(Some(CompletionResponse::Array(vec![
-                //     CompletionItem {
-                //         label: "param1".to_string(),
-                //         kind: Some(CompletionItemKind::PROPERTY),
-                //         detail: Some("int - Example parameter".to_string()),
-                //         documentation: Some(Documentation::String(
-                //             "A placeholder parameter".to_string(),
-                //         )),
-                //         ..Default::default()
-                //     },
-                //     CompletionItem {
-                //         label: "param2".to_string(),
-                //         kind: Some(CompletionItemKind::PROPERTY),
-                //         detail: Some("str - Example parameter".to_string()),
-                //         ..Default::default()
-                //     },
-                // ])))
                 Ok(None) // Placeholder: no completions yet
             }
             CompletionContext::ParameterValue {
@@ -2128,7 +2096,7 @@ fn build_diagnostic_report(
 /// `numThreads` is every thread the server runs, not every thread it hands to
 /// the pools: the async runtime's thread is one of them, so the pools get
 /// `numThreads - RUNTIME_THREADS`. The runtime's thread is not itself
-/// configurable: it is fixed at startup (see `serve` in `main.rs`), because the
+/// configurable: it is fixed at startup (see `serve` in `server.rs`), because the
 /// setting only arrives with `initialize`, by which time the runtime is running.
 /// It is the process's main thread rather than a spawned one, and the client
 /// outbox shares it rather than adding another.
@@ -2287,7 +2255,7 @@ const RUNTIME_THREADS: usize = 1;
 const DEFAULT_NUM_THREADS: usize = DEFAULT_POOL_THREADS + RUNTIME_THREADS;
 
 /// How many LSP messages `tower_lsp` will have handlers in flight for at once,
-/// passed to `Server::concurrency_level` in `main.rs`.
+/// passed to `Server::concurrency_level` in `server.rs`.
 ///
 /// This, not the pool sizes, is what caps parallel analysis. Every handler that
 /// does real work hands exactly one job to a rayon pool and awaits it, so

@@ -63,7 +63,7 @@ impl ruff_db::Db for HydraDatabase {
     /// affects ruff_db queries that branch on `db.python_version()` (parser
     /// dialect, semantic resolution rules in third-party crates). Pointing the
     /// LSP at a Python 3.10 interpreter still gets the latest dialect's
-    /// behavior. Tracked as a follow-up in `CACHING_IMPLEMENTATION_PLAN.md`.
+    /// behavior.
     fn python_version(&self) -> PythonVersion {
         PythonVersion::latest_ty()
     }

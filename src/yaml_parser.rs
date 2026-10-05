@@ -163,19 +163,6 @@ pub enum YamlValue {
     Mapping(LinkedHashMap<String, YamlValue>),
 }
 
-impl YamlValue {
-    pub fn as_bool(&self) -> Option<bool> {
-        match self {
-            YamlValue::Bool(b) => Some(*b),
-            _ => None,
-        }
-    }
-
-    pub fn is_mapping(&self) -> bool {
-        matches!(self, YamlValue::Mapping(_))
-    }
-}
-
 /// Error type for YAML parsing
 #[derive(Debug)]
 pub enum YamlParseError {

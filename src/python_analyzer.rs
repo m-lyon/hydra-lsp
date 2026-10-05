@@ -1241,7 +1241,7 @@ impl PythonAnalyzer {
         result
     }
 
-    /// Format a function definition string (placeholder for future use)
+    /// Format a function definition string
     fn format_definition(
         def_str: &str,
         name: &str,
@@ -1251,7 +1251,6 @@ impl PythonAnalyzer {
         docstring: Option<&String>,
         indent: Option<usize>,
     ) -> String {
-        // Placeholder for future implementation
         let mut result = String::new();
         let indent_str = " ".repeat(indent.unwrap_or(0));
         let single_line_params = if param_strs.is_empty() && !wrap_empty_params {
@@ -1298,24 +1297,10 @@ impl PythonAnalyzer {
 }
 
 /// Visitor to extract function signatures from AST
-pub struct FunctionExtractor {
+struct FunctionExtractor {
     target_name: String,
     result: Option<FunctionSignature>,
     source: String,
-}
-
-impl FunctionExtractor {
-    pub fn new(target_name: String, source: String) -> Self {
-        Self {
-            target_name,
-            result: None,
-            source,
-        }
-    }
-
-    pub fn get_result(self) -> Option<FunctionSignature> {
-        self.result
-    }
 }
 
 impl<'a> Visitor<'a> for FunctionExtractor {
@@ -1352,24 +1337,10 @@ impl<'a> Visitor<'a> for FunctionExtractor {
 }
 
 /// Visitor to extract class information from AST
-pub struct ClassExtractor {
+struct ClassExtractor {
     target_name: String,
     source: String,
     result: Option<ClassInfo>,
-}
-
-impl ClassExtractor {
-    pub fn new(target_name: String, source: String) -> Self {
-        Self {
-            target_name,
-            source,
-            result: None,
-        }
-    }
-
-    pub fn get_result(self) -> Option<ClassInfo> {
-        self.result
-    }
 }
 
 impl<'a> Visitor<'a> for ClassExtractor {
