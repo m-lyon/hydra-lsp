@@ -819,9 +819,6 @@ impl HydraLspBackend {
 
     /// Log a failed `spawn_definition_lookup` for hover, signature help or
     /// go-to-definition, which then return no result.
-    ///
-    /// A malformed `_target_` is logged as an error; every other failure as a
-    /// warning, prefixed with `context` when one is given.
     fn log_lookup_failure(&self, err: &ResolveError, context: Option<&str>) {
         match (err, context) {
             (ResolveError::InvalidFormat(_), _) => self.outbox.log(MessageType::ERROR, err),

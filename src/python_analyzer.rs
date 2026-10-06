@@ -185,12 +185,6 @@ pub enum DefinitionInfo {
 }
 
 /// Why a `_target_` string could not be resolved to a Python definition.
-///
-/// The variants are exactly the kinds callers branch on: diagnostics pick a
-/// rule from them (see `ResolveError::rule` in `diagnostics.rs`), and hover,
-/// go-to-definition, signature help and `hydrust check --trace` pick a log
-/// level or severity. `Display` reproduces the message text these errors had
-/// when they were plain strings, which diagnostics and CLI output depend on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolveError {
     /// The target has no `.` separating a module from a symbol. Holds the
