@@ -1,6 +1,6 @@
 use crate::import_resolver::ImportResolver;
 use crate::python_cache::{
-    InternedSearchPaths, ResolvedDefinition, TargetString, class_parent_attribute,
+    InternedSearchPaths, ResolvedDefinition, TargetString, class_key, class_parent_attribute,
     class_parent_docs, resolve_module_cached,
 };
 use crate::vendored_typeshed::{is_vendored_path, to_vendored_path};
@@ -585,9 +585,7 @@ impl PythonAnalyzer {
             // Try to get the attribute as a class attribute (with inheritance support).
             // The salsa-tracked class_parent_attribute memoises each (class, attr) pair so
             // shared parent classes are only walked once per revision.
-            let normalized = normalize_path_for_key(db, &current_file);
-            let class_key =
-                TargetString::new(db, format!("{}::{}", normalized.display(), current_class));
+            let class_key = class_key(db, &current_file, &current_class);
             let attr_key = TargetString::new(db, attr.to_string());
             let cached_attr = class_parent_attribute(db, class_key, attr_key, interned_sp);
             match cached_attr.get() {
@@ -857,11 +855,7 @@ impl PythonAnalyzer {
         // class_parent_docs walks the MRO recursively and caches results per (class, search_paths),
         // so shared parent classes across different child-class lookups are resolved only once.
         if class_info.docstring.is_none() || class_info.init_signature.is_none() {
-            let normalized_path = normalize_path_for_key(db, &resolved_file);
-            let class_key = TargetString::new(
-                db,
-                format!("{}::{}", normalized_path.display(), class_info.name),
-            );
+            let class_key = class_key(db, &resolved_file, &class_info.name);
             let interned_sp = InternedSearchPaths::new(db, search_paths.to_vec());
             let parent_docs = class_parent_docs(db, class_key, interned_sp);
 
