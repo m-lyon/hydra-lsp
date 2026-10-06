@@ -28,12 +28,7 @@ pub enum SemanticTokenType {
     Number,    // Numeric values
 }
 
-/// Declares the semantic-token legend once and derives from it the legend
-/// advertised in `initialize` and `SemanticTokenType::to_index`/`from_index`.
-///
-/// Each row is `index => LSP_TYPE` with an optional `=> Variant`; a row with
-/// no variant is advertised but never emitted. The indexes must run 0, 1, 2…
-/// in order, which a compile-time check enforces.
+/// Declares the semantic-token legend once and derives from it a legend.
 macro_rules! semantic_token_legend {
     ($($index:literal => $lsp:ident $(=> $variant:ident)?),* $(,)?) => {
         /// The semantic-token legend, in the order clients index it by.
@@ -68,8 +63,6 @@ macro_rules! semantic_token_legend {
     };
 }
 
-// The order is protocol: clients decode token types by position. Append new
-// rows; never reorder or renumber. `VARIABLE` is advertised but unused.
 semantic_token_legend! {
     0 => NAMESPACE => Namespace,
     1 => CLASS => Class,

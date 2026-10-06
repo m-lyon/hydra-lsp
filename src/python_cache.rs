@@ -62,8 +62,6 @@ pub(crate) fn class_key<'db>(
 }
 
 /// Split a key built by [`class_key`] back into its file and class name.
-///
-/// Splits on the *last* `::`: a class name cannot contain one, a path can.
 fn parse_class_key(key: &str) -> Option<(&Path, &str)> {
     let (file, class) = key.rsplit_once("::")?;
     Some((Path::new(file), class))
