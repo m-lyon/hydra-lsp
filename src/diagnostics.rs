@@ -390,10 +390,6 @@ fn validate_parameters(
     if has_kwargs && !param_names.is_subset(&expected_params) {
         let unknown: Vec<_> = param_names.difference(&expected_params).collect();
         if !unknown.is_empty() {
-            diagnostics.retain(|d| {
-                !matches!(&d.code, Some(tower_lsp::lsp_types::NumberOrString::String(code)) if code == DiagnosticRule::UnknownArgument.as_code())
-            });
-
             for param_name in unknown {
                 if let Some(param) = hydra_obj
                     .parameters

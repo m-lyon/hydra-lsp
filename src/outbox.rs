@@ -55,7 +55,7 @@ impl ClientOutbox {
     /// # Panics
     ///
     /// Panics if called outside a tokio runtime, because it spawns a task.
-    /// The backend is only ever built inside `Runtime::block_on` (`main.rs`)
+    /// The backend is only ever built inside `Runtime::block_on` (`server.rs`)
     /// or inside a `#[tokio::test]` (`tests/common`), so this holds.
     pub fn spawn(client: Client) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();

@@ -37,16 +37,12 @@ enum ImportInfo {
     FromImport {
         module: String,
         name: String,
-        _alias: Option<String>,
         level: u32, // For relative imports: 0 = absolute, 1 = '.', 2 = '..', etc.
     },
     /// `from module import *`
     StarImport { module: String, level: u32 },
     /// `import module` or `import module as alias`
-    Import {
-        module: String,
-        _alias: Option<String>,
-    },
+    Import { module: String },
 }
 
 /// Context for import resolution operations
@@ -363,7 +359,6 @@ impl<'db, 'sp> ImportResolver<'db, 'sp> {
             ImportInfo::FromImport {
                 module,
                 name,
-                _alias: _,
                 level,
             } => {
                 let module_file = if *level > 0 {
@@ -384,7 +379,7 @@ impl<'db, 'sp> ImportResolver<'db, 'sp> {
                 };
                 Some((module_file, String::new()))
             }
-            ImportInfo::Import { module, .. } => {
+            ImportInfo::Import { module } => {
                 let module_file = self.resolve_module_path(module)?;
                 Some((module_file, String::new()))
             }
@@ -443,15 +438,12 @@ impl<'a> Visitor<'a> for ImportFinder {
 
                 for alias in &import_from.names {
                     let name = alias.name.as_str();
-                    let asname = alias.asname.as_ref().map(|a| a.as_str().to_string());
-
                     // Check if this alias matches our target (either by name or alias)
-                    let local_name = asname.as_deref().unwrap_or(name);
+                    let local_name = alias.asname.as_ref().map_or(name, |a| a.as_str());
                     if local_name == self.target_symbol {
                         self.result = Some(ImportInfo::FromImport {
                             module: module.clone(),
                             name: name.to_string(),
-                            _alias: asname,
                             level,
                         });
                         return;
@@ -461,13 +453,11 @@ impl<'a> Visitor<'a> for ImportFinder {
             Stmt::Import(import) => {
                 for alias in &import.names {
                     let module = alias.name.as_str();
-                    let asname = alias.asname.as_ref().map(|a| a.as_str().to_string());
-                    let local_name = asname.as_deref().unwrap_or(module);
+                    let local_name = alias.asname.as_ref().map_or(module, |a| a.as_str());
 
                     if local_name == self.target_symbol {
                         self.result = Some(ImportInfo::Import {
                             module: module.to_string(),
-                            _alias: asname,
                         });
                         return;
                     }

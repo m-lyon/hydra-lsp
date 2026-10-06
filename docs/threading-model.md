@@ -36,7 +36,7 @@ the third is about threads.
                                            fewer on a machine with < 6 CPUs
 ```
 
-1. **One runtime thread.** `serve()` in `src/main.rs` builds
+1. **One runtime thread.** `serve()` in `src/server.rs` builds
    `tokio::runtime::Builder::new_current_thread()`.
 2. **Eight concurrent handlers.** `MAX_CONCURRENT_REQUESTS` in
    `src/backend.rs`, passed to `Server::concurrency_level`. Note the
@@ -410,7 +410,7 @@ is still an accident of placement, so the warning still stands.
 
 In `hydra-lsp`:
 
-- `src/main.rs` — `serve()`: the `current_thread` runtime and
+- `src/server.rs` — `serve()`: the `current_thread` runtime and
   `concurrency_level`.
 - `src/backend.rs` — the pool-sizing constants and the `const` invariant block;
   `pool_sizes`, `split_pool_total`, `default_pool_total`/`_for`,

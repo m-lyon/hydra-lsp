@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.7.0]
+
+- Removed unused dependencies were removed and refactored internals.
+
 ## [0.6.1]
 
 - Overloaded targets are now narrowed to the overloads the node's keys and `_args_` match. Hover shows the matching overloads, signature help lists every overload with the first match active, and go-to-definition lands on each matching overload. Argument types are not compared.
