@@ -131,9 +131,51 @@ pub struct ParameterInfo {
     pub is_positional_only: bool,
 }
 
+/// How [`ParameterInfo::label`] shows a parameter's default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefaultStyle {
+    /// No default, as in signature-help labels (`x: int`).
+    Omit,
+    /// The default's source text, as in hover (`x: int = 3`).
+    Value,
+    /// A placeholder, as in the CLI's brief signatures (`x: int = ...`).
+    Ellipsis,
+}
+
 impl ParameterInfo {
     pub fn is_required(&self) -> bool {
         !self.has_default && !self.is_variadic && !self.is_variadic_keyword
+    }
+
+    /// The parameter as it reads in a signature: the `*`/`**` prefix, the
+    /// name, the annotation, then the default as `defaults` asks.
+    pub fn label(&self, defaults: DefaultStyle) -> String {
+        let mut s = String::new();
+        if self.is_variadic {
+            s.push('*');
+        } else if self.is_variadic_keyword {
+            s.push_str("**");
+        }
+        s.push_str(&self.name);
+        if let Some(type_ann) = &self.type_annotation {
+            s.push_str(": ");
+            s.push_str(type_ann);
+        }
+        match defaults {
+            DefaultStyle::Omit => {}
+            DefaultStyle::Value => {
+                if let Some(default) = &self.default_value {
+                    s.push_str(" = ");
+                    s.push_str(default);
+                }
+            }
+            DefaultStyle::Ellipsis => {
+                if self.has_default {
+                    s.push_str(" = ...");
+                }
+            }
+        }
+        s
     }
 }
 
@@ -1120,28 +1162,6 @@ impl PythonAnalyzer {
         )
     }
 
-    /// Format a single parameter for display
-    fn format_parameter(p: &ParameterInfo) -> String {
-        let mut s = String::new();
-
-        // Add * or ** prefix for variadic parameters
-        if p.is_variadic {
-            s.push('*');
-        } else if p.is_variadic_keyword {
-            s.push_str("**");
-        }
-
-        s.push_str(&p.name);
-
-        if let Some(type_ann) = &p.type_annotation {
-            s.push_str(&format!(": {}", type_ann));
-        }
-        if let Some(default) = &p.default_value {
-            s.push_str(&format!(" = {}", default));
-        }
-        s
-    }
-
     /// Where the markers that say *how* a parameter may be passed belong in
     /// `params`, as `(after_positional_only, before_keyword_only)` indexes.
     pub fn parameter_markers(params: &[&ParameterInfo]) -> (Option<usize>, Option<usize>) {
@@ -1176,7 +1196,7 @@ impl PythonAnalyzer {
     /// Render a parameter list for hover, with the `/` and `*` markers in place.
     fn format_parameters(params: &[ParameterInfo]) -> Vec<String> {
         let refs: Vec<&ParameterInfo> = params.iter().collect();
-        Self::render_params(&refs, Self::format_parameter)
+        Self::render_params(&refs, |p| p.label(DefaultStyle::Value))
     }
 
     /// Format a function signature for display (e.g., in hover)
@@ -1842,6 +1862,87 @@ mod tests {
     /// tests don't share salsa caches.
     fn test_db() -> HydraDatabase {
         HydraDatabase::new(SystemPath::new("/"))
+    }
+
+    // ==================== ParameterInfo::label tests ====================
+
+    fn label_param(name: &str) -> ParameterInfo {
+        ParameterInfo {
+            name: name.to_string(),
+            type_annotation: None,
+            default_value: None,
+            has_default: false,
+            is_variadic: false,
+            is_variadic_keyword: false,
+            is_keyword_only: false,
+            is_positional_only: false,
+        }
+    }
+
+    #[test]
+    fn test_label_plain_and_annotated() {
+        let plain = label_param("x");
+        let annotated = ParameterInfo {
+            type_annotation: Some("int".to_string()),
+            ..label_param("x")
+        };
+        for style in [
+            DefaultStyle::Omit,
+            DefaultStyle::Value,
+            DefaultStyle::Ellipsis,
+        ] {
+            assert_eq!(plain.label(style), "x");
+            assert_eq!(annotated.label(style), "x: int");
+        }
+    }
+
+    #[test]
+    fn test_label_default_styles() {
+        let p = ParameterInfo {
+            type_annotation: Some("int".to_string()),
+            default_value: Some("3".to_string()),
+            has_default: true,
+            ..label_param("x")
+        };
+        assert_eq!(p.label(DefaultStyle::Omit), "x: int");
+        assert_eq!(p.label(DefaultStyle::Value), "x: int = 3");
+        assert_eq!(p.label(DefaultStyle::Ellipsis), "x: int = ...");
+    }
+
+    #[test]
+    fn test_label_variadic_prefixes() {
+        let args = ParameterInfo {
+            is_variadic: true,
+            ..label_param("args")
+        };
+        let kwargs = ParameterInfo {
+            is_variadic_keyword: true,
+            type_annotation: Some("Any".to_string()),
+            ..label_param("kwargs")
+        };
+        for style in [
+            DefaultStyle::Omit,
+            DefaultStyle::Value,
+            DefaultStyle::Ellipsis,
+        ] {
+            assert_eq!(args.label(style), "*args");
+            assert_eq!(kwargs.label(style), "**kwargs: Any");
+        }
+    }
+
+    #[test]
+    fn test_label_keyword_and_positional_only_have_no_marker() {
+        // The `/` and `*` separators are `render_params`' job, not the label's.
+        let kw = ParameterInfo {
+            is_keyword_only: true,
+            ..label_param("k")
+        };
+        let pos = ParameterInfo {
+            is_positional_only: true,
+            ..label_param("p")
+        };
+        assert_eq!(kw.label(DefaultStyle::Value), "k");
+        assert_eq!(pos.label(DefaultStyle::Value), "p");
     }
 
     // ==================== ResolveError tests ====================

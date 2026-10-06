@@ -603,6 +603,37 @@ fn test_trace_resolution_keeps_json_stdout_parseable() {
 }
 
 #[test]
+fn test_trace_resolution_shows_variadic_prefixes() {
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("config.yaml"),
+        "model:\n  _target_: my_module.build\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("my_module.py"),
+        "def build(size: int = 4, *args, **kwargs):\n    pass\n",
+    )
+    .unwrap();
+
+    let result = check_in(
+        dir.path(),
+        &[
+            "config.yaml",
+            "--trace-resolution",
+            "--output-format",
+            "compact",
+        ],
+    );
+
+    assert!(
+        result.stderr.contains("(size: int = ..., *args, **kwargs)"),
+        "the trace signature should keep the `*`/`**` prefixes, got: {}",
+        result.stderr
+    );
+}
+
+#[test]
 fn test_default_pretty_summary_counts_errors_and_failures() {
     let dir = TempDir::new().unwrap();
     fs::write(dir.path().join("broken.yaml"), BROKEN_CONFIG).unwrap();

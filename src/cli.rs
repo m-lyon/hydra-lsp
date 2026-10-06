@@ -739,14 +739,7 @@ fn format_signature_brief(
         .filter(|p| Some(p.name.as_str()) != implicit_param)
         .collect();
     let params = PythonAnalyzer::render_params(&filtered, |p| {
-        let mut s = p.name.clone();
-        if let Some(ref ty) = p.type_annotation {
-            s.push_str(&format!(": {}", ty));
-        }
-        if p.has_default {
-            s.push_str(" = ...");
-        }
-        s
+        p.label(hydrust::python_analyzer::DefaultStyle::Ellipsis)
     });
     format!("({})", params.join(", "))
 }
