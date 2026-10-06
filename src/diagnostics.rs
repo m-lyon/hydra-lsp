@@ -1,4 +1,6 @@
-use crate::python_analyzer::{DefinitionInfo, FunctionSignature, ParameterInfo, ResolveError};
+use crate::python_analyzer::{
+    DefinitionInfo, FunctionSignature, ParameterInfo, ParameterKind, ResolveError,
+};
 use crate::python_cache::{PythonConfig, TargetString, cached_definition_info, is_builtin_symbol};
 use crate::vendored_typeshed::BUILTINS_MODULE;
 use crate::yaml_parser::{
@@ -201,9 +203,7 @@ fn validate_parameters(
     let expected_params: HashSet<String> = signature
         .parameters
         .iter()
-        .filter(|p| {
-            Some(p.name.as_str()) != implicit_param && !p.is_variadic && !p.is_variadic_keyword
-        })
+        .filter(|p| Some(p.name.as_str()) != implicit_param && !p.is_variadic())
         .map(|p| p.name.clone())
         .collect();
 
@@ -217,12 +217,7 @@ fn validate_parameters(
     let positional_eligible: Vec<&ParameterInfo> = signature
         .parameters
         .iter()
-        .filter(|p| {
-            Some(p.name.as_str()) != implicit_param
-                && !p.is_variadic
-                && !p.is_variadic_keyword
-                && !p.is_keyword_only
-        })
+        .filter(|p| Some(p.name.as_str()) != implicit_param && p.binds_positionally())
         .collect();
 
     let positionally_covered: HashSet<String> = positional_eligible
@@ -232,12 +227,20 @@ fn validate_parameters(
         .collect();
 
     // Check if function accepts *args or **kwargs
-    let has_variadic = signature.parameters.iter().any(|p| p.is_variadic);
-    let has_kwargs = signature.parameters.iter().any(|p| p.is_variadic_keyword);
+    let has_variadic = signature
+        .parameters
+        .iter()
+        .any(|p| p.kind == ParameterKind::VarPositional);
+    let has_kwargs = signature
+        .parameters
+        .iter()
+        .any(|p| p.kind == ParameterKind::VarKeyword);
     let positional_only: HashSet<&str> = signature
         .parameters
         .iter()
-        .filter(|p| p.is_positional_only && Some(p.name.as_str()) != implicit_param)
+        .filter(|p| {
+            p.kind == ParameterKind::PositionalOnly && Some(p.name.as_str()) != implicit_param
+        })
         .map(|p| p.name.as_str())
         .collect();
 
@@ -301,8 +304,8 @@ fn validate_parameters(
 
     if !hydra_obj.is_partial() {
         for param in &signature.parameters {
-            let accounted_for_by_keyword =
-                param_names.contains(&param.name) && !(param.is_positional_only && has_kwargs);
+            let accounted_for_by_keyword = param_names.contains(&param.name)
+                && !(param.kind == ParameterKind::PositionalOnly && has_kwargs);
 
             if param.is_required()
                 && Some(param.name.as_str()) != implicit_param
@@ -313,7 +316,7 @@ fn validate_parameters(
                     .suppressed_rules
                     .contains(&DiagnosticRule::MissingArgument)
             {
-                let message = if param.is_positional_only {
+                let message = if param.kind == ParameterKind::PositionalOnly {
                     format!(
                         "Missing required positional-only parameter '{}' for '{}'; pass it via {}",
                         param.name, display_name, ARGS_KEY
@@ -759,23 +762,15 @@ mod tests {
             parameters: vec![
                 ParameterInfo {
                     name: "self".to_string(),
+                    kind: ParameterKind::PositionalOrKeyword,
                     type_annotation: None,
                     default_value: None,
-                    has_default: false,
-                    is_variadic: false,
-                    is_variadic_keyword: false,
-                    is_keyword_only: false,
-                    is_positional_only: false,
                 },
                 ParameterInfo {
                     name: "required_param".to_string(),
+                    kind: ParameterKind::PositionalOrKeyword,
                     type_annotation: Some("int".to_string()),
                     default_value: None,
-                    has_default: false,
-                    is_variadic: false,
-                    is_variadic_keyword: false,
-                    is_keyword_only: false,
-                    is_positional_only: false,
                 },
             ],
             return_type: None,
@@ -818,13 +813,9 @@ mod tests {
             name: "Class".to_string(),
             parameters: vec![ParameterInfo {
                 name: "self".to_string(),
+                kind: ParameterKind::PositionalOrKeyword,
                 type_annotation: None,
                 default_value: None,
-                has_default: false,
-                is_variadic: false,
-                is_variadic_keyword: false,
-                is_keyword_only: false,
-                is_positional_only: false,
             }],
             return_type: None,
             docstring: None,
@@ -863,23 +854,15 @@ mod tests {
             parameters: vec![
                 ParameterInfo {
                     name: "self".to_string(),
+                    kind: ParameterKind::PositionalOrKeyword,
                     type_annotation: None,
                     default_value: None,
-                    has_default: false,
-                    is_variadic: false,
-                    is_variadic_keyword: false,
-                    is_keyword_only: false,
-                    is_positional_only: false,
                 },
                 ParameterInfo {
                     name: "**kwargs".to_string(),
+                    kind: ParameterKind::VarKeyword,
                     type_annotation: None,
                     default_value: None,
-                    has_default: false,
-                    is_variadic: false,
-                    is_variadic_keyword: true,
-                    is_keyword_only: false,
-                    is_positional_only: false,
                 },
             ],
             return_type: None,
@@ -918,23 +901,15 @@ mod tests {
             parameters: vec![
                 ParameterInfo {
                     name: "cls".to_string(),
+                    kind: ParameterKind::PositionalOrKeyword,
                     type_annotation: None,
                     default_value: None,
-                    has_default: false,
-                    is_variadic: false,
-                    is_variadic_keyword: false,
-                    is_keyword_only: false,
-                    is_positional_only: false,
                 },
                 ParameterInfo {
                     name: "config_path".to_string(),
+                    kind: ParameterKind::PositionalOrKeyword,
                     type_annotation: Some("str".to_string()),
                     default_value: None,
-                    has_default: false,
-                    is_variadic: false,
-                    is_variadic_keyword: false,
-                    is_keyword_only: false,
-                    is_positional_only: false,
                 },
             ],
             return_type: None,
@@ -989,23 +964,15 @@ mod tests {
             parameters: vec![
                 ParameterInfo {
                     name: "cls".to_string(),
+                    kind: ParameterKind::PositionalOrKeyword,
                     type_annotation: None,
                     default_value: None,
-                    has_default: false,
-                    is_variadic: false,
-                    is_variadic_keyword: false,
-                    is_keyword_only: false,
-                    is_positional_only: false,
                 },
                 ParameterInfo {
                     name: "config_path".to_string(),
+                    kind: ParameterKind::PositionalOrKeyword,
                     type_annotation: Some("str".to_string()),
                     default_value: None,
-                    has_default: false,
-                    is_variadic: false,
-                    is_variadic_keyword: false,
-                    is_keyword_only: false,
-                    is_positional_only: false,
                 },
             ],
             return_type: None,
@@ -1042,23 +1009,15 @@ mod tests {
             parameters: vec![
                 ParameterInfo {
                     name: "this".to_string(),
+                    kind: ParameterKind::PositionalOrKeyword,
                     type_annotation: None,
                     default_value: None,
-                    has_default: false,
-                    is_variadic: false,
-                    is_variadic_keyword: false,
-                    is_keyword_only: false,
-                    is_positional_only: false,
                 },
                 ParameterInfo {
                     name: "value".to_string(),
+                    kind: ParameterKind::PositionalOrKeyword,
                     type_annotation: Some("int".to_string()),
                     default_value: None,
-                    has_default: false,
-                    is_variadic: false,
-                    is_variadic_keyword: false,
-                    is_keyword_only: false,
-                    is_positional_only: false,
                 },
             ],
             return_type: None,
@@ -1112,23 +1071,15 @@ mod tests {
             parameters: vec![
                 ParameterInfo {
                     name: "klass".to_string(),
+                    kind: ParameterKind::PositionalOrKeyword,
                     type_annotation: None,
                     default_value: None,
-                    has_default: false,
-                    is_variadic: false,
-                    is_variadic_keyword: false,
-                    is_keyword_only: false,
-                    is_positional_only: false,
                 },
                 ParameterInfo {
                     name: "config_path".to_string(),
+                    kind: ParameterKind::PositionalOrKeyword,
                     type_annotation: Some("str".to_string()),
                     default_value: None,
-                    has_default: false,
-                    is_variadic: false,
-                    is_variadic_keyword: false,
-                    is_keyword_only: false,
-                    is_positional_only: false,
                 },
             ],
             return_type: None,
@@ -1165,13 +1116,9 @@ mod tests {
             name: "create".to_string(),
             parameters: vec![ParameterInfo {
                 name: "value".to_string(),
+                kind: ParameterKind::PositionalOrKeyword,
                 type_annotation: Some("int".to_string()),
                 default_value: None,
-                has_default: false,
-                is_variadic: false,
-                is_variadic_keyword: false,
-                is_keyword_only: false,
-                is_positional_only: false,
             }],
             return_type: None,
             docstring: None,
@@ -1585,23 +1532,15 @@ mod tests {
             parameters: vec![
                 ParameterInfo {
                     name: "self".to_string(),
+                    kind: ParameterKind::PositionalOrKeyword,
                     type_annotation: None,
                     default_value: None,
-                    has_default: false,
-                    is_variadic: false,
-                    is_variadic_keyword: false,
-                    is_keyword_only: false,
-                    is_positional_only: false,
                 },
                 ParameterInfo {
                     name: "required_param".to_string(),
+                    kind: ParameterKind::PositionalOrKeyword,
                     type_annotation: Some("int".to_string()),
                     default_value: None,
-                    has_default: false,
-                    is_variadic: false,
-                    is_variadic_keyword: false,
-                    is_keyword_only: false,
-                    is_positional_only: false,
                 },
             ],
             return_type: None,
@@ -1637,23 +1576,15 @@ mod tests {
             parameters: vec![
                 ParameterInfo {
                     name: "self".to_string(),
+                    kind: ParameterKind::PositionalOrKeyword,
                     type_annotation: None,
                     default_value: None,
-                    has_default: false,
-                    is_variadic: false,
-                    is_variadic_keyword: false,
-                    is_keyword_only: false,
-                    is_positional_only: false,
                 },
                 ParameterInfo {
                     name: "required_param".to_string(),
+                    kind: ParameterKind::PositionalOrKeyword,
                     type_annotation: Some("int".to_string()),
                     default_value: None,
-                    has_default: false,
-                    is_variadic: false,
-                    is_variadic_keyword: false,
-                    is_keyword_only: false,
-                    is_positional_only: false,
                 },
             ],
             return_type: None,
@@ -1694,33 +1625,21 @@ mod tests {
             parameters: vec![
                 ParameterInfo {
                     name: "self".to_string(),
+                    kind: ParameterKind::PositionalOrKeyword,
                     type_annotation: None,
                     default_value: None,
-                    has_default: false,
-                    is_variadic: false,
-                    is_variadic_keyword: false,
-                    is_keyword_only: false,
-                    is_positional_only: false,
                 },
                 ParameterInfo {
                     name: "required_param".to_string(),
+                    kind: ParameterKind::PositionalOrKeyword,
                     type_annotation: Some("int".to_string()),
                     default_value: None,
-                    has_default: false,
-                    is_variadic: false,
-                    is_variadic_keyword: false,
-                    is_keyword_only: false,
-                    is_positional_only: false,
                 },
                 ParameterInfo {
                     name: "valid_param".to_string(),
+                    kind: ParameterKind::PositionalOrKeyword,
                     type_annotation: Some("str".to_string()),
-                    default_value: None,
-                    has_default: true,
-                    is_variadic: false,
-                    is_variadic_keyword: false,
-                    is_keyword_only: false,
-                    is_positional_only: false,
+                    default_value: Some("\"default\"".to_string()),
                 },
             ],
             return_type: None,
@@ -1758,17 +1677,13 @@ mod tests {
             .collect()
     }
 
-    /// Build a required parameter for a synthetic signature.
-    fn sig_param(name: &str, positional_only: bool, kwargs: bool) -> ParameterInfo {
+    /// Build a parameter with no default for a synthetic signature.
+    fn sig_param(name: &str, kind: ParameterKind) -> ParameterInfo {
         ParameterInfo {
             name: name.to_string(),
+            kind,
             type_annotation: None,
             default_value: None,
-            has_default: false,
-            is_variadic: false,
-            is_variadic_keyword: kwargs,
-            is_keyword_only: false,
-            is_positional_only: positional_only,
         }
     }
 
@@ -1797,7 +1712,7 @@ mod tests {
             0,
             false,
         );
-        let signature = sig_for("f", vec![sig_param("a", true, false)]);
+        let signature = sig_for("f", vec![sig_param("a", ParameterKind::PositionalOnly)]);
 
         let diagnostics = validate_parameters(&hydra_obj, &signature, "f", None, &HashSet::new());
 
@@ -1829,7 +1744,10 @@ mod tests {
         );
         let signature = sig_for(
             "f",
-            vec![sig_param("a", true, false), sig_param("kw", false, true)],
+            vec![
+                sig_param("a", ParameterKind::PositionalOnly),
+                sig_param("kw", ParameterKind::VarKeyword),
+            ],
         );
 
         let diagnostics = validate_parameters(&hydra_obj, &signature, "f", None, &HashSet::new());
@@ -1853,9 +1771,9 @@ mod tests {
             0,
             false,
         );
-        let mut a = sig_param("a", true, false);
-        a.has_default = true;
-        let signature = sig_for("f", vec![a, sig_param("kw", false, true)]);
+        let mut a = sig_param("a", ParameterKind::PositionalOnly);
+        a.default_value = Some("0".to_string());
+        let signature = sig_for("f", vec![a, sig_param("kw", ParameterKind::VarKeyword)]);
 
         let diagnostics = validate_parameters(&hydra_obj, &signature, "f", None, &HashSet::new());
         assert!(diagnostics.is_empty(), "got: {:?}", codes(&diagnostics));
@@ -1873,7 +1791,10 @@ mod tests {
             13,
             false,
         );
-        let signature = sig_for("f", vec![sig_param("a", false, false)]);
+        let signature = sig_for(
+            "f",
+            vec![sig_param("a", ParameterKind::PositionalOrKeyword)],
+        );
 
         let diagnostics = validate_parameters(&hydra_obj, &signature, "f", None, &HashSet::new());
         let unknown = &diagnostics[0];
@@ -1893,7 +1814,10 @@ mod tests {
             *key_start = 34;
         }
         let hydra_obj = build_hydra_object("mod.f", vec![param], 1, 9, 20, false);
-        let signature = sig_for("f", vec![sig_param("a", false, false)]);
+        let signature = sig_for(
+            "f",
+            vec![sig_param("a", ParameterKind::PositionalOrKeyword)],
+        );
 
         let diagnostics = validate_parameters(&hydra_obj, &signature, "f", None, &HashSet::new());
 
@@ -1939,7 +1863,10 @@ mod tests {
         });
         let signature = sig_for(
             "f",
-            vec![sig_param("a", true, false), sig_param("kw", false, true)],
+            vec![
+                sig_param("a", ParameterKind::PositionalOnly),
+                sig_param("kw", ParameterKind::VarKeyword),
+            ],
         );
 
         let diagnostics = validate_parameters(&hydra_obj, &signature, "f", None, &HashSet::new());
@@ -1966,7 +1893,10 @@ mod tests {
             0,
             false,
         );
-        let mut signature = sig_for("f", vec![sig_param("a", false, false)]);
+        let mut signature = sig_for(
+            "f",
+            vec![sig_param("a", ParameterKind::PositionalOrKeyword)],
+        );
         signature.is_overloaded = true;
 
         let diagnostics = validate_parameters(&hydra_obj, &signature, "f", None, &HashSet::new());

@@ -18,7 +18,8 @@ use crate::database::HydraDatabase;
 use crate::diagnostics::{self, DiagnosticRule};
 use crate::outbox::ClientOutbox;
 use crate::python_analyzer::{
-    DefaultStyle, DefinitionInfo, FunctionSignature, ParameterInfo, PythonAnalyzer, ResolveError,
+    DefaultStyle, DefinitionInfo, FunctionSignature, ParameterInfo, ParameterKind, PythonAnalyzer,
+    ResolveError,
 };
 use crate::python_cache::{self, PythonConfig, ResolvedDefinition, TargetString};
 use crate::yaml_cache::{self, DocumentInput, ParsedYaml};
@@ -119,10 +120,12 @@ fn signature_information(
             // Try exact match first, then fall back to **kwargs
             param_infos
                 .iter()
-                .position(|p| p.name == *key && !p.is_variadic && !p.is_variadic_keyword)
+                .position(|p| p.name == *key && !p.is_variadic())
                 .or_else(|| {
                     // Unknown keyword: highlight **kwargs if present
-                    param_infos.iter().position(|p| p.is_variadic_keyword)
+                    param_infos
+                        .iter()
+                        .position(|p| p.kind == ParameterKind::VarKeyword)
                 })
                 .unwrap_or(parameters.len())
         }
@@ -133,10 +136,14 @@ fn signature_information(
             let pos = param_infos
                 .iter()
                 .enumerate()
-                .filter(|(_, p)| !p.is_variadic && !p.is_variadic_keyword && !p.is_keyword_only)
+                .filter(|(_, p)| p.binds_positionally())
                 .nth(*index as usize)
                 .map(|(i, _)| i)
-                .or_else(|| param_infos.iter().position(|p| p.is_variadic))
+                .or_else(|| {
+                    param_infos
+                        .iter()
+                        .position(|p| p.kind == ParameterKind::VarPositional)
+                })
                 .unwrap_or(parameters.len());
             // Don't highlight any parameter when the _args_ list is empty —
             // there are no actual arguments being passed. Also suppress when
