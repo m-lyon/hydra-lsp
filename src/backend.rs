@@ -18,13 +18,13 @@ use crate::database::HydraDatabase;
 use crate::diagnostics::{self, DiagnosticRule};
 use crate::outbox::ClientOutbox;
 use crate::python_analyzer::{
-    DefinitionInfo, FunctionSignature, ParameterInfo, PythonAnalyzer, ResolveError,
+    DefaultStyle, DefinitionInfo, FunctionSignature, ParameterInfo, PythonAnalyzer, ResolveError,
 };
 use crate::python_cache::{self, PythonConfig, ResolvedDefinition, TargetString};
 use crate::yaml_cache::{self, DocumentInput, ParsedYaml};
 use crate::yaml_parser::{
     ARGS_KEY, CONVERT_KEY, CompletionContext, ConvertMode, HydraSemanticToken, PARTIAL_KEY,
-    RECURSIVE_KEY, ResolvedParameterContext, YamlParser,
+    RECURSIVE_KEY, ResolvedParameterContext, SEMANTIC_TOKEN_LEGEND, YamlParser,
 };
 
 /// Glob applied to every watched root — the workspace folders (via a plain
@@ -34,25 +34,10 @@ use crate::yaml_parser::{
 /// aligned with the extensions here.
 const WATCHED_PY_GLOB: &str = "**/*.{py,pyi,pth}";
 
-/// Format a parameter as a string for signature labels (e.g., "*args", "name: str")
-fn format_param_label(p: &ParameterInfo) -> String {
-    let mut s = String::new();
-    if p.is_variadic {
-        s.push('*');
-    } else if p.is_variadic_keyword {
-        s.push_str("**");
-    }
-    s.push_str(&p.name);
-    if let Some(type_ann) = &p.type_annotation {
-        s.push_str(&format!(": {}", type_ann));
-    }
-    s
-}
-
 /// Convert a ParameterInfo to LSP ParameterInformation
 fn to_parameter_information(p: &ParameterInfo) -> ParameterInformation {
     ParameterInformation {
-        label: ParameterLabel::Simple(format_param_label(p)),
+        label: ParameterLabel::Simple(p.label(DefaultStyle::Omit)),
         documentation: p.default_value.as_ref().map(|dv| {
             Documentation::MarkupContent(MarkupContent {
                 kind: MarkupKind::Markdown,
@@ -73,7 +58,7 @@ fn build_signature_params<'a>(
         .iter()
         .filter(|p| filter_param.is_none_or(|f| p.name != f))
         .collect();
-    let param_strs = PythonAnalyzer::render_params(&filtered, format_param_label);
+    let param_strs = PythonAnalyzer::render_params(&filtered, |p| p.label(DefaultStyle::Omit));
 
     let param_infos: Vec<ParameterInformation> = filtered
         .iter()
@@ -1098,16 +1083,7 @@ impl LanguageServer for HydraLspBackend {
                     SemanticTokensServerCapabilities::SemanticTokensOptions(
                         SemanticTokensOptions {
                             legend: SemanticTokensLegend {
-                                token_types: vec![
-                                    SemanticTokenType::NAMESPACE,
-                                    SemanticTokenType::CLASS,
-                                    SemanticTokenType::FUNCTION,
-                                    SemanticTokenType::PARAMETER,
-                                    SemanticTokenType::PROPERTY,
-                                    SemanticTokenType::VARIABLE,
-                                    SemanticTokenType::STRING,
-                                    SemanticTokenType::NUMBER,
-                                ],
+                                token_types: SEMANTIC_TOKEN_LEGEND.to_vec(),
                                 token_modifiers: vec![
                                     SemanticTokenModifier::DECLARATION,
                                     SemanticTokenModifier::DEFINITION,

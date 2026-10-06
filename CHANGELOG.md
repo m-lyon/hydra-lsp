@@ -2,7 +2,8 @@
 
 ## [0.7.0]
 
-- Removed unused dependencies were removed and refactored internals.
+- Removed unused dependencies and refactored internals.
+- `hydrust check --trace-resolution` now shows the `*`/`**` prefix on variadic parameters.
 
 ## [0.6.1]
 

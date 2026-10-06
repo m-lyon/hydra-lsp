@@ -1,6 +1,6 @@
 use crate::import_resolver::ImportResolver;
 use crate::python_cache::{
-    InternedSearchPaths, ResolvedDefinition, TargetString, class_parent_attribute,
+    InternedSearchPaths, ResolvedDefinition, TargetString, class_key, class_parent_attribute,
     class_parent_docs, resolve_module_cached,
 };
 use crate::vendored_typeshed::{is_vendored_path, to_vendored_path};
@@ -131,9 +131,51 @@ pub struct ParameterInfo {
     pub is_positional_only: bool,
 }
 
+/// How [`ParameterInfo::label`] shows a parameter's default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefaultStyle {
+    /// No default, as in signature-help labels (`x: int`).
+    Omit,
+    /// The default's source text, as in hover (`x: int = 3`).
+    Value,
+    /// A placeholder, as in the CLI's brief signatures (`x: int = ...`).
+    Ellipsis,
+}
+
 impl ParameterInfo {
     pub fn is_required(&self) -> bool {
         !self.has_default && !self.is_variadic && !self.is_variadic_keyword
+    }
+
+    /// The parameter as it reads in a signature: the `*`/`**` prefix, the
+    /// name, the annotation, then the default as `defaults` asks.
+    pub fn label(&self, defaults: DefaultStyle) -> String {
+        let mut s = String::new();
+        if self.is_variadic {
+            s.push('*');
+        } else if self.is_variadic_keyword {
+            s.push_str("**");
+        }
+        s.push_str(&self.name);
+        if let Some(type_ann) = &self.type_annotation {
+            s.push_str(": ");
+            s.push_str(type_ann);
+        }
+        match defaults {
+            DefaultStyle::Omit => {}
+            DefaultStyle::Value => {
+                if let Some(default) = &self.default_value {
+                    s.push_str(" = ");
+                    s.push_str(default);
+                }
+            }
+            DefaultStyle::Ellipsis => {
+                if self.has_default {
+                    s.push_str(" = ...");
+                }
+            }
+        }
+        s
     }
 }
 
@@ -543,9 +585,7 @@ impl PythonAnalyzer {
             // Try to get the attribute as a class attribute (with inheritance support).
             // The salsa-tracked class_parent_attribute memoises each (class, attr) pair so
             // shared parent classes are only walked once per revision.
-            let normalized = normalize_path_for_key(db, &current_file);
-            let class_key =
-                TargetString::new(db, format!("{}::{}", normalized.display(), current_class));
+            let class_key = class_key(db, &current_file, &current_class);
             let attr_key = TargetString::new(db, attr.to_string());
             let cached_attr = class_parent_attribute(db, class_key, attr_key, interned_sp);
             match cached_attr.get() {
@@ -568,11 +608,7 @@ impl PythonAnalyzer {
                             resolver.resolve_symbol(&current_file, new_class_name)
                         {
                             current_file = resolved_file;
-                            current_class = if resolved_name.is_empty() {
-                                new_class_name.to_string()
-                            } else {
-                                resolved_name
-                            };
+                            current_class = resolved_name;
                             continue;
                         }
 
@@ -756,15 +792,8 @@ impl PythonAnalyzer {
 
         // Simple name - try to resolve through imports in the current file
         let mut resolver = ImportResolver::new(db, search_paths);
-        if let Some((resolved_file, resolved_name)) =
-            resolver.resolve_symbol(current_file, base_class_expr)
-        {
-            let actual_name = if resolved_name.is_empty() {
-                base_class_expr.to_string()
-            } else {
-                resolved_name
-            };
-            return Some((resolved_file, actual_name));
+        if let Some(resolved) = resolver.resolve_symbol(current_file, base_class_expr) {
+            return Some(resolved);
         }
 
         // Check if the class is defined in the same file
@@ -786,40 +815,26 @@ impl PythonAnalyzer {
         class_name: &str,
         search_paths: &[PathBuf],
     ) -> Result<(ClassInfo, PathBuf)> {
-        let (mut class_info, resolved_file) =
-            if let Ok(class_info) = Self::extract_class_info(db, file_path, class_name) {
-                (class_info, file_path.to_path_buf())
-            } else {
-                // Try to resolve through imports
-                let mut resolver = ImportResolver::new(db, search_paths);
-                if let Some((resolved_file, resolved_name)) =
-                    resolver.resolve_symbol(file_path, class_name)
-                {
-                    let actual_name = if resolved_name.is_empty() {
-                        class_name.to_string()
-                    } else {
-                        resolved_name
-                    };
-                    let class_info = Self::extract_class_info(db, &resolved_file, &actual_name)?;
-                    (class_info, resolved_file)
-                } else {
-                    anyhow::bail!(
-                        "Class '{}' not found in {} (also checked re-exports)",
-                        class_name,
-                        file_path.display()
-                    )
-                }
-            };
+        let (mut class_info, resolved_file) = Self::with_reexports(
+            db,
+            file_path,
+            class_name,
+            search_paths,
+            |file, name| Self::extract_class_info(db, file, name),
+            || {
+                anyhow::anyhow!(
+                    "Class '{}' not found in {} (also checked re-exports)",
+                    class_name,
+                    file_path.display()
+                )
+            },
+        )?;
 
         // Resolve missing properties from parent classes via the memoised salsa query.
         // class_parent_docs walks the MRO recursively and caches results per (class, search_paths),
         // so shared parent classes across different child-class lookups are resolved only once.
         if class_info.docstring.is_none() || class_info.init_signature.is_none() {
-            let normalized_path = normalize_path_for_key(db, &resolved_file);
-            let class_key = TargetString::new(
-                db,
-                format!("{}::{}", normalized_path.display(), class_info.name),
-            );
+            let class_key = class_key(db, &resolved_file, &class_info.name);
             let interned_sp = InternedSearchPaths::new(db, search_paths.to_vec());
             let parent_docs = class_parent_docs(db, class_key, interned_sp);
 
@@ -850,29 +865,46 @@ impl PythonAnalyzer {
         function_name: &str,
         search_paths: &[PathBuf],
     ) -> Result<(FunctionSignature, PathBuf)> {
-        if let Ok(func_sig) = Self::extract_function_signature(db, file_path, function_name) {
-            return Ok((func_sig, file_path.to_path_buf()));
-        }
-
-        // Try to resolve through imports
-        let mut resolver = ImportResolver::new(db, search_paths);
-        if let Some((resolved_file, resolved_name)) =
-            resolver.resolve_symbol(file_path, function_name)
-        {
-            let actual_name = if resolved_name.is_empty() {
-                function_name.to_string()
-            } else {
-                resolved_name
-            };
-            let func_sig = Self::extract_function_signature(db, &resolved_file, &actual_name)?;
-            return Ok((func_sig, resolved_file));
-        }
-
-        anyhow::bail!(
-            "Function '{}' not found in {} (also checked re-exports)",
+        Self::with_reexports(
+            db,
+            file_path,
             function_name,
-            file_path.display()
+            search_paths,
+            |file, name| Self::extract_function_signature(db, file, name),
+            || {
+                anyhow::anyhow!(
+                    "Function '{}' not found in {} (also checked re-exports)",
+                    function_name,
+                    file_path.display()
+                )
+            },
         )
+    }
+
+    /// Run `extract` for `name` in `file_path`, and if that fails, again where
+    /// the file's imports say `name` really lives. Returns the result and the
+    /// file it came from.
+    ///
+    /// The in-file error is dropped. When the import chain resolves, the
+    /// retry's error is returned as is; when it does not, `not_found` is.
+    fn with_reexports<T>(
+        db: &dyn ruff_db::Db,
+        file_path: &Path,
+        name: &str,
+        search_paths: &[PathBuf],
+        extract: impl Fn(&Path, &str) -> Result<T>,
+        not_found: impl FnOnce() -> anyhow::Error,
+    ) -> Result<(T, PathBuf)> {
+        if let Ok(found) = extract(file_path, name) {
+            return Ok((found, file_path.to_path_buf()));
+        }
+
+        let mut resolver = ImportResolver::new(db, search_paths);
+        let Some((resolved_file, resolved_name)) = resolver.resolve_symbol(file_path, name) else {
+            return Err(not_found());
+        };
+        let found = extract(&resolved_file, &resolved_name)?;
+        Ok((found, resolved_file))
     }
 
     /// Extract definition info (function, class or method) from a target
@@ -1094,52 +1126,22 @@ impl PythonAnalyzer {
         method_name: &str,
         search_paths: &[PathBuf],
     ) -> Result<(MethodInfo, PathBuf)> {
-        if let Ok(method_info) = Self::extract_method_info(db, file_path, class_name, method_name) {
-            return Ok((method_info, file_path.to_path_buf()));
-        }
-
-        // Try to resolve class through imports, then find the method
-        let mut resolver = ImportResolver::new(db, search_paths);
-        if let Some((resolved_file, resolved_name)) = resolver.resolve_symbol(file_path, class_name)
-        {
-            let actual_class_name = if resolved_name.is_empty() {
-                class_name.to_string()
-            } else {
-                resolved_name
-            };
-            let method_info =
-                Self::extract_method_info(db, &resolved_file, &actual_class_name, method_name)?;
-            return Ok((method_info, resolved_file));
-        }
-
-        anyhow::bail!(
-            "Method '{}' not found in class '{}' in {} (also checked re-exports)",
-            method_name,
+        // The class is what gets re-exported, so it is the name to follow.
+        Self::with_reexports(
+            db,
+            file_path,
             class_name,
-            file_path.display()
+            search_paths,
+            |file, class| Self::extract_method_info(db, file, class, method_name),
+            || {
+                anyhow::anyhow!(
+                    "Method '{}' not found in class '{}' in {} (also checked re-exports)",
+                    method_name,
+                    class_name,
+                    file_path.display()
+                )
+            },
         )
-    }
-
-    /// Format a single parameter for display
-    fn format_parameter(p: &ParameterInfo) -> String {
-        let mut s = String::new();
-
-        // Add * or ** prefix for variadic parameters
-        if p.is_variadic {
-            s.push('*');
-        } else if p.is_variadic_keyword {
-            s.push_str("**");
-        }
-
-        s.push_str(&p.name);
-
-        if let Some(type_ann) = &p.type_annotation {
-            s.push_str(&format!(": {}", type_ann));
-        }
-        if let Some(default) = &p.default_value {
-            s.push_str(&format!(" = {}", default));
-        }
-        s
     }
 
     /// Where the markers that say *how* a parameter may be passed belong in
@@ -1176,7 +1178,7 @@ impl PythonAnalyzer {
     /// Render a parameter list for hover, with the `/` and `*` markers in place.
     fn format_parameters(params: &[ParameterInfo]) -> Vec<String> {
         let refs: Vec<&ParameterInfo> = params.iter().collect();
-        Self::render_params(&refs, Self::format_parameter)
+        Self::render_params(&refs, |p| p.label(DefaultStyle::Value))
     }
 
     /// Format a function signature for display (e.g., in hover)
@@ -1842,6 +1844,87 @@ mod tests {
     /// tests don't share salsa caches.
     fn test_db() -> HydraDatabase {
         HydraDatabase::new(SystemPath::new("/"))
+    }
+
+    // ==================== ParameterInfo::label tests ====================
+
+    fn label_param(name: &str) -> ParameterInfo {
+        ParameterInfo {
+            name: name.to_string(),
+            type_annotation: None,
+            default_value: None,
+            has_default: false,
+            is_variadic: false,
+            is_variadic_keyword: false,
+            is_keyword_only: false,
+            is_positional_only: false,
+        }
+    }
+
+    #[test]
+    fn test_label_plain_and_annotated() {
+        let plain = label_param("x");
+        let annotated = ParameterInfo {
+            type_annotation: Some("int".to_string()),
+            ..label_param("x")
+        };
+        for style in [
+            DefaultStyle::Omit,
+            DefaultStyle::Value,
+            DefaultStyle::Ellipsis,
+        ] {
+            assert_eq!(plain.label(style), "x");
+            assert_eq!(annotated.label(style), "x: int");
+        }
+    }
+
+    #[test]
+    fn test_label_default_styles() {
+        let p = ParameterInfo {
+            type_annotation: Some("int".to_string()),
+            default_value: Some("3".to_string()),
+            has_default: true,
+            ..label_param("x")
+        };
+        assert_eq!(p.label(DefaultStyle::Omit), "x: int");
+        assert_eq!(p.label(DefaultStyle::Value), "x: int = 3");
+        assert_eq!(p.label(DefaultStyle::Ellipsis), "x: int = ...");
+    }
+
+    #[test]
+    fn test_label_variadic_prefixes() {
+        let args = ParameterInfo {
+            is_variadic: true,
+            ..label_param("args")
+        };
+        let kwargs = ParameterInfo {
+            is_variadic_keyword: true,
+            type_annotation: Some("Any".to_string()),
+            ..label_param("kwargs")
+        };
+        for style in [
+            DefaultStyle::Omit,
+            DefaultStyle::Value,
+            DefaultStyle::Ellipsis,
+        ] {
+            assert_eq!(args.label(style), "*args");
+            assert_eq!(kwargs.label(style), "**kwargs: Any");
+        }
+    }
+
+    #[test]
+    fn test_label_keyword_and_positional_only_have_no_marker() {
+        // The `/` and `*` separators are `render_params`' job, not the label's.
+        let kw = ParameterInfo {
+            is_keyword_only: true,
+            ..label_param("k")
+        };
+        let pos = ParameterInfo {
+            is_positional_only: true,
+            ..label_param("p")
+        };
+        assert_eq!(kw.label(DefaultStyle::Value), "k");
+        assert_eq!(pos.label(DefaultStyle::Value), "p");
     }
 
     // ==================== ResolveError tests ====================

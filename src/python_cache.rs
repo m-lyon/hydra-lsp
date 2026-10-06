@@ -48,6 +48,29 @@ pub struct TargetString {
     pub value: String,
 }
 
+/// The salsa key for a class: `"<normalized file path>::<ClassName>"`.
+///
+/// The path is normalized lexically (see `normalize_path_for_key`), so the
+/// key stays a pure function of salsa inputs.
+pub(crate) fn class_key<'db>(
+    db: &'db dyn ruff_db::Db,
+    file: &Path,
+    class: &str,
+) -> TargetString<'db> {
+    let normalized = normalize_path_for_key(db, file);
+    TargetString::new(db, format!("{}::{}", normalized.display(), class))
+}
+
+/// Split a key built by [`class_key`] back into its file and class name.
+fn parse_class_key(key: &str) -> Option<(&Path, &str)> {
+    let (file, class) = key.rsplit_once("::")?;
+    Some((Path::new(file), class))
+}
+
+/// Bases that exist only for the type system: they carry no constructor,
+/// docstring or attributes of their own, so MRO walks skip them.
+const TYPE_ONLY_BASES: &[&str] = &["object", "ABC", "Protocol", "Generic"];
+
 /// Interned search-path list used as a salsa cache key for module resolution.
 ///
 /// Salsa interns by value, so calls with equal `Vec<PathBuf>` values share a
@@ -391,11 +414,9 @@ pub fn class_parent_docs<'db>(
     class_key: TargetString<'db>,
     search_paths: InternedSearchPaths<'db>,
 ) -> ClassParentDocs {
-    let key_str = class_key.value(db);
-    let Some((file_path_str, class_name)) = key_str.split_once("::") else {
+    let Some((file_path, class_name)) = parse_class_key(class_key.value(db)) else {
         return ClassParentDocs::new(None, None, None, true);
     };
-    let file_path = Path::new(file_path_str);
     let search_paths_vec = search_paths.paths(db);
 
     let class_info = match PythonAnalyzer::extract_class_info(db, file_path, class_name) {
@@ -405,19 +426,12 @@ pub fn class_parent_docs<'db>(
                 .resolve_symbol(file_path, class_name)
             {
                 Some((resolved_file, resolved_name)) => {
-                    let resolved_name = if resolved_name.is_empty() {
-                        class_name.to_string()
-                    } else {
-                        resolved_name
-                    };
-                    let normalized = normalize_path_for_key(db, &resolved_file);
-                    if normalized == file_path && resolved_name == class_name {
+                    if normalize_path_for_key(db, &resolved_file) == file_path
+                        && resolved_name == class_name
+                    {
                         return ClassParentDocs::new(None, None, None, false);
                     }
-                    let resolved_key = TargetString::new(
-                        db,
-                        format!("{}::{}", normalized.display(), resolved_name),
-                    );
+                    let resolved_key = self::class_key(db, &resolved_file, &resolved_name);
                     class_parent_docs(db, resolved_key, search_paths)
                 }
                 None => ClassParentDocs::new(None, None, None, false),
@@ -440,10 +454,7 @@ pub fn class_parent_docs<'db>(
     for base_class in &class_info.base_classes {
         // Bases that exist only for the type system contribute no constructor
         // and no docstring.
-        if matches!(
-            base_class_name(base_class),
-            "object" | "ABC" | "Protocol" | "Generic"
-        ) {
+        if TYPE_ONLY_BASES.contains(&base_class_name(base_class)) {
             continue;
         }
         let Some((parent_file, parent_class_name)) =
@@ -458,11 +469,7 @@ pub fn class_parent_docs<'db>(
         // the resolver's local cycle set; it does not feed the memoised value.)
         // Symlink resolution already happened at root construction; see
         // `normalize_path_for_key`.
-        let normalized = normalize_path_for_key(db, &parent_file);
-        let parent_key = TargetString::new(
-            db,
-            format!("{}::{}", normalized.display(), parent_class_name),
-        );
+        let parent_key = self::class_key(db, &parent_file, &parent_class_name);
         let parent_docs = class_parent_docs(db, parent_key, search_paths);
         all_bases_resolved &= parent_docs.all_bases_resolved();
 
@@ -507,11 +514,9 @@ pub fn class_parent_attribute<'db>(
     attribute_key: TargetString<'db>,
     search_paths: InternedSearchPaths<'db>,
 ) -> CachedClassAttribute {
-    let key_str = class_key.value(db);
-    let Some((file_path_str, class_name)) = key_str.split_once("::") else {
+    let Some((file_path, class_name)) = parse_class_key(class_key.value(db)) else {
         return CachedClassAttribute::not_found();
     };
-    let file_path = Path::new(file_path_str);
     let attribute_name = attribute_key.value(db);
 
     if let Ok(attr_info) =
@@ -533,10 +538,7 @@ pub fn class_parent_attribute<'db>(
     for base_class in &class_info.base_classes {
         // Bases that exist only for the type system carry no attributes of
         // their own, and never resolve.
-        if matches!(
-            base_class_name(base_class),
-            "object" | "ABC" | "Protocol" | "Generic"
-        ) {
+        if TYPE_ONLY_BASES.contains(&base_class_name(base_class)) {
             continue;
         }
         let Some((parent_file, parent_class_name)) =
@@ -548,11 +550,7 @@ pub fn class_parent_attribute<'db>(
         // `fs::canonicalize` syscall, so it stays a pure function of salsa
         // inputs. Symlink resolution already happened at root construction;
         // see `normalize_path_for_key`.
-        let normalized = normalize_path_for_key(db, &parent_file);
-        let parent_key = TargetString::new(
-            db,
-            format!("{}::{}", normalized.display(), parent_class_name),
-        );
+        let parent_key = self::class_key(db, &parent_file, &parent_class_name);
         let result = class_parent_attribute(db, parent_key, attribute_key, search_paths);
         if result.get().is_some() {
             return result;
@@ -581,6 +579,25 @@ mod tests {
     use ruff_db::system::SystemPath;
     use salsa::Setter;
     use std::path::Path;
+
+    #[test]
+    fn test_parse_class_key_splits_on_the_last_separator() {
+        assert_eq!(
+            parse_class_key("/work/a::b/models.py::Model"),
+            Some((Path::new("/work/a::b/models.py"), "Model"))
+        );
+        assert_eq!(parse_class_key("no-separator"), None);
+    }
+
+    #[test]
+    fn test_class_key_round_trips() {
+        let db = HydraDatabase::new(SystemPath::new("/"));
+        let key = class_key(&db, Path::new("/work/pkg/../models.py"), "Model");
+        assert_eq!(
+            parse_class_key(key.value(&db)),
+            Some((Path::new("/work/models.py"), "Model"))
+        );
+    }
 
     #[salsa::interned]
     struct SitePackagesPath {
