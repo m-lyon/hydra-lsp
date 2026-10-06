@@ -24,7 +24,7 @@ use crate::python_cache::{self, PythonConfig, ResolvedDefinition, TargetString};
 use crate::yaml_cache::{self, DocumentInput, ParsedYaml};
 use crate::yaml_parser::{
     ARGS_KEY, CONVERT_KEY, CompletionContext, ConvertMode, HydraSemanticToken, PARTIAL_KEY,
-    RECURSIVE_KEY, ResolvedParameterContext, YamlParser,
+    RECURSIVE_KEY, ResolvedParameterContext, SEMANTIC_TOKEN_LEGEND, YamlParser,
 };
 
 /// Glob applied to every watched root — the workspace folders (via a plain
@@ -1083,16 +1083,7 @@ impl LanguageServer for HydraLspBackend {
                     SemanticTokensServerCapabilities::SemanticTokensOptions(
                         SemanticTokensOptions {
                             legend: SemanticTokensLegend {
-                                token_types: vec![
-                                    SemanticTokenType::NAMESPACE,
-                                    SemanticTokenType::CLASS,
-                                    SemanticTokenType::FUNCTION,
-                                    SemanticTokenType::PARAMETER,
-                                    SemanticTokenType::PROPERTY,
-                                    SemanticTokenType::VARIABLE,
-                                    SemanticTokenType::STRING,
-                                    SemanticTokenType::NUMBER,
-                                ],
+                                token_types: SEMANTIC_TOKEN_LEGEND.to_vec(),
                                 token_modifiers: vec![
                                     SemanticTokenModifier::DECLARATION,
                                     SemanticTokenModifier::DEFINITION,

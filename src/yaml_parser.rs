@@ -28,33 +28,57 @@ pub enum SemanticTokenType {
     Number,    // Numeric values
 }
 
-impl SemanticTokenType {
-    /// Convert to LSP token type index (based on order in legend)
-    pub fn to_index(self) -> u32 {
-        match self {
-            SemanticTokenType::Namespace => 0,
-            SemanticTokenType::Class => 1,
-            SemanticTokenType::Function => 2,
-            SemanticTokenType::Parameter => 3,
-            SemanticTokenType::Property => 4,
-            SemanticTokenType::String => 6,
-            SemanticTokenType::Number => 7,
-        }
-    }
+/// Declares the semantic-token legend once and derives from it the legend
+/// advertised in `initialize` and `SemanticTokenType::to_index`/`from_index`.
+///
+/// Each row is `index => LSP_TYPE` with an optional `=> Variant`; a row with
+/// no variant is advertised but never emitted. The indexes must run 0, 1, 2…
+/// in order, which a compile-time check enforces.
+macro_rules! semantic_token_legend {
+    ($($index:literal => $lsp:ident $(=> $variant:ident)?),* $(,)?) => {
+        /// The semantic-token legend, in the order clients index it by.
+        pub const SEMANTIC_TOKEN_LEGEND: &[tower_lsp::lsp_types::SemanticTokenType] =
+            &[$(tower_lsp::lsp_types::SemanticTokenType::$lsp),*];
 
-    /// Convert from LSP token type index to SemanticTokenType
-    pub fn from_index(index: u32) -> Option<Self> {
-        match index {
-            0 => Some(SemanticTokenType::Namespace),
-            1 => Some(SemanticTokenType::Class),
-            2 => Some(SemanticTokenType::Function),
-            3 => Some(SemanticTokenType::Parameter),
-            4 => Some(SemanticTokenType::Property),
-            6 => Some(SemanticTokenType::String),
-            7 => Some(SemanticTokenType::Number),
-            _ => None,
+        const _: () = {
+            let indexes: &[u32] = &[$($index),*];
+            let mut i = 0;
+            while i < indexes.len() {
+                assert!(indexes[i] as usize == i, "legend indexes must run 0, 1, 2… in order");
+                i += 1;
+            }
+        };
+
+        impl SemanticTokenType {
+            /// Convert to LSP token type index (its position in the legend)
+            pub fn to_index(self) -> u32 {
+                match self {
+                    $($(SemanticTokenType::$variant => $index,)?)*
+                }
+            }
+
+            /// Convert from LSP token type index to SemanticTokenType
+            pub fn from_index(index: u32) -> Option<Self> {
+                match index {
+                    $($($index => Some(SemanticTokenType::$variant),)?)*
+                    _ => None,
+                }
+            }
         }
-    }
+    };
+}
+
+// The order is protocol: clients decode token types by position. Append new
+// rows; never reorder or renumber. `VARIABLE` is advertised but unused.
+semantic_token_legend! {
+    0 => NAMESPACE => Namespace,
+    1 => CLASS => Class,
+    2 => FUNCTION => Function,
+    3 => PARAMETER => Parameter,
+    4 => PROPERTY => Property,
+    5 => VARIABLE,
+    6 => STRING => String,
+    7 => NUMBER => Number,
 }
 
 impl HydraSemanticToken {
@@ -1636,6 +1660,25 @@ pub enum CompletionContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_semantic_token_index_round_trips_through_the_legend() {
+        for index in 0..SEMANTIC_TOKEN_LEGEND.len() as u32 {
+            if let Some(token) = SemanticTokenType::from_index(index) {
+                assert_eq!(token.to_index(), index);
+            }
+        }
+        // `VARIABLE` is advertised at index 5 but no token type maps to it.
+        assert_eq!(
+            SEMANTIC_TOKEN_LEGEND[5],
+            tower_lsp::lsp_types::SemanticTokenType::VARIABLE
+        );
+        assert_eq!(SemanticTokenType::from_index(5), None);
+        assert_eq!(
+            SemanticTokenType::from_index(SEMANTIC_TOKEN_LEGEND.len() as u32),
+            None
+        );
+    }
 
     #[test]
     fn test_is_hydra_file_with_comment() {
