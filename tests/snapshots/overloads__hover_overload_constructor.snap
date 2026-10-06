@@ -1,0 +1,11 @@
+---
+source: tests/overloads.rs
+expression: text
+---
+```python
+class Reader:
+
+    @overload
+    def __init__(self, path: str, *, encoding: str) -> None:
+        """Open a reader."""
+```

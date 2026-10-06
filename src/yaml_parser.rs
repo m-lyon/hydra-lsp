@@ -163,19 +163,6 @@ pub enum YamlValue {
     Mapping(LinkedHashMap<String, YamlValue>),
 }
 
-impl YamlValue {
-    pub fn as_bool(&self) -> Option<bool> {
-        match self {
-            YamlValue::Bool(b) => Some(*b),
-            _ => None,
-        }
-    }
-
-    pub fn is_mapping(&self) -> bool {
-        matches!(self, YamlValue::Mapping(_))
-    }
-}
-
 /// Error type for YAML parsing
 #[derive(Debug)]
 pub enum YamlParseError {
@@ -414,6 +401,16 @@ impl ParsedContent {
         } else {
             None
         }
+    }
+
+    /// The Hydra object a parameter line belongs to, or `None` on a `_target_`
+    /// line or an unrelated one. O(1) on the precomputed `param_line_map`.
+    pub fn hydra_object_for_parameter_line(&self, position: Position) -> Option<&HydraObject> {
+        if self.target_line_map.contains_key(&position.line) {
+            return None;
+        }
+        let (idx, _) = self.param_line_map.get(&position.line)?;
+        Some(&self.hydra_objects[*idx])
     }
 
     /// Look up the target value and parameter context for a parameter line at
