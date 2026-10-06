@@ -598,24 +598,18 @@ pub fn validate_document(
         // Try to resolve the target and validate parameters. `None` here means
         // there is nothing sound to validate against.
         let callable = definition_info.as_ref().and_then(|definition_info| {
-            let signature_and_name = match definition_info {
-                DefinitionInfo::Function(sig) => Some((sig, sig.name.clone())),
+            // A class with no constructor has no parameters to check.
+            let signature = definition_info.call_signature()?;
+            let display_name = match definition_info {
+                DefinitionInfo::Class(class_info) if class_info.constructor_is_uncertain() => {
+                    return None;
+                }
                 DefinitionInfo::Class(class_info) => {
-                    if class_info.constructor_is_uncertain() {
-                        None
-                    } else {
-                        // For classes, use the __init__ signature if available;
-                        // a class with no constructor has no parameters to check.
-                        class_info.init_signature.as_ref().map(|init_sig| {
-                            (init_sig, format!("{}.{}", class_info.name, init_sig.name))
-                        })
-                    }
+                    format!("{}.{}", class_info.name, signature.name)
                 }
-                DefinitionInfo::Method(method_info) => {
-                    Some((&method_info.signature, method_info.signature.name.clone()))
-                }
+                DefinitionInfo::Function(_) | DefinitionInfo::Method(_) => signature.name.clone(),
             };
-            signature_and_name.map(|(sig, name)| (sig, name, definition_info.implicit_param()))
+            Some((signature, display_name, definition_info.implicit_param()))
         });
 
         if let Some((signature, display_name, implicit_param)) = callable {
