@@ -567,6 +567,7 @@ mod tests {
     use super::*;
     use crate::database::HydraDatabase;
     use crate::python_analyzer::DefinitionInfo;
+    use crate::python_cache::ResolvedDefinition;
     use ruff_db::system::SystemPath;
     use std::fs;
     use tempfile::TempDir;
@@ -616,12 +617,14 @@ mod tests {
         let db = HydraDatabase::new(SystemPath::new("/"));
         let search_paths = vec![workspace.to_path_buf(), site_packages.to_path_buf()];
 
-        let (definition_info, file_path, _module_path, symbol_name) =
-            PythonAnalyzer::extract_definition_info(&db, symbol_path, &search_paths).unwrap_or_else(
-                |_| panic!("{symbol_path} should resolve when site-packages is nested inside the workspace"),
-            );
+        let def = PythonAnalyzer::extract_definition_info(&db, symbol_path, &search_paths)
+            .unwrap_or_else(|_| {
+                panic!(
+                    "{symbol_path} should resolve when site-packages is nested inside the workspace"
+                )
+            });
 
-        (definition_info, file_path, symbol_name)
+        (def.definition_info, def.file_path, def.symbol_name)
     }
 
     fn assert_exported_class(definition_info: &DefinitionInfo, file_path: &Path) {
@@ -1063,13 +1066,17 @@ mod tests {
         let db = HydraDatabase::new(SystemPath::new("/"));
         let search_paths = vec![root.clone()];
 
-        let (definition_info, file_path, _module_path, symbol_name) =
-            PythonAnalyzer::extract_definition_info(
-                &db,
-                "example_pkg.ExportedClass",
-                &search_paths,
-            )
-            .expect("the lazy export should resolve end-to-end");
+        let ResolvedDefinition {
+            definition_info,
+            file_path,
+            symbol_name,
+            ..
+        } = PythonAnalyzer::extract_definition_info(
+            &db,
+            "example_pkg.ExportedClass",
+            &search_paths,
+        )
+        .expect("the lazy export should resolve end-to-end");
 
         assert_eq!(symbol_name, "ExportedClass");
         assert!(
@@ -1140,9 +1147,13 @@ mod tests {
         let db = HydraDatabase::new(SystemPath::new("/"));
         let search_paths = vec![repo.clone(), repo.join("src")];
 
-        let (definition_info, file_path, _module_path, symbol_name) =
-            PythonAnalyzer::extract_definition_info(&db, "pkg.ExportedClass", &search_paths)
-                .expect("ExportedClass should resolve through the sibling module");
+        let ResolvedDefinition {
+            definition_info,
+            file_path,
+            symbol_name,
+            ..
+        } = PythonAnalyzer::extract_definition_info(&db, "pkg.ExportedClass", &search_paths)
+            .expect("ExportedClass should resolve through the sibling module");
 
         assert_eq!(symbol_name, "ExportedClass");
         assert!(
@@ -1180,7 +1191,7 @@ mod tests {
         assert!(
             result.is_err(),
             "expected no resolution, got {:?}",
-            result.map(|(_, file_path, _, _)| file_path)
+            result.map(|def| def.file_path)
         );
     }
 

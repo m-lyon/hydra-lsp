@@ -19,7 +19,7 @@ use tracing::{Level, debug, error, info, warn};
 
 use hydrust::database::HydraDatabase;
 use hydrust::diagnostics::{DiagnosticRule, validate_document};
-use hydrust::python_analyzer::PythonAnalyzer;
+use hydrust::python_analyzer::{PythonAnalyzer, ResolveError};
 use hydrust::python_cache::PythonConfig;
 use hydrust::yaml_parser::YamlParser;
 
@@ -648,16 +648,15 @@ fn trace_target_resolution(
     let cached = hydrust::python_cache::cached_definition_info(db, python_config, target);
     match cached.get() {
         Ok(def) => {
-            let (def_info, file_path, module_path, symbol_name) = (
-                &def.definition_info,
-                &def.file_path,
-                &def.module_path,
-                &def.symbol_name,
+            eprintln!("  {} {}", "Module:".dimmed(), def.module_path);
+            eprintln!("  {} {}", "Symbol:".dimmed(), def.symbol_name);
+            eprintln!(
+                "  {} {}",
+                "Definition found:".green(),
+                def.file_path.display()
             );
-            eprintln!("  {} {}", "Module:".dimmed(), module_path);
-            eprintln!("  {} {}", "Symbol:".dimmed(), symbol_name);
-            eprintln!("  {} {}", "Definition found:".green(), file_path.display());
 
+            let def_info = &def.definition_info;
             let implicit_param = def_info.implicit_param();
             match def_info {
                 hydrust::python_analyzer::DefinitionInfo::Function(sig) => {
@@ -702,15 +701,12 @@ fn trace_target_resolution(
                 }
             }
         }
-        Err(error_msg) => {
-            if error_msg.starts_with("Invalid _target_ format:")
-                || error_msg.starts_with("Could not resolve module:")
-            {
-                eprintln!("  {} {}", "Error:".red(), error_msg)
-            } else {
-                eprintln!("  {} {}", "Warning:".yellow(), error_msg);
+        Err(err) => match err {
+            ResolveError::InvalidFormat(_) | ResolveError::UnresolvedModule(_) => {
+                eprintln!("  {} {}", "Error:".red(), err)
             }
-        }
+            ResolveError::Other(_) => eprintln!("  {} {}", "Warning:".yellow(), err),
+        },
     }
 
     // Show parameters

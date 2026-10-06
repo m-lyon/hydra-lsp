@@ -1,7 +1,7 @@
 use crate::import_resolver::ImportResolver;
 use crate::python_cache::{
-    InternedSearchPaths, TargetString, class_parent_attribute, class_parent_docs,
-    resolve_module_cached,
+    InternedSearchPaths, ResolvedDefinition, TargetString, class_parent_attribute,
+    class_parent_docs, resolve_module_cached,
 };
 use crate::vendored_typeshed::{is_vendored_path, to_vendored_path};
 use anyhow::{Context, Result};
@@ -183,6 +183,31 @@ pub enum DefinitionInfo {
     Class(ClassInfo),
     Method(MethodInfo),
 }
+
+/// Why a `_target_` string could not be resolved to a Python definition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolveError {
+    /// The target has no `.` separating a module from a symbol. Holds the
+    /// target as written.
+    InvalidFormat(String),
+    /// No search path contains the target's module. Holds the module path.
+    UnresolvedModule(String),
+    /// Anything else, e.g. the module resolved but the symbol was not found.
+    /// Holds the full message.
+    Other(String),
+}
+
+impl std::fmt::Display for ResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidFormat(target) => write!(f, "Invalid _target_ format: '{target}'"),
+            Self::UnresolvedModule(module) => write!(f, "Could not resolve module: '{module}'"),
+            Self::Other(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for ResolveError {}
 
 impl DefinitionInfo {
     /// Get the source location (start_line, start_col, end_line, end_col)
@@ -850,18 +875,17 @@ impl PythonAnalyzer {
         )
     }
 
-    /// Extract definition info (function or class) from a target string.
-    /// Returns:
-    /// - DefinitionInfo (Function or Class)
-    /// - File path where the definition was found
-    /// - Module path
-    /// - Symbol name
+    /// Extract definition info (function, class or method) from a target
+    /// string, along with the file it was found in and the module path and
+    /// symbol name the target resolved to.
     pub fn extract_definition_info(
         db: &dyn ruff_db::Db,
         target: &str,
         search_paths: &[PathBuf],
-    ) -> Result<(DefinitionInfo, PathBuf, String, String)> {
-        let (module_path, symbol_name) = Self::split_target(target)?;
+    ) -> std::result::Result<ResolvedDefinition, ResolveError> {
+        let Ok((module_path, symbol_name)) = Self::split_target(target) else {
+            return Err(ResolveError::InvalidFormat(target.to_string()));
+        };
 
         // Track whether we found the module but not the symbol
         let mut module_found = false;
@@ -883,24 +907,24 @@ impl PythonAnalyzer {
                 &symbol_name,
                 search_paths,
             ) {
-                return Ok((
-                    DefinitionInfo::Function(func_sig),
-                    resolved_file,
+                return Ok(ResolvedDefinition {
+                    definition_info: DefinitionInfo::Function(func_sig),
+                    file_path: resolved_file,
                     module_path,
                     symbol_name,
-                ));
+                });
             }
 
             // Try to extract as class (with import resolution)
             if let Ok((class_info, resolved_file)) =
                 Self::extract_class_info_with_imports(db, &file_path, &symbol_name, search_paths)
             {
-                return Ok((
-                    DefinitionInfo::Class(class_info),
-                    resolved_file,
+                return Ok(ResolvedDefinition {
+                    definition_info: DefinitionInfo::Class(class_info),
+                    file_path: resolved_file,
                     module_path,
                     symbol_name,
-                ));
+                });
             }
         }
 
@@ -922,12 +946,12 @@ impl PythonAnalyzer {
                         &method_name,
                         search_paths,
                     ) {
-                        return Ok((
-                            DefinitionInfo::Method(method_info),
-                            final_file,
-                            module_path.clone(),
-                            format!("{}.{}", class_name, method_name),
-                        ));
+                        return Ok(ResolvedDefinition {
+                            definition_info: DefinitionInfo::Method(method_info),
+                            file_path: final_file,
+                            module_path: module_path.clone(),
+                            symbol_name: format!("{}.{}", class_name, method_name),
+                        });
                     }
                 }
                 ClassAttributeChainResult::Class {
@@ -941,12 +965,12 @@ impl PythonAnalyzer {
                         &class_name,
                         search_paths,
                     ) {
-                        return Ok((
-                            DefinitionInfo::Class(class_info),
-                            final_file,
-                            module_path.clone(),
-                            class_name,
-                        ));
+                        return Ok(ResolvedDefinition {
+                            definition_info: DefinitionInfo::Class(class_info),
+                            file_path: final_file,
+                            module_path: module_path.clone(),
+                            symbol_name: class_name,
+                        });
                     }
                 }
             }
@@ -954,13 +978,12 @@ impl PythonAnalyzer {
 
         // Return appropriate error based on whether module was found
         if module_found {
-            anyhow::bail!(
+            Err(ResolveError::Other(format!(
                 "Symbol '{}' not found in module '{}'",
-                symbol_name,
-                module_path
-            )
+                symbol_name, module_path
+            )))
         } else {
-            anyhow::bail!("Could not resolve module: '{}'", module_path)
+            Err(ResolveError::UnresolvedModule(module_path))
         }
     }
 
@@ -1821,6 +1844,64 @@ mod tests {
         HydraDatabase::new(SystemPath::new("/"))
     }
 
+    // ==================== ResolveError tests ====================
+
+    // Diagnostic messages, CLI output and snapshots depend on this text, so
+    // each variant is checked against the format string it replaced.
+
+    #[test]
+    fn test_resolve_error_display_invalid_format() {
+        let target = "InvalidTarget";
+        assert_eq!(
+            ResolveError::InvalidFormat(target.to_string()).to_string(),
+            format!("Invalid _target_ format: '{}'", target)
+        );
+    }
+
+    #[test]
+    fn test_resolve_error_display_unresolved_module() {
+        let module = "no_such.module";
+        assert_eq!(
+            ResolveError::UnresolvedModule(module.to_string()).to_string(),
+            format!("Could not resolve module: '{}'", module)
+        );
+    }
+
+    #[test]
+    fn test_resolve_error_display_other() {
+        let message = format!(
+            "Symbol '{}' not found in module '{}'",
+            "Missing", "my_module"
+        );
+        assert_eq!(ResolveError::Other(message.clone()).to_string(), message);
+    }
+
+    #[test]
+    fn test_extract_definition_info_error_kinds() {
+        let examples_dir = get_simple_test_dir();
+        let search_paths = [examples_dir, PathBuf::from(".")];
+        let resolve = |target: &str| {
+            PythonAnalyzer::extract_definition_info(&test_db(), target, &search_paths)
+                .err()
+                .expect("target should not resolve")
+        };
+
+        assert_eq!(
+            resolve("InvalidTarget"),
+            ResolveError::InvalidFormat("InvalidTarget".to_string())
+        );
+        assert_eq!(
+            resolve("no_such_module_xyz.Thing"),
+            ResolveError::UnresolvedModule("no_such_module_xyz".to_string())
+        );
+        assert_eq!(
+            resolve("my_module.NoSuchSymbolXyz"),
+            ResolveError::Other(
+                "Symbol 'NoSuchSymbolXyz' not found in module 'my_module'".to_string()
+            )
+        );
+    }
+
     // ==================== split_target tests ====================
 
     #[test]
@@ -2212,7 +2293,7 @@ mod tests {
             &[examples_dir.clone(), PathBuf::from(".")],
         );
         assert!(result.is_ok());
-        let (definition_info, _file_path, _module_path, _symbol_name) = result.unwrap();
+        let definition_info = result.unwrap().definition_info;
 
         match definition_info {
             DefinitionInfo::Class(class_info) => {
@@ -2245,7 +2326,7 @@ mod tests {
             "Should resolve classmethod: {:?}",
             result.err()
         );
-        let (definition_info, _file_path, _module_path, _symbol_name) = result.unwrap();
+        let definition_info = result.unwrap().definition_info;
 
         match definition_info {
             DefinitionInfo::Method(method_info) => {
@@ -2277,7 +2358,7 @@ mod tests {
             "Should resolve staticmethod: {:?}",
             result.err()
         );
-        let (definition_info, _file_path, _module_path, _symbol_name) = result.unwrap();
+        let definition_info = result.unwrap().definition_info;
 
         match definition_info {
             DefinitionInfo::Method(method_info) => {
@@ -2308,7 +2389,7 @@ mod tests {
             "Should resolve classmethod: {:?}",
             result.err()
         );
-        let (definition_info, _file_path, _module_path, _symbol_name) = result.unwrap();
+        let definition_info = result.unwrap().definition_info;
 
         match definition_info {
             DefinitionInfo::Class(class_info) => {
@@ -2340,7 +2421,7 @@ mod tests {
             &[examples_dir.clone(), PathBuf::from(".")],
         );
         assert!(result.is_ok());
-        let (definition_info, _file_path, _module_path, _symbol_name) = result.unwrap();
+        let definition_info = result.unwrap().definition_info;
 
         match definition_info {
             DefinitionInfo::Function(sig) => {
@@ -2360,7 +2441,7 @@ mod tests {
             &[examples_dir.clone(), PathBuf::from(".")],
         );
         assert!(result.is_ok());
-        let (definition_info, _file_path, _module_path, _symbol_name) = result.unwrap();
+        let definition_info = result.unwrap().definition_info;
 
         match definition_info {
             DefinitionInfo::Class(class_info) => {
@@ -2380,7 +2461,7 @@ mod tests {
             &[examples_dir.clone(), PathBuf::from(".")],
         );
         assert!(result.is_ok());
-        let (definition_info, _file_path, _module_path, _symbol_name) = result.unwrap();
+        let definition_info = result.unwrap().definition_info;
 
         match definition_info {
             DefinitionInfo::Class(class_info) => {
@@ -3271,7 +3352,7 @@ mod tests {
             "Should resolve Linear through re-export chain: {:?}",
             result.err()
         );
-        let (definition_info, _file_path, _module_path, _symbol_name) = result.unwrap();
+        let definition_info = result.unwrap().definition_info;
 
         match definition_info {
             DefinitionInfo::Class(class_info) => {
@@ -3305,7 +3386,7 @@ mod tests {
             "Should resolve AliasedClass through aliased re-export: {:?}",
             result.err()
         );
-        let (definition_info, _file_path, _module_path, _symbol_name) = result.unwrap();
+        let definition_info = result.unwrap().definition_info;
 
         match definition_info {
             DefinitionInfo::Class(class_info) => {
@@ -3334,7 +3415,7 @@ mod tests {
             "Should resolve StarExportedClass through star import: {:?}",
             result.err()
         );
-        let (definition_info, _file_path, _module_path, _symbol_name) = result.unwrap();
+        let definition_info = result.unwrap().definition_info;
 
         match definition_info {
             DefinitionInfo::Class(class_info) => {
@@ -3360,7 +3441,7 @@ mod tests {
             "Should resolve DirectClass directly: {:?}",
             result.err()
         );
-        let (definition_info, _file_path, _module_path, _symbol_name) = result.unwrap();
+        let definition_info = result.unwrap().definition_info;
 
         match definition_info {
             DefinitionInfo::Class(class_info) => {
@@ -3406,7 +3487,7 @@ mod tests {
             "Should resolve classmethod: {:?}",
             result.err()
         );
-        let (definition_info, _file_path, _module_path, _symbol_name) = result.unwrap();
+        let definition_info = result.unwrap().definition_info;
 
         match definition_info {
             DefinitionInfo::Method(method_info) => {
@@ -3440,7 +3521,7 @@ mod tests {
             "Should resolve staticmethod: {:?}",
             result.err()
         );
-        let (definition_info, _file_path, _module_path, _symbol_name) = result.unwrap();
+        let definition_info = result.unwrap().definition_info;
 
         match definition_info {
             DefinitionInfo::Method(method_info) => {
@@ -3474,7 +3555,7 @@ mod tests {
             "Should resolve classmethod: {:?}",
             result.err()
         );
-        let (definition_info, _file_path, _module_path, _symbol_name) = result.unwrap();
+        let definition_info = result.unwrap().definition_info;
 
         match definition_info {
             DefinitionInfo::Method(method_info) => {
@@ -3506,7 +3587,7 @@ mod tests {
             "Should resolve classmethod: {:?}",
             result.err()
         );
-        let (definition_info, _file_path, _module_path, _symbol_name) = result.unwrap();
+        let definition_info = result.unwrap().definition_info;
 
         match definition_info {
             DefinitionInfo::Method(method_info) => {
@@ -3623,7 +3704,7 @@ mod tests {
             "Should resolve classmethod: {:?}",
             result.err()
         );
-        let (definition_info, _file_path, _module_path, _symbol_name) = result.unwrap();
+        let definition_info = result.unwrap().definition_info;
 
         match definition_info {
             DefinitionInfo::Method(method_info) => {
@@ -3658,7 +3739,7 @@ mod tests {
             "Should resolve staticmethod: {:?}",
             result.err()
         );
-        let (definition_info, _file_path, _module_path, _symbol_name) = result.unwrap();
+        let definition_info = result.unwrap().definition_info;
 
         match definition_info {
             DefinitionInfo::Method(method_info) => {
