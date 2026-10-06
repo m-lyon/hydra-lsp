@@ -428,11 +428,6 @@ pub fn class_parent_docs<'db>(
                 .resolve_symbol(file_path, class_name)
             {
                 Some((resolved_file, resolved_name)) => {
-                    let resolved_name = if resolved_name.is_empty() {
-                        class_name.to_string()
-                    } else {
-                        resolved_name
-                    };
                     if normalize_path_for_key(db, &resolved_file) == file_path
                         && resolved_name == class_name
                     {

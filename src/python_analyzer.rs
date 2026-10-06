@@ -608,11 +608,7 @@ impl PythonAnalyzer {
                             resolver.resolve_symbol(&current_file, new_class_name)
                         {
                             current_file = resolved_file;
-                            current_class = if resolved_name.is_empty() {
-                                new_class_name.to_string()
-                            } else {
-                                resolved_name
-                            };
+                            current_class = resolved_name;
                             continue;
                         }
 
@@ -796,15 +792,8 @@ impl PythonAnalyzer {
 
         // Simple name - try to resolve through imports in the current file
         let mut resolver = ImportResolver::new(db, search_paths);
-        if let Some((resolved_file, resolved_name)) =
-            resolver.resolve_symbol(current_file, base_class_expr)
-        {
-            let actual_name = if resolved_name.is_empty() {
-                base_class_expr.to_string()
-            } else {
-                resolved_name
-            };
-            return Some((resolved_file, actual_name));
+        if let Some(resolved) = resolver.resolve_symbol(current_file, base_class_expr) {
+            return Some(resolved);
         }
 
         // Check if the class is defined in the same file
@@ -826,30 +815,20 @@ impl PythonAnalyzer {
         class_name: &str,
         search_paths: &[PathBuf],
     ) -> Result<(ClassInfo, PathBuf)> {
-        let (mut class_info, resolved_file) =
-            if let Ok(class_info) = Self::extract_class_info(db, file_path, class_name) {
-                (class_info, file_path.to_path_buf())
-            } else {
-                // Try to resolve through imports
-                let mut resolver = ImportResolver::new(db, search_paths);
-                if let Some((resolved_file, resolved_name)) =
-                    resolver.resolve_symbol(file_path, class_name)
-                {
-                    let actual_name = if resolved_name.is_empty() {
-                        class_name.to_string()
-                    } else {
-                        resolved_name
-                    };
-                    let class_info = Self::extract_class_info(db, &resolved_file, &actual_name)?;
-                    (class_info, resolved_file)
-                } else {
-                    anyhow::bail!(
-                        "Class '{}' not found in {} (also checked re-exports)",
-                        class_name,
-                        file_path.display()
-                    )
-                }
-            };
+        let (mut class_info, resolved_file) = Self::with_reexports(
+            db,
+            file_path,
+            class_name,
+            search_paths,
+            |file, name| Self::extract_class_info(db, file, name),
+            || {
+                anyhow::anyhow!(
+                    "Class '{}' not found in {} (also checked re-exports)",
+                    class_name,
+                    file_path.display()
+                )
+            },
+        )?;
 
         // Resolve missing properties from parent classes via the memoised salsa query.
         // class_parent_docs walks the MRO recursively and caches results per (class, search_paths),
@@ -886,29 +865,46 @@ impl PythonAnalyzer {
         function_name: &str,
         search_paths: &[PathBuf],
     ) -> Result<(FunctionSignature, PathBuf)> {
-        if let Ok(func_sig) = Self::extract_function_signature(db, file_path, function_name) {
-            return Ok((func_sig, file_path.to_path_buf()));
-        }
-
-        // Try to resolve through imports
-        let mut resolver = ImportResolver::new(db, search_paths);
-        if let Some((resolved_file, resolved_name)) =
-            resolver.resolve_symbol(file_path, function_name)
-        {
-            let actual_name = if resolved_name.is_empty() {
-                function_name.to_string()
-            } else {
-                resolved_name
-            };
-            let func_sig = Self::extract_function_signature(db, &resolved_file, &actual_name)?;
-            return Ok((func_sig, resolved_file));
-        }
-
-        anyhow::bail!(
-            "Function '{}' not found in {} (also checked re-exports)",
+        Self::with_reexports(
+            db,
+            file_path,
             function_name,
-            file_path.display()
+            search_paths,
+            |file, name| Self::extract_function_signature(db, file, name),
+            || {
+                anyhow::anyhow!(
+                    "Function '{}' not found in {} (also checked re-exports)",
+                    function_name,
+                    file_path.display()
+                )
+            },
         )
+    }
+
+    /// Run `extract` for `name` in `file_path`, and if that fails, again where
+    /// the file's imports say `name` really lives. Returns the result and the
+    /// file it came from.
+    ///
+    /// The in-file error is dropped. When the import chain resolves, the
+    /// retry's error is returned as is; when it does not, `not_found` is.
+    fn with_reexports<T>(
+        db: &dyn ruff_db::Db,
+        file_path: &Path,
+        name: &str,
+        search_paths: &[PathBuf],
+        extract: impl Fn(&Path, &str) -> Result<T>,
+        not_found: impl FnOnce() -> anyhow::Error,
+    ) -> Result<(T, PathBuf)> {
+        if let Ok(found) = extract(file_path, name) {
+            return Ok((found, file_path.to_path_buf()));
+        }
+
+        let mut resolver = ImportResolver::new(db, search_paths);
+        let Some((resolved_file, resolved_name)) = resolver.resolve_symbol(file_path, name) else {
+            return Err(not_found());
+        };
+        let found = extract(&resolved_file, &resolved_name)?;
+        Ok((found, resolved_file))
     }
 
     /// Extract definition info (function, class or method) from a target
@@ -1130,29 +1126,21 @@ impl PythonAnalyzer {
         method_name: &str,
         search_paths: &[PathBuf],
     ) -> Result<(MethodInfo, PathBuf)> {
-        if let Ok(method_info) = Self::extract_method_info(db, file_path, class_name, method_name) {
-            return Ok((method_info, file_path.to_path_buf()));
-        }
-
-        // Try to resolve class through imports, then find the method
-        let mut resolver = ImportResolver::new(db, search_paths);
-        if let Some((resolved_file, resolved_name)) = resolver.resolve_symbol(file_path, class_name)
-        {
-            let actual_class_name = if resolved_name.is_empty() {
-                class_name.to_string()
-            } else {
-                resolved_name
-            };
-            let method_info =
-                Self::extract_method_info(db, &resolved_file, &actual_class_name, method_name)?;
-            return Ok((method_info, resolved_file));
-        }
-
-        anyhow::bail!(
-            "Method '{}' not found in class '{}' in {} (also checked re-exports)",
-            method_name,
+        // The class is what gets re-exported, so it is the name to follow.
+        Self::with_reexports(
+            db,
+            file_path,
             class_name,
-            file_path.display()
+            search_paths,
+            |file, class| Self::extract_method_info(db, file, class, method_name),
+            || {
+                anyhow::anyhow!(
+                    "Method '{}' not found in class '{}' in {} (also checked re-exports)",
+                    method_name,
+                    class_name,
+                    file_path.display()
+                )
+            },
         )
     }
 

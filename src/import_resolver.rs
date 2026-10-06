@@ -39,8 +39,6 @@ enum ImportInfo {
         name: String,
         level: u32, // For relative imports: 0 = absolute, 1 = '.', 2 = '..', etc.
     },
-    /// `from module import *`
-    StarImport { module: String, level: u32 },
     /// `import module` or `import module as alias`
     Import { module: String },
 }
@@ -157,6 +155,16 @@ impl<'db, 'sp> ImportResolver<'db, 'sp> {
         Self::find_module_file(self.db, &candidate)
     }
 
+    /// The file an import of `module` at `level` names, as seen from `from`:
+    /// relative to `from` when `level > 0`, else through the search paths.
+    fn module_file(&self, from: &Path, module: &str, level: u32) -> Option<PathBuf> {
+        if level > 0 {
+            self.resolve_relative_module_file(from, Some(module), level)
+        } else {
+            self.resolve_module_path(module)
+        }
+    }
+
     /// Extract __all__ from a module
     fn extract_dunder_all(&mut self, file_path: &Path) -> Option<FxHashSet<String>> {
         let parsed = get_parsed_module(self.db, file_path).ok()?;
@@ -234,8 +242,8 @@ impl<'db, 'sp> ImportResolver<'db, 'sp> {
         None
     }
 
-    /// Extract all star imports from a module
-    fn find_star_imports(&mut self, file_path: &Path) -> Vec<ImportInfo> {
+    /// Extract all star imports from a module, as `(module, level)` pairs
+    fn find_star_imports(&mut self, file_path: &Path) -> Vec<(String, u32)> {
         let Ok(parsed) = get_parsed_module(self.db, file_path) else {
             return Vec::new();
         };
@@ -258,13 +266,31 @@ impl<'db, 'sp> ImportResolver<'db, 'sp> {
         PythonAnalyzer::extract_function_signature(self.db, file_path, function_name).ok()
     }
 
-    /// Resolve a symbol by following import chains
-    /// Returns (file_path, original_name) where the symbol is actually defined
+    /// Resolve a symbol by following import chains.
+    ///
+    /// Returns the file the symbol is defined in and its name there. When the
+    /// chain ends on a module rather than a symbol (`import pkg.mod as Name`),
+    /// the name returned is `symbol_name` itself, so callers look it up in
+    /// that module's file.
     pub fn resolve_symbol(
         &mut self,
         starting_file: &Path,
         symbol_name: &str,
     ) -> Option<(PathBuf, String)> {
+        let (file, name) = self.resolve(starting_file, symbol_name)?;
+        Some((file, name.unwrap_or_else(|| symbol_name.to_string())))
+    }
+
+    /// One hop of [`Self::resolve_symbol`], with the depth limit and cycle
+    /// check around it. The name is `None` when the chain ends on a module.
+    ///
+    /// `visited_files` is never cleared, so a file is entered at most once
+    /// per resolver, even on a different branch of the search.
+    fn resolve(
+        &mut self,
+        starting_file: &Path,
+        symbol_name: &str,
+    ) -> Option<(PathBuf, Option<String>)> {
         // Check for cycles and depth limit
         if self.depth >= MAX_IMPORT_DEPTH {
             return None;
@@ -276,24 +302,33 @@ impl<'db, 'sp> ImportResolver<'db, 'sp> {
         if self.visited_files.contains(&canonical_path) {
             return None;
         }
-        self.visited_files.insert(canonical_path.clone());
-        self.depth += 1;
+        self.visited_files.insert(canonical_path);
 
+        self.depth += 1;
+        let result = self.resolve_in_file(starting_file, symbol_name);
+        self.depth -= 1;
+        result
+    }
+
+    /// Look for `symbol_name` in `starting_file`: defined there, imported
+    /// explicitly, exported lazily, or re-exported through a star import.
+    fn resolve_in_file(
+        &mut self,
+        starting_file: &Path,
+        symbol_name: &str,
+    ) -> Option<(PathBuf, Option<String>)> {
         // First, check if the symbol is directly defined in this file
         if self.find_class_direct(starting_file, symbol_name).is_some()
             || self
                 .find_function_direct(starting_file, symbol_name)
                 .is_some()
         {
-            self.depth -= 1;
-            return Some((starting_file.to_path_buf(), symbol_name.to_string()));
+            return Some((starting_file.to_path_buf(), Some(symbol_name.to_string())));
         }
 
         // Look for an explicit import of this symbol
         if let Some(ref import_info) = self.find_import_for_symbol(starting_file, symbol_name) {
-            let result = self.follow_import(starting_file, import_info);
-            self.depth -= 1;
-            return result;
+            return self.follow_import(starting_file, import_info);
         }
 
         // Lazy-export fallback: a package can expose a name through a statically
@@ -308,44 +343,28 @@ impl<'db, 'sp> ImportResolver<'db, 'sp> {
                 self.find_type_checking_import_for_symbol(starting_file, symbol_name)
             && let Some(result) = self.follow_import(starting_file, &import_info)
         {
-            self.depth -= 1;
             return Some(result);
         }
 
         // Check star imports to see if the symbol is re-exported from another module
-        let star_imports = self.find_star_imports(starting_file);
+        for (module, level) in self.find_star_imports(starting_file) {
+            let Some(module_file) = self.module_file(starting_file, &module, level) else {
+                continue;
+            };
 
-        for star_import in star_imports {
-            if let ImportInfo::StarImport { ref module, level } = star_import {
-                let module_file = if level > 0 {
-                    self.resolve_relative_module_file(starting_file, Some(module), level)
-                } else {
-                    self.resolve_module_path(module)
-                };
+            // Check if this symbol is exported from the star-imported module.
+            // If __all__ is defined, check if symbol is in it;
+            // if not defined, check if symbol doesn't start with _
+            let is_exported = match self.extract_dunder_all(&module_file) {
+                Some(all_names) => all_names.contains(symbol_name),
+                None => !symbol_name.starts_with('_'),
+            };
 
-                if let Some(module_file) = module_file {
-                    // Check if this symbol is exported from the star-imported module
-                    let star_dunder_all = self.extract_dunder_all(&module_file);
-
-                    // If __all__ is defined, check if symbol is in it
-                    // If not defined, check if symbol doesn't start with _
-                    let is_exported = if let Some(ref all_names) = star_dunder_all {
-                        all_names.contains(&symbol_name.to_string())
-                    } else {
-                        !symbol_name.starts_with('_')
-                    };
-
-                    if is_exported
-                        && let Some(result) = self.resolve_symbol(&module_file, symbol_name)
-                    {
-                        self.depth -= 1;
-                        return Some(result);
-                    }
-                }
+            if is_exported && let Some(result) = self.resolve(&module_file, symbol_name) {
+                return Some(result);
             }
         }
 
-        self.depth -= 1;
         None
     }
 
@@ -354,34 +373,21 @@ impl<'db, 'sp> ImportResolver<'db, 'sp> {
         &mut self,
         current_file: &Path,
         import: &ImportInfo,
-    ) -> Option<(PathBuf, String)> {
+    ) -> Option<(PathBuf, Option<String>)> {
         match import {
             ImportInfo::FromImport {
                 module,
                 name,
                 level,
             } => {
-                let module_file = if *level > 0 {
-                    self.resolve_relative_module_file(current_file, Some(module), *level)?
-                } else {
-                    self.resolve_module_path(module)?
-                };
+                let module_file = self.module_file(current_file, module, *level)?;
 
                 // Recursively resolve the symbol in the imported module
-                self.resolve_symbol(&module_file, name)
-            }
-            ImportInfo::StarImport { module, level } => {
-                // This shouldn't be called directly for star imports
-                let module_file = if *level > 0 {
-                    self.resolve_relative_module_file(current_file, Some(module), *level)?
-                } else {
-                    self.resolve_module_path(module)?
-                };
-                Some((module_file, String::new()))
+                self.resolve(&module_file, name)
             }
             ImportInfo::Import { module } => {
                 let module_file = self.resolve_module_path(module)?;
-                Some((module_file, String::new()))
+                Some((module_file, None))
             }
         }
     }
@@ -471,7 +477,8 @@ impl<'a> Visitor<'a> for ImportFinder {
 /// Visitor to find all star imports
 #[derive(Default)]
 struct StarImportFinder {
-    star_imports: Vec<ImportInfo>,
+    /// `(module, level)` for each `from module import *`
+    star_imports: Vec<(String, u32)>,
 }
 
 impl<'a> Visitor<'a> for StarImportFinder {
@@ -485,10 +492,7 @@ impl<'a> Visitor<'a> for StarImportFinder {
                         .map(|m| m.as_str().to_string())
                         .unwrap_or_default();
 
-                    self.star_imports.push(ImportInfo::StarImport {
-                        module,
-                        level: import_from.level,
-                    });
+                    self.star_imports.push((module, import_from.level));
                 }
             }
         }
@@ -700,6 +704,26 @@ mod tests {
         let mut resolver = ImportResolver::new(&db, &search_paths);
         let init_file = root.join("example_pkg").join("__init__.py");
         resolver.resolve_symbol(&init_file, symbol_name)
+    }
+
+    #[test]
+    fn test_chain_ending_on_a_module_returns_the_requested_name() {
+        // `X` -> `shim.Y` -> `import example_pkg._implementation as Y`: the
+        // chain ends on a module, so the name is the one first asked for.
+        let (_temp, root) = lazy_export_fixture("from .shim import Y as X\n", "Unused");
+        write_file(
+            &root.join("example_pkg").join("shim.py"),
+            "import example_pkg._implementation as Y\n",
+        );
+
+        let (file_path, symbol_name) =
+            resolve_lazy_export(&root, "X").expect("the module import should resolve");
+
+        assert!(
+            file_path.ends_with("_implementation.py"),
+            "got {file_path:?}"
+        );
+        assert_eq!(symbol_name, "X");
     }
 
     #[test]
