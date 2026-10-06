@@ -403,6 +403,16 @@ impl ParsedContent {
         }
     }
 
+    /// The Hydra object a parameter line belongs to, or `None` on a `_target_`
+    /// line or an unrelated one. O(1) on the precomputed `param_line_map`.
+    pub fn hydra_object_for_parameter_line(&self, position: Position) -> Option<&HydraObject> {
+        if self.target_line_map.contains_key(&position.line) {
+            return None;
+        }
+        let (idx, _) = self.param_line_map.get(&position.line)?;
+        Some(&self.hydra_objects[*idx])
+    }
+
     /// Look up the target value and parameter context for a parameter line at
     /// the given position. Returns `None` when the cursor is on a `_target_`
     /// line or an unrelated line. The third element of the tuple is the list

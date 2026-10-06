@@ -111,6 +111,8 @@ pub struct FunctionSignature {
     /// Set when the symbol is `@overload`ed - `parameters` then describes only the
     /// first declaration, so it is not a sound basis for argument diagnostics.
     pub is_overloaded: bool,
+    /// Every `@overload` declaration, in source order; empty if not overloaded.
+    pub overloads: Vec<FunctionSignature>,
     pub start_line: u32,
     pub start_column: u32,
     pub end_line: u32,
@@ -237,6 +239,25 @@ impl DefinitionInfo {
                         .map(|p| p.name.as_str())
                 }
             }
+        }
+    }
+
+    /// The signature Hydra calls for this target: the function or method
+    /// itself, or a class's constructor.
+    pub fn call_signature(&self) -> Option<&FunctionSignature> {
+        match self {
+            DefinitionInfo::Function(sig) => Some(sig),
+            DefinitionInfo::Class(class_info) => class_info.init_signature.as_ref(),
+            DefinitionInfo::Method(method_info) => Some(&method_info.signature),
+        }
+    }
+
+    /// Mutable access to [`DefinitionInfo::call_signature`].
+    pub fn call_signature_mut(&mut self) -> Option<&mut FunctionSignature> {
+        match self {
+            DefinitionInfo::Function(sig) => Some(sig),
+            DefinitionInfo::Class(class_info) => class_info.init_signature.as_mut(),
+            DefinitionInfo::Method(method_info) => Some(&mut method_info.signature),
         }
     }
 }
@@ -1139,25 +1160,7 @@ impl PythonAnalyzer {
     pub fn format_function(sig: &FunctionSignature) -> String {
         let mut result = String::new();
         result.push_str("```python\n");
-
-        // Only the first overload is shown; say so rather than presenting one
-        // of many signatures as if it were the only one.
-        if sig.is_overloaded {
-            result.push_str("@overload\n");
-        }
-
-        let param_strs = Self::format_parameters(&sig.parameters);
-
-        result.push_str(&Self::format_definition(
-            "def",
-            &sig.name,
-            &param_strs,
-            true,
-            sig.return_type.as_ref(),
-            sig.docstring.as_ref(),
-            None,
-        ));
-
+        result.push_str(&Self::format_callable(sig, None, None));
         result.push_str("\n```");
 
         result
@@ -1183,23 +1186,8 @@ impl PythonAnalyzer {
         // Add the constructor (`__init__`, or `__new__` when that is all the
         // class declares) if present
         if let Some(init_sig) = &class.init_signature {
-            let param_strs = Self::format_parameters(&init_sig.parameters);
-
             result.push_str("\n\n");
-
-            if init_sig.is_overloaded {
-                result.push_str("    @overload\n");
-            }
-
-            result.push_str(&Self::format_definition(
-                "def",
-                &init_sig.name,
-                &param_strs,
-                true,
-                init_sig.return_type.as_ref(),
-                init_sig.docstring.as_ref(),
-                Some(4),
-            ));
+            result.push_str(&Self::format_callable(init_sig, None, Some(4)));
         }
 
         result.push_str("\n```");
@@ -1210,35 +1198,65 @@ impl PythonAnalyzer {
     /// Format a method for display (e.g., in hover)
     /// Shows the method signature with @classmethod or @staticmethod decorator if applicable
     pub fn format_method(method: &MethodInfo) -> String {
+        let decorator = if method.is_classmethod {
+            Some("classmethod")
+        } else if method.is_staticmethod {
+            Some("staticmethod")
+        } else {
+            None
+        };
+
         let mut result = String::new();
         result.push_str("```python\n");
-
-        // Show decorator if applicable
-        if method.is_classmethod {
-            result.push_str("@classmethod\n");
-        } else if method.is_staticmethod {
-            result.push_str("@staticmethod\n");
-        }
-
-        if method.signature.is_overloaded {
-            result.push_str("@overload\n");
-        }
-
-        let param_strs = Self::format_parameters(&method.signature.parameters);
-
-        result.push_str(&Self::format_definition(
-            "def",
-            &method.signature.name,
-            &param_strs,
-            true,
-            method.signature.return_type.as_ref(),
-            method.signature.docstring.as_ref(),
-            None,
-        ));
-
+        result.push_str(&Self::format_callable(&method.signature, decorator, None));
         result.push_str("\n```");
 
         result
+    }
+
+    /// Render a callable's `def`, or one `@overload`-decorated `def` per entry
+    /// in `sig.overloads` when it has them.
+    fn format_callable(
+        sig: &FunctionSignature,
+        decorator: Option<&str>,
+        indent: Option<usize>,
+    ) -> String {
+        let indent_str = " ".repeat(indent.unwrap_or(0));
+        let is_overload_set = !sig.overloads.is_empty();
+        let shown: Vec<&FunctionSignature> = if is_overload_set {
+            sig.overloads.iter().collect()
+        } else {
+            vec![sig]
+        };
+        let docstring = shown
+            .iter()
+            .find_map(|s| s.docstring.as_ref())
+            .or(sig.docstring.as_ref());
+
+        let defs: Vec<String> = shown
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let mut def = String::new();
+                if let Some(decorator) = decorator {
+                    def.push_str(&format!("{indent_str}@{decorator}\n"));
+                }
+                if is_overload_set {
+                    def.push_str(&format!("{indent_str}@overload\n"));
+                }
+                def.push_str(&Self::format_definition(
+                    "def",
+                    &s.name,
+                    &Self::format_parameters(&s.parameters),
+                    true,
+                    s.return_type.as_ref(),
+                    docstring.filter(|_| i + 1 == shown.len()),
+                    indent,
+                ));
+                def
+            })
+            .collect();
+        defs.join("\n")
     }
 
     /// Format a function definition string
@@ -1448,6 +1466,8 @@ impl<'a> Visitor<'a> for MethodExtractor {
                     let mut signature =
                         extract_function_signature_from_def(declaration, &self.source);
                     signature.is_overloaded = is_overloaded;
+                    signature.overloads =
+                        overload_signatures(&class_def.body, &self.method_name, &self.source);
 
                     // Check decorators for @classmethod or @staticmethod, on the
                     // declaration actually chosen rather than on this statement.
@@ -1522,7 +1542,24 @@ fn extract_declared_signature(
     let (func_def, is_overloaded) = resolve_declaration(body, name)?;
     let mut signature = extract_function_signature_from_def(func_def, source);
     signature.is_overloaded = is_overloaded;
+    signature.overloads = overload_signatures(body, name, source);
     Some(signature)
+}
+
+/// The signature of every `@overload` declaration of `name` in `body`, in
+/// source order.
+fn overload_signatures(body: &[Stmt], name: &str, source: &str) -> Vec<FunctionSignature> {
+    body.iter()
+        .filter_map(|stmt| match stmt {
+            Stmt::FunctionDef(func_def)
+                if func_def.name.as_str() == name
+                    && has_overload_decorator(&func_def.decorator_list) =>
+            {
+                Some(extract_function_signature_from_def(func_def, source))
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// Check for `@overload`, however `typing.overload` was imported.
@@ -1598,6 +1635,7 @@ fn extract_function_signature_from_def(
         return_type,
         docstring,
         is_overloaded: false,
+        overloads: Vec::new(),
         start_line,
         start_column,
         end_line,
@@ -2374,6 +2412,7 @@ mod tests {
             return_type: None,
             docstring: None,
             is_overloaded: false,
+            overloads: Vec::new(),
             start_line: 0,
             start_column: 0,
             end_line: 5,
@@ -2415,6 +2454,7 @@ mod tests {
             return_type: Some("bool".to_string()),
             docstring: Some("Test docstring".to_string()),
             is_overloaded: false,
+            overloads: Vec::new(),
             start_line: 0,
             start_column: 0,
             end_line: 5,
@@ -2455,6 +2495,7 @@ mod tests {
             return_type: None,
             docstring: None,
             is_overloaded: false,
+            overloads: Vec::new(),
             start_line: 0,
             start_column: 0,
             end_line: 5,
@@ -2526,6 +2567,7 @@ mod tests {
                 return_type: None,
                 docstring: None,
                 is_overloaded: false,
+                overloads: Vec::new(),
                 start_line: 0,
                 start_column: 0,
                 end_line: 5,
@@ -2582,6 +2624,7 @@ mod tests {
                 return_type: None,
                 docstring: None,
                 is_overloaded: false,
+                overloads: Vec::new(),
                 start_line: 0,
                 start_column: 0,
                 end_line: 5,
@@ -3511,6 +3554,7 @@ mod tests {
                 return_type: Some("MyClass".to_string()),
                 docstring: Some("Create from config".to_string()),
                 is_overloaded: false,
+                overloads: Vec::new(),
                 start_line: 0,
                 start_column: 0,
                 end_line: 5,
@@ -3546,6 +3590,7 @@ mod tests {
                 return_type: Some("int".to_string()),
                 docstring: None,
                 is_overloaded: false,
+                overloads: Vec::new(),
                 start_line: 0,
                 start_column: 0,
                 end_line: 5,
@@ -3744,6 +3789,7 @@ mod tests {
             return_type: None,
             docstring: None,
             is_overloaded: false,
+            overloads: Vec::new(),
             start_line: 0,
             start_column: 0,
             end_line: 0,
@@ -3785,6 +3831,7 @@ mod tests {
                 return_type: None,
                 docstring: None,
                 is_overloaded: false,
+                overloads: Vec::new(),
                 start_line: 0,
                 start_column: 0,
                 end_line: 0,
@@ -3821,6 +3868,7 @@ mod tests {
                 return_type: None,
                 docstring: None,
                 is_overloaded: false,
+                overloads: Vec::new(),
                 start_line: 0,
                 start_column: 0,
                 end_line: 0,
@@ -3873,6 +3921,7 @@ mod tests {
                 return_type: None,
                 docstring: None,
                 is_overloaded: false,
+                overloads: Vec::new(),
                 start_line: 0,
                 start_column: 0,
                 end_line: 0,
@@ -3904,6 +3953,7 @@ mod tests {
                 return_type: None,
                 docstring: None,
                 is_overloaded: false,
+                overloads: Vec::new(),
                 start_line: 0,
                 start_column: 0,
                 end_line: 0,
@@ -3935,6 +3985,7 @@ mod tests {
                 return_type: None,
                 docstring: None,
                 is_overloaded: false,
+                overloads: Vec::new(),
                 start_line: 0,
                 start_column: 0,
                 end_line: 0,
@@ -3966,6 +4017,7 @@ mod tests {
                 return_type: None,
                 docstring: None,
                 is_overloaded: false,
+                overloads: Vec::new(),
                 start_line: 0,
                 start_column: 0,
                 end_line: 0,
