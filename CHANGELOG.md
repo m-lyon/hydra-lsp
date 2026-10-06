@@ -2,7 +2,7 @@
 
 ## [0.6.1]
 
-- Overloaded targets are now narrowed to the overloads the node's keys and `_args_` match, as `ty` does for a call. Hover shows the matching overloads, signature help lists every overload with the first match active, and go-to-definition lands on each matching overload (plus the implementation in a `.py` source). Argument types are not compared.
+- Overloaded targets are now narrowed to the overloads the node's keys and `_args_` match. Hover shows the matching overloads, signature help lists every overload with the first match active, and go-to-definition lands on each matching overload. Argument types are not compared.
 
 ## [0.6.0]
 

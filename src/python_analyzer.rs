@@ -112,7 +112,6 @@ pub struct FunctionSignature {
     /// first declaration, so it is not a sound basis for argument diagnostics.
     pub is_overloaded: bool,
     /// Every `@overload` declaration, in source order; empty if not overloaded.
-    /// Used by hover, signature help and goto - validation still uses `parameters`.
     pub overloads: Vec<FunctionSignature>,
     pub start_line: u32,
     pub start_column: u32,
@@ -1217,13 +1216,6 @@ impl PythonAnalyzer {
 
     /// Render a callable's `def`, or one `@overload`-decorated `def` per entry
     /// in `sig.overloads` when it has them.
-    ///
-    /// The overloads are shown instead of any implementation because they are
-    /// the call shapes a caller sees, which is what `ty` shows too. Callers
-    /// narrow `sig.overloads` to those the YAML node matches beforehand (see
-    /// `diagnostics::narrow_overloads`). The docstring is given once, on the
-    /// last `def`: the first overload that has one wins, falling back to the
-    /// implementation's, since stubs rarely document each overload.
     fn format_callable(
         sig: &FunctionSignature,
         decorator: Option<&str>,

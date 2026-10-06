@@ -84,9 +84,7 @@ fn build_signature_params<'a>(
 /// `(start_line, start_col, end_line, end_col)` ranges in one file.
 ///
 /// An overloaded function or method lands on each of its (already narrowed)
-/// overloads, and then on the implementation when a `.py` source has one —
-/// the same set `ty` offers for a call. A class always lands on the class
-/// itself, not its constructor.
+/// overloads.
 fn definition_positions(definition_info: &DefinitionInfo) -> Vec<(u32, u32, u32, u32)> {
     let signature = match definition_info {
         DefinitionInfo::Function(sig) => sig,
@@ -111,12 +109,12 @@ fn definition_positions(definition_info: &DefinitionInfo) -> Vec<(u32, u32, u32,
     positions
 }
 
-/// One signature for signature help: `sig` labelled as `label_prefix(...)`,
-/// with the parameter under the cursor active, or a bare `label_prefix()` when
-/// there is no signature (a class with no constructor).
+/// Build one signature-help entry: show `label_prefix(...)` with the active parameter
+/// under the cursor, or just `label_prefix()` when there is no callable signature
+/// (for example, a class with no constructor).
 ///
-/// The active index is out of bounds when the cursor's key matches no
-/// parameter, so the client does not default to highlighting the first one.
+/// If the cursor's key matches no parameter, the active index is set past the
+/// end so the client leaves no parameter highlighted by default.
 fn signature_information(
     label_prefix: &str,
     sig: Option<&FunctionSignature>,
@@ -1711,9 +1709,9 @@ impl LanguageServer for HydraLspBackend {
                 let call_signature = definition_info.call_signature();
 
                 // An overloaded target lists every overload, with the first one
-                // the YAML node's arguments match made active — the shape `ty`
-                // gives a call. Otherwise there is just the one signature, or
-                // a bare `Name()` for a class with no constructor at all.
+                // the YAML node's arguments match made active. Otherwise there is just
+                // the one signature, or a bare `Name()` for a class with no constructor
+                // at all.
                 let (shown, active_signature): (Vec<Option<&FunctionSignature>>, usize) =
                     match call_signature {
                         Some(sig) if !sig.overloads.is_empty() => (

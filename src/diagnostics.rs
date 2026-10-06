@@ -430,13 +430,6 @@ fn validate_parameters(
 
 /// Whether `signature` accepts the arguments `hydra_obj` passes: its keys,
 /// its `_args_` count and, unless it is `_partial_`, every required parameter.
-///
-/// This is [`validate_parameters`] with no file-level suppressions, so an
-/// overload is matched by exactly the rules a non-overloaded target is
-/// validated by. Suppressions on the node or a parameter line still apply, so
-/// an overload whose only error is silenced there counts as a match. Only
-/// the call shape is compared, not argument types — ty narrows on those too,
-/// but YAML values carry too little type information for it (see #14).
 fn accepts_arguments(
     hydra_obj: &HydraObject,
     signature: &FunctionSignature,
@@ -464,10 +457,7 @@ pub fn matching_overloads(
 }
 
 /// Narrow the overloads of `definition`'s call signature to those matching
-/// `hydra_obj`, the way `ty` narrows them to a call's arguments.
-///
-/// When none match — mid-edit, say, before a required key is typed — every
-/// overload is kept, so the reader still sees what the target accepts.
+/// `hydra_obj`.
 pub fn narrow_overloads(definition: &mut DefinitionInfo, hydra_obj: &HydraObject) {
     let implicit_param = definition.implicit_param().map(str::to_owned);
     let Some(signature) = definition.call_signature_mut() else {

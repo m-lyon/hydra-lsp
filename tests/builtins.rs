@@ -396,8 +396,6 @@ length:
     assert_eq!(sig_help.active_parameter, Some(0));
 }
 
-/// An overloaded target lists every overload, as `ty` does for a call, rather
-/// than presenting the first as if it were the whole story.
 #[tokio::test]
 async fn test_signature_help_lists_overloads() {
     let mut ctx = TestContext::new(TestWorkspace::Simple);
