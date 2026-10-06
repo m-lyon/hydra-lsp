@@ -1,0 +1,9 @@
+---
+source: tests/overloads.rs
+expression: binary
+---
+```python
+@overload
+def load(path: str, *, binary: bool) -> bytes:
+    """Load a file as text, or as bytes when `binary` is set."""
+```

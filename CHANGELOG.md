@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.6.1]
+
+- Overloaded targets are now narrowed to the overloads the node's keys and `_args_` match. Hover shows the matching overloads, signature help lists every overload with the first match active, and go-to-definition lands on each matching overload. Argument types are not compared.
+
 ## [0.6.0]
 
 - Added support for Python builtins as a `_target_`, resolved from the typeshed stubs vendored by `ty_vendored`.
