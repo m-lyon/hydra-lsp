@@ -22,7 +22,7 @@ async-trait = "0.1"
 
 # State management
 dashmap = "6.1"
-parking_lot = "0.12"
+parking_lot = "0.13"
 
 # YAML parsing
 saphyr = "0.0.6"
