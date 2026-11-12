@@ -4,8 +4,7 @@ use crate::python_analyzer::{
 use crate::python_cache::{PythonConfig, TargetString, cached_definition_info, is_builtin_symbol};
 use crate::vendored_typeshed::BUILTINS_MODULE;
 use crate::yaml_parser::{
-    ARGS_KEY, CONVERT_KEY, ConvertMode, HydraObject, PARTIAL_KEY, Parameter, ParsedContent,
-    RECURSIVE_KEY, utf16_len,
+    ARGS_KEY, ArgKind, CONVERT_KEY, ConvertMode, HydraObject, Parameter, ParsedContent, utf16_len,
 };
 use std::collections::HashSet;
 use std::fmt;
@@ -188,19 +187,14 @@ impl<'a> CallCheck<'a> {
         let keywords = hydra_obj
             .parameters
             .iter()
-            .filter_map(|param| match param {
-                Parameter::Keyword {
-                    key,
-                    line,
-                    key_start,
-                    ..
-                } => Some(KeywordArg {
+            .filter_map(|param| match &param.kind {
+                ArgKind::Keyword { key, key_start } => Some(KeywordArg {
                     param,
                     key,
-                    line: *line,
+                    line: param.line,
                     key_start: *key_start,
                 }),
-                Parameter::Positional { .. } => None,
+                ArgKind::Positional => None,
             })
             .collect();
         CallCheck {
@@ -218,7 +212,7 @@ impl<'a> CallCheck<'a> {
             num_positional_args: hydra_obj
                 .parameters
                 .iter()
-                .filter(|p| matches!(p, Parameter::Positional { .. }))
+                .filter(|p| p.is_positional())
                 .count(),
         }
     }
@@ -230,7 +224,7 @@ impl<'a> CallCheck<'a> {
 
     /// Whether `rule` is off for `arg`, which may also suppress it itself.
     fn suppressed_at(&self, rule: DiagnosticRule, arg: &KeywordArg) -> bool {
-        self.rule_suppressed(rule) || arg.param.suppressed_rules().contains(&rule)
+        self.rule_suppressed(rule) || arg.param.suppressed_rules.contains(&rule)
     }
 
     /// A diagnostic on `arg`'s key.
@@ -506,78 +500,41 @@ fn validate_hydra_keywords(
     hydra_obj: &HydraObject,
     file_suppressions: &HashSet<DiagnosticRule>,
 ) -> Vec<Diagnostic> {
-    let mut diagnostics = Vec::new();
-
     if file_suppressions.contains(&DiagnosticRule::InvalidHydraParameter)
         || hydra_obj
             .suppressed_rules
             .contains(&DiagnosticRule::InvalidHydraParameter)
     {
-        return diagnostics;
+        return Vec::new();
     }
 
-    let mut check_keyword =
-        |keyword: &str, hp_invalid: bool, hp_line: u32, hp_key_start: u32, msg: String| {
-            if hp_invalid {
-                diagnostics.push(create_diagnostic(
-                    hp_line,
-                    hp_key_start,
-                    hp_key_start + keyword.len() as u32,
-                    DiagnosticSeverity::ERROR,
-                    Some(DiagnosticRule::InvalidHydraParameter),
-                    msg,
-                ));
-            }
-        };
+    // What a valid value for each keyword looks like.
+    let expected = |keyword: &str| match keyword {
+        CONVERT_KEY => format!("one of: {}", ConvertMode::variants().join(", ")),
+        ARGS_KEY => "a list".to_string(),
+        // _partial_ and _recursive_
+        _ => "a boolean (true or false)".to_string(),
+    };
 
-    if let Some(ref hp) = hydra_obj.partial {
-        check_keyword(
-            PARTIAL_KEY,
-            hp.invalid,
-            hp.line,
-            hp.key_start,
-            format!(
-                "Invalid value for '{}': must be a boolean (true or false)",
-                PARTIAL_KEY
-            ),
-        );
-    }
-    if let Some(ref hp) = hydra_obj.recursive {
-        check_keyword(
-            RECURSIVE_KEY,
-            hp.invalid,
-            hp.line,
-            hp.key_start,
-            format!(
-                "Invalid value for '{}': must be a boolean (true or false)",
-                RECURSIVE_KEY
-            ),
-        );
-    }
-    if let Some(ref hp) = hydra_obj.convert {
-        check_keyword(
-            CONVERT_KEY,
-            hp.invalid,
-            hp.line,
-            hp.key_start,
-            format!(
-                "Invalid value for '{}': must be one of: {}",
-                CONVERT_KEY,
-                ConvertMode::variants().join(", ")
-            ),
-        );
-    }
-    if let Some(ref hp) = hydra_obj.args {
-        check_keyword(
-            ARGS_KEY,
-            hp.invalid,
-            hp.line,
-            hp.key_start,
-            format!("Invalid value for '{}': must be a list", ARGS_KEY),
-        );
-    }
-
-    diagnostics
+    hydra_obj
+        .keywords()
+        .into_iter()
+        .filter_map(|(keyword, hp)| Some((keyword, hp.filter(|hp| hp.invalid)?)))
+        .map(|(keyword, hp)| {
+            create_diagnostic(
+                hp.line,
+                hp.key_start,
+                hp.key_start + keyword.len() as u32,
+                DiagnosticSeverity::ERROR,
+                Some(DiagnosticRule::InvalidHydraParameter),
+                format!(
+                    "Invalid value for '{}': must be {}",
+                    keyword,
+                    expected(keyword)
+                ),
+            )
+        })
+        .collect()
 }
 
 /// Validate all targets in a document.
@@ -720,11 +677,13 @@ mod tests {
 
     /// Helper to create a keyword Parameter with default suppression fields.
     fn make_param(key: &str, value: YamlValue, line: u32) -> Parameter {
-        Parameter::Keyword {
-            key: key.to_string(),
+        Parameter {
+            kind: ArgKind::Keyword {
+                key: key.to_string(),
+                key_start: 0,
+            },
             value,
             line,
-            key_start: 0,
             value_start: 0,
             value_end: 0,
             suppressed_rules: HashSet::new(),
@@ -1816,7 +1775,7 @@ mod tests {
     #[test]
     fn test_parameter_diagnostics_point_at_the_parameter() {
         let mut param = make_param("nope", YamlValue::Integer(1), 1);
-        if let Parameter::Keyword { key_start, .. } = &mut param {
+        if let ArgKind::Keyword { key_start, .. } = &mut param.kind {
             *key_start = 34;
         }
         let hydra_obj = build_hydra_object("mod.f", vec![param], 1, 9, 20, false);
@@ -1846,7 +1805,8 @@ mod tests {
             "mod.f",
             vec![
                 make_param("a", YamlValue::Integer(2), 1),
-                Parameter::Positional {
+                Parameter {
+                    kind: ArgKind::Positional,
                     value: YamlValue::Integer(1),
                     line: 2,
                     value_start: 0,

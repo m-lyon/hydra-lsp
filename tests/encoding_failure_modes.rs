@@ -8,7 +8,7 @@
 //! These diverge for any non-ASCII char (bytes) and for astral chars
 //! (codepoints vs UTF-16).
 
-use hydrust::yaml_parser::{CompletionContext, Parameter, YamlParser};
+use hydrust::yaml_parser::{CompletionContext, YamlParser};
 use tower_lsp::lsp_types::Position;
 
 /// FM1 (Group C) — cursor column vs byte slicing on a `_target_` value line.
@@ -81,22 +81,13 @@ fn fm3_param_value_end_counts_utf16_not_codepoints() {
         .find(|p| p.key() == Some("tag"))
         .expect("tag parameter should be parsed");
 
-    match tag {
-        Parameter::Keyword {
-            value_start,
-            value_end,
-            ..
-        } => {
-            // ASCII prefix => encoding-agnostic.
-            assert_eq!(*value_start, 7);
-            // Discriminator: 🎯 counts as 2 UTF-16 units, so end = 10 not 9.
-            assert_eq!(
-                *value_end, 10,
-                "value end must count 🎯 as 2 UTF-16 units, not 1 codepoint"
-            );
-        }
-        _ => panic!("tag should be a keyword parameter"),
-    }
+    // ASCII prefix => encoding-agnostic.
+    assert_eq!(tag.value_start, 7);
+    // Discriminator: 🎯 counts as 2 UTF-16 units, so end = 10 not 9.
+    assert_eq!(
+        tag.value_end, 10,
+        "value end must count 🎯 as 2 UTF-16 units, not 1 codepoint"
+    );
 }
 
 /// FM4 (Group D) — locating inline `_args_` must keep document offsets
