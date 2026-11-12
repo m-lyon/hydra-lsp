@@ -160,7 +160,6 @@ fn target_format_hint(db: &dyn ruff_db::Db, target: TargetString<'_>) -> String 
 struct KeywordArg<'a> {
     param: &'a Parameter,
     key: &'a str,
-    line: u32,
     key_start: u32,
 }
 
@@ -191,7 +190,6 @@ impl<'a> CallCheck<'a> {
                 ArgKind::Keyword { key, key_start } => Some(KeywordArg {
                     param,
                     key,
-                    line: param.line,
                     key_start: *key_start,
                 }),
                 ArgKind::Positional => None,
@@ -236,7 +234,7 @@ impl<'a> CallCheck<'a> {
         message: String,
     ) -> Diagnostic {
         create_diagnostic(
-            arg.line,
+            arg.param.line,
             arg.key_start,
             arg.key_start + utf16_len(arg.key),
             severity,
