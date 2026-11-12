@@ -18,7 +18,8 @@ use crate::database::HydraDatabase;
 use crate::diagnostics::{self, DiagnosticRule};
 use crate::outbox::ClientOutbox;
 use crate::python_analyzer::{
-    DefaultStyle, DefinitionInfo, FunctionSignature, ParameterInfo, PythonAnalyzer, ResolveError,
+    DefaultStyle, DefinitionInfo, FunctionSignature, ParameterInfo, ParameterKind, PythonAnalyzer,
+    ResolveError,
 };
 use crate::python_cache::{self, PythonConfig, ResolvedDefinition, TargetString};
 use crate::yaml_cache::{self, DocumentInput, ParsedYaml};
@@ -96,6 +97,39 @@ fn definition_positions(definition_info: &DefinitionInfo) -> Vec<(u32, u32, u32,
     positions
 }
 
+/// Returns the index in `params` of the parameter that the cursor is on, or
+/// `params.len()` when no parameter should be highlighted.
+fn active_parameter(
+    params: &[&ParameterInfo],
+    param_context: &ResolvedParameterContext,
+    keyword_keys: &[String],
+) -> u32 {
+    let position_of = |kind| params.iter().position(|p| p.kind == kind);
+    let none = params.len();
+    let active = match param_context {
+        ResolvedParameterContext::Keyword(key) => params
+            .iter()
+            .position(|p| p.name == *key && !p.is_variadic())
+            .or_else(|| position_of(ParameterKind::VarKeyword))
+            .unwrap_or(none),
+        ResolvedParameterContext::Positional(_, 0) => none,
+        ResolvedParameterContext::Positional(index, _) => {
+            let pos = params
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p.binds_positionally())
+                .nth(*index as usize)
+                .map(|(i, _)| i)
+                .or_else(|| position_of(ParameterKind::VarPositional));
+            match pos {
+                Some(i) if !keyword_keys.contains(&params[i].name) => i,
+                _ => none,
+            }
+        }
+    };
+    active as u32
+}
+
 /// Build one signature-help entry: show `label_prefix(...)` with the active parameter
 /// under the cursor, or just `label_prefix()` when there is no callable signature
 /// (for example, a class with no constructor).
@@ -113,44 +147,7 @@ fn signature_information(
         Some(sig) => build_signature_params(&sig.parameters, implicit_param),
         None => (String::new(), vec![], vec![]),
     };
-
-    let active_parameter = match param_context {
-        ResolvedParameterContext::Keyword(key) => {
-            // Try exact match first, then fall back to **kwargs
-            param_infos
-                .iter()
-                .position(|p| p.name == *key && !p.is_variadic && !p.is_variadic_keyword)
-                .or_else(|| {
-                    // Unknown keyword: highlight **kwargs if present
-                    param_infos.iter().position(|p| p.is_variadic_keyword)
-                })
-                .unwrap_or(parameters.len())
-        }
-        ResolvedParameterContext::Positional(index, num_args_in_yaml) => {
-            // _args_ entries map to positional parameters in order: the idx-th
-            // parameter that can be passed positionally, overflowing into
-            // *args if present.
-            let pos = param_infos
-                .iter()
-                .enumerate()
-                .filter(|(_, p)| !p.is_variadic && !p.is_variadic_keyword && !p.is_keyword_only)
-                .nth(*index as usize)
-                .map(|(i, _)| i)
-                .or_else(|| param_infos.iter().position(|p| p.is_variadic))
-                .unwrap_or(parameters.len());
-            // Don't highlight any parameter when the _args_ list is empty —
-            // there are no actual arguments being passed. Also suppress when
-            // the positional parameter is already specified as a keyword
-            // argument.
-            if *num_args_in_yaml == 0
-                || (pos < param_infos.len() && keyword_keys.contains(&param_infos[pos].name))
-            {
-                parameters.len()
-            } else {
-                pos
-            }
-        }
-    };
+    let active_parameter = active_parameter(&param_infos, param_context, keyword_keys);
 
     SignatureInformation {
         label: format!("{label_prefix}({params_str})"),
@@ -160,7 +157,7 @@ fn signature_information(
         } else {
             Some(parameters)
         },
-        active_parameter: Some(active_parameter as u32),
+        active_parameter: Some(active_parameter),
     }
 }
 
@@ -2397,6 +2394,112 @@ mod tests {
     use salsa::{Database as _, Setter};
     use std::cell::Cell;
     use std::time::Duration;
+
+    // ==================== active_parameter tests ====================
+
+    fn param(name: &str, kind: ParameterKind) -> ParameterInfo {
+        ParameterInfo {
+            name: name.to_string(),
+            kind,
+            type_annotation: None,
+            default_value: None,
+        }
+    }
+
+    /// `def f(a, /, b, *args, c, **kwargs)`
+    fn full_signature() -> Vec<ParameterInfo> {
+        vec![
+            param("a", ParameterKind::PositionalOnly),
+            param("b", ParameterKind::PositionalOrKeyword),
+            param("args", ParameterKind::VarPositional),
+            param("c", ParameterKind::KeywordOnly),
+            param("kwargs", ParameterKind::VarKeyword),
+        ]
+    }
+
+    fn active(params: &[ParameterInfo], ctx: ResolvedParameterContext, keys: &[&str]) -> u32 {
+        let refs: Vec<&ParameterInfo> = params.iter().collect();
+        let keys: Vec<String> = keys.iter().map(|k| k.to_string()).collect();
+        active_parameter(&refs, &ctx, &keys)
+    }
+
+    fn keyword(key: &str) -> ResolvedParameterContext {
+        ResolvedParameterContext::Keyword(key.to_string())
+    }
+
+    #[test]
+    fn test_active_parameter_keyword_match() {
+        let params = full_signature();
+        assert_eq!(active(&params, keyword("b"), &[]), 1);
+        assert_eq!(active(&params, keyword("c"), &[]), 3);
+    }
+
+    #[test]
+    fn test_active_parameter_keyword_falls_back_to_kwargs() {
+        let params = full_signature();
+        assert_eq!(active(&params, keyword("unknown"), &[]), 4);
+        // A key naming a variadic parameter is not that parameter.
+        assert_eq!(active(&params, keyword("args"), &[]), 4);
+    }
+
+    #[test]
+    fn test_active_parameter_keyword_no_match() {
+        let params = vec![param("a", ParameterKind::PositionalOrKeyword)];
+        assert_eq!(active(&params, keyword("unknown"), &[]), 1);
+        assert_eq!(active(&[], keyword("unknown"), &[]), 0);
+    }
+
+    #[test]
+    fn test_active_parameter_positional_index() {
+        let params = full_signature();
+        let positional = |i| ResolvedParameterContext::Positional(i, 3);
+        // Positional-only and positional-or-keyword both bind in order.
+        assert_eq!(active(&params, positional(0), &[]), 0);
+        assert_eq!(active(&params, positional(1), &[]), 1);
+    }
+
+    #[test]
+    fn test_active_parameter_positional_overflow_into_args() {
+        let params = full_signature();
+        // Past the last positional parameter, `*args` takes the rest; the
+        // keyword-only `c` is never filled positionally.
+        assert_eq!(
+            active(&params, ResolvedParameterContext::Positional(2, 3), &[]),
+            2
+        );
+        assert_eq!(
+            active(&params, ResolvedParameterContext::Positional(5, 6), &[]),
+            2
+        );
+    }
+
+    #[test]
+    fn test_active_parameter_positional_stops_at_keyword_only() {
+        // `def f(a, *, c)`: no `*args`, so a second `_args_` entry fills nothing.
+        let params = vec![
+            param("a", ParameterKind::PositionalOrKeyword),
+            param("c", ParameterKind::KeywordOnly),
+        ];
+        assert_eq!(
+            active(&params, ResolvedParameterContext::Positional(1, 2), &[]),
+            2
+        );
+    }
+
+    #[test]
+    fn test_active_parameter_positional_suppressed() {
+        let params = full_signature();
+        // An empty `_args_` list passes nothing.
+        assert_eq!(
+            active(&params, ResolvedParameterContext::Positional(0, 0), &[]),
+            5
+        );
+        // A parameter also given by keyword is not highlighted.
+        assert_eq!(
+            active(&params, ResolvedParameterContext::Positional(1, 2), &["b"]),
+            5
+        );
+    }
 
     thread_local! {
         /// What [`available_cpus`] should report inside [`with_cpus`]: the outer

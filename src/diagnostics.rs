@@ -1,4 +1,6 @@
-use crate::python_analyzer::{DefinitionInfo, FunctionSignature, ParameterInfo, ResolveError};
+use crate::python_analyzer::{
+    DefinitionInfo, FunctionSignature, ParameterInfo, ParameterKind, ResolveError,
+};
 use crate::python_cache::{PythonConfig, TargetString, cached_definition_info, is_builtin_symbol};
 use crate::vendored_typeshed::BUILTINS_MODULE;
 use crate::yaml_parser::{
@@ -156,15 +158,128 @@ fn target_format_hint(db: &dyn ruff_db::Db, target: TargetString<'_>) -> String 
     }
 }
 
-fn is_suppressed(
-    rule: DiagnosticRule,
-    param: &Parameter,
-    hydra_obj: &HydraObject,
-    file_suppressions: &HashSet<DiagnosticRule>,
-) -> bool {
-    file_suppressions.contains(&rule)
-        || hydra_obj.suppressed_rules.contains(&rule)
-        || param.suppressed_rules().contains(&rule)
+struct KeywordArg<'a> {
+    param: &'a Parameter,
+    key: &'a str,
+    line: u32,
+    key_start: u32,
+}
+
+struct CallCheck<'a> {
+    hydra_obj: &'a HydraObject,
+    display_name: &'a str,
+    file_suppressions: &'a HashSet<DiagnosticRule>,
+    params: Vec<&'a ParameterInfo>,
+    has_var_positional: bool,
+    has_var_keyword: bool,
+    keywords: Vec<KeywordArg<'a>>,
+    num_positional_args: usize,
+}
+
+impl<'a> CallCheck<'a> {
+    fn new(
+        hydra_obj: &'a HydraObject,
+        signature: &'a FunctionSignature,
+        display_name: &'a str,
+        implicit_param: Option<&str>,
+        file_suppressions: &'a HashSet<DiagnosticRule>,
+    ) -> Self {
+        let has_kind = |kind| signature.parameters.iter().any(|p| p.kind == kind);
+        let keywords = hydra_obj
+            .parameters
+            .iter()
+            .filter_map(|param| match param {
+                Parameter::Keyword {
+                    key,
+                    line,
+                    key_start,
+                    ..
+                } => Some(KeywordArg {
+                    param,
+                    key,
+                    line: *line,
+                    key_start: *key_start,
+                }),
+                Parameter::Positional { .. } => None,
+            })
+            .collect();
+        CallCheck {
+            hydra_obj,
+            display_name,
+            file_suppressions,
+            params: signature
+                .parameters
+                .iter()
+                .filter(|p| Some(p.name.as_str()) != implicit_param)
+                .collect(),
+            has_var_positional: has_kind(ParameterKind::VarPositional),
+            has_var_keyword: has_kind(ParameterKind::VarKeyword),
+            keywords,
+            num_positional_args: hydra_obj
+                .parameters
+                .iter()
+                .filter(|p| matches!(p, Parameter::Positional { .. }))
+                .count(),
+        }
+    }
+
+    /// Whether `rule` is off for the whole file or this node.
+    fn rule_suppressed(&self, rule: DiagnosticRule) -> bool {
+        self.file_suppressions.contains(&rule) || self.hydra_obj.suppressed_rules.contains(&rule)
+    }
+
+    /// Whether `rule` is off for `arg`, which may also suppress it itself.
+    fn suppressed_at(&self, rule: DiagnosticRule, arg: &KeywordArg) -> bool {
+        self.rule_suppressed(rule) || arg.param.suppressed_rules().contains(&rule)
+    }
+
+    /// A diagnostic on `arg`'s key.
+    fn at_key(
+        &self,
+        arg: &KeywordArg,
+        severity: DiagnosticSeverity,
+        rule: Option<DiagnosticRule>,
+        message: String,
+    ) -> Diagnostic {
+        create_diagnostic(
+            arg.line,
+            arg.key_start,
+            arg.key_start + utf16_len(arg.key),
+            severity,
+            rule,
+            message,
+        )
+    }
+
+    /// The named parameter `name`, if the signature has one a keyword can
+    /// match (`*args` and `**kwargs` are not matched by name).
+    fn named(&self, name: &str) -> Option<&'a ParameterInfo> {
+        self.params
+            .iter()
+            .copied()
+            .find(|p| p.name == name && !p.is_variadic())
+    }
+
+    /// The parameters `_args_` entries can fill, in order.
+    fn positional_params(&self) -> impl Iterator<Item = &'a ParameterInfo> + '_ {
+        self.params
+            .iter()
+            .copied()
+            .filter(|p| p.binds_positionally())
+    }
+
+    /// The parameters the `_args_` entries actually fill.
+    fn positionally_covered(&self) -> impl Iterator<Item = &'a ParameterInfo> + '_ {
+        self.positional_params().take(self.num_positional_args)
+    }
+
+    fn is_positionally_covered(&self, name: &str) -> bool {
+        self.positionally_covered().any(|p| p.name == name)
+    }
+
+    fn has_keyword(&self, name: &str) -> bool {
+        self.keywords.iter().any(|arg| arg.key == name)
+    }
 }
 
 /// Validate parameters against a function signature.
@@ -187,251 +302,156 @@ fn validate_parameters(
         return diagnostics;
     }
 
-    // Get parameter names from YAML (only keyword params, not positional)
-    let param_names: HashSet<String> = hydra_obj
-        .parameters
-        .iter()
-        .filter_map(|p| match p {
-            Parameter::Keyword { key, .. } => Some(key.clone()),
-            Parameter::Positional { .. } => None,
-        })
-        .collect();
+    let check = CallCheck::new(
+        hydra_obj,
+        signature,
+        display_name,
+        implicit_param,
+        file_suppressions,
+    );
+    check_positional_only_keywords(&check, &mut diagnostics);
+    check_unknown_keywords(&check, &mut diagnostics);
+    check_missing_arguments(&check, &mut diagnostics);
+    check_already_assigned(&check, &mut diagnostics);
+    check_too_many_positional(&check, &mut diagnostics);
+    diagnostics
+}
 
-    // Get expected parameter names from signature (excluding the implicit parameter)
-    let expected_params: HashSet<String> = signature
-        .parameters
-        .iter()
-        .filter(|p| {
-            Some(p.name.as_str()) != implicit_param && !p.is_variadic && !p.is_variadic_keyword
-        })
-        .map(|p| p.name.clone())
-        .collect();
-
-    // Determine which signature params are satisfied by positional args from _args_
-    let num_positional_args = hydra_obj
-        .parameters
-        .iter()
-        .filter(|p| matches!(p, Parameter::Positional { .. }))
-        .count();
-
-    let positional_eligible: Vec<&ParameterInfo> = signature
-        .parameters
-        .iter()
-        .filter(|p| {
-            Some(p.name.as_str()) != implicit_param
-                && !p.is_variadic
-                && !p.is_variadic_keyword
-                && !p.is_keyword_only
-        })
-        .collect();
-
-    let positionally_covered: HashSet<String> = positional_eligible
-        .iter()
-        .take(num_positional_args)
-        .map(|p| p.name.clone())
-        .collect();
-
-    // Check if function accepts *args or **kwargs
-    let has_variadic = signature.parameters.iter().any(|p| p.is_variadic);
-    let has_kwargs = signature.parameters.iter().any(|p| p.is_variadic_keyword);
-    let positional_only: HashSet<&str> = signature
-        .parameters
-        .iter()
-        .filter(|p| p.is_positional_only && Some(p.name.as_str()) != implicit_param)
-        .map(|p| p.name.as_str())
-        .collect();
-
-    for param in &hydra_obj.parameters {
-        if let Parameter::Keyword {
-            key,
-            line,
-            key_start,
-            ..
-        } = param
-            && !has_kwargs
-            && positional_only.contains(key.as_str())
-            && !is_suppressed(
-                DiagnosticRule::PositionalOnlyParameter,
-                param,
-                hydra_obj,
-                file_suppressions,
-            )
-        {
-            diagnostics.push(create_diagnostic(
-                *line,
-                *key_start,
-                key_start + utf16_len(key),
+fn check_positional_only_keywords(check: &CallCheck, diagnostics: &mut Vec<Diagnostic>) {
+    if check.has_var_keyword {
+        return;
+    }
+    let rule = DiagnosticRule::PositionalOnlyParameter;
+    for arg in &check.keywords {
+        let positional_only = check
+            .named(arg.key)
+            .is_some_and(|p| p.kind == ParameterKind::PositionalOnly);
+        if positional_only && !check.suppressed_at(rule, arg) {
+            diagnostics.push(check.at_key(
+                arg,
                 DiagnosticSeverity::ERROR,
-                Some(DiagnosticRule::PositionalOnlyParameter),
+                Some(rule),
                 format!(
                     "Parameter '{}' of '{}' is positional-only; pass it via {}",
-                    key, display_name, ARGS_KEY
+                    arg.key, check.display_name, ARGS_KEY
                 ),
             ));
         }
     }
+}
 
-    // Check for unknown parameters (only keyword params)
-    for param in &hydra_obj.parameters {
-        if let Parameter::Keyword {
-            key,
-            line,
-            key_start,
-            ..
-        } = param
-            && !expected_params.contains(key)
-            && !has_kwargs
-            && !is_suppressed(
-                DiagnosticRule::UnknownArgument,
-                param,
-                hydra_obj,
-                file_suppressions,
-            )
-        {
-            diagnostics.push(create_diagnostic(
-                *line,
-                *key_start,
-                key_start + utf16_len(key),
-                DiagnosticSeverity::ERROR,
-                Some(DiagnosticRule::UnknownArgument),
-                format!("Unknown parameter '{}' for '{}'", key, display_name),
+fn check_unknown_keywords(check: &CallCheck, diagnostics: &mut Vec<Diagnostic>) {
+    let rule = DiagnosticRule::UnknownArgument;
+    let mut hinted = HashSet::new();
+    for arg in &check.keywords {
+        if check.named(arg.key).is_some() {
+            continue;
+        }
+        if !check.has_var_keyword {
+            if !check.suppressed_at(rule, arg) {
+                diagnostics.push(check.at_key(
+                    arg,
+                    DiagnosticSeverity::ERROR,
+                    Some(rule),
+                    format!(
+                        "Unknown parameter '{}' for '{}'",
+                        arg.key, check.display_name
+                    ),
+                ));
+            }
+        } else if hinted.insert(arg.key) && !check.suppressed_at(rule, arg) {
+            diagnostics.push(check.at_key(
+                arg,
+                DiagnosticSeverity::HINT,
+                None,
+                format!("Parameter '{}' will be passed via **kwargs", arg.key),
             ));
         }
     }
+}
 
-    if !hydra_obj.is_partial() {
-        for param in &signature.parameters {
-            let accounted_for_by_keyword =
-                param_names.contains(&param.name) && !(param.is_positional_only && has_kwargs);
-
-            if param.is_required()
-                && Some(param.name.as_str()) != implicit_param
-                && !accounted_for_by_keyword
-                && !positionally_covered.contains(&param.name)
-                && !file_suppressions.contains(&DiagnosticRule::MissingArgument)
-                && !hydra_obj
-                    .suppressed_rules
-                    .contains(&DiagnosticRule::MissingArgument)
-            {
-                let message = if param.is_positional_only {
-                    format!(
-                        "Missing required positional-only parameter '{}' for '{}'; pass it via {}",
-                        param.name, display_name, ARGS_KEY
-                    )
-                } else {
-                    format!(
-                        "Missing required parameter '{}' for '{}'",
-                        param.name, display_name
-                    )
-                };
-                diagnostics.push(create_diagnostic(
-                    hydra_obj.target.line,
-                    hydra_obj.target.value_start,
-                    hydra_obj.target_value_end(),
-                    DiagnosticSeverity::ERROR,
-                    Some(DiagnosticRule::MissingArgument),
-                    message,
-                ));
-            }
-        }
+fn check_missing_arguments(check: &CallCheck, diagnostics: &mut Vec<Diagnostic>) {
+    let rule = DiagnosticRule::MissingArgument;
+    if check.hydra_obj.is_partial() || check.rule_suppressed(rule) {
+        return;
     }
+    for param in &check.params {
+        let positional_only = param.kind == ParameterKind::PositionalOnly;
+        let accounted_for_by_keyword =
+            check.has_keyword(&param.name) && !(positional_only && check.has_var_keyword);
 
-    // Check for parameters provided both positionally via _args_ and as keyword args.
-    // Positional-only names are skipped as they have no keyword form at all.
-    for param_name in &positionally_covered {
-        if param_names.contains(param_name)
-            && !positional_only.contains(param_name.as_str())
-            && let Some(param) = hydra_obj
-                .parameters
-                .iter()
-                .find(|p| matches!(p, Parameter::Keyword { key, .. } if key == param_name))
-            && let Parameter::Keyword {
-                key,
-                line,
-                key_start,
-                ..
-            } = param
-            && !is_suppressed(
-                DiagnosticRule::ParameterAlreadyAssigned,
-                param,
-                hydra_obj,
-                file_suppressions,
-            )
+        if param.is_required()
+            && !accounted_for_by_keyword
+            && !check.is_positionally_covered(&param.name)
         {
+            let message = if positional_only {
+                format!(
+                    "Missing required positional-only parameter '{}' for '{}'; pass it via {}",
+                    param.name, check.display_name, ARGS_KEY
+                )
+            } else {
+                format!(
+                    "Missing required parameter '{}' for '{}'",
+                    param.name, check.display_name
+                )
+            };
+            let hydra_obj = check.hydra_obj;
             diagnostics.push(create_diagnostic(
-                    *line,
-                    *key_start,
-                    key_start + utf16_len(key),
-                    DiagnosticSeverity::ERROR,
-                    Some(DiagnosticRule::ParameterAlreadyAssigned),
-                    format!(
-                        "'{}' got multiple values for argument '{}' (already provided positionally via _args_)",
-                        display_name, param_name
-                    ),
-                ));
+                hydra_obj.target.line,
+                hydra_obj.target.value_start,
+                hydra_obj.target_value_end(),
+                DiagnosticSeverity::ERROR,
+                Some(rule),
+                message,
+            ));
         }
     }
+}
 
-    // Check for too many positional arguments
-    if num_positional_args > positional_eligible.len()
-        && !has_variadic
-        && !file_suppressions.contains(&DiagnosticRule::TooManyPositionalArguments)
-        && !hydra_obj
-            .suppressed_rules
-            .contains(&DiagnosticRule::TooManyPositionalArguments)
-        && let Some(ref hp) = hydra_obj.args
+fn check_already_assigned(check: &CallCheck, diagnostics: &mut Vec<Diagnostic>) {
+    let rule = DiagnosticRule::ParameterAlreadyAssigned;
+    let mut seen = HashSet::new();
+    for arg in &check.keywords {
+        if !seen.insert(arg.key) {
+            continue;
+        }
+        let assigned_twice = check
+            .positionally_covered()
+            .any(|p| p.name == arg.key && p.kind != ParameterKind::PositionalOnly);
+        if assigned_twice && !check.suppressed_at(rule, arg) {
+            diagnostics.push(check.at_key(
+                arg,
+                DiagnosticSeverity::ERROR,
+                Some(rule),
+                format!(
+                    "'{}' got multiple values for argument '{}' (already provided positionally via _args_)",
+                    check.display_name, arg.key
+                ),
+            ));
+        }
+    }
+}
+
+fn check_too_many_positional(check: &CallCheck, diagnostics: &mut Vec<Diagnostic>) {
+    let rule = DiagnosticRule::TooManyPositionalArguments;
+    let capacity = check.positional_params().count();
+    if check.num_positional_args > capacity
+        && !check.has_var_positional
+        && !check.rule_suppressed(rule)
+        && let Some(ref hp) = check.hydra_obj.args
     {
         diagnostics.push(create_diagnostic(
             hp.line,
             hp.key_start,
             hp.key_start + ARGS_KEY.len() as u32,
             DiagnosticSeverity::ERROR,
-            Some(DiagnosticRule::TooManyPositionalArguments),
+            Some(rule),
             format!(
                 "'{}' takes {} positional argument(s) but {} were given via _args_",
-                display_name,
-                positional_eligible.len(),
-                num_positional_args
+                check.display_name, capacity, check.num_positional_args
             ),
         ));
     }
-
-    // If **kwargs present, give a warning instead of error for unknown params
-    if has_kwargs && !param_names.is_subset(&expected_params) {
-        let unknown: Vec<_> = param_names.difference(&expected_params).collect();
-        if !unknown.is_empty() {
-            for param_name in unknown {
-                if let Some(param) = hydra_obj
-                    .parameters
-                    .iter()
-                    .find(|p| matches!(p, Parameter::Keyword { key, .. } if key == param_name))
-                    && let Parameter::Keyword {
-                        key,
-                        line,
-                        key_start,
-                        ..
-                    } = param
-                    && !is_suppressed(
-                        DiagnosticRule::UnknownArgument,
-                        param,
-                        hydra_obj,
-                        file_suppressions,
-                    )
-                {
-                    diagnostics.push(create_diagnostic(
-                        *line,
-                        *key_start,
-                        key_start + utf16_len(key),
-                        DiagnosticSeverity::HINT,
-                        None,
-                        format!("Parameter '{}' will be passed via **kwargs", param_name),
-                    ));
-                }
-            }
-        }
-    }
-
-    diagnostics
 }
 
 /// Whether `signature` accepts the arguments `hydra_obj` passes: its keys,
@@ -595,24 +615,18 @@ pub fn validate_document(
         // Try to resolve the target and validate parameters. `None` here means
         // there is nothing sound to validate against.
         let callable = definition_info.as_ref().and_then(|definition_info| {
-            let signature_and_name = match definition_info {
-                DefinitionInfo::Function(sig) => Some((sig, sig.name.clone())),
+            // A class with no constructor has no parameters to check.
+            let signature = definition_info.call_signature()?;
+            let display_name = match definition_info {
+                DefinitionInfo::Class(class_info) if class_info.constructor_is_uncertain() => {
+                    return None;
+                }
                 DefinitionInfo::Class(class_info) => {
-                    if class_info.constructor_is_uncertain() {
-                        None
-                    } else {
-                        // For classes, use the __init__ signature if available;
-                        // a class with no constructor has no parameters to check.
-                        class_info.init_signature.as_ref().map(|init_sig| {
-                            (init_sig, format!("{}.{}", class_info.name, init_sig.name))
-                        })
-                    }
+                    format!("{}.{}", class_info.name, signature.name)
                 }
-                DefinitionInfo::Method(method_info) => {
-                    Some((&method_info.signature, method_info.signature.name.clone()))
-                }
+                DefinitionInfo::Function(_) | DefinitionInfo::Method(_) => signature.name.clone(),
             };
-            signature_and_name.map(|(sig, name)| (sig, name, definition_info.implicit_param()))
+            Some((signature, display_name, definition_info.implicit_param()))
         });
 
         if let Some((signature, display_name, implicit_param)) = callable {
@@ -632,14 +646,9 @@ pub fn validate_document(
         diagnostics.extend(keyword_diagnostics);
     }
 
-    // Sort all diagnostics by position for consistent ordering
-    diagnostics.sort_by(|a, b| {
-        a.range
-            .start
-            .line
-            .cmp(&b.range.start.line)
-            .then_with(|| a.range.start.character.cmp(&b.range.start.character))
-    });
+    // Sort all diagnostics by position for consistent ordering. The sort is
+    // stable, so diagnostics at the same position keep their emission order.
+    diagnostics.sort_by_key(|d| (d.range.start.line, d.range.start.character));
 
     diagnostics
 }
@@ -759,23 +768,15 @@ mod tests {
             parameters: vec![
                 ParameterInfo {
                     name: "self".to_string(),
+                    kind: ParameterKind::PositionalOrKeyword,
                     type_annotation: None,
                     default_value: None,
-                    has_default: false,
-                    is_variadic: false,
-                    is_variadic_keyword: false,
-                    is_keyword_only: false,
-                    is_positional_only: false,
                 },
                 ParameterInfo {
                     name: "required_param".to_string(),
+                    kind: ParameterKind::PositionalOrKeyword,
                     type_annotation: Some("int".to_string()),
                     default_value: None,
-                    has_default: false,
-                    is_variadic: false,
-                    is_variadic_keyword: false,
-                    is_keyword_only: false,
-                    is_positional_only: false,
                 },
             ],
             return_type: None,
@@ -818,13 +819,9 @@ mod tests {
             name: "Class".to_string(),
             parameters: vec![ParameterInfo {
                 name: "self".to_string(),
+                kind: ParameterKind::PositionalOrKeyword,
                 type_annotation: None,
                 default_value: None,
-                has_default: false,
-                is_variadic: false,
-                is_variadic_keyword: false,
-                is_keyword_only: false,
-                is_positional_only: false,
             }],
             return_type: None,
             docstring: None,
@@ -863,23 +860,15 @@ mod tests {
             parameters: vec![
                 ParameterInfo {
                     name: "self".to_string(),
+                    kind: ParameterKind::PositionalOrKeyword,
                     type_annotation: None,
                     default_value: None,
-                    has_default: false,
-                    is_variadic: false,
-                    is_variadic_keyword: false,
-                    is_keyword_only: false,
-                    is_positional_only: false,
                 },
                 ParameterInfo {
                     name: "**kwargs".to_string(),
+                    kind: ParameterKind::VarKeyword,
                     type_annotation: None,
                     default_value: None,
-                    has_default: false,
-                    is_variadic: false,
-                    is_variadic_keyword: true,
-                    is_keyword_only: false,
-                    is_positional_only: false,
                 },
             ],
             return_type: None,
@@ -918,23 +907,15 @@ mod tests {
             parameters: vec![
                 ParameterInfo {
                     name: "cls".to_string(),
+                    kind: ParameterKind::PositionalOrKeyword,
                     type_annotation: None,
                     default_value: None,
-                    has_default: false,
-                    is_variadic: false,
-                    is_variadic_keyword: false,
-                    is_keyword_only: false,
-                    is_positional_only: false,
                 },
                 ParameterInfo {
                     name: "config_path".to_string(),
+                    kind: ParameterKind::PositionalOrKeyword,
                     type_annotation: Some("str".to_string()),
                     default_value: None,
-                    has_default: false,
-                    is_variadic: false,
-                    is_variadic_keyword: false,
-                    is_keyword_only: false,
-                    is_positional_only: false,
                 },
             ],
             return_type: None,
@@ -989,23 +970,15 @@ mod tests {
             parameters: vec![
                 ParameterInfo {
                     name: "cls".to_string(),
+                    kind: ParameterKind::PositionalOrKeyword,
                     type_annotation: None,
                     default_value: None,
-                    has_default: false,
-                    is_variadic: false,
-                    is_variadic_keyword: false,
-                    is_keyword_only: false,
-                    is_positional_only: false,
                 },
                 ParameterInfo {
                     name: "config_path".to_string(),
+                    kind: ParameterKind::PositionalOrKeyword,
                     type_annotation: Some("str".to_string()),
                     default_value: None,
-                    has_default: false,
-                    is_variadic: false,
-                    is_variadic_keyword: false,
-                    is_keyword_only: false,
-                    is_positional_only: false,
                 },
             ],
             return_type: None,
@@ -1042,23 +1015,15 @@ mod tests {
             parameters: vec![
                 ParameterInfo {
                     name: "this".to_string(),
+                    kind: ParameterKind::PositionalOrKeyword,
                     type_annotation: None,
                     default_value: None,
-                    has_default: false,
-                    is_variadic: false,
-                    is_variadic_keyword: false,
-                    is_keyword_only: false,
-                    is_positional_only: false,
                 },
                 ParameterInfo {
                     name: "value".to_string(),
+                    kind: ParameterKind::PositionalOrKeyword,
                     type_annotation: Some("int".to_string()),
                     default_value: None,
-                    has_default: false,
-                    is_variadic: false,
-                    is_variadic_keyword: false,
-                    is_keyword_only: false,
-                    is_positional_only: false,
                 },
             ],
             return_type: None,
@@ -1112,23 +1077,15 @@ mod tests {
             parameters: vec![
                 ParameterInfo {
                     name: "klass".to_string(),
+                    kind: ParameterKind::PositionalOrKeyword,
                     type_annotation: None,
                     default_value: None,
-                    has_default: false,
-                    is_variadic: false,
-                    is_variadic_keyword: false,
-                    is_keyword_only: false,
-                    is_positional_only: false,
                 },
                 ParameterInfo {
                     name: "config_path".to_string(),
+                    kind: ParameterKind::PositionalOrKeyword,
                     type_annotation: Some("str".to_string()),
                     default_value: None,
-                    has_default: false,
-                    is_variadic: false,
-                    is_variadic_keyword: false,
-                    is_keyword_only: false,
-                    is_positional_only: false,
                 },
             ],
             return_type: None,
@@ -1165,13 +1122,9 @@ mod tests {
             name: "create".to_string(),
             parameters: vec![ParameterInfo {
                 name: "value".to_string(),
+                kind: ParameterKind::PositionalOrKeyword,
                 type_annotation: Some("int".to_string()),
                 default_value: None,
-                has_default: false,
-                is_variadic: false,
-                is_variadic_keyword: false,
-                is_keyword_only: false,
-                is_positional_only: false,
             }],
             return_type: None,
             docstring: None,
@@ -1585,23 +1538,15 @@ mod tests {
             parameters: vec![
                 ParameterInfo {
                     name: "self".to_string(),
+                    kind: ParameterKind::PositionalOrKeyword,
                     type_annotation: None,
                     default_value: None,
-                    has_default: false,
-                    is_variadic: false,
-                    is_variadic_keyword: false,
-                    is_keyword_only: false,
-                    is_positional_only: false,
                 },
                 ParameterInfo {
                     name: "required_param".to_string(),
+                    kind: ParameterKind::PositionalOrKeyword,
                     type_annotation: Some("int".to_string()),
                     default_value: None,
-                    has_default: false,
-                    is_variadic: false,
-                    is_variadic_keyword: false,
-                    is_keyword_only: false,
-                    is_positional_only: false,
                 },
             ],
             return_type: None,
@@ -1637,23 +1582,15 @@ mod tests {
             parameters: vec![
                 ParameterInfo {
                     name: "self".to_string(),
+                    kind: ParameterKind::PositionalOrKeyword,
                     type_annotation: None,
                     default_value: None,
-                    has_default: false,
-                    is_variadic: false,
-                    is_variadic_keyword: false,
-                    is_keyword_only: false,
-                    is_positional_only: false,
                 },
                 ParameterInfo {
                     name: "required_param".to_string(),
+                    kind: ParameterKind::PositionalOrKeyword,
                     type_annotation: Some("int".to_string()),
                     default_value: None,
-                    has_default: false,
-                    is_variadic: false,
-                    is_variadic_keyword: false,
-                    is_keyword_only: false,
-                    is_positional_only: false,
                 },
             ],
             return_type: None,
@@ -1694,33 +1631,21 @@ mod tests {
             parameters: vec![
                 ParameterInfo {
                     name: "self".to_string(),
+                    kind: ParameterKind::PositionalOrKeyword,
                     type_annotation: None,
                     default_value: None,
-                    has_default: false,
-                    is_variadic: false,
-                    is_variadic_keyword: false,
-                    is_keyword_only: false,
-                    is_positional_only: false,
                 },
                 ParameterInfo {
                     name: "required_param".to_string(),
+                    kind: ParameterKind::PositionalOrKeyword,
                     type_annotation: Some("int".to_string()),
                     default_value: None,
-                    has_default: false,
-                    is_variadic: false,
-                    is_variadic_keyword: false,
-                    is_keyword_only: false,
-                    is_positional_only: false,
                 },
                 ParameterInfo {
                     name: "valid_param".to_string(),
+                    kind: ParameterKind::PositionalOrKeyword,
                     type_annotation: Some("str".to_string()),
-                    default_value: None,
-                    has_default: true,
-                    is_variadic: false,
-                    is_variadic_keyword: false,
-                    is_keyword_only: false,
-                    is_positional_only: false,
+                    default_value: Some("\"default\"".to_string()),
                 },
             ],
             return_type: None,
@@ -1758,17 +1683,13 @@ mod tests {
             .collect()
     }
 
-    /// Build a required parameter for a synthetic signature.
-    fn sig_param(name: &str, positional_only: bool, kwargs: bool) -> ParameterInfo {
+    /// Build a parameter with no default for a synthetic signature.
+    fn sig_param(name: &str, kind: ParameterKind) -> ParameterInfo {
         ParameterInfo {
             name: name.to_string(),
+            kind,
             type_annotation: None,
             default_value: None,
-            has_default: false,
-            is_variadic: false,
-            is_variadic_keyword: kwargs,
-            is_keyword_only: false,
-            is_positional_only: positional_only,
         }
     }
 
@@ -1797,7 +1718,7 @@ mod tests {
             0,
             false,
         );
-        let signature = sig_for("f", vec![sig_param("a", true, false)]);
+        let signature = sig_for("f", vec![sig_param("a", ParameterKind::PositionalOnly)]);
 
         let diagnostics = validate_parameters(&hydra_obj, &signature, "f", None, &HashSet::new());
 
@@ -1829,7 +1750,10 @@ mod tests {
         );
         let signature = sig_for(
             "f",
-            vec![sig_param("a", true, false), sig_param("kw", false, true)],
+            vec![
+                sig_param("a", ParameterKind::PositionalOnly),
+                sig_param("kw", ParameterKind::VarKeyword),
+            ],
         );
 
         let diagnostics = validate_parameters(&hydra_obj, &signature, "f", None, &HashSet::new());
@@ -1853,9 +1777,9 @@ mod tests {
             0,
             false,
         );
-        let mut a = sig_param("a", true, false);
-        a.has_default = true;
-        let signature = sig_for("f", vec![a, sig_param("kw", false, true)]);
+        let mut a = sig_param("a", ParameterKind::PositionalOnly);
+        a.default_value = Some("0".to_string());
+        let signature = sig_for("f", vec![a, sig_param("kw", ParameterKind::VarKeyword)]);
 
         let diagnostics = validate_parameters(&hydra_obj, &signature, "f", None, &HashSet::new());
         assert!(diagnostics.is_empty(), "got: {:?}", codes(&diagnostics));
@@ -1873,7 +1797,10 @@ mod tests {
             13,
             false,
         );
-        let signature = sig_for("f", vec![sig_param("a", false, false)]);
+        let signature = sig_for(
+            "f",
+            vec![sig_param("a", ParameterKind::PositionalOrKeyword)],
+        );
 
         let diagnostics = validate_parameters(&hydra_obj, &signature, "f", None, &HashSet::new());
         let unknown = &diagnostics[0];
@@ -1893,7 +1820,10 @@ mod tests {
             *key_start = 34;
         }
         let hydra_obj = build_hydra_object("mod.f", vec![param], 1, 9, 20, false);
-        let signature = sig_for("f", vec![sig_param("a", false, false)]);
+        let signature = sig_for(
+            "f",
+            vec![sig_param("a", ParameterKind::PositionalOrKeyword)],
+        );
 
         let diagnostics = validate_parameters(&hydra_obj, &signature, "f", None, &HashSet::new());
 
@@ -1939,7 +1869,10 @@ mod tests {
         });
         let signature = sig_for(
             "f",
-            vec![sig_param("a", true, false), sig_param("kw", false, true)],
+            vec![
+                sig_param("a", ParameterKind::PositionalOnly),
+                sig_param("kw", ParameterKind::VarKeyword),
+            ],
         );
 
         let diagnostics = validate_parameters(&hydra_obj, &signature, "f", None, &HashSet::new());
@@ -1966,7 +1899,10 @@ mod tests {
             0,
             false,
         );
-        let mut signature = sig_for("f", vec![sig_param("a", false, false)]);
+        let mut signature = sig_for(
+            "f",
+            vec![sig_param("a", ParameterKind::PositionalOrKeyword)],
+        );
         signature.is_overloaded = true;
 
         let diagnostics = validate_parameters(&hydra_obj, &signature, "f", None, &HashSet::new());

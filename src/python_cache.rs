@@ -975,13 +975,9 @@ mod tests {
             parameters: (0..param_count)
                 .map(|i| crate::python_analyzer::ParameterInfo {
                     name: format!("p{i}"),
+                    kind: crate::python_analyzer::ParameterKind::PositionalOrKeyword,
                     type_annotation: None,
                     default_value: None,
-                    has_default: false,
-                    is_variadic: false,
-                    is_variadic_keyword: false,
-                    is_keyword_only: false,
-                    is_positional_only: false,
                 })
                 .collect(),
             return_type: None,
