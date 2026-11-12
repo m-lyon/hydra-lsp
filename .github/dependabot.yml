@@ -1,0 +1,27 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    # dist generates release.yml from dist-workspace.toml, and CI fails if the
+    # two differ. Update the pins in [dist.github-action-commits] by hand.
+    exclude-paths:
+      - .github/workflows/release.yml
+    # Wait a week after a release before proposing it, so a compromised
+    # release has time to be found and pulled.
+    cooldown:
+      default-days: 7
+    groups:
+      github-actions:
+        patterns: ["*"]
+
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      cargo-minor-and-patch:
+        update-types: [minor, patch]
