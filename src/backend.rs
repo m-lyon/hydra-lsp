@@ -97,13 +97,8 @@ fn definition_positions(definition_info: &DefinitionInfo) -> Vec<(u32, u32, u32,
     positions
 }
 
-/// The index into `params` of the parameter the cursor's argument fills, or
+/// Returns the index in `params` of the parameter that the cursor is on, or
 /// `params.len()` when no parameter should be highlighted.
-///
-/// A keyword argument selects the named parameter, falling back to `**kwargs`.
-/// The n-th `_args_` entry selects the n-th parameter that binds positionally,
-/// overflowing into `*args`; nothing is selected when `_args_` is empty or the
-/// parameter is also given by keyword (in `keyword_keys`).
 fn active_parameter(
     params: &[&ParameterInfo],
     param_context: &ResolvedParameterContext,

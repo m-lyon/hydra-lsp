@@ -158,7 +158,6 @@ fn target_format_hint(db: &dyn ruff_db::Db, target: TargetString<'_>) -> String 
     }
 }
 
-/// A keyword argument from the YAML node: `key: value`.
 struct KeywordArg<'a> {
     param: &'a Parameter,
     key: &'a str,
@@ -166,21 +165,14 @@ struct KeywordArg<'a> {
     key_start: u32,
 }
 
-/// What every parameter rule needs: the YAML node, the signature it is
-/// checked against, and where diagnostics are suppressed.
 struct CallCheck<'a> {
     hydra_obj: &'a HydraObject,
     display_name: &'a str,
     file_suppressions: &'a HashSet<DiagnosticRule>,
-    /// The signature's parameters, without the implicit `self`/`cls`.
     params: Vec<&'a ParameterInfo>,
-    /// Whether the signature has `*args` / `**kwargs`. Taken over every
-    /// parameter, the implicit one included, as the checks always have been.
     has_var_positional: bool,
     has_var_keyword: bool,
-    /// The keyword arguments, in YAML order.
     keywords: Vec<KeywordArg<'a>>,
-    /// How many `_args_` entries there are.
     num_positional_args: usize,
 }
 
@@ -325,8 +317,6 @@ fn validate_parameters(
     diagnostics
 }
 
-/// A positional-only parameter passed by keyword, when there is no
-/// `**kwargs` for the key to land in instead.
 fn check_positional_only_keywords(check: &CallCheck, diagnostics: &mut Vec<Diagnostic>) {
     if check.has_var_keyword {
         return;
@@ -350,8 +340,6 @@ fn check_positional_only_keywords(check: &CallCheck, diagnostics: &mut Vec<Diagn
     }
 }
 
-/// A key naming no parameter: an error, or with `**kwargs` a hint that it
-/// is passed through. The hint is given once per key, at its first use.
 fn check_unknown_keywords(check: &CallCheck, diagnostics: &mut Vec<Diagnostic>) {
     let rule = DiagnosticRule::UnknownArgument;
     let mut hinted = HashSet::new();
@@ -382,8 +370,6 @@ fn check_unknown_keywords(check: &CallCheck, diagnostics: &mut Vec<Diagnostic>) 
     }
 }
 
-/// A required parameter that neither a key nor an `_args_` entry supplies,
-/// unless the node is `_partial_`.
 fn check_missing_arguments(check: &CallCheck, diagnostics: &mut Vec<Diagnostic>) {
     let rule = DiagnosticRule::MissingArgument;
     if check.hydra_obj.is_partial() || check.rule_suppressed(rule) {
@@ -391,8 +377,6 @@ fn check_missing_arguments(check: &CallCheck, diagnostics: &mut Vec<Diagnostic>)
     }
     for param in &check.params {
         let positional_only = param.kind == ParameterKind::PositionalOnly;
-        // With `**kwargs`, a positional-only parameter's key lands there
-        // rather than filling the parameter.
         let accounted_for_by_keyword =
             check.has_keyword(&param.name) && !(positional_only && check.has_var_keyword);
 
@@ -424,9 +408,6 @@ fn check_missing_arguments(check: &CallCheck, diagnostics: &mut Vec<Diagnostic>)
     }
 }
 
-/// A parameter given both positionally via `_args_` and by key, reported at
-/// the key's first use. Positional-only names are skipped as they have no
-/// keyword form at all.
 fn check_already_assigned(check: &CallCheck, diagnostics: &mut Vec<Diagnostic>) {
     let rule = DiagnosticRule::ParameterAlreadyAssigned;
     let mut seen = HashSet::new();
@@ -451,7 +432,6 @@ fn check_already_assigned(check: &CallCheck, diagnostics: &mut Vec<Diagnostic>) 
     }
 }
 
-/// More `_args_` entries than positional parameters, with no `*args`.
 fn check_too_many_positional(check: &CallCheck, diagnostics: &mut Vec<Diagnostic>) {
     let rule = DiagnosticRule::TooManyPositionalArguments;
     let capacity = check.positional_params().count();

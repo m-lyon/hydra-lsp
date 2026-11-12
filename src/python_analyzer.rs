@@ -119,7 +119,6 @@ pub struct FunctionSignature {
     pub end_column: u32,
 }
 
-/// How a parameter may be passed, as Python's `inspect.Parameter.kind` puts it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParameterKind {
     /// Declared before `/`.
@@ -178,7 +177,6 @@ impl ParameterInfo {
         self.default_value.is_some()
     }
 
-    /// A named parameter with no default, which every call must supply.
     pub fn is_required(&self) -> bool {
         !self.has_default() && !self.is_variadic()
     }
