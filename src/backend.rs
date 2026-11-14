@@ -579,6 +579,20 @@ pub(crate) enum PoolOutcome<R> {
     Panicked(String),
 }
 
+impl<R> PoolOutcome<R> {
+    /// The outcome a [`spawn_on_pool`] receiver resolved to, with a dropped
+    /// sender read as `Cancelled`.
+    ///
+    /// The sender is only dropped unsent when the pool is not built yet (or has
+    /// shut down), and every caller treats that the way it treats a superseded
+    /// revision: the request is stale.
+    pub(crate) fn from_received(
+        received: std::result::Result<Self, tokio::sync::oneshot::error::RecvError>,
+    ) -> Self {
+        received.unwrap_or(PoolOutcome::Cancelled)
+    }
+}
+
 /// Best-effort human-readable message from a panic payload.
 fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(s) = payload.downcast_ref::<&str>() {
@@ -654,10 +668,10 @@ fn classify_diag_outcome(
         tokio::sync::oneshot::error::RecvError,
     >,
 ) -> DiagAction {
-    match outcome {
-        Ok(PoolOutcome::Completed(diagnostics)) => DiagAction::Publish(diagnostics),
-        Ok(PoolOutcome::Cancelled) | Err(_) => DiagAction::Skip,
-        Ok(PoolOutcome::Panicked(msg)) => DiagAction::LogPanic(msg),
+    match PoolOutcome::from_received(outcome) {
+        PoolOutcome::Completed(diagnostics) => DiagAction::Publish(diagnostics),
+        PoolOutcome::Cancelled => DiagAction::Skip,
+        PoolOutcome::Panicked(msg) => DiagAction::LogPanic(msg),
     }
 }
 
@@ -938,7 +952,7 @@ impl HydraLspBackend {
         };
         let SessionSnapshot { db, python_config } = snapshot;
 
-        spawn_on_pool(&self.latency_pool, move || {
+        let received = spawn_on_pool(&self.latency_pool, move || {
             let start = Instant::now();
             let target = TargetString::new(&db, target_value);
             let cached = python_cache::cached_definition_info(&db, python_config, target);
@@ -951,22 +965,19 @@ impl HydraLspBackend {
             );
             result
         })
-        .await
-        .map_or_else(
-            // Sender dropped without sending (e.g. pool shutdown); treat like
-            // cancellation — the request is stale.
-            |_| Err(superseded()),
-            |outcome| match outcome {
-                PoolOutcome::Completed(result) => result,
-                PoolOutcome::Cancelled => Err(superseded()),
-                PoolOutcome::Panicked(msg) => {
-                    tracing::error!(%msg, "definition lookup panicked");
-                    Err(ResolveError::Other(format!(
-                        "definition lookup panicked: {msg}"
-                    )))
-                }
-            },
-        )
+        .await;
+        // A dropped sender (e.g. pool shutdown) counts as cancellation: the
+        // request is stale.
+        match PoolOutcome::from_received(received) {
+            PoolOutcome::Completed(result) => result,
+            PoolOutcome::Cancelled => Err(superseded()),
+            PoolOutcome::Panicked(msg) => {
+                tracing::error!(%msg, "definition lookup panicked");
+                Err(ResolveError::Other(format!(
+                    "definition lookup panicked: {msg}"
+                )))
+            }
+        }
     }
 
     /// Log a failed `spawn_definition_lookup` for hover, signature help or
@@ -1223,21 +1234,7 @@ impl LanguageServer for HydraLspBackend {
             return;
         };
 
-        // Publish diagnostics if this is a Hydra file (using cached check). When it is
-        // not a Hydra file we clear any diagnostics previously published.
-        let is_hydra = self
-            .with_session("opening documents", |s| {
-                let db = s.db.lock();
-                yaml_cache::is_hydra_file(&*db, input)
-            })
-            .unwrap_or(false);
-        if self.settings.read().features.diagnostics {
-            if is_hydra {
-                self.publish_diagnostics_if_needed(&uri);
-            } else {
-                self.clear_diagnostics_if_needed(&uri);
-            }
-        }
+        self.refresh_after_edit(&uri, input, "opening documents");
 
         self.outbox
             .log(MessageType::INFO, format!("Document opened: {}", uri));
@@ -1255,22 +1252,7 @@ impl LanguageServer for HydraLspBackend {
                 return;
             };
 
-            // Re-publish diagnostics if this is a Hydra file (using cached
-            // check). When it is not a Hydra file we clear any diagnostics
-            // previously published.
-            let is_hydra = self
-                .with_session("changing documents", |s| {
-                    let db = s.db.lock();
-                    yaml_cache::is_hydra_file(&*db, input)
-                })
-                .unwrap_or(false);
-            if self.settings.read().features.diagnostics {
-                if is_hydra {
-                    self.publish_diagnostics_if_needed(&uri);
-                } else {
-                    self.clear_diagnostics_if_needed(&uri);
-                }
-            }
+            self.refresh_after_edit(&uri, input, "changing documents");
 
             self.outbox
                 .log(MessageType::INFO, format!("Document changed: {}", uri));
@@ -1841,15 +1823,15 @@ impl LanguageServer for HydraLspBackend {
         })
         .await;
 
-        let data = match outcome {
-            Ok(PoolOutcome::Completed(Some(data))) => data,
+        let data = match PoolOutcome::from_received(outcome) {
+            PoolOutcome::Completed(Some(data)) => data,
             // Not a Hydra file.
-            Ok(PoolOutcome::Completed(None)) => return Ok(None),
-            // A concurrent edit bumped the revision out from under the query.
-            // `Err` is the same situation reached a different way: the pool is
-            // not built yet, so the sender was dropped. Both want a re-request.
-            Ok(PoolOutcome::Cancelled) | Err(_) => return Err(content_modified_error()),
-            Ok(PoolOutcome::Panicked(msg)) => {
+            PoolOutcome::Completed(None) => return Ok(None),
+            // A concurrent edit bumped the revision out from under the query,
+            // or (the same situation reached a different way) the pool is not
+            // built yet, so the sender was dropped. Both want a re-request.
+            PoolOutcome::Cancelled => return Err(content_modified_error()),
+            PoolOutcome::Panicked(msg) => {
                 tracing::error!(%msg, "semantic_tokens task panicked");
                 return Ok(None);
             }
@@ -1900,24 +1882,14 @@ impl LanguageServer for HydraLspBackend {
         };
         let disabled_rules = self.settings.read().disabled_rules.clone();
 
-        // Same closure as the push path: parse + validate on the worker pool,
-        // inside the pool's catch_unwind so a `salsa::Cancelled` unwind is caught
-        // rather than aborting the process.
+        // The push path's parse + validate, but on the worker pool, inside the
+        // pool's catch_unwind so a `salsa::Cancelled` unwind is caught rather
+        // than aborting the process.
         let join_result = spawn_on_pool(&self.worker_pool, move || {
             if !yaml_cache::is_hydra_file(&db_snapshot, input) {
                 return Vec::new();
             }
-
-            let parsed_yaml = yaml_cache::parsed_yaml(&db_snapshot, input);
-            match parsed_yaml.result() {
-                Ok(content) => diagnostics::validate_document(
-                    content,
-                    &disabled_rules,
-                    &db_snapshot,
-                    python_config,
-                ),
-                Err(e) => vec![yaml_syntax_error_diagnostic(e)],
-            }
+            validate_input(&db_snapshot, input, &disabled_rules, python_config)
         })
         .await;
 
@@ -1966,28 +1938,42 @@ impl HydraLspBackend {
         self.publish_diagnostics_for_document(uri);
     }
 
-    /// Compute the diagnostics for `uri` from the current database state.
+    /// After a document is opened or edited: publish its diagnostics if it is a
+    /// Hydra file, or clear any previously published if it is not. Both only for
+    /// a push client, and only while diagnostics are enabled. `context` names
+    /// the caller in the no-session warning.
+    fn refresh_after_edit(&self, uri: &Url, input: DocumentInput, context: &'static str) {
+        // Cached salsa check, so this is cheap on the warm path.
+        let is_hydra = self
+            .with_session(context, |s| {
+                let db = s.db.lock();
+                yaml_cache::is_hydra_file(&*db, input)
+            })
+            .unwrap_or(false);
+        if self.settings.read().features.diagnostics {
+            if is_hydra {
+                self.publish_diagnostics_if_needed(uri);
+            } else {
+                self.clear_diagnostics_if_needed(uri);
+            }
+        }
+    }
+
+    /// Compute the diagnostics for `input` from the current database state.
     ///
-    /// Returns `None` when there is no session or no `DocumentInput` for the
-    /// URI. The parse and validation run while holding the db lock so no
-    /// concurrent write can bump the salsa revision mid-compute — the same
-    /// synchronous model ty uses for its push handler, which is why no
-    /// cancellation (and therefore no retry) is possible here.
-    fn compute_diagnostics(&self, uri: &Url) -> Option<Vec<Diagnostic>> {
-        let input = *self.document_inputs.get(uri)?;
+    /// Returns `None` when there is no session. The parse and validation run
+    /// while holding the db lock so no concurrent write can bump the salsa
+    /// revision mid-compute — the same synchronous model ty uses for its push
+    /// handler, which is why no cancellation (and therefore no retry) is
+    /// possible here.
+    fn compute_diagnostics(&self, input: DocumentInput) -> Option<Vec<Diagnostic>> {
         let disabled_rules = self.settings.read().disabled_rules.clone();
         self.with_session("compute diagnostics", |s| {
             // Hold the lock across the whole compute: with no interleaved
             // `set_text`, the revision can't move under us, so `parsed_yaml`
             // and `validate_document` never observe a `salsa::Cancelled`.
             let db = s.db.lock();
-            let parsed_yaml = yaml_cache::parsed_yaml(&*db, input);
-            match parsed_yaml.result() {
-                Ok(content) => {
-                    diagnostics::validate_document(content, &disabled_rules, &*db, s.python_config)
-                }
-                Err(e) => vec![yaml_syntax_error_diagnostic(e)],
-            }
+            validate_input(&db, input, &disabled_rules, s.python_config)
         })
     }
 
@@ -2001,7 +1987,9 @@ impl HydraLspBackend {
     fn publish_diagnostics_for_document(&self, uri: &Url) {
         // Callers (`did_open`, `did_change`) always create the input first, so a
         // missing entry is a programmer error rather than a runtime concern.
-        if !self.document_inputs.contains_key(uri) {
+        // Copy the input out so the shard guard drops before the db lock is
+        // taken (see the `document_inputs` lock order).
+        let Some(input) = self.document_inputs.get(uri).map(|entry| *entry) else {
             debug_assert!(
                 false,
                 "publish_diagnostics_for_document called for {} with no DocumentInput; \
@@ -2010,12 +1998,28 @@ impl HydraLspBackend {
             );
             tracing::warn!(%uri, "no DocumentInput for diagnostics; skipping");
             return;
-        }
+        };
 
-        if let Some(diagnostics) = self.compute_diagnostics(uri) {
+        if let Some(diagnostics) = self.compute_diagnostics(input) {
             self.outbox
                 .publish_diagnostics(uri.clone(), diagnostics, None);
         }
+    }
+}
+
+/// Parse `input` and validate it: the diagnostics for one document, shared by
+/// the push path (under the db lock) and the pull path (on a snapshot, on the
+/// worker pool). The caller decides whether the document is a Hydra file.
+fn validate_input(
+    db: &HydraDatabase,
+    input: DocumentInput,
+    disabled_rules: &HashSet<DiagnosticRule>,
+    python_config: PythonConfig,
+) -> Vec<Diagnostic> {
+    let parsed_yaml = yaml_cache::parsed_yaml(db, input);
+    match parsed_yaml.result() {
+        Ok(content) => diagnostics::validate_document(content, disabled_rules, db, python_config),
+        Err(e) => vec![yaml_syntax_error_diagnostic(e)],
     }
 }
 
