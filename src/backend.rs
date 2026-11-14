@@ -99,11 +99,7 @@ fn definition_positions(definition_info: &DefinitionInfo) -> Vec<(u32, u32, u32,
 
 /// Returns the index in `params` of the parameter that the cursor is on, or
 /// `params.len()` when no parameter should be highlighted.
-fn active_parameter(
-    params: &[&ParameterInfo],
-    param_context: &ResolvedParameterContext,
-    keyword_keys: &[String],
-) -> u32 {
+fn active_parameter(params: &[&ParameterInfo], param_context: &ResolvedParameterContext) -> u32 {
     let position_of = |kind| params.iter().position(|p| p.kind == kind);
     let none = params.len();
     let active = match param_context {
@@ -112,8 +108,12 @@ fn active_parameter(
             .position(|p| p.name == *key && !p.is_variadic())
             .or_else(|| position_of(ParameterKind::VarKeyword))
             .unwrap_or(none),
-        ResolvedParameterContext::Positional(_, 0) => none,
-        ResolvedParameterContext::Positional(index, _) => {
+        ResolvedParameterContext::Positional { num_args: 0, .. } => none,
+        ResolvedParameterContext::Positional {
+            index,
+            keyword_keys,
+            ..
+        } => {
             let pos = params
                 .iter()
                 .enumerate()
@@ -141,13 +141,12 @@ fn signature_information(
     sig: Option<&FunctionSignature>,
     implicit_param: Option<&str>,
     param_context: &ResolvedParameterContext,
-    keyword_keys: &[String],
 ) -> SignatureInformation {
     let (params_str, parameters, param_infos) = match sig {
         Some(sig) => build_signature_params(&sig.parameters, implicit_param),
         None => (String::new(), vec![], vec![]),
     };
-    let active_parameter = active_parameter(&param_infos, param_context, keyword_keys);
+    let active_parameter = active_parameter(&param_infos, param_context);
 
     SignatureInformation {
         label: format!("{label_prefix}({params_str})"),
@@ -1634,8 +1633,7 @@ impl LanguageServer for HydraLspBackend {
         let Ok(content) = parsed.result() else {
             return Ok(None);
         };
-        let Some((target_value, param_context, keyword_keys)) =
-            content.target_for_parameter_line(position)
+        let Some((target_value, param_context)) = content.target_for_parameter_line(position)
         else {
             return Ok(None);
         };
@@ -1679,13 +1677,7 @@ impl LanguageServer for HydraLspBackend {
                 let signatures: Vec<SignatureInformation> = shown
                     .into_iter()
                     .map(|sig| {
-                        signature_information(
-                            &label_prefix,
-                            sig,
-                            implicit_param,
-                            &param_context,
-                            &keyword_keys,
-                        )
+                        signature_information(&label_prefix, sig, implicit_param, &param_context)
                     })
                     .collect();
                 let active_parameter = signatures[active_signature].active_parameter;
@@ -2417,45 +2409,51 @@ mod tests {
         ]
     }
 
-    fn active(params: &[ParameterInfo], ctx: ResolvedParameterContext, keys: &[&str]) -> u32 {
+    fn active(params: &[ParameterInfo], ctx: ResolvedParameterContext) -> u32 {
         let refs: Vec<&ParameterInfo> = params.iter().collect();
-        let keys: Vec<String> = keys.iter().map(|k| k.to_string()).collect();
-        active_parameter(&refs, &ctx, &keys)
+        active_parameter(&refs, &ctx)
     }
 
     fn keyword(key: &str) -> ResolvedParameterContext {
         ResolvedParameterContext::Keyword(key.to_string())
     }
 
+    fn positional(index: u32, num_args: u32, keyword_keys: &[&str]) -> ResolvedParameterContext {
+        ResolvedParameterContext::Positional {
+            index,
+            num_args,
+            keyword_keys: keyword_keys.iter().map(|k| k.to_string()).collect(),
+        }
+    }
+
     #[test]
     fn test_active_parameter_keyword_match() {
         let params = full_signature();
-        assert_eq!(active(&params, keyword("b"), &[]), 1);
-        assert_eq!(active(&params, keyword("c"), &[]), 3);
+        assert_eq!(active(&params, keyword("b")), 1);
+        assert_eq!(active(&params, keyword("c")), 3);
     }
 
     #[test]
     fn test_active_parameter_keyword_falls_back_to_kwargs() {
         let params = full_signature();
-        assert_eq!(active(&params, keyword("unknown"), &[]), 4);
+        assert_eq!(active(&params, keyword("unknown")), 4);
         // A key naming a variadic parameter is not that parameter.
-        assert_eq!(active(&params, keyword("args"), &[]), 4);
+        assert_eq!(active(&params, keyword("args")), 4);
     }
 
     #[test]
     fn test_active_parameter_keyword_no_match() {
         let params = vec![param("a", ParameterKind::PositionalOrKeyword)];
-        assert_eq!(active(&params, keyword("unknown"), &[]), 1);
-        assert_eq!(active(&[], keyword("unknown"), &[]), 0);
+        assert_eq!(active(&params, keyword("unknown")), 1);
+        assert_eq!(active(&[], keyword("unknown")), 0);
     }
 
     #[test]
     fn test_active_parameter_positional_index() {
         let params = full_signature();
-        let positional = |i| ResolvedParameterContext::Positional(i, 3);
         // Positional-only and positional-or-keyword both bind in order.
-        assert_eq!(active(&params, positional(0), &[]), 0);
-        assert_eq!(active(&params, positional(1), &[]), 1);
+        assert_eq!(active(&params, positional(0, 3, &[])), 0);
+        assert_eq!(active(&params, positional(1, 3, &[])), 1);
     }
 
     #[test]
@@ -2463,14 +2461,8 @@ mod tests {
         let params = full_signature();
         // Past the last positional parameter, `*args` takes the rest; the
         // keyword-only `c` is never filled positionally.
-        assert_eq!(
-            active(&params, ResolvedParameterContext::Positional(2, 3), &[]),
-            2
-        );
-        assert_eq!(
-            active(&params, ResolvedParameterContext::Positional(5, 6), &[]),
-            2
-        );
+        assert_eq!(active(&params, positional(2, 3, &[])), 2);
+        assert_eq!(active(&params, positional(5, 6, &[])), 2);
     }
 
     #[test]
@@ -2480,25 +2472,16 @@ mod tests {
             param("a", ParameterKind::PositionalOrKeyword),
             param("c", ParameterKind::KeywordOnly),
         ];
-        assert_eq!(
-            active(&params, ResolvedParameterContext::Positional(1, 2), &[]),
-            2
-        );
+        assert_eq!(active(&params, positional(1, 2, &[])), 2);
     }
 
     #[test]
     fn test_active_parameter_positional_suppressed() {
         let params = full_signature();
         // An empty `_args_` list passes nothing.
-        assert_eq!(
-            active(&params, ResolvedParameterContext::Positional(0, 0), &[]),
-            5
-        );
+        assert_eq!(active(&params, positional(0, 0, &[])), 5);
         // A parameter also given by keyword is not highlighted.
-        assert_eq!(
-            active(&params, ResolvedParameterContext::Positional(1, 2), &["b"]),
-            5
-        );
+        assert_eq!(active(&params, positional(1, 2, &["b"])), 5);
     }
 
     thread_local! {

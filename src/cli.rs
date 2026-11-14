@@ -717,14 +717,8 @@ fn trace_target_resolution(
             hydra_object.parameters.len()
         );
         for param in &hydra_object.parameters {
-            match param {
-                hydrust::yaml_parser::Parameter::Keyword { key, line, .. } => {
-                    eprintln!("    - {} (line {})", key.cyan(), line + 1);
-                }
-                hydrust::yaml_parser::Parameter::Positional { line, .. } => {
-                    eprintln!("    - {} (line {})", "<positional>".cyan(), line + 1);
-                }
-            }
+            let name = param.key().unwrap_or("<positional>");
+            eprintln!("    - {} (line {})", name.cyan(), param.line + 1);
         }
     }
 }
