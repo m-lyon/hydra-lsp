@@ -1571,13 +1571,8 @@ pub enum ResolvedParameterContext {
     Keyword(String),
     /// Positional parameter context from `_args_`.
     Positional {
-        /// The cursor's index within `_args_`.
         index: u32,
-        /// How many items the `_args_` list actually holds, used to tell an
-        /// empty list from a populated one.
         num_args: u32,
-        /// The keyword parameters already given on the same Hydra object, used
-        /// to detect a parameter assigned both positionally and by keyword.
         keyword_keys: Vec<String>,
     },
 }
