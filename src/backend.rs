@@ -223,6 +223,38 @@ pub struct Settings {
     pub features: FeatureToggles,
 }
 
+impl Settings {
+    /// Parse the `initializationOptions.settings` object. Unknown keys, and
+    /// values of the wrong type, are ignored. `numThreads` is not kept here: it
+    /// only sizes the pools, once, so `HydraLspBackend::apply_settings` reads
+    /// it itself.
+    fn from_json(settings: &serde_json::Value) -> Self {
+        let python_interpreter = settings
+            .get("pythonInterpreter")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        let mut disabled_rules = HashSet::new();
+        if let Some(rules) = settings.get("disabledRules")
+            && let Some(rules_array) = rules.as_array()
+        {
+            for rule_value in rules_array {
+                if let Some(rule_str) = rule_value.as_str()
+                    && let Some(rule) = DiagnosticRule::from_code(rule_str)
+                {
+                    disabled_rules.insert(rule);
+                }
+            }
+        }
+
+        Self {
+            python_interpreter,
+            disabled_rules,
+            features: FeatureToggles::from_json(settings),
+        }
+    }
+}
+
 /// Version of the `experimental.hydrust` block described by
 /// [`HydrustCapabilities`]. A client compares it against the highest version it
 /// knows how to read.
@@ -236,7 +268,8 @@ const HYDRUST_PROTOCOL_VERSION: u32 = 1;
 
 /// The non-toggle keys the server reads out of
 /// `initializationOptions.settings`. This list must stay in step with the
-/// parsing in `initialize`; the feature toggles alongside it come from
+/// parsing in [`Settings::from_json`] and `apply_settings` (which reads
+/// `numThreads`); the feature toggles alongside it come from
 /// [`FeatureToggles::SETTING_KEYS`], which is generated with the toggles
 /// themselves.
 const CORE_SETTINGS: &[&str] = &["pythonInterpreter", "disabledRules", "numThreads"];
@@ -696,6 +729,108 @@ impl HydraLspBackend {
             })
     }
 
+    /// Parse `initializationOptions.settings` into [`Self::settings`], log what
+    /// was set, and return the `numThreads` override (`None` for the server
+    /// default), already clamped to a range the server can honour.
+    ///
+    /// Without a `settings` object everything keeps its default.
+    fn apply_settings(&self, init_options: Option<&serde_json::Value>) -> Option<usize> {
+        let settings = init_options?.get("settings")?;
+        let parsed = Settings::from_json(settings);
+
+        // Parse optional thread-count override (every thread the server
+        // runs, the protocol loop's included), clamped to a range the server
+        // can honour.
+        let (num_threads, num_threads_warning) = settings
+            .get("numThreads")
+            .and_then(|v| v.as_u64())
+            .map_or((None, None), clamp_num_threads);
+
+        if let Some(ref path) = parsed.python_interpreter {
+            self.outbox.log(
+                MessageType::INFO,
+                format!("Python interpreter configured: {}", path),
+            );
+        }
+
+        if !parsed.disabled_rules.is_empty() {
+            self.outbox.log(
+                MessageType::INFO,
+                format!("Disabled rules: {:?}", parsed.disabled_rules),
+            );
+        }
+
+        let disabled_features = parsed.features.disabled_names();
+        if !disabled_features.is_empty() {
+            self.outbox.log(
+                MessageType::INFO,
+                format!("Disabled features: {:?}", disabled_features),
+            );
+        }
+
+        {
+            let mut s = self.settings.write();
+            if parsed.python_interpreter.is_some() {
+                s.python_interpreter = parsed.python_interpreter;
+            }
+            s.disabled_rules = parsed.disabled_rules;
+            s.features = parsed.features;
+        }
+
+        if let Some(warning) = num_threads_warning {
+            self.outbox.log(MessageType::WARNING, warning);
+        }
+
+        num_threads
+    }
+
+    /// Build the latency and worker pools for a `numThreads` override (`None`
+    /// for the server default) and log the split. Called once, from
+    /// `initialize`; fails only when the OS refuses to create the threads.
+    fn build_pools(&self, num_threads: Option<usize>) -> Result<()> {
+        // Build the two rayon pools exactly once, when `numThreads` is known.
+        let (latency, worker) = pool_sizes(num_threads);
+        match (
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(latency)
+                .thread_name(|i| format!("hydra-latency-{i}"))
+                .build(),
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(worker)
+                .thread_name(|i| format!("hydra-worker-{i}"))
+                .build(),
+        ) {
+            (Ok(latency_pool), Ok(worker_pool)) => {
+                // `set` cannot fail: `initialize` is the sole writer, once.
+                let _ = self.latency_pool.set(latency_pool);
+                let _ = self.worker_pool.set(worker_pool);
+                let total = latency + worker + RUNTIME_THREADS;
+                let note = match num_threads {
+                    None => cpu_limited_default_note(total),
+                    Some(_) => oversubscription_note(total),
+                };
+                self.outbox.log(
+                    MessageType::INFO,
+                    format!(
+                        "Thread pools configured: {latency} latency + {worker} worker, \
+                         plus the protocol loop ({total} threads in all){note}"
+                    ),
+                );
+                Ok(())
+            }
+            _ => {
+                let msg = format!(
+                    "Failed to build thread pools ({latency} latency + {worker} worker); \
+                     the OS refused thread creation"
+                );
+                self.outbox.log(MessageType::ERROR, &msg);
+                let mut err = Error::internal_error();
+                err.message = msg.into();
+                Err(err)
+            }
+        }
+    }
+
     fn initialize_session(
         &self,
         workspace_root: Option<String>,
@@ -901,6 +1036,71 @@ impl HydraLspBackend {
     }
 }
 
+/// The `ServerCapabilities` sent back from `initialize`. Everything is fixed
+/// except the `experimental.hydrust` block, which lists the features negotiated
+/// with this client.
+fn server_capabilities(client: &ClientFeatures) -> ServerCapabilities {
+    ServerCapabilities {
+        // `position_encoding` is intentionally left unset (it falls under
+        // `..Default::default()` below). Per the LSP spec, an unset
+        // encoding means the default: UTF-16. Every position we emit and
+        // consume is therefore counted in UTF-16 code units (see
+        // `cp_to_utf16_col` / `utf16_col_to_byte_offset` in yaml_parser
+        // and the `PositionEncoding::Utf16` conversion in python_analyzer).
+        // The only realistic client is the UTF-16-native VSCode extension,
+        // so explicit negotiation buys nothing; revisit only if a client
+        // that prefers UTF-8 is added (which would also require making the
+        // internals byte-native to be worthwhile).
+        text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
+        hover_provider: Some(HoverProviderCapability::Simple(true)),
+        completion_provider: Some(CompletionOptions {
+            trigger_characters: Some(vec![".".to_string(), "_".to_string()]),
+            resolve_provider: Some(false),
+            ..Default::default()
+        }),
+        signature_help_provider: Some(SignatureHelpOptions {
+            trigger_characters: Some(vec![
+                ":".to_string(),
+                "-".to_string(),
+                "[".to_string(),
+                ",".to_string(),
+            ]),
+            retrigger_characters: None,
+            work_done_progress_options: WorkDoneProgressOptions::default(),
+        }),
+        definition_provider: Some(OneOf::Left(true)),
+        semantic_tokens_provider: Some(SemanticTokensServerCapabilities::SemanticTokensOptions(
+            SemanticTokensOptions {
+                legend: SemanticTokensLegend {
+                    token_types: SEMANTIC_TOKEN_LEGEND.to_vec(),
+                    token_modifiers: vec![
+                        SemanticTokenModifier::DECLARATION,
+                        SemanticTokenModifier::DEFINITION,
+                    ],
+                },
+                range: Some(false),
+                full: Some(SemanticTokensFullOptions::Bool(true)),
+                ..Default::default()
+            },
+        )),
+        diagnostic_provider: Some(DiagnosticServerCapabilities::Options(DiagnosticOptions {
+            identifier: Some("hydra-lsp".to_string()),
+            // Hydra targets resolve into watched Python files, so a
+            // change in one file can affect another's diagnostics.
+            inter_file_dependencies: true,
+            // Document/open-files pull only; no whole-workspace pull.
+            workspace_diagnostics: false,
+            work_done_progress_options: Default::default(),
+        })),
+        // Tell the client which settings and rules this build
+        // understands, so it can warn about anything it sends that
+        // would be silently ignored, plus the features that are
+        // actually switched on for this session.
+        experimental: HydrustCapabilities::new(client.negotiated).to_experimental(),
+        ..Default::default()
+    }
+}
+
 #[tower_lsp::async_trait]
 impl LanguageServer for HydraLspBackend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
@@ -922,193 +1122,14 @@ impl LanguageServer for HydraLspBackend {
             ),
         );
 
-        // Parse initialization options
-        let mut num_threads: Option<usize> = None;
-        let mut num_threads_warning: Option<String> = None;
-        if let Some(init_options) = params.initialization_options
-            && let Some(settings) = init_options.get("settings")
-        {
-            // Extract values without holding the lock across awaits
-            let interpreter_path = settings
-                .get("pythonInterpreter")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-
-            let mut parsed_rules = HashSet::new();
-            if let Some(disabled_rules) = settings.get("disabledRules")
-                && let Some(rules_array) = disabled_rules.as_array()
-            {
-                for rule_value in rules_array {
-                    if let Some(rule_str) = rule_value.as_str()
-                        && let Some(rule) = DiagnosticRule::from_code(rule_str)
-                    {
-                        parsed_rules.insert(rule);
-                    }
-                }
-            }
-
-            // Parse feature toggle settings
-            let toggles = FeatureToggles::from_json(settings);
-
-            // Parse optional thread-count override (every thread the server
-            // runs, the protocol loop's included), clamped to a range the server
-            // can honour.
-            let (parsed, out_of_range) = settings
-                .get("numThreads")
-                .and_then(|v| v.as_u64())
-                .map_or((None, None), clamp_num_threads);
-            num_threads = parsed;
-            num_threads_warning = out_of_range;
-
-            // Write settings under the lock (no awaits)
-            {
-                let mut s = self.settings.write();
-                if interpreter_path.is_some() {
-                    s.python_interpreter = interpreter_path.clone();
-                }
-                s.disabled_rules = parsed_rules;
-                s.features = toggles;
-            }
-
-            // Log after releasing the lock
-            if let Some(ref path) = interpreter_path {
-                self.outbox.log(
-                    MessageType::INFO,
-                    format!("Python interpreter configured: {}", path),
-                );
-            }
-
-            if !self.settings.read().disabled_rules.is_empty() {
-                self.outbox.log(
-                    MessageType::INFO,
-                    format!("Disabled rules: {:?}", self.settings.read().disabled_rules),
-                );
-            }
-
-            // Log disabled features
-            let disabled_features = toggles.disabled_names();
-            if !disabled_features.is_empty() {
-                self.outbox.log(
-                    MessageType::INFO,
-                    format!("Disabled features: {:?}", disabled_features),
-                );
-            }
-        }
-
-        if let Some(warning) = num_threads_warning {
-            self.outbox.log(MessageType::WARNING, warning);
-        }
-
-        // Build the two rayon pools exactly once, when `numThreads` is known.
-        let (latency, worker) = pool_sizes(num_threads);
-        match (
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(latency)
-                .thread_name(|i| format!("hydra-latency-{i}"))
-                .build(),
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(worker)
-                .thread_name(|i| format!("hydra-worker-{i}"))
-                .build(),
-        ) {
-            (Ok(latency_pool), Ok(worker_pool)) => {
-                // `set` cannot fail: `initialize` is the sole writer, once.
-                let _ = self.latency_pool.set(latency_pool);
-                let _ = self.worker_pool.set(worker_pool);
-                let total = latency + worker + RUNTIME_THREADS;
-                let note = match num_threads {
-                    None => cpu_limited_default_note(total),
-                    Some(_) => oversubscription_note(total),
-                };
-                self.outbox.log(
-                    MessageType::INFO,
-                    format!(
-                        "Thread pools configured: {latency} latency + {worker} worker, \
-                         plus the protocol loop ({total} threads in all){note}"
-                    ),
-                );
-            }
-            _ => {
-                let msg = format!(
-                    "Failed to build thread pools ({latency} latency + {worker} worker); \
-                     the OS refused thread creation"
-                );
-                self.outbox.log(MessageType::ERROR, &msg);
-                let mut err = Error::internal_error();
-                err.message = msg.into();
-                return Err(err);
-            }
-        }
+        let num_threads = self.apply_settings(params.initialization_options.as_ref());
+        self.build_pools(num_threads)?;
 
         let interpreter_path = self.settings.read().python_interpreter.clone();
         self.initialize_session(workspace_root, interpreter_path)?;
 
         Ok(InitializeResult {
-            capabilities: ServerCapabilities {
-                // `position_encoding` is intentionally left unset (it falls under
-                // `..Default::default()` below). Per the LSP spec, an unset
-                // encoding means the default: UTF-16. Every position we emit and
-                // consume is therefore counted in UTF-16 code units (see
-                // `cp_to_utf16_col` / `utf16_col_to_byte_offset` in yaml_parser
-                // and the `PositionEncoding::Utf16` conversion in python_analyzer).
-                // The only realistic client is the UTF-16-native VSCode extension,
-                // so explicit negotiation buys nothing; revisit only if a client
-                // that prefers UTF-8 is added (which would also require making the
-                // internals byte-native to be worthwhile).
-                text_document_sync: Some(TextDocumentSyncCapability::Kind(
-                    TextDocumentSyncKind::FULL,
-                )),
-                hover_provider: Some(HoverProviderCapability::Simple(true)),
-                completion_provider: Some(CompletionOptions {
-                    trigger_characters: Some(vec![".".to_string(), "_".to_string()]),
-                    resolve_provider: Some(false),
-                    ..Default::default()
-                }),
-                signature_help_provider: Some(SignatureHelpOptions {
-                    trigger_characters: Some(vec![
-                        ":".to_string(),
-                        "-".to_string(),
-                        "[".to_string(),
-                        ",".to_string(),
-                    ]),
-                    retrigger_characters: None,
-                    work_done_progress_options: WorkDoneProgressOptions::default(),
-                }),
-                definition_provider: Some(OneOf::Left(true)),
-                semantic_tokens_provider: Some(
-                    SemanticTokensServerCapabilities::SemanticTokensOptions(
-                        SemanticTokensOptions {
-                            legend: SemanticTokensLegend {
-                                token_types: SEMANTIC_TOKEN_LEGEND.to_vec(),
-                                token_modifiers: vec![
-                                    SemanticTokenModifier::DECLARATION,
-                                    SemanticTokenModifier::DEFINITION,
-                                ],
-                            },
-                            range: Some(false),
-                            full: Some(SemanticTokensFullOptions::Bool(true)),
-                            ..Default::default()
-                        },
-                    ),
-                ),
-                diagnostic_provider: Some(DiagnosticServerCapabilities::Options(
-                    DiagnosticOptions {
-                        identifier: Some("hydra-lsp".to_string()),
-                        // Hydra targets resolve into watched Python files, so a
-                        // change in one file can affect another's diagnostics.
-                        inter_file_dependencies: true,
-                        // Document/open-files pull only; no whole-workspace pull.
-                        workspace_diagnostics: false,
-                        work_done_progress_options: Default::default(),
-                    },
-                )),
-                // Tell the client which settings and rules this build
-                // understands, so it can warn about anything it sends that
-                // would be silently ignored, plus the features that are
-                // actually switched on for this session.
-                experimental: HydrustCapabilities::new(client.negotiated).to_experimental(),
-                ..Default::default()
-            },
+            capabilities: server_capabilities(&client),
             server_info: Some(ServerInfo {
                 name: "hydrust".to_string(),
                 version: Some(env!("CARGO_PKG_VERSION").to_string()),

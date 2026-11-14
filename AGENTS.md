@@ -12,7 +12,9 @@ cargo clippy
 
 ## Adding a feature
 
-**A settings key** — parse it in `initialize`, then add it to `CORE_SETTINGS` (or
+**A settings key** — parse it in `Settings::from_json` (or in `apply_settings`,
+for one that is only read at `initialize`, like `numThreads`), then add it to
+`CORE_SETTINGS` (or
 to the `feature_toggles!` list for an on/off switch, which registers the key for
 you). Update the counts in [tests/capabilities.rs](tests/capabilities.rs). In the
 extension: declare it in `package.json`, send it from `startServer`, add a
