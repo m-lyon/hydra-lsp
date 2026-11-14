@@ -5,7 +5,8 @@ How hydra-lsp uses threads, and why it is set up this way.
 Read this before changing any thread count, the concurrency level, or where a
 request handler does its work. Symbols are named rather than cited by line, so
 `rg` is the way to find them; the constants and functions this describes all live
-in `src/backend.rs` unless another file is given.
+under `src/backend/` (pool sizing in `src/backend/pools.rs`) unless another file
+is given.
 
 ## The shape
 
@@ -39,12 +40,13 @@ the third is about threads.
 1. **One runtime thread.** `serve()` in `src/server.rs` builds
    `tokio::runtime::Builder::new_current_thread()`.
 2. **Eight concurrent handlers.** `MAX_CONCURRENT_REQUESTS` in
-   `src/backend.rs`, passed to `Server::concurrency_level`. Note the
+   `src/backend/pools.rs`, passed to `Server::concurrency_level`. Note the
    integration harness (`tests/common/mod.rs`) does *not* set this, so those
    tests run at tower-lsp's default of 4.
 3. **Up to five pool threads.** 2 latency + 3 worker, from `pool_sizes` in
-   `src/backend.rs`, overridable through the `numThreads` setting and trimmed on
-   a small machine — see *The default is capped by the CPU count* below.
+   `src/backend/pools.rs`, overridable through the `numThreads` setting and
+   trimmed on a small machine — see *The default is capped by the CPU count*
+   below.
 4. **One outbox task.** `src/outbox.rs`. Not a thread and not a handler — it
    holds no lock and does no analysis, it only moves finished messages out to
    the client.
@@ -412,13 +414,19 @@ In `hydra-lsp`:
 
 - `src/server.rs` — `serve()`: the `current_thread` runtime and
   `concurrency_level`.
-- `src/backend.rs` — the pool-sizing constants and the `const` invariant block;
-  `pool_sizes`, `split_pool_total`, `default_pool_total`/`_for`,
-  `clamp_num_threads`, `oversubscription_note`, `cpu_limited_default_note`;
-  `initialize`, which is the only place the pools are built; `snapshot`,
-  `with_session`, `spawn_on_pool`, `spawn_definition_lookup`;
-  `compute_diagnostics` and the publish helpers. Unit tests for all of the sizing
-  logic are in the same file.
+- `src/backend/pools.rs` — the pool-sizing constants and the `const` invariant
+  block; `pool_sizes`, `split_pool_total`, `default_pool_total`,
+  `available_cpus`, `clamp_num_threads`, `oversubscription_note`,
+  `cpu_limited_default_note`; `build_pools`, called only from `initialize`, which
+  is the only place the pools are built; `spawn_on_pool` and `PoolOutcome`. Unit
+  tests for all of the sizing logic are in the same file.
+- `src/backend/session.rs` — `Session`, `snapshot`, `with_session`,
+  `get_or_create_input`; the `document_inputs` lock order is documented on the
+  field in `src/backend.rs`.
+- `src/backend/handlers.rs` — the `LanguageServer` impl, including `initialize`,
+  and `spawn_definition_lookup`.
+- `src/backend/diag.rs` — `compute_diagnostics` and the publish helpers, and the
+  pull path's report building.
 - `src/outbox.rs` — the outbound queue and its drain task.
 - `tests/server_cli.rs` — `EXIT_TIMEOUT`, the guard against the outbox hang
   coming back.
