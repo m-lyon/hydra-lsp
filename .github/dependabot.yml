@@ -22,6 +22,11 @@ updates:
       interval: weekly
     cooldown:
       default-days: 7
+    # saphyr hands back mappings as hashlink's LinkedHashMap, so our hashlink
+    # must be the same version as saphyr's or the types don't match. Bump it
+    # together with saphyr.
+    ignore:
+      - dependency-name: hashlink
     groups:
       cargo-minor-and-patch:
         update-types: [minor, patch]
