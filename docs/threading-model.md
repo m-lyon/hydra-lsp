@@ -212,7 +212,7 @@ out the split each value produces.
 ### The default is capped by the CPU count
 
 The *shape* of the default does not scale with cores, per the section above; its
-*size* is still bounded by them. `default_pool_total_for` gives
+*size* is still bounded by them. `default_pool_total` gives
 `min(5, available_parallelism - 1)`, and `split_pool_total` divides that with the
 same rule an explicit `numThreads` gets, so the equivalence in the invariants
 section below still holds.
