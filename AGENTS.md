@@ -25,10 +25,13 @@ the extension, add a `RULE_COMPAT` entry; for a *rename*, record the old code as
 `invalid-target` → `invalid-hydra-parameter` did in v0.3.0.
 
 **A behaviour the client must know about** — only needed when it depends on a
-client capability, or the client has to branch on it. Read the client capability
-in `initialize` and store the flag, add a field to `NegotiatedFeatures` and a
-`(name, gate)` pair to `SUPPORTED_FEATURES`, and gate the behaviour on that same
-flag so the advertised name is never a promise the session will not keep. Cover
+client capability, or the client has to branch on it. Add a field to
+`NegotiatedFeatures`, read the client capability into it in
+`ClientFeatures::from_capabilities` (stored once in `initialize`), and add a
+`(name, gate)` pair to `SUPPORTED_FEATURES`. Gate the behaviour on that same
+field, through `self.negotiated()`: the `experimental.hydrust` block is built
+from the same stored value, so the advertised name is never a promise the
+session will not keep. Cover
 it both ways in [tests/capabilities.rs](tests/capabilities.rs). In the extension,
 add a `FEATURE_COMPAT` entry; names become `hydrust.supports.<name>` context keys.
 

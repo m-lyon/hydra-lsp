@@ -3,7 +3,6 @@ use parking_lot::RwLock;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use tower_lsp::jsonrpc::{Error, Result};
 use tower_lsp::lsp_types::*;
@@ -255,7 +254,8 @@ static SUPPORTED_SETTINGS: std::sync::LazyLock<Vec<&'static str>> =
 
 /// Which optional behaviours the server will actually use this session. Each
 /// one needs the client to have asked for it in its `initialize` capabilities,
-/// so these are read from the flags captured at the top of `initialize`.
+/// so these are read by [`ClientFeatures::from_capabilities`]. The handlers
+/// gate on the same value the `experimental.hydrust` block is built from.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NegotiatedFeatures {
     /// The client issues `textDocument/diagnostic`, so we answer pull requests
@@ -267,6 +267,53 @@ pub struct NegotiatedFeatures {
     /// The client accepts `workspace/diagnostic/refresh`, so we can ask it to
     /// re-pull after a watched Python file changes.
     pub diagnostic_refresh: bool,
+}
+
+/// What the client said it can do, read once from its `initialize`
+/// capabilities and kept for the whole session.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ClientFeatures {
+    /// The optional behaviours advertised in `experimental.hydrust`, and the
+    /// flags the handlers gate those behaviours on.
+    pub(crate) negotiated: NegotiatedFeatures,
+    /// The client accepts relative patterns for watched files. Required to watch
+    /// out-of-workspace Python search paths. Not advertised: it only refines
+    /// which watchers `watched_files` registers.
+    pub(crate) relative_patterns: bool,
+}
+
+impl ClientFeatures {
+    /// Read the client capabilities the server branches on.
+    pub(crate) fn from_capabilities(capabilities: &ClientCapabilities) -> Self {
+        let watched_files_caps = capabilities
+            .workspace
+            .as_ref()
+            .and_then(|w| w.did_change_watched_files.as_ref());
+        Self {
+            negotiated: NegotiatedFeatures {
+                // Pull diagnostics: does the client issue `textDocument/diagnostic`?
+                pull_diagnostics: capabilities
+                    .text_document
+                    .as_ref()
+                    .and_then(|t| t.diagnostic.as_ref())
+                    .is_some(),
+                watched_files: watched_files_caps
+                    .and_then(|d| d.dynamic_registration)
+                    .unwrap_or(false),
+                // Refresh: can we nudge the client to re-pull with
+                // `workspace/diagnostic/refresh`?
+                diagnostic_refresh: capabilities
+                    .workspace
+                    .as_ref()
+                    .and_then(|w| w.diagnostic.as_ref())
+                    .and_then(|d| d.refresh_support)
+                    .unwrap_or(false),
+            },
+            relative_patterns: watched_files_caps
+                .and_then(|d| d.relative_pattern_support)
+                .unwrap_or(false),
+        }
+    }
 }
 
 /// A feature name paired with the flag that decides whether it is on.
@@ -471,23 +518,14 @@ pub struct HydraLspBackend {
     /// Defaults to 3 threads — see [`pool_sizes`]. Built alongside
     /// `latency_pool`, and overridable through `numThreads`.
     worker_pool: OnceLock<rayon::ThreadPool>,
-    /// Whether the client advertised `workspace/didChangeWatchedFiles`
-    /// dynamic registration in its `initialize` capabilities. Captured in
-    /// `initialize` and read in `initialized` to decide whether to register the
-    /// watchers at all.
-    watched_files_dynamic: AtomicBool,
-    /// Whether the client advertised relative-pattern support for watched
-    /// files. Required to watch out-of-workspace Python search paths.
-    watched_files_relative_patterns: AtomicBool,
-    /// Whether the client advertised support for pull diagnostics
-    /// (`textDocument/diagnostic`, LSP 3.17). Captured in `initialize`. When
-    /// true we answer pull requests and skip proactively pushing diagnostics;
-    /// when false we fall back to pushing via `publish_diagnostics`.
-    supports_pull_diagnostics: AtomicBool,
-    /// Whether the client advertised `workspace/diagnostic/refresh` support.
-    /// When true, a watched-file change nudges the client to re-pull instead of
-    /// the server re-publishing each open document.
-    supports_diagnostic_refresh: AtomicBool,
+    /// What the client advertised in its `initialize` capabilities. Set exactly
+    /// once, in `initialize`, like the pools, and read through
+    /// [`Self::client_features`] and [`Self::negotiated`], which report
+    /// everything off until then.
+    ///
+    /// The `experimental.hydrust` block is built from this same value, so a
+    /// feature is only advertised when the handlers that gate on it will act.
+    client_features: OnceLock<ClientFeatures>,
 }
 
 /// Outcome of a closure run on a rayon pool via [`spawn_on_pool`].
@@ -610,30 +648,28 @@ impl HydraLspBackend {
             document_inputs: DashMap::new(),
             latency_pool: OnceLock::new(),
             worker_pool: OnceLock::new(),
-            watched_files_dynamic: AtomicBool::new(false),
-            watched_files_relative_patterns: AtomicBool::new(false),
-            supports_pull_diagnostics: AtomicBool::new(false),
-            supports_diagnostic_refresh: AtomicBool::new(false),
+            client_features: OnceLock::new(),
         }
     }
 
-    /// Whether the client supports pull diagnostics (`textDocument/diagnostic`).
-    /// When true we answer pull requests and stop pushing diagnostics proactively.
-    fn supports_pull(&self) -> bool {
-        self.supports_pull_diagnostics.load(Ordering::Relaxed)
+    /// What the client advertised at `initialize`, or everything off before
+    /// then.
+    fn client_features(&self) -> ClientFeatures {
+        self.client_features.get().copied().unwrap_or_default()
     }
 
-    /// Whether the client supports dynamic registration for
-    /// `workspace/didChangeWatchedFiles`. When true we register our own file watchers
-    /// on `initialized`, so the client does not need to configure any.
-    fn supports_dynamic_watched_files(&self) -> bool {
-        self.watched_files_dynamic.load(Ordering::Relaxed)
-    }
-
-    /// Whether the client supports `workspace/diagnostic/refresh`, letting us nudge
-    /// it to re-pull instead of re-publishing each open document ourselves.
-    fn supports_diag_refresh(&self) -> bool {
-        self.supports_diagnostic_refresh.load(Ordering::Relaxed)
+    /// The optional behaviours on for this session: the same flags the
+    /// `experimental.hydrust` block advertised.
+    ///
+    /// - `pull_diagnostics`: answer `textDocument/diagnostic` and stop pushing
+    ///   diagnostics proactively; without it, push via `publish_diagnostics`.
+    /// - `watched_files`: register our own file watchers on `initialized`, so
+    ///   the client does not need to configure any.
+    /// - `diagnostic_refresh`: nudge the client to re-pull with
+    ///   `workspace/diagnostic/refresh` instead of re-publishing each open
+    ///   document ourselves.
+    fn negotiated(&self) -> NegotiatedFeatures {
+        self.client_features().negotiated
     }
 
     fn fallback_workspace_root() -> Result<String> {
@@ -874,45 +910,9 @@ impl LanguageServer for HydraLspBackend {
             .and_then(|root_uri| root_uri.to_file_path().ok())
             .map(|path| path.to_string_lossy().to_string());
 
-        let watched_files_caps = params
-            .capabilities
-            .workspace
-            .as_ref()
-            .and_then(|w| w.did_change_watched_files.as_ref());
-        self.watched_files_dynamic.store(
-            watched_files_caps
-                .and_then(|d| d.dynamic_registration)
-                .unwrap_or(false),
-            Ordering::Relaxed,
-        );
-        self.watched_files_relative_patterns.store(
-            watched_files_caps
-                .and_then(|d| d.relative_pattern_support)
-                .unwrap_or(false),
-            Ordering::Relaxed,
-        );
-
-        // Pull diagnostics: does the client issue `textDocument/diagnostic`?
-        self.supports_pull_diagnostics.store(
-            params
-                .capabilities
-                .text_document
-                .as_ref()
-                .and_then(|t| t.diagnostic.as_ref())
-                .is_some(),
-            Ordering::Relaxed,
-        );
-        // Refresh: can we nudge the client to re-pull with `workspace/diagnostic/refresh`?
-        self.supports_diagnostic_refresh.store(
-            params
-                .capabilities
-                .workspace
-                .as_ref()
-                .and_then(|w| w.diagnostic.as_ref())
-                .and_then(|d| d.refresh_support)
-                .unwrap_or(false),
-            Ordering::Relaxed,
-        );
+        let client = ClientFeatures::from_capabilities(&params.capabilities);
+        // `set` cannot fail: `initialize` is the sole writer, once.
+        let _ = self.client_features.set(client);
 
         self.outbox.log(
             MessageType::INFO,
@@ -1106,12 +1106,7 @@ impl LanguageServer for HydraLspBackend {
                 // understands, so it can warn about anything it sends that
                 // would be silently ignored, plus the features that are
                 // actually switched on for this session.
-                experimental: HydrustCapabilities::new(NegotiatedFeatures {
-                    pull_diagnostics: self.supports_pull(),
-                    watched_files: self.supports_dynamic_watched_files(),
-                    diagnostic_refresh: self.supports_diag_refresh(),
-                })
-                .to_experimental(),
+                experimental: HydrustCapabilities::new(client.negotiated).to_experimental(),
                 ..Default::default()
             },
             server_info: Some(ServerInfo {
@@ -1126,7 +1121,7 @@ impl LanguageServer for HydraLspBackend {
         // source of truth for which paths trigger `did_change_watched_files`
         // (see `WATCHED_PY_GLOB`). The client creates the watchers on its side
         // in response and forwards matching events back to us.
-        if self.supports_dynamic_watched_files() {
+        if self.negotiated().watched_files {
             // Workspace folders: the client matches this string glob against
             // them, covering first-party sources and any in-workspace `.venv`.
             let mut watchers = vec![FileSystemWatcher {
@@ -1147,7 +1142,7 @@ impl LanguageServer for HydraLspBackend {
             // reverse map, and macOS FSEvents does not fire under symlinked
             // directories; both are accepted limitations. Do NOT re-canonicalize
             // roots here, or watched paths would diverge from interned keys.
-            if self.watched_files_relative_patterns.load(Ordering::Relaxed) {
+            if self.client_features().relative_patterns {
                 for root in self.out_of_workspace_search_roots() {
                     if let Ok(base_uri) = Url::from_directory_path(&root) {
                         watchers.push(FileSystemWatcher {
@@ -1354,7 +1349,8 @@ impl LanguageServer for HydraLspBackend {
 
         // Pull clients with refresh support: a single `workspace/diagnostic/refresh`
         // nudges the client to re-pull every open document — no per-doc work here.
-        if self.supports_pull() && self.supports_diag_refresh() {
+        let negotiated = self.negotiated();
+        if negotiated.pull_diagnostics && negotiated.diagnostic_refresh {
             self.outbox.workspace_diagnostic_refresh();
             return;
         }
@@ -1365,7 +1361,7 @@ impl LanguageServer for HydraLspBackend {
         // collection. Diagnostics derived from the changed Python file stay
         // stale until the client re-pulls on its own (next edit, open, or
         // focus change).
-        if self.supports_pull() {
+        if negotiated.pull_diagnostics {
             tracing::warn!(
                 "python inputs changed but client supports pull diagnostics without \
                  workspace/diagnostic/refresh; diagnostics may be stale until the \
@@ -1932,7 +1928,7 @@ impl HydraLspBackend {
     /// Pull clients own their diagnostic state (they stop requesting a closed
     /// document), so there is nothing for the server to clear.
     fn clear_diagnostics_if_needed(&self, uri: &Url) {
-        if self.supports_pull() {
+        if self.negotiated().pull_diagnostics {
             return;
         }
         self.clear_diagnostics(uri);
@@ -1943,7 +1939,7 @@ impl HydraLspBackend {
     /// Pull clients fetch diagnostics via `textDocument/diagnostic`; pushing to
     /// them would be redundant, so this is a no-op for them.
     fn publish_diagnostics_if_needed(&self, uri: &Url) {
-        if self.supports_pull() {
+        if self.negotiated().pull_diagnostics {
             return;
         }
         self.publish_diagnostics_for_document(uri);
