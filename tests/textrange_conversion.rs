@@ -1,7 +1,7 @@
-use hydrust::database::HydraDatabase;
-use hydrust::python::extract::{extract_class_info, extract_function_signature};
-use hydrust::python::model::DefinitionInfo;
-use hydrust::python::resolve::extract_definition_info;
+use hydrust::{
+    DefinitionInfo, HydraDatabase, extract_class_info, extract_definition_info,
+    extract_function_signature,
+};
 use ruff_db::system::SystemPath;
 use std::fs;
 use std::io::Write;

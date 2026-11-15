@@ -30,7 +30,7 @@ enum ClassAttributeChainResult<'sp> {
 
 /// Split a `_target_` string into module path and symbol name
 /// Example: "myproject.models.MyClass" -> ("myproject.models", "MyClass")
-pub fn split_target(target: &str) -> Result<(String, String)> {
+fn split_target(target: &str) -> Result<(String, String)> {
     let parts: Vec<&str> = target.split('.').collect();
     if parts.len() < 2 {
         anyhow::bail!("Invalid _target_ format: '{}'", target);
@@ -153,7 +153,7 @@ fn resolve_attribute_chain(
 /// This function handles:
 /// - Simple names: `ParentClass` - looks up in the current file's imports
 /// - Qualified names: `module.ClassName` - resolves the module path
-pub(crate) fn resolve_base_class(
+pub(super) fn resolve_base_class(
     db: &dyn ruff_db::Db,
     base_class_expr: &str,
     current_file: &Path,
@@ -196,7 +196,7 @@ pub(crate) fn resolve_base_class(
 ///
 /// This also resolves missing properties (docstring, __init__) from parent classes
 /// when they are not defined in the child class.
-pub fn extract_class_info_with_imports(
+fn extract_class_info_with_imports(
     db: &dyn ruff_db::Db,
     file_path: &Path,
     class_name: &str,
@@ -246,7 +246,7 @@ pub fn extract_class_info_with_imports(
 
 /// Extract function signature, following re-exports if necessary.
 /// Returns the FunctionSignature and the file path where it was found.
-pub fn extract_function_signature_with_imports(
+fn extract_function_signature_with_imports(
     db: &dyn ruff_db::Db,
     file_path: &Path,
     function_name: &str,
@@ -494,7 +494,7 @@ fn resolve_class_attribute_chain<'sp>(
 
 /// Extract method info, following re-exports if necessary.
 /// Returns the MethodInfo and the file path where it was found.
-pub fn extract_method_info_with_imports(
+fn extract_method_info_with_imports(
     db: &dyn ruff_db::Db,
     file_path: &Path,
     class_name: &str,
@@ -522,7 +522,7 @@ pub fn extract_method_info_with_imports(
 /// The class named by a base-class expression, with any generic subscript
 /// removed: `Sequence[_T_co]` is `Sequence` and `typing.Generic[T]` is
 /// `typing.Generic`.
-pub(crate) fn base_class_name(base_class_expr: &str) -> &str {
+pub(super) fn base_class_name(base_class_expr: &str) -> &str {
     base_class_expr
         .split('[')
         .next()

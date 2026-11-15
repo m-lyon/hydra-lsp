@@ -63,6 +63,7 @@ impl ParsedYaml {
     }
 
     /// Returns true if parsing succeeded.
+    #[cfg(test)]
     pub fn is_ok(&self) -> bool {
         self.inner.is_ok()
     }

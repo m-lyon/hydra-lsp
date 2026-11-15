@@ -342,9 +342,9 @@ pub struct ParsedContent {
     /// All hydra objects found in the document, in the order they appear
     pub hydra_objects: Vec<HydraObject>,
     /// Mapping from line number to index in the hydra_objects vector for quick lookup
-    pub target_line_map: HashMap<u32, usize>,
+    pub(crate) target_line_map: HashMap<u32, usize>,
     /// Mapping from parameter line number to (hydra_objects index, parameter context)
-    pub param_line_map: HashMap<u32, (usize, ParameterContext)>,
+    pub(crate) param_line_map: HashMap<u32, (usize, ParameterContext)>,
     /// File-wide diagnostic suppressions from header comments
     pub file_suppressions: HashSet<DiagnosticRule>,
 }

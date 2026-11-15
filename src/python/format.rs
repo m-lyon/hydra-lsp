@@ -7,7 +7,7 @@ use super::model::{
 
 /// Where the markers that say *how* a parameter may be passed belong in
 /// `params`, as `(after_positional_only, before_keyword_only)` indexes.
-pub fn parameter_markers(params: &[&ParameterInfo]) -> (Option<usize>, Option<usize>) {
+fn parameter_markers(params: &[&ParameterInfo]) -> (Option<usize>, Option<usize>) {
     let after_positional_only = params
         .iter()
         .rposition(|p| p.kind == ParameterKind::PositionalOnly);

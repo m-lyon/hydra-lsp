@@ -1,9 +1,34 @@
-pub mod backend;
-pub mod database;
-pub mod diagnostics;
-pub mod outbox;
-pub mod python;
-pub mod rules;
-pub mod server;
-pub mod yaml_cache;
-pub mod yaml_parser;
+//! A language server for Hydra YAML configs.
+//!
+//! The modules are internal. What the `hydrust` binary and the integration
+//! tests use is re-exported here.
+
+mod backend;
+mod database;
+mod diagnostics;
+mod outbox;
+mod python;
+mod rules;
+mod server;
+mod yaml_cache;
+mod yaml_parser;
+
+pub use backend::{HydraLspBackend, HydrustCapabilities, NegotiatedFeatures};
+pub use database::HydraDatabase;
+pub use diagnostics::validate_document;
+pub use python::cache::{PythonConfig, TargetString, cached_definition_info};
+pub use python::format::render_params;
+pub use python::model::{
+    ClassInfo, DefaultStyle, DefinitionInfo, FunctionSignature, MethodInfo, ParameterInfo,
+    ParameterKind, ResolveError,
+};
+pub use rules::DiagnosticRule;
+pub use server::serve;
+pub use yaml_parser::{CompletionContext, HydraObject, SemanticTokenType, YamlParser};
+
+// Only `tests/textrange_conversion.rs` calls these, to check positions on an
+// extracted definition directly.
+#[doc(hidden)]
+pub use python::extract::{extract_class_info, extract_function_signature};
+#[doc(hidden)]
+pub use python::resolve::extract_definition_info;

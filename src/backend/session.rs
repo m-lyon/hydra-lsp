@@ -80,9 +80,9 @@ impl Session {
 /// `Session::snapshot`; consumed by handlers that hand the database to
 /// `tokio::task::spawn_blocking`.
 #[derive(Clone)]
-pub struct SessionSnapshot {
-    pub db: HydraDatabase,
-    pub python_config: PythonConfig,
+pub(super) struct SessionSnapshot {
+    pub(super) db: HydraDatabase,
+    pub(super) python_config: PythonConfig,
 }
 
 impl HydraLspBackend {

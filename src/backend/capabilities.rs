@@ -137,7 +137,7 @@ static SUPPORTED_SETTINGS: std::sync::LazyLock<Vec<&'static str>> =
 
 /// Which optional behaviours the server will actually use this session. Each
 /// one needs the client to have asked for it in its `initialize` capabilities,
-/// so these are read by [`ClientFeatures::from_capabilities`]. The handlers
+/// so these are read by `ClientFeatures::from_capabilities`. The handlers
 /// gate on the same value the `experimental.hydrust` block is built from.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NegotiatedFeatures {
@@ -232,7 +232,7 @@ const SUPPORTED_FEATURES: &[FeatureGate] = &[
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HydrustCapabilities {
-    /// See [`HYDRUST_PROTOCOL_VERSION`].
+    /// See `HYDRUST_PROTOCOL_VERSION`.
     pub protocol_version: u32,
     /// Setting keys under `initializationOptions.settings` that do something.
     pub supported_settings: &'static [&'static str],
@@ -243,7 +243,7 @@ pub struct HydrustCapabilities {
     /// the server can do against what the client asked for. A name being absent
     /// means the behaviour will not happen on this connection, not that the
     /// server is too old to do it. Empty when the client asked for none of
-    /// them. See [`SUPPORTED_FEATURES`].
+    /// them. See `SUPPORTED_FEATURES`.
     pub features: Vec<&'static str>,
 }
 

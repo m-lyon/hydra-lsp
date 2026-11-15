@@ -39,7 +39,7 @@ fn path_to_file(db: &dyn ruff_db::Db, path: &Path) -> Option<File> {
 ///
 /// Falls back to an untracked `Path::exists()` only for non-UTF-8 paths, which
 /// cannot be represented as a `SystemPath`.
-pub(crate) fn path_is_file(db: &dyn ruff_db::Db, path: &Path) -> bool {
+pub(super) fn path_is_file(db: &dyn ruff_db::Db, path: &Path) -> bool {
     if is_vendored_path(path) {
         return path_to_file(db, path).is_some();
     }
@@ -58,7 +58,7 @@ pub(crate) fn path_is_file(db: &dyn ruff_db::Db, path: &Path) -> bool {
 ///
 /// The returned `SourceText` is `Arc`-backed; callers should bind it to a
 /// local and call `.as_str()` to get a borrowed `&str`.
-pub fn read_source(db: &dyn ruff_db::Db, path: &Path) -> Result<SourceText> {
+pub(super) fn read_source(db: &dyn ruff_db::Db, path: &Path) -> Result<SourceText> {
     let file = path_to_file(db, path)
         .with_context(|| format!("could not resolve file: {}", path.display()))?;
     let source = source_text(db, file);
@@ -73,7 +73,7 @@ pub fn read_source(db: &dyn ruff_db::Db, path: &Path) -> Result<SourceText> {
 /// Returns the salsa-cached `ParsedModuleRef` (LRU 200). Callers that also need
 /// the raw source text should call `read_source` separately — both are cache hits
 /// for the same revision.
-pub(crate) fn get_parsed_module(db: &dyn ruff_db::Db, path: &Path) -> Result<ParsedModuleRef> {
+pub(super) fn get_parsed_module(db: &dyn ruff_db::Db, path: &Path) -> Result<ParsedModuleRef> {
     let file = path_to_file(db, path)
         .with_context(|| format!("could not resolve file: {}", path.display()))?;
     Ok(parsed_module(db, file).load(db))
@@ -89,7 +89,7 @@ pub(crate) fn get_parsed_module(db: &dyn ruff_db::Db, path: &Path) -> Result<Par
 ///
 /// Falls back to the original path for non-UTF8 paths that cannot be represented
 /// as a `SystemPath`.
-pub(crate) fn normalize_path_for_key(db: &dyn ruff_db::Db, path: &Path) -> PathBuf {
+pub(super) fn normalize_path_for_key(db: &dyn ruff_db::Db, path: &Path) -> PathBuf {
     // Vendored sentinel paths are already canonical.
     if is_vendored_path(path) {
         return path.to_path_buf();
@@ -123,7 +123,7 @@ pub fn extract_function_signature(
 }
 
 /// Whether `name` is bound at module scope in the module at `path`.
-pub fn module_defines_top_level(db: &dyn ruff_db::Db, path: &Path, name: &str) -> bool {
+pub(super) fn module_defines_top_level(db: &dyn ruff_db::Db, path: &Path, name: &str) -> bool {
     fn body_binds(body: &[Stmt], name: &str) -> bool {
         body.iter().any(|stmt| match stmt {
             Stmt::FunctionDef(func_def) => {
@@ -179,7 +179,7 @@ pub fn extract_class_info(
 }
 
 /// Extract method information from source code via salsa-cached parsing.
-pub fn extract_method_info(
+pub(super) fn extract_method_info(
     db: &dyn ruff_db::Db,
     path: &Path,
     class_name: &str,
@@ -205,7 +205,7 @@ pub fn extract_method_info(
 }
 
 /// Extract class attribute from source code via salsa-cached parsing.
-pub fn extract_class_attribute(
+pub(super) fn extract_class_attribute(
     db: &dyn ruff_db::Db,
     path: &Path,
     class_name: &str,

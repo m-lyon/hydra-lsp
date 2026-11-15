@@ -20,7 +20,7 @@ use ty_python_semantic::{PythonEnvironment, SysPrefixPathOrigin};
 ///
 /// The configured interpreter is always preferred if provided, as it represents
 /// the user's explicit choice via LSP configuration.
-pub fn discover_python_environment(
+pub(super) fn discover_python_environment(
     workspace_root: Option<&Path>,
     python_path: Option<&str>,
 ) -> Result<Vec<SystemPathBuf>> {
@@ -68,7 +68,7 @@ pub fn discover_python_environment(
 }
 
 /// Build search paths from discovered site-packages
-pub fn build_search_paths(
+pub(super) fn build_search_paths(
     db: &dyn ruff_db::Db,
     workspace_root: Option<&Path>,
     site_packages_paths: &Vec<SystemPathBuf>,
@@ -105,7 +105,7 @@ pub fn build_search_paths(
 /// - All other lines are treated as directories to add to `sys.path`
 ///
 /// See: https://docs.python.org/3/library/site.html
-pub(crate) fn parse_pth_files(db: &dyn ruff_db::Db, site_packages: &Path) -> Vec<PathBuf> {
+pub(super) fn parse_pth_files(db: &dyn ruff_db::Db, site_packages: &Path) -> Vec<PathBuf> {
     let mut paths = Vec::new();
 
     // Depend on the site-packages directory's `FileRoot` revision so `.pth`
