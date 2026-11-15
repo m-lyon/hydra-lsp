@@ -10,14 +10,14 @@ cargo test
 cargo clippy
 ```
 
+## Code comments
+
+Use comments sparingly. Add one only when the code cannot explain itself, such as a non-obvious reason or constraint. Keep each comment short. Do not restate what the code does.
+
 ## Adding a feature
 
-**A settings key** — parse it in `Settings::from_json` (or in `apply_settings`,
-for one that is only read at `initialize`, like `numThreads`), then add it to
-`CORE_SETTINGS` (or
-to the `feature_toggles!` list for an on/off switch, which registers the key for
-you). Update the counts in [tests/capabilities.rs](tests/capabilities.rs). In the
-extension: declare it in `package.json`, send it from `startServer`, add a
+**A settings key** — parse it in `Settings::from_json` (or in `apply_settings`, for one that is only read at `initialize`, like `numThreads`), then add it to `CORE_SETTINGS` (or
+to the `feature_toggles!` list for an on/off switch, which registers the key for you). Update the counts in [tests/capabilities.rs](tests/capabilities.rs). In the extension: declare it in `package.json`, send it from `startServer`, add a
 `SETTING_COMPAT` entry.
 
 **A diagnostic rule** — add it to `diagnostic_rules!` in
@@ -26,14 +26,7 @@ the extension, add a `RULE_COMPAT` entry; for a *rename*, record the old code as
 `previousCode` so the client can rewrite it for older servers, as
 `invalid-target` → `invalid-hydra-parameter` did in v0.3.0.
 
-**A behaviour the client must know about** — only needed when it depends on a
-client capability, or the client has to branch on it. Add a field to
-`NegotiatedFeatures`, read the client capability into it in
-`ClientFeatures::from_capabilities` (stored once in `initialize`), and add a
-`(name, gate)` pair to `SUPPORTED_FEATURES`. Gate the behaviour on that same
-field, through `self.negotiated()`: the `experimental.hydrust` block is built
-from the same stored value, so the advertised name is never a promise the
-session will not keep. Cover
+**A behaviour the client must know about** — only needed when it depends on a client capability, or the client has to branch on it. Add a field to `NegotiatedFeatures`, read the client capability into it in `ClientFeatures::from_capabilities` (stored once in `initialize`), and add a `(name, gate)` pair to `SUPPORTED_FEATURES`. Gate the behaviour on that same field, through `self.negotiated()`: the `experimental.hydrust` block is built from the same stored value, so the advertised name is never a promise the session will not keep. Cover
 it both ways in [tests/capabilities.rs](tests/capabilities.rs). In the extension,
 add a `FEATURE_COMPAT` entry; names become `hydrust.supports.<name>` context keys.
 

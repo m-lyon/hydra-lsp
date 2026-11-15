@@ -12,7 +12,7 @@ use ruff_db::system::SystemPath;
 
 use super::HydraLspBackend;
 use super::capabilities::{ClientFeatures, server_capabilities};
-use super::diag::{
+use super::diagnostics::{
     DiagAction, build_diagnostic_report, classify_diag_outcome, empty_full_report,
     server_cancelled_error, validate_input,
 };

@@ -1,6 +1,4 @@
-//! Diagnostics for one document, and getting them to the client: pushed
-//! (computed inline under the db lock) or pulled (computed on the worker pool,
-//! reported with result IDs).
+//! Diagnostics for a hydra document
 
 use std::collections::HashSet;
 use tower_lsp::lsp_types::*;

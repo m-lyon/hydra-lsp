@@ -5,8 +5,7 @@ How hydra-lsp uses threads, and why it is set up this way.
 Read this before changing any thread count, the concurrency level, or where a
 request handler does its work. Symbols are named rather than cited by line, so
 `rg` is the way to find them; the constants and functions this describes all live
-under `src/backend/` (pool sizing in `src/backend/pools.rs`) unless another file
-is given.
+under `src/backend/` (pool sizing in `src/backend/pools.rs`) unless another file is given.
 
 ## The shape
 
@@ -40,13 +39,9 @@ the third is about threads.
 1. **One runtime thread.** `serve()` in `src/server.rs` builds
    `tokio::runtime::Builder::new_current_thread()`.
 2. **Eight concurrent handlers.** `MAX_CONCURRENT_REQUESTS` in
-   `src/backend/pools.rs`, passed to `Server::concurrency_level`. Note the
-   integration harness (`tests/common/mod.rs`) does *not* set this, so those
-   tests run at tower-lsp's default of 4.
+   `src/backend/pools.rs`, passed to `Server::concurrency_level`. Note the integration harness (`tests/common/mod.rs`) does *not* set this, so those tests run at tower-lsp's default of 4.
 3. **Up to five pool threads.** 2 latency + 3 worker, from `pool_sizes` in
-   `src/backend/pools.rs`, overridable through the `numThreads` setting and
-   trimmed on a small machine — see *The default is capped by the CPU count*
-   below.
+   `src/backend/pools.rs`, overridable through the `numThreads` setting and trimmed on a small machine — see *The default is capped by the CPU count* below.
 4. **One outbox task.** `src/outbox.rs`. Not a thread and not a handler — it
    holds no lock and does no analysis, it only moves finished messages out to
    the client.

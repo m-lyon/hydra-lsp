@@ -1,18 +1,3 @@
-//! The language server backend: [`HydraLspBackend`] and the state it runs on.
-//!
-//! - `capabilities`: settings, what the client can do, and the capabilities
-//!   sent back from `initialize`.
-//! - `pools`: the two rayon pools, how they are sized, and `spawn_on_pool`.
-//! - `session`: the salsa database behind its lock, snapshots of it, and the
-//!   per-document inputs.
-//! - `handlers`: the `LanguageServer` implementation.
-//! - `diag`: computing diagnostics and getting them to the client, pushed or
-//!   pulled.
-//! - `presentation`: signature-help and go-to-definition results built from
-//!   the Python analysis.
-//!
-//! See `docs/threading-model.md` for where each handler does its work.
-
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use std::sync::Arc;
@@ -24,7 +9,7 @@ use crate::outbox::ClientOutbox;
 use crate::yaml_cache::DocumentInput;
 
 mod capabilities;
-mod diag;
+mod diagnostics;
 mod handlers;
 mod pools;
 mod presentation;
@@ -100,9 +85,6 @@ pub struct HydraLspBackend {
     /// once, in `initialize`, like the pools, and read through
     /// [`Self::client_features`] and [`Self::negotiated`], which report
     /// everything off until then.
-    ///
-    /// The `experimental.hydrust` block is built from this same value, so a
-    /// feature is only advertised when the handlers that gate on it will act.
     client_features: OnceLock<ClientFeatures>,
 }
 
@@ -130,8 +112,6 @@ impl HydraLspBackend {
         }
     }
 
-    /// What the client advertised at `initialize`, or everything off before
-    /// then.
     fn client_features(&self) -> ClientFeatures {
         self.client_features.get().copied().unwrap_or_default()
     }
