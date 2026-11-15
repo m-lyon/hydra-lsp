@@ -133,7 +133,7 @@ exits `0`.
 A client can be pointed at any released server binary, and an old server quietly
 ignores settings it was never taught to read. So the server describes itself in
 `capabilities.experimental.hydrust` at `initialize` (`HydrustCapabilities::new`
-in [src/backend.rs](src/backend.rs)):
+in [src/backend/capabilities.rs](src/backend/capabilities.rs)):
 
 - `protocolVersion` — the version of this block's shape.
 - `supportedSettings` — keys read from `initializationOptions.settings`.
