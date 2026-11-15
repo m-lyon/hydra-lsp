@@ -3,7 +3,7 @@ updates:
   - package-ecosystem: github-actions
     directory: /
     schedule:
-      interval: weekly
+      interval: monthly
     # dist generates release.yml from dist-workspace.toml, and CI fails if the
     # two differ. Update the pins in [dist.github-action-commits] by hand.
     exclude-paths:
@@ -19,7 +19,7 @@ updates:
   - package-ecosystem: cargo
     directory: /
     schedule:
-      interval: weekly
+      interval: monthly
     cooldown:
       default-days: 7
     # saphyr hands back mappings as hashlink's LinkedHashMap, so our hashlink
@@ -27,6 +27,9 @@ updates:
     # together with saphyr.
     ignore:
       - dependency-name: hashlink
+      # Major upgrades are done by hand.
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
     groups:
       cargo-minor-and-patch:
         update-types: [minor, patch]
