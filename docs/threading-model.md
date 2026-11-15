@@ -420,7 +420,7 @@ In `hydra-lsp`:
   field in `src/backend.rs`.
 - `src/backend/handlers.rs` — the `LanguageServer` impl, including `initialize`,
   and `spawn_definition_lookup`.
-- `src/backend/diag.rs` — `compute_diagnostics` and the publish helpers, and the
+- `src/backend/diagnostics.rs` — `compute_diagnostics` and the publish helpers, and the
   pull path's report building.
 - `src/outbox.rs` — the outbound queue and its drain task.
 - `tests/server_cli.rs` — `EXIT_TIMEOUT`, the guard against the outbox hang
