@@ -5,7 +5,7 @@ use std::error::Error;
 use std::fmt;
 use tower_lsp::lsp_types::Position;
 
-use crate::diagnostics::DiagnosticRule;
+use crate::rules::DiagnosticRule;
 
 /// Represents a semantic token in the document (internal representation)
 #[derive(Debug, Clone, PartialEq, Eq)]

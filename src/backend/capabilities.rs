@@ -6,7 +6,7 @@ use tower_lsp::lsp_types::*;
 
 use super::HydraLspBackend;
 use super::pools::clamp_num_threads;
-use crate::diagnostics::DiagnosticRule;
+use crate::rules::DiagnosticRule;
 use crate::yaml_parser::SEMANTIC_TOKEN_LEGEND;
 
 /// Declare the per-capability feature toggles once, as

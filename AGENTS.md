@@ -21,7 +21,7 @@ to the `feature_toggles!` list for an on/off switch, which registers the key for
 `SETTING_COMPAT` entry.
 
 **A diagnostic rule** — add it to `diagnostic_rules!` in
-[src/diagnostics.rs](src/diagnostics.rs) and it is advertised automatically. In
+[src/rules.rs](src/rules.rs) and it is advertised automatically. In
 the extension, add a `RULE_COMPAT` entry; for a *rename*, record the old code as
 `previousCode` so the client can rewrite it for older servers, as
 `invalid-target` → `invalid-hydra-parameter` did in v0.3.0.

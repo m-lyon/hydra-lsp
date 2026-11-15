@@ -6,7 +6,7 @@
 mod common;
 
 use hydrust::backend::{HydrustCapabilities, NegotiatedFeatures};
-use hydrust::diagnostics::DiagnosticRule;
+use hydrust::rules::DiagnosticRule;
 
 use crate::common::*;
 

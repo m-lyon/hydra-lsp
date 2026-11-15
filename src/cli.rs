@@ -18,9 +18,10 @@ use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
 use tracing::{Level, debug, error, info, warn};
 
 use hydrust::database::HydraDatabase;
-use hydrust::diagnostics::{DiagnosticRule, validate_document};
+use hydrust::diagnostics::validate_document;
 use hydrust::python_analyzer::{PythonAnalyzer, ResolveError};
 use hydrust::python_cache::PythonConfig;
+use hydrust::rules::DiagnosticRule;
 use hydrust::yaml_parser::YamlParser;
 
 use std::collections::{HashMap, HashSet};

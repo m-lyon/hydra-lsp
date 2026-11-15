@@ -6,8 +6,9 @@ use tower_lsp::lsp_types::*;
 use super::HydraLspBackend;
 use super::pools::PoolOutcome;
 use crate::database::HydraDatabase;
-use crate::diagnostics::{self, DiagnosticRule};
+use crate::diagnostics;
 use crate::python_cache::PythonConfig;
+use crate::rules::DiagnosticRule;
 use crate::yaml_cache::{self, DocumentInput};
 
 /// What to do with the result of the diagnostics validation task.
