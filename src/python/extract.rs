@@ -667,20 +667,8 @@ fn expr_to_string(expr: &Expr) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::database::HydraDatabase;
 
-    fn get_simple_test_dir() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests")
-            .join("workspace")
-            .join("simple")
-    }
-
-    /// Build a fresh `HydraDatabase` for tests. Each call is a clean db so
-    /// tests don't share salsa caches.
-    fn test_db() -> HydraDatabase {
-        HydraDatabase::new(SystemPath::new("/"))
-    }
+    use crate::python::test_support::{get_simple_test_dir, test_db};
 
     // ==================== extract_function_signature tests ====================
 

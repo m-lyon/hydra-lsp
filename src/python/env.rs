@@ -173,23 +173,11 @@ pub(super) fn parse_pth_files(db: &dyn ruff_db::Db, site_packages: &Path) -> Vec
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::database::HydraDatabase;
     use crate::python::cache::{InternedSearchPaths, TargetString, resolve_module_cached};
     use crate::python::extract::extract_class_info;
     use crate::python::resolve::extract_definition_info;
 
-    fn get_simple_test_dir() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests")
-            .join("workspace")
-            .join("simple")
-    }
-
-    /// Build a fresh `HydraDatabase` for tests. Each call is a clean db so
-    /// tests don't share salsa caches.
-    fn test_db() -> HydraDatabase {
-        HydraDatabase::new(SystemPath::new("/"))
-    }
+    use crate::python::test_support::{get_simple_test_dir, test_db};
 
     // ==================== Environment discovery and module resolution tests ====================
 

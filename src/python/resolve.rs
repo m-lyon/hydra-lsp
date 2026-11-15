@@ -533,24 +533,11 @@ pub(super) fn base_class_name(base_class_expr: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::database::HydraDatabase;
     use crate::python::extract::{module_defines_top_level, path_is_file, read_source};
     use crate::python::format::{format_class, format_function, format_method};
     use crate::python::model::ParameterKind;
-    use ruff_db::system::SystemPath;
 
-    fn get_simple_test_dir() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests")
-            .join("workspace")
-            .join("simple")
-    }
-
-    /// Build a fresh `HydraDatabase` for tests. Each call is a clean db so
-    /// tests don't share salsa caches.
-    fn test_db() -> HydraDatabase {
-        HydraDatabase::new(SystemPath::new("/"))
-    }
+    use crate::python::test_support::{get_simple_test_dir, test_db};
 
     #[test]
     fn test_extract_definition_info_error_kinds() {
