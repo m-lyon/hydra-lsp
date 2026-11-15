@@ -25,12 +25,12 @@ jobs:
         with:
           persist-credentials: false
 
-      # Pinned to the `stable` branch head; the toolchain is named explicitly
-      # because a SHA ref does not carry it.
-      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
-        with:
-          toolchain: stable
-          components: rustfmt, clippy
+      # Uses the runner's preinstalled rustup instead of a third-party action,
+      # so there is no action ref to pin or to break when upstream rewrites it.
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
