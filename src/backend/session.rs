@@ -11,7 +11,7 @@ use tower_lsp::lsp_types::Url;
 
 use super::HydraLspBackend;
 use crate::database::HydraDatabase;
-use crate::python_cache::{self, PythonConfig};
+use crate::python::cache::{self as python_cache, PythonConfig};
 use crate::yaml_cache::{self, DocumentInput, ParsedYaml};
 
 /// Initialized analysis state owned by `HydraLspBackend`.
@@ -273,7 +273,7 @@ mod tests {
     /// real site-packages directory, and register its `FileRoot`s exactly as
     /// production does (via `python_cache::site_packages_paths`). Discovery uses
     /// a real `OsSystem` (not the db's system), so this must be an actual
-    /// filesystem layout, not an in-memory one — it mirrors `python_analyzer`'s
+    /// filesystem layout, not an in-memory one — it mirrors `python::env`'s
     /// in-memory `create_mock_venv`. The returned `TempDir` must be kept alive
     /// for the venv to persist.
     fn session_with_real_venv() -> (Session, std::path::PathBuf, tempfile::TempDir) {

@@ -39,7 +39,7 @@ impl HydraDatabase {
 ///
 /// `ty_vendored` keeps the zip archive in a `LazyLock` and `VendoredFileSystem`
 /// is `Arc`-backed, so cloning it per database is a refcount bump, not a copy.
-/// See [`crate::vendored_typeshed`] for how these stubs are addressed.
+/// See [`crate::python::typeshed`] for how these stubs are addressed.
 fn vendored_typeshed() -> VendoredFileSystem {
     ty_vendored::file_system().clone()
 }

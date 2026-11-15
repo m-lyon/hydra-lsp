@@ -3,8 +3,9 @@
 
 use tower_lsp::lsp_types::*;
 
-use crate::python_analyzer::{
-    DefaultStyle, DefinitionInfo, FunctionSignature, ParameterInfo, ParameterKind, PythonAnalyzer,
+use crate::python::format::render_params;
+use crate::python::model::{
+    DefaultStyle, DefinitionInfo, FunctionSignature, ParameterInfo, ParameterKind,
 };
 use crate::yaml_parser::ResolvedParameterContext;
 
@@ -32,7 +33,7 @@ fn build_signature_params<'a>(
         .iter()
         .filter(|p| filter_param.is_none_or(|f| p.name != f))
         .collect();
-    let param_strs = PythonAnalyzer::render_params(&filtered, |p| p.label(DefaultStyle::Omit));
+    let param_strs = render_params(&filtered, |p| p.label(DefaultStyle::Omit));
 
     let param_infos: Vec<ParameterInformation> = filtered
         .iter()

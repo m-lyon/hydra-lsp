@@ -1,9 +1,9 @@
-use crate::python_analyzer::{
+use crate::python::cache::{PythonConfig, TargetString, cached_definition_info, is_builtin_symbol};
+use crate::python::model::{
     DefinitionInfo, FunctionSignature, ParameterInfo, ParameterKind, ResolveError,
 };
-use crate::python_cache::{PythonConfig, TargetString, cached_definition_info, is_builtin_symbol};
+use crate::python::typeshed::BUILTINS_MODULE;
 use crate::rules::DiagnosticRule;
-use crate::vendored_typeshed::BUILTINS_MODULE;
 use crate::yaml_parser::{
     ARGS_KEY, ArgKind, CONVERT_KEY, ConvertMode, HydraObject, Parameter, ParsedContent, utf16_len,
 };
@@ -79,7 +79,7 @@ fn validate_target(
 impl ResolveError {
     /// The diagnostic rule a failed `_target_` lookup is reported under.
     ///
-    /// Lives here rather than beside `ResolveError` so `python_analyzer` does
+    /// Lives here rather than beside `ResolveError` so `python::model` does
     /// not depend on `diagnostics`.
     pub fn rule(&self) -> DiagnosticRule {
         match self {
@@ -554,7 +554,7 @@ pub fn validate_document(
 mod tests {
     use super::*;
     use crate::database::HydraDatabase;
-    use crate::python_analyzer::ParameterInfo;
+    use crate::python::model::ParameterInfo;
     use crate::yaml_parser::{HydraParameter, Parameter, YamlValue};
     use hashlink::LinkedHashMap;
     use ruff_db::system::SystemPath;

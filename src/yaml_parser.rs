@@ -207,7 +207,7 @@ impl From<saphyr::ScanError> for YamlParseError {
 /// How a [`Parameter`] is passed to its target: under its own key in the
 /// mapping, or as an entry of `_args_`.
 ///
-/// Not to be confused with [`crate::python_analyzer::ParameterKind`], which
+/// Not to be confused with [`crate::python::model::ParameterKind`], which
 /// describes how a Python parameter accepts arguments.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ArgKind {

@@ -20,8 +20,9 @@ use super::pools::{PoolOutcome, spawn_on_pool};
 use super::presentation::{definition_positions, signature_information};
 use super::session::SessionSnapshot;
 use crate::diagnostics;
-use crate::python_analyzer::{DefinitionInfo, FunctionSignature, PythonAnalyzer, ResolveError};
-use crate::python_cache::{self, ResolvedDefinition, TargetString};
+use crate::python::cache::{self as python_cache, ResolvedDefinition, TargetString};
+use crate::python::format::{format_class, format_function, format_method};
+use crate::python::model::{DefinitionInfo, FunctionSignature, ResolveError};
 use crate::yaml_cache::{self, DocumentInput};
 use crate::yaml_parser::{
     ARGS_KEY, CONVERT_KEY, CompletionContext, ConvertMode, HydraSemanticToken, PARTIAL_KEY,
@@ -456,11 +457,9 @@ impl LanguageServer for HydraLspBackend {
             }) => {
                 diagnostics::narrow_overloads(&mut definition_info, hydra_object);
                 let hover_content = match definition_info {
-                    DefinitionInfo::Function(sig) => PythonAnalyzer::format_function(&sig),
-                    DefinitionInfo::Class(class_info) => PythonAnalyzer::format_class(&class_info),
-                    DefinitionInfo::Method(method_info) => {
-                        PythonAnalyzer::format_method(&method_info)
-                    }
+                    DefinitionInfo::Function(sig) => format_function(&sig),
+                    DefinitionInfo::Class(class_info) => format_class(&class_info),
+                    DefinitionInfo::Method(method_info) => format_method(&method_info),
                 };
                 let range = Range {
                     start: Position {
@@ -729,7 +728,7 @@ impl LanguageServer for HydraLspBackend {
         // A definition inside the vendored typeshed archive has no file on disk
         // to jump to. Hover and diagnostics still work; go-to-definition is a
         // silent no-op rather than an error the user cannot act on.
-        if crate::vendored_typeshed::is_vendored_path(&file_path) {
+        if crate::python::typeshed::is_vendored_path(&file_path) {
             tracing::debug!(
                 path = %file_path.display(),
                 "goto_definition: target is a vendored stub; nothing to open"

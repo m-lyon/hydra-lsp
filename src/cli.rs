@@ -19,8 +19,9 @@ use tracing::{Level, debug, error, info, warn};
 
 use hydrust::database::HydraDatabase;
 use hydrust::diagnostics::validate_document;
-use hydrust::python_analyzer::{PythonAnalyzer, ResolveError};
-use hydrust::python_cache::PythonConfig;
+use hydrust::python::cache::PythonConfig;
+use hydrust::python::format::render_params;
+use hydrust::python::model::ResolveError;
 use hydrust::rules::DiagnosticRule;
 use hydrust::yaml_parser::YamlParser;
 
@@ -645,8 +646,8 @@ fn trace_target_resolution(
         hydra_object.target.line + 1
     );
 
-    let target = hydrust::python_cache::TargetString::new(db, hydra_object.target.value.clone());
-    let cached = hydrust::python_cache::cached_definition_info(db, python_config, target);
+    let target = hydrust::python::cache::TargetString::new(db, hydra_object.target.value.clone());
+    let cached = hydrust::python::cache::cached_definition_info(db, python_config, target);
     match cached.get() {
         Ok(def) => {
             eprintln!("  {} {}", "Module:".dimmed(), def.module_path);
@@ -660,7 +661,7 @@ fn trace_target_resolution(
             let def_info = &def.definition_info;
             let implicit_param = def_info.implicit_param();
             match def_info {
-                hydrust::python_analyzer::DefinitionInfo::Function(sig) => {
+                hydrust::python::model::DefinitionInfo::Function(sig) => {
                     eprintln!("  {} Function", "Type:".dimmed());
                     eprintln!(
                         "  {} {}",
@@ -668,7 +669,7 @@ fn trace_target_resolution(
                         format_signature_brief(sig, implicit_param)
                     );
                 }
-                hydrust::python_analyzer::DefinitionInfo::Class(class_info) => {
+                hydrust::python::model::DefinitionInfo::Class(class_info) => {
                     eprintln!("  {} Class", "Type:".dimmed());
                     if let Some(ref init_sig) = class_info.init_signature {
                         eprintln!(
@@ -680,7 +681,7 @@ fn trace_target_resolution(
                         eprintln!("  {} (no __init__ found)", "__init__:".dimmed());
                     }
                 }
-                hydrust::python_analyzer::DefinitionInfo::Method(method_info) => {
+                hydrust::python::model::DefinitionInfo::Method(method_info) => {
                     let method_type = if method_info.is_classmethod {
                         "classmethod"
                     } else if method_info.is_staticmethod {
@@ -725,16 +726,16 @@ fn trace_target_resolution(
 }
 
 fn format_signature_brief(
-    sig: &hydrust::python_analyzer::FunctionSignature,
+    sig: &hydrust::python::model::FunctionSignature,
     implicit_param: Option<&str>,
 ) -> String {
-    let filtered: Vec<&hydrust::python_analyzer::ParameterInfo> = sig
+    let filtered: Vec<&hydrust::python::model::ParameterInfo> = sig
         .parameters
         .iter()
         .filter(|p| Some(p.name.as_str()) != implicit_param)
         .collect();
-    let params = PythonAnalyzer::render_params(&filtered, |p| {
-        p.label(hydrust::python_analyzer::DefaultStyle::Ellipsis)
+    let params = render_params(&filtered, |p| {
+        p.label(hydrust::python::model::DefaultStyle::Ellipsis)
     });
     format!("({})", params.join(", "))
 }
