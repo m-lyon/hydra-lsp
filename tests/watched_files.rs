@@ -1,7 +1,7 @@
 //! End-to-end tests for `workspace/didChangeWatchedFiles`-driven invalidation.
 //!
 //! These drive the real `HydraLspBackend` over the LSP protocol against a real
-//! on-disk temp workspace. Unlike the unit tests in `python_cache.rs` (which
+//! on-disk temp workspace. Unlike the unit tests in `python/cache.rs` (which
 //! call `File::sync_path` directly), these exercise the full wiring:
 //!
 //!   client CREATE/DELETE event

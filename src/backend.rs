@@ -15,11 +15,10 @@ mod pools;
 mod presentation;
 mod session;
 
-pub use capabilities::{FeatureToggles, HydrustCapabilities, NegotiatedFeatures, Settings};
-pub use pools::MAX_CONCURRENT_REQUESTS;
-pub use session::SessionSnapshot;
+pub use capabilities::{HydrustCapabilities, NegotiatedFeatures};
+pub(crate) use pools::MAX_CONCURRENT_REQUESTS;
 
-use capabilities::ClientFeatures;
+use capabilities::{ClientFeatures, Settings};
 use session::Session;
 
 pub struct HydraLspBackend {
@@ -29,8 +28,8 @@ pub struct HydraLspBackend {
     /// from a handler can wedge the whole server once the client's pipe
     /// closes — see the [`outbox`](crate::outbox) module docs — so the only
     /// `Client` in the process lives in the outbox's drain task.
-    pub outbox: ClientOutbox,
-    pub settings: Arc<RwLock<Settings>>,
+    outbox: ClientOutbox,
+    settings: Arc<RwLock<Settings>>,
     /// Initialized lazily on `initialize`. `None` means a notification
     /// arrived before `initialize` (LSP protocol violation) — handlers log
     /// a warning and ignore the event. The outer `RwLock` only guards the

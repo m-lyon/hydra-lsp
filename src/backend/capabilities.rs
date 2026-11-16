@@ -6,7 +6,7 @@ use tower_lsp::lsp_types::*;
 
 use super::HydraLspBackend;
 use super::pools::clamp_num_threads;
-use crate::diagnostics::DiagnosticRule;
+use crate::rules::DiagnosticRule;
 use crate::yaml_parser::SEMANTIC_TOKEN_LEGEND;
 
 /// Declare the per-capability feature toggles once, as
@@ -137,7 +137,7 @@ static SUPPORTED_SETTINGS: std::sync::LazyLock<Vec<&'static str>> =
 
 /// Which optional behaviours the server will actually use this session. Each
 /// one needs the client to have asked for it in its `initialize` capabilities,
-/// so these are read by [`ClientFeatures::from_capabilities`]. The handlers
+/// so these are read by `ClientFeatures::from_capabilities`. The handlers
 /// gate on the same value the `experimental.hydrust` block is built from.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NegotiatedFeatures {
@@ -232,7 +232,7 @@ const SUPPORTED_FEATURES: &[FeatureGate] = &[
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HydrustCapabilities {
-    /// See [`HYDRUST_PROTOCOL_VERSION`].
+    /// See `HYDRUST_PROTOCOL_VERSION`.
     pub protocol_version: u32,
     /// Setting keys under `initializationOptions.settings` that do something.
     pub supported_settings: &'static [&'static str],
@@ -243,7 +243,7 @@ pub struct HydrustCapabilities {
     /// the server can do against what the client asked for. A name being absent
     /// means the behaviour will not happen on this connection, not that the
     /// server is too old to do it. Empty when the client asked for none of
-    /// them. See [`SUPPORTED_FEATURES`].
+    /// them. See `SUPPORTED_FEATURES`.
     pub features: Vec<&'static str>,
 }
 
@@ -285,7 +285,7 @@ pub(super) fn server_capabilities(client: &ClientFeatures) -> ServerCapabilities
         // encoding means the default: UTF-16. Every position we emit and
         // consume is therefore counted in UTF-16 code units (see
         // `cp_to_utf16_col` / `utf16_col_to_byte_offset` in yaml_parser
-        // and the `PositionEncoding::Utf16` conversion in python_analyzer).
+        // and the `PositionEncoding::Utf16` conversion in python::extract).
         // The only realistic client is the UTF-16-native VSCode extension,
         // so explicit negotiation buys nothing; revisit only if a client
         // that prefers UTF-8 is added (which would also require making the

@@ -1,12 +1,14 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::import_resolver::{ImportResolver, join_module_parts};
-use crate::python_analyzer::{
-    ClassAttributeInfo, DefinitionInfo, FunctionSignature, PythonAnalyzer, ResolveError,
-    base_class_name, normalize_path_for_key,
+use super::env::{build_search_paths, discover_python_environment};
+use super::extract::{
+    extract_class_attribute, extract_class_info, module_defines_top_level, normalize_path_for_key,
 };
-use crate::vendored_typeshed::{
+use super::import_resolver::{ImportResolver, join_module_parts};
+use super::model::{ClassAttributeInfo, DefinitionInfo, FunctionSignature, ResolveError};
+use super::resolve::{base_class_name, extract_definition_info, resolve_base_class};
+use super::typeshed::{
     BUILTINS_MODULE, is_runtime_builtin_name, is_vendored_module, stdlib_search_root,
     vendored_module_name,
 };
@@ -92,7 +94,7 @@ pub struct ResolvedDefinition {
     pub symbol_name: String,
 }
 
-/// Cached result of `PythonAnalyzer::extract_definition_info`.
+/// Cached result of `extract_definition_info`.
 ///
 /// Uses Arc + pointer-based equality (same pattern as `ParsedYaml`)
 /// to satisfy salsa's Update requirements without expensive deep comparison.
@@ -124,7 +126,7 @@ impl Eq for CachedDefinitionResult {}
 
 /// Cached site-packages discovery for a Python environment.
 ///
-/// Wraps `PythonAnalyzer::discover_python_environment` with salsa caching.
+/// Wraps `discover_python_environment` with salsa caching.
 /// The result is cached and only recomputed when `PythonConfig`'s `workspace_root`
 /// or `interpreter` fields change — both are salsa inputs, so invalidation is
 /// automatic.
@@ -136,8 +138,8 @@ impl Eq for CachedDefinitionResult {}
 pub fn site_packages_paths(db: &dyn ruff_db::Db, config: PythonConfig) -> Vec<SystemPathBuf> {
     let workspace_root = config.workspace_root(db).as_deref().map(Path::new);
     let interpreter = config.interpreter(db);
-    let paths = PythonAnalyzer::discover_python_environment(workspace_root, interpreter.as_deref())
-        .unwrap_or_default();
+    let paths =
+        discover_python_environment(workspace_root, interpreter.as_deref()).unwrap_or_default();
     for path in &paths {
         db.files()
             .try_add_root(db, path.as_path(), FileRootKind::LibrarySearchPath);
@@ -151,15 +153,15 @@ pub fn site_packages_paths(db: &dyn ruff_db::Db, config: PythonConfig) -> Vec<Sy
 /// `[workspace_root, ".", site_packages_0, pth_paths_0…, site_packages_1, …]`.
 ///
 /// Recomputes when `PythonConfig`'s `workspace_root` or `interpreter` fields
-/// change, and — via `PythonAnalyzer::parse_pth_files`'s dependency (called within
-/// PythonAnalyzer::build_search_paths) on each site-packages `FileRoot` revision —
+/// change, and — via `parse_pth_files`'s dependency (called within
+/// `build_search_paths`) on each site-packages `FileRoot` revision —
 /// when a `.pth` file is created or deleted in a site-packages directory.
 #[salsa::tracked(returns(ref))]
 pub fn search_paths_for_config(db: &dyn ruff_db::Db, config: PythonConfig) -> Vec<PathBuf> {
     let workspace_root = config.workspace_root(db).as_deref().map(Path::new);
     let site_packages = site_packages_paths(db, config);
 
-    PythonAnalyzer::build_search_paths(db, workspace_root, site_packages)
+    build_search_paths(db, workspace_root, site_packages)
 }
 
 /// Cached module path → file path resolution.
@@ -240,7 +242,7 @@ pub fn vendored_module_exposes<'db>(
         return false;
     };
 
-    PythonAnalyzer::module_defines_top_level(db, &stub, symbol)
+    module_defines_top_level(db, &stub, symbol)
 }
 
 /// Whether `name` is a symbol the runtime `builtins` module exposes.
@@ -250,7 +252,7 @@ pub fn is_builtin_symbol<'db>(db: &'db dyn ruff_db::Db, name: TargetString<'db>)
 
 /// Cached extraction of Python definition info for a `_target_` string.
 ///
-/// Wraps `PythonAnalyzer::extract_definition_info` with salsa caching.
+/// Wraps `extract_definition_info` with salsa caching.
 /// The result is cached and only recomputed when:
 /// - The target string changes (different `_target_` value)
 /// - The Python configuration changes (interpreter, workspace root, or
@@ -272,7 +274,7 @@ pub fn cached_definition_info<'db>(
     );
 
     let search_paths = search_paths_for_config(db, config);
-    let mut result = PythonAnalyzer::extract_definition_info(db, target_str, search_paths);
+    let mut result = extract_definition_info(db, target_str, search_paths);
 
     if let Ok(def) = &result
         && let Some(module) = vendored_module_name(&def.file_path)
@@ -344,7 +346,7 @@ impl ClassParentDocs {
     /// Resolved `__new__` signature — from the class itself or the nearest ancestor.
     ///
     /// Only meaningful when [`init`](Self::init) is `None`; see
-    /// [`ClassInfo::new_signature`](crate::python_analyzer::ClassInfo::new_signature).
+    /// [`ClassInfo::new_signature`](crate::python::model::ClassInfo::new_signature).
     pub fn new_signature(&self) -> Option<&FunctionSignature> {
         self.inner.new_signature.as_ref()
     }
@@ -419,7 +421,7 @@ pub fn class_parent_docs<'db>(
     };
     let search_paths_vec = search_paths.paths(db);
 
-    let class_info = match PythonAnalyzer::extract_class_info(db, file_path, class_name) {
+    let class_info = match extract_class_info(db, file_path, class_name) {
         Ok(class_info) => class_info,
         Err(_) => {
             return match ImportResolver::new(db, &search_paths_vec)
@@ -458,7 +460,7 @@ pub fn class_parent_docs<'db>(
             continue;
         }
         let Some((parent_file, parent_class_name)) =
-            PythonAnalyzer::resolve_base_class(db, base_class, file_path, &search_paths_vec)
+            resolve_base_class(db, base_class, file_path, &search_paths_vec)
         else {
             all_bases_resolved = false;
             continue;
@@ -519,9 +521,7 @@ pub fn class_parent_attribute<'db>(
     };
     let attribute_name = attribute_key.value(db);
 
-    if let Ok(attr_info) =
-        PythonAnalyzer::extract_class_attribute(db, file_path, class_name, attribute_name)
-    {
+    if let Ok(attr_info) = extract_class_attribute(db, file_path, class_name, attribute_name) {
         return CachedClassAttribute::found(
             attr_info,
             file_path.to_path_buf(),
@@ -529,7 +529,7 @@ pub fn class_parent_attribute<'db>(
         );
     }
 
-    let Ok(class_info) = PythonAnalyzer::extract_class_info(db, file_path, class_name) else {
+    let Ok(class_info) = extract_class_info(db, file_path, class_name) else {
         return CachedClassAttribute::not_found();
     };
 
@@ -542,7 +542,7 @@ pub fn class_parent_attribute<'db>(
             continue;
         }
         let Some((parent_file, parent_class_name)) =
-            PythonAnalyzer::resolve_base_class(db, base_class, file_path, &search_paths_vec)
+            resolve_base_class(db, base_class, file_path, &search_paths_vec)
         else {
             continue;
         };
@@ -575,6 +575,7 @@ mod tests {
     use super::*;
     use crate::database::HydraDatabase;
     use crate::database::tests::TestDb;
+    use crate::python::env::parse_pth_files;
     use ruff_db::Db;
     use ruff_db::system::SystemPath;
     use salsa::Setter;
@@ -610,7 +611,7 @@ mod tests {
         db: &'db dyn ruff_db::Db,
         site_packages: SitePackagesPath<'db>,
     ) -> Vec<PathBuf> {
-        PythonAnalyzer::parse_pth_files(db, Path::new(site_packages.path(db)))
+        parse_pth_files(db, Path::new(site_packages.path(db)))
     }
 
     fn examples_dir() -> PathBuf {
@@ -973,9 +974,9 @@ mod tests {
         FunctionSignature {
             name: name.to_string(),
             parameters: (0..param_count)
-                .map(|i| crate::python_analyzer::ParameterInfo {
+                .map(|i| crate::python::model::ParameterInfo {
                     name: format!("p{i}"),
-                    kind: crate::python_analyzer::ParameterKind::PositionalOrKeyword,
+                    kind: crate::python::model::ParameterKind::PositionalOrKeyword,
                     type_annotation: None,
                     default_value: None,
                 })
@@ -1547,5 +1548,56 @@ mod tests {
         assert!(!check("count"), "a method of `list`, not a builtin");
         assert!(!check(""));
         assert!(!check("builtins.len"), "a dotted name is not a bare name");
+    }
+
+    use crate::python::test_support::{get_simple_test_dir, test_db};
+
+    // ==================== resolve_module_cached tests ====================
+
+    #[test]
+    fn test_resolve_module_simple() {
+        let examples_dir = get_simple_test_dir();
+        let db = test_db();
+        let search_paths = vec![examples_dir.clone(), PathBuf::from(".")];
+        let mid = TargetString::new(&db, "my_module".to_string());
+        let spid = InternedSearchPaths::new(&db, search_paths);
+        let result = resolve_module_cached(&db, mid, spid).clone();
+        assert!(result.is_some());
+        assert!(result.unwrap().ends_with("my_module.py"));
+    }
+
+    #[test]
+    fn test_resolve_module_package() {
+        let examples_dir = get_simple_test_dir();
+        let db = test_db();
+        let search_paths = vec![examples_dir.clone(), PathBuf::from(".")];
+        let mid = TargetString::new(&db, "test_package".to_string());
+        let spid = InternedSearchPaths::new(&db, search_paths);
+        let result = resolve_module_cached(&db, mid, spid).clone();
+        assert!(result.is_some());
+        assert!(result.unwrap().ends_with("__init__.py"));
+    }
+
+    #[test]
+    fn test_resolve_module_submodule() {
+        let examples_dir = get_simple_test_dir();
+        let db = test_db();
+        let search_paths = vec![examples_dir.clone(), PathBuf::from(".")];
+        let mid = TargetString::new(&db, "test_package.submodule".to_string());
+        let spid = InternedSearchPaths::new(&db, search_paths);
+        let result = resolve_module_cached(&db, mid, spid).clone();
+        assert!(result.is_some());
+        assert!(result.unwrap().ends_with("submodule.py"));
+    }
+
+    #[test]
+    fn test_resolve_module_nonexistent() {
+        let examples_dir = get_simple_test_dir();
+        let db = test_db();
+        let search_paths = vec![examples_dir.clone(), PathBuf::from(".")];
+        let mid = TargetString::new(&db, "nonexistent_module".to_string());
+        let spid = InternedSearchPaths::new(&db, search_paths);
+        let result = resolve_module_cached(&db, mid, spid).clone();
+        assert!(result.is_none());
     }
 }

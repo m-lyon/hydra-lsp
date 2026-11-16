@@ -16,7 +16,7 @@
 //! is built and probed exactly like a real one — `ImportResolver`'s
 //! `find_module_file` walks the same `.pyi`-before-`.py` candidates against
 //! [`stdlib_search_root`] — and only the two functions that actually touch a
-//! file, `path_is_file` and `path_to_file` in `python_analyzer`, branch on
+//! file, `path_is_file` and `path_to_file` in `extract`, branch on
 //! [`is_vendored_path`] to reach the `VendoredFileSystem` instead of the OS.
 //!
 //! The root is *not* a member of the search-path list built by

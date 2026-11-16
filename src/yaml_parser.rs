@@ -5,7 +5,7 @@ use std::error::Error;
 use std::fmt;
 use tower_lsp::lsp_types::Position;
 
-use crate::diagnostics::DiagnosticRule;
+use crate::rules::DiagnosticRule;
 
 /// Represents a semantic token in the document (internal representation)
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -207,7 +207,7 @@ impl From<saphyr::ScanError> for YamlParseError {
 /// How a [`Parameter`] is passed to its target: under its own key in the
 /// mapping, or as an entry of `_args_`.
 ///
-/// Not to be confused with [`crate::python_analyzer::ParameterKind`], which
+/// Not to be confused with [`crate::python::model::ParameterKind`], which
 /// describes how a Python parameter accepts arguments.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ArgKind {
@@ -342,9 +342,9 @@ pub struct ParsedContent {
     /// All hydra objects found in the document, in the order they appear
     pub hydra_objects: Vec<HydraObject>,
     /// Mapping from line number to index in the hydra_objects vector for quick lookup
-    pub target_line_map: HashMap<u32, usize>,
+    pub(crate) target_line_map: HashMap<u32, usize>,
     /// Mapping from parameter line number to (hydra_objects index, parameter context)
-    pub param_line_map: HashMap<u32, (usize, ParameterContext)>,
+    pub(crate) param_line_map: HashMap<u32, (usize, ParameterContext)>,
     /// File-wide diagnostic suppressions from header comments
     pub file_suppressions: HashSet<DiagnosticRule>,
 }
