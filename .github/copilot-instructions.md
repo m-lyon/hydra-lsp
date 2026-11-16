@@ -17,8 +17,8 @@ This is a **Language Server Protocol (LSP) implementation** for [Hydra](https://
 ### Data Flow
 
 1. **YAML Parsing** ([yaml_parser.rs](../src/yaml_parser.rs)) - Extracts `_target_` references and parameters from Hydra configs
-2. **Python Resolution** ([python_analyzer.rs](../src/python_analyzer.rs)) - Resolves `_target_` strings (e.g., `torch.nn.Linear`) to Python source files using ruff's `ty_module_resolver`
-3. **Import Resolution** ([import_resolver.rs](../src/import_resolver.rs)) - Follows Python imports/re-exports to find actual symbol definitions
+2. **Python Resolution** ([python/resolve.rs](../src/python/resolve.rs)) - Resolves `_target_` strings (e.g., `torch.nn.Linear`) to Python source files using ruff's `ty_module_resolver`
+3. **Import Resolution** ([python/import_resolver.rs](../src/python/import_resolver.rs)) - Follows Python imports/re-exports to find actual symbol definitions
 4. **LSP Backend** ([backend.rs](../src/backend.rs)) - Implements LSP protocol via `tower-lsp` crate
 
 ### Key Design Decisions
@@ -91,7 +91,7 @@ Register capabilities in `initialize()` method.
 
 ### Python Symbol Extraction
 
-Use visitor pattern from `ruff_python_ast`. See `ClassExtractor` and `FunctionExtractor` in [python_analyzer.rs](../src/python_analyzer.rs#L413):
+Use visitor pattern from `ruff_python_ast`. See `ClassExtractor` and `FunctionExtractor` in [python/extract.rs](../src/python/extract.rs):
 
 ```rust
 impl<'a> Visitor<'a> for ClassExtractor<'a> {

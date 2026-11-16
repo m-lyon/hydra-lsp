@@ -1,6 +1,6 @@
 mod common;
 
-use hydrust::yaml_parser::SemanticTokenType;
+use hydrust::SemanticTokenType;
 use tower_lsp::lsp_types::*;
 
 use crate::common::*;

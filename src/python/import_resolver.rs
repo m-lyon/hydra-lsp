@@ -1,7 +1,8 @@
-use crate::python_analyzer::{
-    ClassInfo, FunctionSignature, PythonAnalyzer, get_parsed_module, path_is_file,
+use super::cache::{InternedSearchPaths, TargetString, resolve_module_cached};
+use super::extract::{
+    extract_class_info, extract_function_signature, get_parsed_module, path_is_file,
 };
-use crate::python_cache::{InternedSearchPaths, TargetString, resolve_module_cached};
+use super::model::{ClassInfo, FunctionSignature};
 use ruff_python_ast::{self as ast, Expr, Stmt, visitor::Visitor};
 use rustc_hash::FxHashSet;
 use std::cell::OnceCell;
@@ -254,7 +255,7 @@ impl<'db, 'sp> ImportResolver<'db, 'sp> {
 
     /// Check if a class is directly defined in the file
     fn find_class_direct(&mut self, file_path: &Path, class_name: &str) -> Option<ClassInfo> {
-        PythonAnalyzer::extract_class_info(self.db, file_path, class_name).ok()
+        extract_class_info(self.db, file_path, class_name).ok()
     }
 
     /// Check if a function is directly defined in the file
@@ -263,7 +264,7 @@ impl<'db, 'sp> ImportResolver<'db, 'sp> {
         file_path: &Path,
         function_name: &str,
     ) -> Option<FunctionSignature> {
-        PythonAnalyzer::extract_function_signature(self.db, file_path, function_name).ok()
+        extract_function_signature(self.db, file_path, function_name).ok()
     }
 
     /// Resolve a symbol by following import chains.
@@ -570,8 +571,9 @@ fn extract_list_of_strings(expr: &Expr) -> Option<FxHashSet<String>> {
 mod tests {
     use super::*;
     use crate::database::HydraDatabase;
-    use crate::python_analyzer::DefinitionInfo;
-    use crate::python_cache::ResolvedDefinition;
+    use crate::python::cache::ResolvedDefinition;
+    use crate::python::model::DefinitionInfo;
+    use crate::python::resolve::extract_definition_info;
     use ruff_db::system::SystemPath;
     use std::fs;
     use tempfile::TempDir;
@@ -621,12 +623,9 @@ mod tests {
         let db = HydraDatabase::new(SystemPath::new("/"));
         let search_paths = vec![workspace.to_path_buf(), site_packages.to_path_buf()];
 
-        let def = PythonAnalyzer::extract_definition_info(&db, symbol_path, &search_paths)
-            .unwrap_or_else(|_| {
-                panic!(
-                    "{symbol_path} should resolve when site-packages is nested inside the workspace"
-                )
-            });
+        let def = extract_definition_info(&db, symbol_path, &search_paths).unwrap_or_else(|_| {
+            panic!("{symbol_path} should resolve when site-packages is nested inside the workspace")
+        });
 
         (def.definition_info, def.file_path, def.symbol_name)
     }
@@ -1065,7 +1064,7 @@ mod tests {
     }
 
     /// End-to-end: the same lazy-export pattern resolves through
-    /// `PythonAnalyzer::extract_definition_info`, the entry point diagnostics,
+    /// `extract_definition_info`, the entry point diagnostics,
     /// hover, and go-to-definition all share.
     #[test]
     fn test_extract_definition_info_resolves_lazy_export() {
@@ -1095,12 +1094,8 @@ mod tests {
             file_path,
             symbol_name,
             ..
-        } = PythonAnalyzer::extract_definition_info(
-            &db,
-            "example_pkg.ExportedClass",
-            &search_paths,
-        )
-        .expect("the lazy export should resolve end-to-end");
+        } = extract_definition_info(&db, "example_pkg.ExportedClass", &search_paths)
+            .expect("the lazy export should resolve end-to-end");
 
         assert_eq!(symbol_name, "ExportedClass");
         assert!(
@@ -1176,7 +1171,7 @@ mod tests {
             file_path,
             symbol_name,
             ..
-        } = PythonAnalyzer::extract_definition_info(&db, "pkg.ExportedClass", &search_paths)
+        } = extract_definition_info(&db, "pkg.ExportedClass", &search_paths)
             .expect("ExportedClass should resolve through the sibling module");
 
         assert_eq!(symbol_name, "ExportedClass");
@@ -1209,8 +1204,7 @@ mod tests {
         let db = HydraDatabase::new(SystemPath::new("/"));
         let search_paths = vec![repo.clone(), repo.join("src")];
 
-        let result =
-            PythonAnalyzer::extract_definition_info(&db, "pkg.ExportedClass", &search_paths);
+        let result = extract_definition_info(&db, "pkg.ExportedClass", &search_paths);
 
         assert!(
             result.is_err(),
@@ -1341,7 +1335,7 @@ mod tests {
     }
 
     /// `resolve_module_path` delegates to `resolve_module_cached`, whose escape
-    /// guard is covered in `python_cache`. This only checks the delegation is
+    /// guard is covered in `cache`. This only checks the delegation is
     /// wired up, plus the same guard on the relative path, which resolves
     /// without going through that query.
     #[test]

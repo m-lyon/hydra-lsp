@@ -324,7 +324,7 @@ const DEFAULT_NUM_THREADS: usize = DEFAULT_POOL_THREADS + RUNTIME_THREADS;
 /// Note this limits handlers *started*, not messages read. tower-lsp builds each
 /// handler future as it decodes the message and queues it 100 deep, so stdin
 /// keeps draining well past this number.
-pub const MAX_CONCURRENT_REQUESTS: usize = 8;
+pub(crate) const MAX_CONCURRENT_REQUESTS: usize = 8;
 
 /// Most threads the two pools can be given between them.
 ///

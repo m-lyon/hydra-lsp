@@ -133,7 +133,7 @@ that is not holding it. Adding threads does not help work that is queued on the
 lock.
 
 **The pools isolate threads, not work.** Both pools reach
-`python_cache::cached_definition_info`. When two requests want the same key,
+`python::cache::cached_definition_info`. When two requests want the same key,
 salsa blocks one until the other finishes, regardless of which pool they came
 from. Separating the pools stops a diagnostics burst from occupying every thread
 and leaving a hover waiting; it does not stop them contending on shared queries.
@@ -420,7 +420,7 @@ In `hydra-lsp`:
   field in `src/backend.rs`.
 - `src/backend/handlers.rs` — the `LanguageServer` impl, including `initialize`,
   and `spawn_definition_lookup`.
-- `src/backend/diag.rs` — `compute_diagnostics` and the publish helpers, and the
+- `src/backend/diagnostics.rs` — `compute_diagnostics` and the publish helpers, and the
   pull path's report building.
 - `src/outbox.rs` — the outbound queue and its drain task.
 - `tests/server_cli.rs` — `EXIT_TIMEOUT`, the guard against the outbox hang

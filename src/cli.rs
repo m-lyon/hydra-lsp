@@ -17,11 +17,10 @@ use ignore::WalkBuilder;
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
 use tracing::{Level, debug, error, info, warn};
 
-use hydrust::database::HydraDatabase;
-use hydrust::diagnostics::{DiagnosticRule, validate_document};
-use hydrust::python_analyzer::{PythonAnalyzer, ResolveError};
-use hydrust::python_cache::PythonConfig;
-use hydrust::yaml_parser::YamlParser;
+use hydrust::{
+    DiagnosticRule, HydraDatabase, PythonConfig, ResolveError, YamlParser, render_params,
+    validate_document,
+};
 
 use std::collections::{HashMap, HashSet};
 
@@ -209,7 +208,7 @@ fn main() {
                 // stderr, never stdout: stdout is the LSP transport.
                 eprintln!("hydrust: ignoring unrecognised arguments; starting language server");
             }
-            hydrust::server::serve();
+            hydrust::serve();
             return;
         }
     };
@@ -632,7 +631,7 @@ fn check_target(
 
 fn trace_target_resolution(
     index: usize,
-    hydra_object: &hydrust::yaml_parser::HydraObject,
+    hydra_object: &hydrust::HydraObject,
     db: &HydraDatabase,
     python_config: PythonConfig,
 ) {
@@ -644,8 +643,8 @@ fn trace_target_resolution(
         hydra_object.target.line + 1
     );
 
-    let target = hydrust::python_cache::TargetString::new(db, hydra_object.target.value.clone());
-    let cached = hydrust::python_cache::cached_definition_info(db, python_config, target);
+    let target = hydrust::TargetString::new(db, hydra_object.target.value.clone());
+    let cached = hydrust::cached_definition_info(db, python_config, target);
     match cached.get() {
         Ok(def) => {
             eprintln!("  {} {}", "Module:".dimmed(), def.module_path);
@@ -659,7 +658,7 @@ fn trace_target_resolution(
             let def_info = &def.definition_info;
             let implicit_param = def_info.implicit_param();
             match def_info {
-                hydrust::python_analyzer::DefinitionInfo::Function(sig) => {
+                hydrust::DefinitionInfo::Function(sig) => {
                     eprintln!("  {} Function", "Type:".dimmed());
                     eprintln!(
                         "  {} {}",
@@ -667,7 +666,7 @@ fn trace_target_resolution(
                         format_signature_brief(sig, implicit_param)
                     );
                 }
-                hydrust::python_analyzer::DefinitionInfo::Class(class_info) => {
+                hydrust::DefinitionInfo::Class(class_info) => {
                     eprintln!("  {} Class", "Type:".dimmed());
                     if let Some(ref init_sig) = class_info.init_signature {
                         eprintln!(
@@ -679,7 +678,7 @@ fn trace_target_resolution(
                         eprintln!("  {} (no __init__ found)", "__init__:".dimmed());
                     }
                 }
-                hydrust::python_analyzer::DefinitionInfo::Method(method_info) => {
+                hydrust::DefinitionInfo::Method(method_info) => {
                     let method_type = if method_info.is_classmethod {
                         "classmethod"
                     } else if method_info.is_staticmethod {
@@ -724,17 +723,15 @@ fn trace_target_resolution(
 }
 
 fn format_signature_brief(
-    sig: &hydrust::python_analyzer::FunctionSignature,
+    sig: &hydrust::FunctionSignature,
     implicit_param: Option<&str>,
 ) -> String {
-    let filtered: Vec<&hydrust::python_analyzer::ParameterInfo> = sig
+    let filtered: Vec<&hydrust::ParameterInfo> = sig
         .parameters
         .iter()
         .filter(|p| Some(p.name.as_str()) != implicit_param)
         .collect();
-    let params = PythonAnalyzer::render_params(&filtered, |p| {
-        p.label(hydrust::python_analyzer::DefaultStyle::Ellipsis)
-    });
+    let params = render_params(&filtered, |p| p.label(hydrust::DefaultStyle::Ellipsis));
     format!("({})", params.join(", "))
 }
 
