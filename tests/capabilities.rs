@@ -57,7 +57,8 @@ fn test_capability_block_shape_with_all_features() {
                 "invalid-hydra-parameter",
                 "parameter-already-assigned",
                 "too-many-positional-arguments",
-                "positional-only-parameter"
+                "positional-only-parameter",
+                "yaml-syntax-error"
             ],
             "features": ["pullDiagnostics", "watchedFiles", "diagnosticRefresh"]
         })

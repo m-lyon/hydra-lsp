@@ -5,6 +5,8 @@
 - Removed unused dependencies and refactored internals.
 - `hydrust check --trace-resolution` now shows the `*`/`**` prefix on variadic parameters.
 - Parameter validation is split into one check per rule, over a single parameter-kind model.
+- Diagnostics now carry `hydrust` as their `source`, in place of `hydra-lsp`. The pull-diagnostics identifier is renamed to match.
+- `yaml-syntax-error` is now a diagnostic rule.
 
 ## [0.6.1]
 
