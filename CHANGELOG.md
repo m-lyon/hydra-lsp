@@ -5,6 +5,8 @@
 - Removed unused dependencies and refactored internals.
 - `hydrust check --trace-resolution` now shows the `*`/`**` prefix on variadic parameters.
 - Parameter validation is split into one check per rule, over a single parameter-kind model.
+- Updated the ruff and ty crates to the revision behind ty 0.0.104, and salsa to 0.28.5.
+- Python environment discovery now falls back to a `python3` or `python` on `PATH`, recognises Pixi environments, ignores an empty `VIRTUAL_ENV`, and skips a broken `.venv` instead of failing.
 
 ## [0.6.1]
 

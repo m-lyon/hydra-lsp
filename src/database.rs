@@ -2,7 +2,6 @@ use ruff_db::files::Files;
 use ruff_db::system::System;
 use ruff_db::system::{OsSystem, SystemPath};
 use ruff_db::vendored::VendoredFileSystem;
-use ruff_python_ast::PythonVersion;
 
 /// The core Salsa database for hydra-lsp.
 ///
@@ -57,16 +56,6 @@ impl ruff_db::Db for HydraDatabase {
     fn files(&self) -> &Files {
         &self.files
     }
-
-    /// **Limitation:** the configured interpreter's actual version is not yet
-    /// plumbed through to the database. We always report `latest_ty()`, which
-    /// affects ruff_db queries that branch on `db.python_version()` (parser
-    /// dialect, semantic resolution rules in third-party crates). Pointing the
-    /// LSP at a Python 3.10 interpreter still gets the latest dialect's
-    /// behavior.
-    fn python_version(&self) -> PythonVersion {
-        PythonVersion::latest_ty()
-    }
 }
 
 #[salsa::db]
@@ -77,8 +66,8 @@ impl HydraDatabase {
     ///
     /// Reports struct counts, field sizes, and query memo counts.
     /// Useful for tuning LRU cache sizes and diagnosing memory issues.
-    pub fn log_memory_usage(&self) {
-        let db: &dyn salsa::Database = self;
+    pub fn log_memory_usage(&mut self) {
+        let db: &mut dyn salsa::Database = self;
         let info = db.memory_usage();
 
         for s in &info.structs {
@@ -112,7 +101,6 @@ pub mod tests {
     use ruff_db::files::Files;
     use ruff_db::system::{DbWithTestSystem, System, TestSystem};
     use ruff_db::vendored::VendoredFileSystem;
-    use ruff_python_ast::PythonVersion;
 
     /// Test database using an in-memory filesystem.
     #[salsa::db]
@@ -157,13 +145,6 @@ pub mod tests {
         fn files(&self) -> &Files {
             &self.files
         }
-
-        /// Mirrors the production `HydraDatabase::python_version` limitation:
-        /// always returns `latest_ty()` regardless of the configured
-        /// interpreter version.
-        fn python_version(&self) -> PythonVersion {
-            PythonVersion::latest_ty()
-        }
     }
 
     impl DbWithTestSystem for TestDb {
@@ -189,7 +170,7 @@ pub mod tests {
 
     #[test]
     fn test_hydra_database_memory_usage() {
-        let db = super::HydraDatabase::new(ruff_db::system::SystemPath::new("/tmp"));
+        let mut db = super::HydraDatabase::new(ruff_db::system::SystemPath::new("/tmp"));
         // Should not panic — verifies salsa_unstable feature works
         db.log_memory_usage();
     }
@@ -198,7 +179,7 @@ pub mod tests {
     fn test_hydra_database_memory_usage_after_queries() {
         use crate::yaml_cache::{DocumentInput, is_hydra_file, parsed_yaml};
 
-        let db = TestDb::new();
+        let mut db = TestDb::new();
         let input =
             DocumentInput::new(&db, "# @hydra\nmodel:\n  _target_: my.Mod\n".to_string(), 1);
         // Run some queries to populate the memo table
@@ -206,7 +187,7 @@ pub mod tests {
         let _ = parsed_yaml(&db, input);
 
         // memory_usage should reflect the cached queries
-        let db_ref: &dyn salsa::Database = &db;
+        let db_ref: &mut dyn salsa::Database = &mut db;
         let info = db_ref.memory_usage();
         let total_memos: usize = info.queries.values().map(|q| q.count()).sum();
         assert!(total_memos > 0, "should have cached query memos");
