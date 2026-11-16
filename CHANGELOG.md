@@ -5,6 +5,8 @@
 - Removed unused dependencies and refactored internals.
 - `hydrust check --trace-resolution` now shows the `*`/`**` prefix on variadic parameters.
 - Parameter validation is split into one check per rule, over a single parameter-kind model.
+- Diagnostics now carry `hydrust` as their `source`, in place of `hydra-lsp`. The pull-diagnostics identifier is renamed to match.
+- `yaml-syntax-error` is now a diagnostic rule. It is listed in `supportedRules`, and naming it in `disabledRules` silences it. A file that fails to parse has no suppression comments to read, so this setting is the only way to turn it off. `hydrust check` still reports such a file as a `parse-error` failure, so `--disable-rule yaml-syntax-error` has no effect there.
 
 ## [0.6.1]
 

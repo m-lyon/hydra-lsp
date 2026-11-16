@@ -1415,13 +1415,57 @@ async fn test_pull_diagnostic_reflects_watched_py_edit() {
     }
 }
 
+/// A Hydra document whose YAML does not parse gets one `yaml-syntax-error`
+/// diagnostic, carrying the same `source` as every other diagnostic.
+#[tokio::test]
+async fn test_yaml_syntax_error_is_reported() {
+    let mut ctx = TestContext::new(TestWorkspace::Simple);
+    ctx.initialize().await;
+
+    ctx.open_document(
+        "broken.yaml",
+        "# @hydra\nservices:\n  web: image\n    ports: [8080\n".to_string(),
+    )
+    .await;
+
+    let dp = ctx.recv::<PublishDiagnosticsParams>().await;
+    assert_eq!(dp.diagnostics.len(), 1, "got: {:?}", dp.diagnostics);
+    let diagnostic = &dp.diagnostics[0];
+    assert_eq!(extract_code(diagnostic), "yaml-syntax-error");
+    assert_eq!(diagnostic.source.as_deref(), Some("hydrust"));
+    assert!(
+        diagnostic.message.starts_with("YAML syntax error: "),
+        "got: {}",
+        diagnostic.message
+    );
+}
+
+/// `yaml-syntax-error` is a rule like any other: naming it in `disabledRules`
+/// silences it. A file that fails to parse has no suppression comments to
+/// read, so this setting is the only way to turn it off.
+#[tokio::test]
+async fn test_yaml_syntax_error_can_be_disabled() {
+    let mut ctx = TestContext::new(TestWorkspace::Simple);
+    ctx.initialize_with_settings(serde_json::json!({ "disabledRules": ["yaml-syntax-error"] }))
+        .await;
+
+    ctx.open_document(
+        "broken.yaml",
+        "# @hydra\nservices:\n  web: image\n    ports: [8080\n".to_string(),
+    )
+    .await;
+
+    let dp = ctx.recv::<PublishDiagnosticsParams>().await;
+    assert!(dp.diagnostics.is_empty(), "got: {:?}", dp.diagnostics);
+}
+
 /// Pull path: a non-Hydra document reports nothing, even when its YAML is
 /// unparseable.
 ///
 /// The push path gates on `is_hydra_file` in `did_open` / `did_change` and
 /// clears diagnostics for files it does not own. The pull handler has to make
 /// the same call itself, or a broken plain YAML file would draw a spurious
-/// "YAML syntax error" from hydra-lsp for pull clients only. The Hydra half of
+/// "YAML syntax error" from hydrust for pull clients only. The Hydra half of
 /// this test pins the other side: the gate must not swallow syntax errors on
 /// files we do own.
 #[tokio::test]
