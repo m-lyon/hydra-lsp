@@ -1,7 +1,4 @@
 //! A language server for Hydra YAML configs.
-//!
-//! The modules are internal. What the `hydrust` binary and the integration
-//! tests use is re-exported here.
 
 mod backend;
 mod database;
@@ -26,8 +23,7 @@ pub use rules::DiagnosticRule;
 pub use server::serve;
 pub use yaml_parser::{CompletionContext, HydraObject, SemanticTokenType, YamlParser};
 
-// Only `tests/textrange_conversion.rs` calls these, to check positions on an
-// extracted definition directly.
+// Only called by tests
 #[doc(hidden)]
 pub use python::extract::{extract_class_info, extract_function_signature};
 #[doc(hidden)]

@@ -5,7 +5,6 @@
 - Removed unused dependencies and refactored internals.
 - `hydrust check --trace-resolution` now shows the `*`/`**` prefix on variadic parameters.
 - Parameter validation is split into one check per rule, over a single parameter-kind model.
-- The library's modules are now internal; its public items are re-exported from the crate root (`use hydrust::YamlParser` rather than `use hydrust::yaml_parser::YamlParser`).
 
 ## [0.6.1]
 

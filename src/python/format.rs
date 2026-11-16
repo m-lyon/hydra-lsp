@@ -1,5 +1,4 @@
-//! Rendering signatures as text: parameter lists with their `/` and `*`
-//! markers, and the Markdown shown on hover.
+//! Rendering signatures as text
 
 use super::model::{
     ClassInfo, DefaultStyle, FunctionSignature, MethodInfo, ParameterInfo, ParameterKind,

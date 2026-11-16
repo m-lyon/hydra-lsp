@@ -1,7 +1,4 @@
-//! The diagnostic rules: each rule's code, and the lookups between the two.
-//!
-//! Depends on nothing else in the crate, so the parser and the validator can
-//! both name a rule without depending on each other.
+//! The diagnostic rules
 
 use std::fmt;
 

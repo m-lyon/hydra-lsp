@@ -1,6 +1,6 @@
 //! Reading definitions out of one Python file: salsa-tracked reads and parses,
 //! and the AST visitors that pull out a function, class, method or class
-//! attribute by name. Nothing here follows an import.
+//! attribute by name.
 
 use super::model::{
     ClassAttributeInfo, ClassInfo, FunctionSignature, MethodInfo, ParameterInfo, ParameterKind,

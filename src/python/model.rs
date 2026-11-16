@@ -1,6 +1,5 @@
 //! What the Python analysis produces: signatures, classes, methods, and why a
-//! `_target_` could not be resolved. Plain data, depending on nothing else in
-//! the crate.
+//! `_target_` could not be resolved.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FunctionSignature {
