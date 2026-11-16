@@ -10,7 +10,6 @@ use crate::yaml_parser::{
 use std::collections::HashSet;
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 
-/// The `source` every diagnostic carries, naming the server that produced it.
 pub(crate) const DIAGNOSTIC_SOURCE: &str = "hydrust";
 
 pub(crate) fn create_diagnostic(
