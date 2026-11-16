@@ -12,6 +12,11 @@ updates:
     # release has time to be found and pulled.
     cooldown:
       default-days: 7
+    # build-wheels.yml keeps its artifacts-* uploads on v4 to match the
+    # download-artifact major in release.yml. Move both majors together by hand.
+    ignore:
+      - dependency-name: actions/upload-artifact
+        update-types: ["version-update:semver-major"]
     groups:
       github-actions:
         patterns: ["*"]
