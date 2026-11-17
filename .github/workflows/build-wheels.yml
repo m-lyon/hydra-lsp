@@ -216,6 +216,10 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           architecture: x64
+      # The ruff git dependency contains paths longer than Windows' 260-char
+      # MAX_PATH once checked out under ~/.cargo/git/checkouts.
+      - name: Enable git long paths
+        run: git config --global core.longpaths true
       - name: Build wheel
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
