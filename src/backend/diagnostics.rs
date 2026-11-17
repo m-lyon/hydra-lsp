@@ -153,31 +153,23 @@ pub(super) fn validate_input(
     let parsed_yaml = yaml_cache::parsed_yaml(db, input);
     match parsed_yaml.result() {
         Ok(content) => diagnostics::validate_document(content, disabled_rules, db, python_config),
+        // A document that fails to parse has no suppression comments to read,
+        // so `disabledRules` is the only way to silence this one.
+        Err(_) if disabled_rules.contains(&DiagnosticRule::YamlSyntaxError) => Vec::new(),
         Err(e) => vec![yaml_syntax_error_diagnostic(e)],
     }
 }
 
 /// Build the single diagnostic shown for a YAML document that failed to parse.
 fn yaml_syntax_error_diagnostic(msg: &str) -> Diagnostic {
-    Diagnostic {
-        range: Range {
-            start: Position {
-                line: 0,
-                character: 0,
-            },
-            end: Position {
-                line: 0,
-                character: 0,
-            },
-        },
-        severity: Some(DiagnosticSeverity::ERROR),
-        code: Some(tower_lsp::lsp_types::NumberOrString::String(
-            "yaml-syntax-error".to_string(),
-        )),
-        source: Some("hydra-lsp".to_string()),
-        message: format!("YAML syntax error: {}", msg),
-        ..Default::default()
-    }
+    diagnostics::create_diagnostic(
+        0,
+        0,
+        0,
+        DiagnosticSeverity::ERROR,
+        Some(DiagnosticRule::YamlSyntaxError),
+        format!("YAML syntax error: {}", msg),
+    )
 }
 
 /// An empty `Full` diagnostic report — nothing to show for this document.

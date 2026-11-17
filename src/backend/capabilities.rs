@@ -323,7 +323,7 @@ pub(super) fn server_capabilities(client: &ClientFeatures) -> ServerCapabilities
             },
         )),
         diagnostic_provider: Some(DiagnosticServerCapabilities::Options(DiagnosticOptions {
-            identifier: Some("hydra-lsp".to_string()),
+            identifier: Some(crate::diagnostics::DIAGNOSTIC_SOURCE.to_string()),
             // Hydra targets resolve into watched Python files, so a
             // change in one file can affect another's diagnostics.
             inter_file_dependencies: true,

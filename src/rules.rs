@@ -52,6 +52,7 @@ diagnostic_rules! {
     ParameterAlreadyAssigned => "parameter-already-assigned",
     TooManyPositionalArguments => "too-many-positional-arguments",
     PositionalOnlyParameter => "positional-only-parameter",
+    YamlSyntaxError => "yaml-syntax-error",
 }
 
 impl fmt::Display for DiagnosticRule {
