@@ -17,6 +17,9 @@ Thank you for your interest in Hydrust. This page explains how to send a change.
 3. Make the change, and add or update the tests for it.
 4. Run the checks below. CI runs the same checks.
 5. Push the branch to your fork and open a pull request against `main`.
+6. When the pull request is ready, mark it **Ready for review**. GitHub then
+   requests a review from a maintainer. You do not need to add a reviewer.
+   While the work is not finished, keep the pull request as a draft.
 
 Outside contributors do not get write access. A maintainer must approve each CI
 run on a pull request from a fork, so the checks start after a short wait.
