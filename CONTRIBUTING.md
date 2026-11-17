@@ -37,12 +37,29 @@ did not expect. [tests/README.md](tests/README.md) explains the test layout.
 
 ## Before you open the pull request
 
-- Add an entry to [CHANGELOG.md](CHANGELOG.md) for any change a user can see.
+- Add an entry under `## [Unreleased]` in [CHANGELOG.md](CHANGELOG.md) for any
+  change a user can see. Do not change the version in `Cargo.toml`. A maintainer
+  bumps it when they cut a release.
 - For a new settings key, diagnostic rule, or client-visible feature, follow
   **Adding a feature** in [AGENTS.md](AGENTS.md). The VSCode extension depends on
   these names, so the rules there also apply to you.
 - Before you change thread counts or where a request handler runs, read
   [docs/threading-model.md](docs/threading-model.md).
+
+## Cut a release
+
+Maintainers only.
+
+1. Choose the version. Bump the minor version if a change in `[Unreleased]` is
+   breaking. Otherwise, bump the patch version.
+2. In [CHANGELOG.md](CHANGELOG.md), rename `## [Unreleased]` to the new version,
+   for example `## [0.7.1]`. Add a new, empty `## [Unreleased]` section above it.
+3. Set the same version in `Cargo.toml`, then run `cargo check` to update
+   `Cargo.lock`.
+4. Commit these changes and merge them to `main`.
+5. Tag the merge commit with the version and push the tag, for example
+   `git tag v0.7.1 && git push origin v0.7.1`. The tag starts the release
+   workflow.
 
 ## Security problems
 

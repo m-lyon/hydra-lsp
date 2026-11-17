@@ -41,8 +41,10 @@ capability field needs none of this.
 - Never remove or repurpose a name quietly — a client may still send it.
 - Unknown settings keys stay ignored, never rejected.
 - `features` is always an array, even when empty; clients test membership on it.
-- Bump the crate version and add a CHANGELOG entry. The client's fallback table
-  is keyed on release versions.
+- Add a CHANGELOG entry under `## [Unreleased]`. Do not bump the crate version
+  in a feature PR. The version is bumped when a release is cut (see "Cut a
+  release" in [CONTRIBUTING.md](CONTRIBUTING.md)). The client's fallback table is
+  keyed on release versions, so only released versions matter to it.
 
 ### Checking it
 
