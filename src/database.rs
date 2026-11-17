@@ -3,7 +3,7 @@ use ruff_db::system::System;
 use ruff_db::system::{OsSystem, SystemPath};
 use ruff_db::vendored::VendoredFileSystem;
 
-/// The core Salsa database for hydra-lsp.
+/// The core Salsa database for hydrust.
 ///
 /// Implements `ruff_db::Db` (which extends `salsa::Database`) to provide:
 /// - File tracking and interning via `Files`
