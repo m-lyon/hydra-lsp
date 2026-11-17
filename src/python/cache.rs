@@ -24,18 +24,15 @@ use tracing::debug;
 ///
 /// This input participates in the cache key for Python definition lookups, so
 /// changing its values invalidates cached module-resolution results. Per-file
-/// invalidation for watched Python source and existing `.pth` edits is handled
-/// separately via `ruff_db::files::File::sync_path` in the LSP backend, while
-/// `.pth` create/delete events bump the enclosing site-packages `FileRoot`
-/// revision via `ruff_db::files::Files::touch_root`.
+/// invalidation for watched Python source and `.pth` files is handled
+/// separately via `ruff_db::files::File::sync_path` in the LSP backend, which
+/// also bumps the parent directory when a file is created or deleted.
 #[salsa::input]
 pub struct PythonConfig {
     /// Workspace root directory path.
-    #[returns(ref)]
     pub workspace_root: Option<String>,
 
     /// Configured Python interpreter path.
-    #[returns(ref)]
     pub interpreter: Option<String>,
 }
 
@@ -46,7 +43,6 @@ pub struct PythonConfig {
 /// and use cheap identity comparison as the cache key.
 #[salsa::interned]
 pub struct TargetString {
-    #[returns(ref)]
     pub value: String,
 }
 
@@ -131,10 +127,10 @@ impl Eq for CachedDefinitionResult {}
 /// or `interpreter` fields change — both are salsa inputs, so invalidation is
 /// automatic.
 ///
-/// Also registers each discovered directory as a `LibrarySearchPath` file root
+/// Also registers each discovered directory as a `SearchPath` file root
 /// so library files get `Durability::HIGH`: project-file edits don't invalidate
 /// library-derived memos.
-#[salsa::tracked(returns(ref))]
+#[salsa::tracked]
 pub fn site_packages_paths(db: &dyn ruff_db::Db, config: PythonConfig) -> Vec<SystemPathBuf> {
     let workspace_root = config.workspace_root(db).as_deref().map(Path::new);
     let interpreter = config.interpreter(db);
@@ -142,7 +138,7 @@ pub fn site_packages_paths(db: &dyn ruff_db::Db, config: PythonConfig) -> Vec<Sy
         discover_python_environment(workspace_root, interpreter.as_deref()).unwrap_or_default();
     for path in &paths {
         db.files()
-            .try_add_root(db, path.as_path(), FileRootKind::LibrarySearchPath);
+            .try_add_root(db, path.as_path(), FileRootKind::SearchPath);
     }
     paths
 }
@@ -154,9 +150,9 @@ pub fn site_packages_paths(db: &dyn ruff_db::Db, config: PythonConfig) -> Vec<Sy
 ///
 /// Recomputes when `PythonConfig`'s `workspace_root` or `interpreter` fields
 /// change, and — via `parse_pth_files`'s dependency (called within
-/// `build_search_paths`) on each site-packages `FileRoot` revision —
+/// `build_search_paths`) on each site-packages directory listing —
 /// when a `.pth` file is created or deleted in a site-packages directory.
-#[salsa::tracked(returns(ref))]
+#[salsa::tracked]
 pub fn search_paths_for_config(db: &dyn ruff_db::Db, config: PythonConfig) -> Vec<PathBuf> {
     let workspace_root = config.workspace_root(db).as_deref().map(Path::new);
     let site_packages = site_packages_paths(db, config);
@@ -182,7 +178,7 @@ pub fn search_paths_for_config(db: &dyn ruff_db::Db, config: PythonConfig) -> Ve
 ///
 /// When nothing on the real search path matches, resolution falls through to
 /// the vendored typeshed stubs for `builtins`, see [`is_vendored_module`].
-#[salsa::tracked(returns(ref), lru = 1024)]
+#[salsa::tracked(lru = 1024)]
 pub fn resolve_module_cached<'db>(
     db: &'db dyn ruff_db::Db,
     module_path: TargetString<'db>,
@@ -218,7 +214,7 @@ pub fn resolve_module_cached<'db>(
 
 /// Whether the runtime module `module` exposes `symbol`, according to its
 /// vendored stub.
-#[salsa::tracked]
+#[salsa::tracked(returns(copy))]
 pub fn vendored_module_exposes<'db>(
     db: &'db dyn ruff_db::Db,
     module: TargetString<'db>,
@@ -261,7 +257,7 @@ pub fn is_builtin_symbol<'db>(db: &'db dyn ruff_db::Db, name: TargetString<'db>)
 /// Uses `lru=1024` to bound memory for workspaces with many distinct targets.
 /// Hydra projects often reference many `_target_` strings (e.g. one per config),
 /// so the bound is set well above typical workspace sizes to avoid thrashing.
-#[salsa::tracked(no_eq, lru = 1024)]
+#[salsa::tracked(returns(clone), no_eq, lru = 1024)]
 pub fn cached_definition_info<'db>(
     db: &'db dyn ruff_db::Db,
     config: PythonConfig,
@@ -410,7 +406,7 @@ impl Eq for CachedClassAttribute {}
 ///
 /// `cycle_result` handles circular inheritance (invalid Python) gracefully by
 /// returning empty docs rather than panicking.
-#[salsa::tracked(lru = 512, cycle_result = class_parent_docs_cycle)]
+#[salsa::tracked(returns(clone), lru = 512, cycle_result = class_parent_docs_cycle)]
 pub fn class_parent_docs<'db>(
     db: &'db dyn ruff_db::Db,
     class_key: TargetString<'db>,
@@ -424,7 +420,7 @@ pub fn class_parent_docs<'db>(
     let class_info = match extract_class_info(db, file_path, class_name) {
         Ok(class_info) => class_info,
         Err(_) => {
-            return match ImportResolver::new(db, &search_paths_vec)
+            return match ImportResolver::new(db, search_paths_vec)
                 .resolve_symbol(file_path, class_name)
             {
                 Some((resolved_file, resolved_name)) => {
@@ -460,7 +456,7 @@ pub fn class_parent_docs<'db>(
             continue;
         }
         let Some((parent_file, parent_class_name)) =
-            resolve_base_class(db, base_class, file_path, &search_paths_vec)
+            resolve_base_class(db, base_class, file_path, search_paths_vec)
         else {
             all_bases_resolved = false;
             continue;
@@ -509,7 +505,7 @@ fn class_parent_docs_cycle(
 /// shared parent classes are looked up at most once per revision.
 ///
 /// `cycle_result` handles circular inheritance gracefully.
-#[salsa::tracked(lru = 512, cycle_result = class_parent_attribute_cycle)]
+#[salsa::tracked(returns(clone), lru = 512, cycle_result = class_parent_attribute_cycle)]
 pub fn class_parent_attribute<'db>(
     db: &'db dyn ruff_db::Db,
     class_key: TargetString<'db>,
@@ -542,7 +538,7 @@ pub fn class_parent_attribute<'db>(
             continue;
         }
         let Some((parent_file, parent_class_name)) =
-            resolve_base_class(db, base_class, file_path, &search_paths_vec)
+            resolve_base_class(db, base_class, file_path, search_paths_vec)
         else {
             continue;
         };
@@ -602,11 +598,10 @@ mod tests {
 
     #[salsa::interned]
     struct SitePackagesPath {
-        #[returns(ref)]
         path: String,
     }
 
-    #[salsa::tracked(returns(ref))]
+    #[salsa::tracked]
     fn tracked_pth_paths<'db>(
         db: &'db dyn ruff_db::Db,
         site_packages: SitePackagesPath<'db>,
@@ -906,7 +901,7 @@ mod tests {
 
     #[test]
     fn test_site_packages_pth_root_invalidation_on_file_create() {
-        use ruff_db::files::Files;
+        use ruff_db::files::File;
         use std::fs;
         use tempfile::TempDir;
 
@@ -920,10 +915,9 @@ mod tests {
         let site_packages_sys = SystemPath::from_std_path(&site_packages).unwrap();
 
         // Register the site-packages directory as a `FileRoot`, exactly as
-        // `site_packages_paths` does in production. `parse_pth_files` then reads
-        // this root's revision, so bumping it invalidates the directory scan.
+        // `site_packages_paths` does in production.
         db.files()
-            .try_add_root(&db, site_packages_sys, FileRootKind::LibrarySearchPath);
+            .try_add_root(&db, site_packages_sys, FileRootKind::SearchPath);
 
         let site_packages_str = site_packages.to_string_lossy().to_string();
         let result1 = {
@@ -932,11 +926,12 @@ mod tests {
         };
         assert!(result1.is_empty());
 
-        // Create a `.pth` file and bump the enclosing root, exactly as
-        // `did_change_watched_files` does on a `.pth` CREATE event.
+        // Create a `.pth` file and sync it, exactly as
+        // `did_change_watched_files` does on a `.pth` CREATE event. Syncing a
+        // new file bumps its parent directory, which the scan depends on.
         let pth_file = site_packages.join("editable_package.pth");
         fs::write(&pth_file, "../src\n").expect("write pth");
-        Files::touch_root(&mut db, site_packages_sys);
+        File::sync_path(&mut db, SystemPath::from_std_path(&pth_file).unwrap());
 
         let result2 = {
             let site_packages_key = SitePackagesPath::new(&db, site_packages_str);

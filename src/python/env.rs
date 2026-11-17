@@ -3,8 +3,8 @@
 
 use super::extract::read_source;
 use anyhow::Result;
+use ruff_db::files::directory_listing;
 use ruff_db::system::{OsSystem, SystemPath, SystemPathBuf};
-use std::fs;
 use std::path::{Path, PathBuf};
 use ty_python_semantic::{PythonEnvironment, SysPrefixPathOrigin};
 
@@ -13,10 +13,10 @@ use ty_python_semantic::{PythonEnvironment, SysPrefixPathOrigin};
 /// This uses `ty` Python environment discovery with the following priority:
 /// 1. Configured Python interpreter from LSP initialization (highest priority)
 /// 2. Activated virtual environment (VIRTUAL_ENV)
-/// 3. Conda environment (CONDA_PREFIX)
+/// 3. Active child Conda or Pixi environment (CONDA_PREFIX)
 /// 4. Working directory virtual environment (.venv)
-/// 5. Conda base environment
-/// 6. System Python (fallback)
+/// 5. Active base Conda environment
+/// 6. A Python interpreter on PATH
 ///
 /// The configured interpreter is always preferred if provided, as it represents
 /// the user's explicit choice via LSP configuration.
@@ -53,10 +53,11 @@ pub(super) fn discover_python_environment(
     } else {
         // Auto-discover Python environment with built-in priority:
         // 1. Activated virtual environment (VIRTUAL_ENV)
-        // 2. Conda environment (CONDA_PREFIX)
+        // 2. Active child Conda or Pixi environment (CONDA_PREFIX)
         // 3. Working directory virtual environment (.venv)
-        // 4. Conda base environment
-        PythonEnvironment::discover(project_root, &system)?
+        // 4. Active base Conda environment
+        // 5. A Python interpreter on PATH
+        PythonEnvironment::discover(Some(project_root), &system)?
             .ok_or_else(|| anyhow::anyhow!("No Python environment found"))?
     };
 
@@ -108,30 +109,20 @@ pub(super) fn build_search_paths(
 pub(super) fn parse_pth_files(db: &dyn ruff_db::Db, site_packages: &Path) -> Vec<PathBuf> {
     let mut paths = Vec::new();
 
-    // Depend on the site-packages directory's `FileRoot` revision so `.pth`
-    // create/delete events invalidate this directory scan. The root is
-    // registered in `site_packages_paths` (via `try_add_root`) with the same
-    // path handed here, and `did_change_watched_files` bumps it via
-    // `Files::touch_root`. Routing is purely lexical on both sides (matching
-    // `ty`), so no filesystem syscall runs here. Falls back to no dependency
-    // when no root is registered (e.g. cli/test callers).
-    if let Some(sys_path) = SystemPath::from_std_path(site_packages)
-        && let Some(root) = db.files().root(db, sys_path)
-    {
-        let _ = root.revision(db);
-    }
-
-    let Ok(entries) = fs::read_dir(site_packages) else {
+    // Listing through salsa makes this scan depend on the directory's own
+    // revision, which `File::sync_path` on a created or deleted `.pth` bumps.
+    let Some(directory) = SystemPath::from_std_path(site_packages) else {
+        return paths;
+    };
+    let Ok(listing) = directory_listing(db, directory) else {
         return paths;
     };
 
-    // Collect and sort .pth files alphabetically (per Python spec)
-    let mut pth_files: Vec<PathBuf> = entries
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().is_some_and(|ext| ext == "pth"))
-        .map(|e| e.path())
-        .collect();
-    pth_files.sort();
+    // The listing is sorted by name, the order the Python spec asks for.
+    let pth_files = listing
+        .iter()
+        .filter(|(name, _)| Path::new(name).extension().is_some_and(|ext| ext == "pth"))
+        .map(|(name, _)| site_packages.join(name));
 
     for pth_file in pth_files {
         let Ok(contents) = read_source(db, &pth_file) else {

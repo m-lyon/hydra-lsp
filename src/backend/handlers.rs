@@ -1,7 +1,6 @@
 //! The `LanguageServer` implementation: one method per LSP request or
 //! notification, delegating to the rest of the backend.
 
-use std::collections::HashSet;
 use std::time::Instant;
 use tower_lsp::LanguageServer;
 use tower_lsp::jsonrpc::Result;
@@ -259,21 +258,16 @@ impl LanguageServer for HydraLspBackend {
         // (typically Python sources outside the editor). For each changed
         // path we call `File::sync_path`, which bumps the per-file revision
         // inside ruff_db so that any salsa query reading that file's
-        // `source_text` is invalidated on the next request.
+        // `source_text` is invalidated on the next request. A file that was
+        // created or deleted also bumps its parent directory, which is what
+        // makes `parse_pth_files` re-scan site-packages for a new `.pth`.
         //
         // We filter to Python analysis inputs before locking: `.py`, `.pyi`,
         // and watched `.pth` files all participate in analysis. These extensions
         // must stay aligned with `WATCHED_PY_GLOB`.
-        //
-        // Syncing existing files bumps the per-file revision inside ruff_db so
-        // any query that read them through `source_text` is invalidated on the
-        // next request. For `.pth` create/delete events we also bump the
-        // enclosing site-packages `FileRoot` revision so the directory scan in
-        // `parse_pth_files` is recomputed.
         if params.changes.is_empty() {
             return;
         }
-        let mut pth_root_dirs = HashSet::new();
         let tracked_paths: Vec<std::path::PathBuf> = params
             .changes
             .iter()
@@ -285,56 +279,41 @@ impl LanguageServer for HydraLspBackend {
                     .map(str::to_ascii_lowercase)
                     .as_deref()
                 {
-                    Some("py") | Some("pyi") => Some(path),
-                    Some("pth") => {
-                        if matches!(
-                            change.typ,
-                            FileChangeType::CREATED | FileChangeType::DELETED
-                        ) && let Some(parent) = path.parent()
-                        {
-                            pth_root_dirs.insert(parent.to_path_buf());
-                        }
-                        Some(path)
-                    }
+                    Some("py") | Some("pyi") | Some("pth") => Some(path),
                     _ => None,
                 }
             })
             .collect();
-        if tracked_paths.is_empty() && pth_root_dirs.is_empty() {
+        if tracked_paths.is_empty() {
             tracing::debug!(
                 changed = params.changes.len(),
                 "watched files changed; no python analysis inputs to sync"
             );
             return;
         }
-        let (synced, bumped_roots) = self
+        let synced = self
             .with_session("watching files", |s| {
                 let mut synced = 0usize;
-                {
-                    let mut db = s.db.lock();
-                    for std_path in &tracked_paths {
-                        let Some(sys_path) = SystemPath::from_std_path(std_path) else {
-                            continue;
-                        };
-                        File::sync_path(&mut *db, sys_path);
-                        synced += 1;
-                    }
+                let mut db = s.db.lock();
+                for std_path in &tracked_paths {
+                    let Some(sys_path) = SystemPath::from_std_path(std_path) else {
+                        continue;
+                    };
+                    File::sync_path(&mut *db, sys_path);
+                    synced += 1;
                 }
-                let bumped_roots = s.bump_site_packages_pth_roots(&pth_root_dirs);
-                (synced, bumped_roots)
+                synced
             })
-            .unwrap_or((0, 0));
+            .unwrap_or(0);
         tracing::debug!(
             changed = params.changes.len(),
             synced,
-            pth_root_candidate_dirs = pth_root_dirs.len(),
-            pth_root_bumped_dirs = bumped_roots,
             "watched files changed; synced python analysis inputs"
         );
 
         // The sync above invalidated Python-dependent salsa queries but did not
         // refresh diagnostics, now we refresh diagnostics, unless none to refresh.
-        if !self.settings.read().features.diagnostics || (synced == 0 && bumped_roots == 0) {
+        if !self.settings.read().features.diagnostics || synced == 0 {
             return;
         }
 

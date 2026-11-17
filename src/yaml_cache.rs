@@ -13,10 +13,10 @@ use crate::yaml_parser::{HydraSemanticToken, ParsedContent, YamlParseError, Yaml
 #[salsa::input]
 pub struct DocumentInput {
     /// The full text of the document.
-    #[returns(ref)]
     pub text: String,
 
     /// The document version from the LSP protocol.
+    #[returns(copy)]
     pub version: i32,
 }
 
@@ -81,7 +81,7 @@ impl Eq for ParsedYaml {}
 ///
 /// Depends on `DocumentInput::text`, so it automatically invalidates
 /// when the document content changes. Bounded with `lru=512`.
-#[salsa::tracked(lru = 512)]
+#[salsa::tracked(returns(copy), lru = 512)]
 pub fn is_hydra_file(db: &dyn salsa::Database, input: DocumentInput) -> bool {
     debug!("is_hydra_file: executing (cache miss)");
     let text = input.text(db);
@@ -98,7 +98,7 @@ pub fn is_hydra_file(db: &dyn salsa::Database, input: DocumentInput) -> bool {
 /// Uses `lru=512` to bound memory usage for large workspaces while
 /// comfortably exceeding the number of YAML files an editor typically
 /// has open at once.
-#[salsa::tracked(no_eq, lru = 512)]
+#[salsa::tracked(returns(clone), no_eq, lru = 512)]
 pub fn parsed_yaml(db: &dyn salsa::Database, input: DocumentInput) -> ParsedYaml {
     debug!("parsed_yaml: executing (cache miss)");
     let text = input.text(db);
@@ -111,7 +111,7 @@ pub fn parsed_yaml(db: &dyn salsa::Database, input: DocumentInput) -> ParsedYaml
 /// invalidated whenever the document text changes. On the warm path (same
 /// document, no edits) this is a single salsa hit that returns the cached
 /// `Vec` via `Arc`-shared storage without re-tokenising.
-#[salsa::tracked(returns(ref), lru = 256)]
+#[salsa::tracked(lru = 256)]
 pub fn semantic_tokens(db: &dyn salsa::Database, input: DocumentInput) -> Vec<HydraSemanticToken> {
     debug!("semantic_tokens: executing (cache miss)");
     let parsed = parsed_yaml(db, input);
