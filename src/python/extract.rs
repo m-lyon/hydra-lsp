@@ -483,12 +483,10 @@ fn check_method_decorators(decorators: &[ast::Decorator]) -> (bool, bool) {
     let mut is_staticmethod = false;
 
     for decorator in decorators {
-        if let Expr::Name(name) = &decorator.expression {
-            match name.id.as_str() {
-                "classmethod" => is_classmethod = true,
-                "staticmethod" => is_staticmethod = true,
-                _ => {}
-            }
+        match expr_to_string(&decorator.expression).as_str() {
+            "classmethod" | "builtins.classmethod" => is_classmethod = true,
+            "staticmethod" | "builtins.staticmethod" => is_staticmethod = true,
+            _ => {}
         }
     }
 
@@ -669,6 +667,36 @@ mod tests {
     use super::*;
 
     use crate::python::test_support::{get_simple_test_dir, test_db};
+
+    #[test]
+    fn test_extract_qualified_method_decorators() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("methods.py");
+        std::fs::write(
+            &path,
+            "\
+import builtins
+
+class Factory:
+    @builtins.staticmethod
+    def make(value): ...
+
+    @builtins.classmethod
+    def from_value(cls, value): ...
+
+    @other.staticmethod
+    def custom(self, value): ...
+",
+        )
+        .unwrap();
+
+        let db = test_db();
+        let kinds = ["make", "from_value", "custom"].map(|name| {
+            let method = extract_method_info(&db, &path, "Factory", name).unwrap();
+            (method.is_classmethod, method.is_staticmethod)
+        });
+        assert_eq!(kinds, [(false, true), (true, false), (false, false)]);
+    }
 
     // ==================== extract_function_signature tests ====================
 

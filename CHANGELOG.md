@@ -1,5 +1,9 @@
 # Changelog
 
+## [Unreleased]
+
+- Recognise `@builtins.staticmethod` and `@builtins.classmethod` when resolving Python method targets.
+
 ## [0.7.0]
 
 - Removed unused dependencies and refactored internals.
