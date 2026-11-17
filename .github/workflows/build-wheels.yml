@@ -137,9 +137,9 @@ jobs:
       - uses: ./.github/actions/release-archive
         with:
           target: ${{ matrix.target }}
-      # Kept on v4 to match the download-artifact v4.3.0 that dist pins in
-      # release.yml. The upload-artifact docs do not say v4 reads v7 uploads.
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      # release.yml downloads these. Its action pins live in dist-workspace.toml;
+      # keep them on the same versions as this file.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: artifacts-${{ matrix.target }}
           path: archive
@@ -196,9 +196,9 @@ jobs:
         with:
           target: ${{ matrix.target }}
           run-binary: ${{ matrix.target == 'aarch64-apple-darwin' }}
-      # Kept on v4 to match the download-artifact v4.3.0 that dist pins in
-      # release.yml. The upload-artifact docs do not say v4 reads v7 uploads.
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      # release.yml downloads these. Its action pins live in dist-workspace.toml;
+      # keep them on the same versions as this file.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: artifacts-${{ matrix.target }}
           path: archive
@@ -240,9 +240,9 @@ jobs:
       - uses: ./.github/actions/release-archive
         with:
           target: ${{ matrix.target }}
-      # Kept on v4 to match the download-artifact v4.3.0 that dist pins in
-      # release.yml. The upload-artifact docs do not say v4 reads v7 uploads.
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      # release.yml downloads these. Its action pins live in dist-workspace.toml;
+      # keep them on the same versions as this file.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: artifacts-${{ matrix.target }}
           path: archive
