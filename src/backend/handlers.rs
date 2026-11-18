@@ -258,9 +258,9 @@ impl LanguageServer for HydraLspBackend {
         // (typically Python sources outside the editor). For each changed
         // path we call `File::sync_path`, which bumps the per-file revision
         // inside ruff_db so that any salsa query reading that file's
-        // `source_text` is invalidated on the next request. A file that was
-        // created or deleted also bumps its parent directory, which is what
-        // makes `parse_pth_files` re-scan site-packages for a new `.pth`.
+        // `source_text` is invalidated on the next request. A created or
+        // deleted file also bumps its ancestor directories, whose listings
+        // module resolution and the `.pth` scan read.
         //
         // We filter to Python analysis inputs before locking: `.py`, `.pyi`,
         // and watched `.pth` files all participate in analysis. These extensions
@@ -268,7 +268,7 @@ impl LanguageServer for HydraLspBackend {
         if params.changes.is_empty() {
             return;
         }
-        let tracked_paths: Vec<std::path::PathBuf> = params
+        let tracked_paths: Vec<(std::path::PathBuf, FileChangeType)> = params
             .changes
             .iter()
             .filter_map(|change| {
@@ -279,7 +279,7 @@ impl LanguageServer for HydraLspBackend {
                     .map(str::to_ascii_lowercase)
                     .as_deref()
                 {
-                    Some("py") | Some("pyi") | Some("pth") => Some(path),
+                    Some("py") | Some("pyi") | Some("pth") => Some((path, change.typ)),
                     _ => None,
                 }
             })
@@ -295,11 +295,11 @@ impl LanguageServer for HydraLspBackend {
             .with_session("watching files", |s| {
                 let mut synced = 0usize;
                 let mut db = s.db.lock();
-                for std_path in &tracked_paths {
+                for (std_path, typ) in &tracked_paths {
                     let Some(sys_path) = SystemPath::from_std_path(std_path) else {
                         continue;
                     };
-                    File::sync_path(&mut *db, sys_path);
+                    sync_watched_path(&mut *db, sys_path, *typ != FileChangeType::CHANGED);
                     synced += 1;
                 }
                 synced
@@ -870,6 +870,20 @@ impl LanguageServer for HydraLspBackend {
                 tracing::error!(%msg, "validate_document task panicked (pull)");
                 Ok(empty_full_report())
             }
+        }
+    }
+}
+
+/// Sync a watched path. When it was created or deleted, its ancestors are
+/// synced too: a new `pkg/sub/mod.py` also adds `pkg` to its parent's listing,
+/// and the client reports no event for the directories. Only directories some
+/// query already read cost a `stat`.
+fn sync_watched_path(db: &mut dyn ruff_db::Db, path: &SystemPath, created_or_deleted: bool) {
+    File::sync_path(db, path);
+    if created_or_deleted {
+        let absolute = SystemPath::absolute(path, db.system().current_directory());
+        for ancestor in absolute.ancestors().skip(1) {
+            File::sync_path_only(db, ancestor);
         }
     }
 }

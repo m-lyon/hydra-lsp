@@ -9,22 +9,19 @@
 //!
 //! # Sentinel paths
 //!
-//! Module resolution throughout the crate uses `std::path::Path`, however the
-//! vendored stubs are not on disk. Rather than thread a `FilePath` enum through
-//! every resolver signature, vendored files are addressed by a sentinel path
-//! rooted at [`VENDORED_ROOT`]: `<typeshed>/stdlib/builtins.pyi`. Such a path
-//! is built and probed exactly like a real one — `ImportResolver`'s
-//! `find_module_file` walks the same `.pyi`-before-`.py` candidates against
-//! [`stdlib_search_root`] — and only the two functions that actually touch a
+//! Module resolution goes through `ty_module_resolver`, which hands back the
+//! vendored stub as a `File`, but the rest of the crate addresses files by
+//! `std::path::Path`. Rather than thread a `FilePath` enum through every
+//! signature, a vendored file is given a sentinel path rooted at
+//! [`VENDORED_ROOT`]: `<typeshed>/stdlib/builtins.pyi`
+//! ([`vendored_sentinel_path`]). Only the two functions that actually touch a
 //! file, `path_is_file` and `path_to_file` in `extract`, branch on
 //! [`is_vendored_path`] to reach the `VendoredFileSystem` instead of the OS.
 //!
-//! The root is *not* a member of the search-path list built by
-//! `build_search_paths`. `resolve_module_cached` consults it as a last resort,
-//! after every real root has missed, and only for a module [`is_vendored_module`]
-//! admits — so a workspace or site-packages `builtins` still shadows the stub,
-//! and the sentinel never leaks into consumers of the search paths such as the
-//! file watcher.
+//! The resolver puts the stdlib stubs after the first-party roots and before
+//! site-packages, as the typing spec orders them. `resolve_module_cached` keeps
+//! a stub-backed module only when [`is_vendored_module`] admits it, so the
+//! rest of the stdlib stays unresolved.
 //!
 //! `<typeshed>` is a relative single-component path containing characters that
 //! are illegal in Windows filenames, so it cannot collide with a real search
@@ -45,10 +42,17 @@ pub const BUILTINS_MODULE: &str = "builtins";
 ///
 /// Typeshed's stdlib stubs live under `stdlib/` inside the archive, so the root
 /// is `<typeshed>/stdlib` and `builtins` resolves to
-/// `<typeshed>/stdlib/builtins.pyi`. `resolve_module_cached` probes it after
-/// every real search root has missed.
+/// `<typeshed>/stdlib/builtins.pyi`.
 pub fn stdlib_search_root() -> PathBuf {
     Path::new(VENDORED_ROOT).join("stdlib")
+}
+
+/// The sentinel path for a file in the vendored archive, the inverse of
+/// [`to_vendored_path`].
+pub fn vendored_sentinel_path(path: &VendoredPath) -> PathBuf {
+    let mut sentinel = PathBuf::from(VENDORED_ROOT);
+    sentinel.extend(path.as_str().split('/'));
+    sentinel
 }
 
 /// Whether `path` addresses a file inside the vendored typeshed archive.
@@ -125,10 +129,9 @@ pub fn vendored_module_name(path: &Path) -> Option<String> {
     Some(parts.join("."))
 }
 
-/// Whether module resolution may fall through to the vendored search root for
-/// `module_path`.
+/// Whether a module the vendored stdlib stubs answer for `module_path` is kept.
 ///
-/// Wiring in typeshed makes the whole stdlib reachable, but only builtins is relevant
+/// The resolver makes the whole stdlib reachable, but only builtins is relevant
 /// for hydra, therefore only `builtins` and its submodules are admitted.
 pub fn is_vendored_module(module_path: &str) -> bool {
     module_path == BUILTINS_MODULE
@@ -154,6 +157,16 @@ mod tests {
         assert_eq!(
             to_vendored_path(&stub).unwrap().as_str(),
             "stdlib/builtins.pyi"
+        );
+    }
+
+    #[test]
+    fn archive_paths_round_trip_through_sentinels() {
+        let sentinel = vendored_sentinel_path(VendoredPath::new("stdlib/os/path.pyi"));
+        assert_eq!(sentinel, stdlib_search_root().join("os").join("path.pyi"));
+        assert_eq!(
+            to_vendored_path(&sentinel).unwrap().as_str(),
+            "stdlib/os/path.pyi"
         );
     }
 

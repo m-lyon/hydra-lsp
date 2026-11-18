@@ -25,6 +25,8 @@ pub use yaml_parser::{CompletionContext, HydraObject, SemanticTokenType, YamlPar
 
 // Only called by tests
 #[doc(hidden)]
+pub use python::cache::environment_for_roots;
+#[doc(hidden)]
 pub use python::extract::{extract_class_info, extract_function_signature};
 #[doc(hidden)]
 pub use python::resolve::extract_definition_info;

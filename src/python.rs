@@ -27,4 +27,17 @@ pub(crate) mod test_support {
     pub(crate) fn test_db() -> HydraDatabase {
         HydraDatabase::new(SystemPath::new("/"))
     }
+
+    /// `extract_definition_info` with `roots` as the first-party search roots.
+    pub(crate) fn extract_definition_info(
+        db: &dyn ty_module_resolver::Db,
+        target: &str,
+        roots: &[PathBuf],
+    ) -> Result<super::cache::ResolvedDefinition, super::model::ResolveError> {
+        super::resolve::extract_definition_info(
+            db,
+            target,
+            super::cache::environment_for_roots(db, roots),
+        )
+    }
 }

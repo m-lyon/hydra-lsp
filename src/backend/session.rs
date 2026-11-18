@@ -136,10 +136,10 @@ impl HydraLspBackend {
     ///
     /// These are the site-packages and `.pth`-target directories the resolver
     /// reads from but that a workspace-relative watcher glob would miss (see
-    /// `initialized`). Shares the exact `search_paths_for_config` list the
-    /// resolver uses, so each watched root equals the path the resolver interns
-    /// under. Nested paths are collapsed so a parent `**` watcher isn't
-    /// duplicated by one of its children.
+    /// `initialized`). Taken from the resolver's own search paths, so each
+    /// watched root equals the path the resolver interns under. Nested paths
+    /// are collapsed so a parent `**` watcher isn't duplicated by one of its
+    /// children.
     pub(super) fn out_of_workspace_search_roots(&self) -> Vec<std::path::PathBuf> {
         self.with_session("computing watched search paths", |s| {
             let db = s.db.lock();
@@ -148,16 +148,17 @@ impl HydraLspBackend {
                 .workspace_root(&*db)
                 .as_deref()
                 .map(std::path::PathBuf::from);
+            let environment = python_cache::resolver_environment(&*db, s.python_config);
             let roots: Vec<ruff_db::system::SystemPathBuf> =
-                python_cache::search_paths_for_config(&*db, s.python_config)
-                    .iter()
-                    // Drop the relative "." entry and anything under the
-                    // workspace (already covered by the workspace-relative glob).
-                    .filter(|path| path.is_absolute())
-                    .filter(|path| workspace.as_ref().is_none_or(|w| !path.starts_with(w)))
-                    .filter_map(|path| {
-                        ruff_db::system::SystemPathBuf::from_path_buf(path.clone()).ok()
+                ty_module_resolver::system_module_search_paths(&*db, environment)
+                    // Drop anything under the workspace (already covered by
+                    // the workspace-relative glob).
+                    .filter(|path| {
+                        workspace
+                            .as_ref()
+                            .is_none_or(|w| !path.as_std_path().starts_with(w))
                     })
+                    .map(ToOwned::to_owned)
                     .collect();
             ruff_db::system::deduplicate_nested_paths(roots)
                 .map(|path| path.as_std_path().to_path_buf())
@@ -236,7 +237,7 @@ mod tests {
 
     /// Build a minimal on-disk venv so `discover_python_environment` returns a
     /// real site-packages directory, and register its `FileRoot`s exactly as
-    /// production does (via `python_cache::site_packages_paths`). Discovery uses
+    /// production does (via `python_cache::discovered_environment`). Discovery uses
     /// a real `OsSystem` (not the db's system), so this must be an actual
     /// filesystem layout, not an in-memory one — it mirrors `python::env`'s
     /// in-memory `create_mock_venv`. The returned `TempDir` must be kept alive
@@ -300,7 +301,9 @@ mod tests {
 
         let has_editable = |session: &Session| {
             let db = session.db.lock();
-            python_cache::search_paths_for_config(&*db, session.python_config).contains(&editable)
+            let environment = python_cache::resolver_environment(&*db, session.python_config);
+            ty_module_resolver::editable_search_paths(&*db, environment)
+                .any(|path| path.as_std_path() == editable)
         };
         assert!(!has_editable(&session));
 

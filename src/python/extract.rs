@@ -74,13 +74,17 @@ pub(super) fn read_source(db: &dyn ruff_db::Db, path: &Path) -> Result<SourceTex
 /// Returns the salsa-cached `ParsedModuleRef` (LRU 200). Callers that also need
 /// the raw source text should call `read_source` separately — both are cache hits
 /// for the same revision.
-pub(super) fn get_parsed_module(db: &dyn ruff_db::Db, path: &Path) -> Result<ParsedModuleRef> {
+///
+/// The version is part of the parse's salsa key, so callers pass the resolver
+/// environment's version: any other value parses the same file a second time.
+pub(super) fn get_parsed_module(
+    db: &dyn ruff_db::Db,
+    path: &Path,
+    python_version: PythonVersion,
+) -> Result<ParsedModuleRef> {
     let file = path_to_file(db, path)
         .with_context(|| format!("could not resolve file: {}", path.display()))?;
-    // The interpreter's version is not plumbed through yet, so every file is
-    // parsed as the latest dialect. It only affects which syntax the parser
-    // reports as unsupported, which nothing here reads.
-    let file = PythonFile::new(db, file, PythonVersion::latest_ty());
+    let file = PythonFile::new(db, file, python_version);
     Ok(parsed_module(db, file).load(db))
 }
 
@@ -112,9 +116,10 @@ pub fn extract_function_signature(
     db: &dyn ruff_db::Db,
     path: &Path,
     function_name: &str,
+    python_version: PythonVersion,
 ) -> Result<FunctionSignature> {
     let source = read_source(db, path)?;
-    let parsed = get_parsed_module(db, path)?;
+    let parsed = get_parsed_module(db, path, python_version)?;
 
     let mut visitor = FunctionExtractor {
         target_name: function_name.to_string(),
@@ -128,7 +133,12 @@ pub fn extract_function_signature(
 }
 
 /// Whether `name` is bound at module scope in the module at `path`.
-pub(super) fn module_defines_top_level(db: &dyn ruff_db::Db, path: &Path, name: &str) -> bool {
+pub(super) fn module_defines_top_level(
+    db: &dyn ruff_db::Db,
+    path: &Path,
+    name: &str,
+    python_version: PythonVersion,
+) -> bool {
     fn body_binds(body: &[Stmt], name: &str) -> bool {
         body.iter().any(|stmt| match stmt {
             Stmt::FunctionDef(func_def) => {
@@ -157,7 +167,7 @@ pub(super) fn module_defines_top_level(db: &dyn ruff_db::Db, path: &Path, name: 
         })
     }
 
-    let Ok(parsed) = get_parsed_module(db, path) else {
+    let Ok(parsed) = get_parsed_module(db, path, python_version) else {
         return false;
     };
     body_binds(parsed.suite(), name)
@@ -168,9 +178,10 @@ pub fn extract_class_info(
     db: &dyn ruff_db::Db,
     path: &Path,
     class_name: &str,
+    python_version: PythonVersion,
 ) -> Result<ClassInfo> {
     let source = read_source(db, path)?;
-    let parsed = get_parsed_module(db, path)?;
+    let parsed = get_parsed_module(db, path, python_version)?;
 
     let mut visitor = ClassExtractor {
         target_name: class_name.to_string(),
@@ -189,9 +200,10 @@ pub(super) fn extract_method_info(
     path: &Path,
     class_name: &str,
     method_name: &str,
+    python_version: PythonVersion,
 ) -> Result<MethodInfo> {
     let source = read_source(db, path)?;
-    let parsed = get_parsed_module(db, path)?;
+    let parsed = get_parsed_module(db, path, python_version)?;
 
     let mut visitor = MethodExtractor {
         class_name: class_name.to_string(),
@@ -215,8 +227,9 @@ pub(super) fn extract_class_attribute(
     path: &Path,
     class_name: &str,
     attribute_name: &str,
+    python_version: PythonVersion,
 ) -> Result<ClassAttributeInfo> {
-    let parsed = get_parsed_module(db, path)?;
+    let parsed = get_parsed_module(db, path, python_version)?;
 
     let mut visitor = ClassAttributeExtractor {
         class_name: class_name.to_string(),
@@ -683,7 +696,13 @@ mod tests {
         let test_file = examples_dir.join("my_module.py");
         let db = test_db();
 
-        let sig = extract_function_signature(&db, &test_file, "simple_function").unwrap();
+        let sig = extract_function_signature(
+            &db,
+            &test_file,
+            "simple_function",
+            PythonVersion::latest_ty(),
+        )
+        .unwrap();
         assert_eq!(sig.name, "simple_function");
         assert_eq!(sig.parameters.len(), 0);
         assert!(sig.docstring.is_some());
@@ -696,7 +715,13 @@ mod tests {
         let test_file = examples_dir.join("my_module.py");
         let db = test_db();
 
-        let sig = extract_function_signature(&db, &test_file, "function_with_params").unwrap();
+        let sig = extract_function_signature(
+            &db,
+            &test_file,
+            "function_with_params",
+            PythonVersion::latest_ty(),
+        )
+        .unwrap();
         assert_eq!(sig.name, "function_with_params");
         assert_eq!(sig.parameters.len(), 3);
 
@@ -726,7 +751,13 @@ mod tests {
         let test_file = examples_dir.join("my_module.py");
         let db = test_db();
 
-        let sig = extract_function_signature(&db, &test_file, "function_with_return").unwrap();
+        let sig = extract_function_signature(
+            &db,
+            &test_file,
+            "function_with_return",
+            PythonVersion::latest_ty(),
+        )
+        .unwrap();
         assert_eq!(sig.name, "function_with_return");
         assert!(sig.return_type.is_some());
         assert_eq!(sig.return_type.as_ref().unwrap(), "int");
@@ -738,7 +769,13 @@ mod tests {
         let test_file = examples_dir.join("my_module.py");
         let db = test_db();
 
-        let sig = extract_function_signature(&db, &test_file, "variadic_function").unwrap();
+        let sig = extract_function_signature(
+            &db,
+            &test_file,
+            "variadic_function",
+            PythonVersion::latest_ty(),
+        )
+        .unwrap();
         assert_eq!(sig.name, "variadic_function");
         assert_eq!(sig.parameters.len(), 2);
 
@@ -757,7 +794,13 @@ mod tests {
         let test_file = examples_dir.join("my_module.py");
         let db = test_db();
 
-        let sig = extract_function_signature(&db, &test_file, "complex_function").unwrap();
+        let sig = extract_function_signature(
+            &db,
+            &test_file,
+            "complex_function",
+            PythonVersion::latest_ty(),
+        )
+        .unwrap();
         assert_eq!(sig.name, "complex_function");
 
         // Should have: pos_only, regular, *args, keyword_only, another_kw, **kwargs
@@ -781,7 +824,8 @@ mod tests {
         let test_file = examples_dir.join("my_module.py");
         let db = test_db();
 
-        let result = extract_function_signature(&db, &test_file, "nonexistent");
+        let result =
+            extract_function_signature(&db, &test_file, "nonexistent", PythonVersion::latest_ty());
         assert!(result.is_err());
     }
 
@@ -793,7 +837,8 @@ mod tests {
         let test_file = examples_dir.join("my_module.py");
         let db = test_db();
 
-        let class_info = extract_class_info(&db, &test_file, "SimpleClass").unwrap();
+        let class_info =
+            extract_class_info(&db, &test_file, "SimpleClass", PythonVersion::latest_ty()).unwrap();
         assert_eq!(class_info.name, "SimpleClass");
         assert!(class_info.docstring.is_some());
         assert!(class_info.init_signature.is_none());
@@ -805,7 +850,9 @@ mod tests {
         let test_file = examples_dir.join("my_module.py");
         let db = test_db();
 
-        let class_info = extract_class_info(&db, &test_file, "ClassWithInit").unwrap();
+        let class_info =
+            extract_class_info(&db, &test_file, "ClassWithInit", PythonVersion::latest_ty())
+                .unwrap();
         assert_eq!(class_info.name, "ClassWithInit");
         assert!(class_info.docstring.is_some());
         assert!(class_info.init_signature.is_some());
@@ -839,7 +886,9 @@ mod tests {
         let test_file = examples_dir.join("my_module.py");
         let db = test_db();
 
-        let class_info = extract_class_info(&db, &test_file, "ComplexClass").unwrap();
+        let class_info =
+            extract_class_info(&db, &test_file, "ComplexClass", PythonVersion::latest_ty())
+                .unwrap();
         assert_eq!(class_info.name, "ComplexClass");
         assert!(class_info.init_signature.is_some());
 
@@ -854,7 +903,12 @@ mod tests {
         let test_file = examples_dir.join("my_module.py");
         let db = test_db();
 
-        let result = extract_class_info(&db, &test_file, "NonexistentClass");
+        let result = extract_class_info(
+            &db,
+            &test_file,
+            "NonexistentClass",
+            PythonVersion::latest_ty(),
+        );
         assert!(result.is_err());
     }
 }

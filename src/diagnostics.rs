@@ -1,4 +1,6 @@
-use crate::python::cache::{PythonConfig, TargetString, cached_definition_info, is_builtin_symbol};
+use crate::python::cache::{
+    PythonConfig, TargetString, cached_definition_info, is_builtin_symbol, resolver_environment,
+};
 use crate::python::model::{
     DefinitionInfo, FunctionSignature, ParameterInfo, ParameterKind, ResolveError,
 };
@@ -45,7 +47,7 @@ pub(crate) fn create_diagnostic(
 /// Routes through `cached_definition_info`.
 fn validate_target(
     hydra_obj: &HydraObject,
-    db: &dyn ruff_db::Db,
+    db: &dyn ty_module_resolver::Db,
     python_config: PythonConfig,
     file_suppressions: &HashSet<DiagnosticRule>,
 ) -> (Vec<Diagnostic>, Option<DefinitionInfo>) {
@@ -59,7 +61,7 @@ fn validate_target(
             let rule = err.rule();
             let msg = match err {
                 ResolveError::InvalidFormat(_) => {
-                    format!("{}. {}", err, target_format_hint(db, target))
+                    format!("{}. {}", err, target_format_hint(db, python_config, target))
                 }
                 ResolveError::UnresolvedModule(_) | ResolveError::Other(_) => err.to_string(),
             };
@@ -92,9 +94,13 @@ impl ResolveError {
     }
 }
 
-fn target_format_hint(db: &dyn ruff_db::Db, target: TargetString<'_>) -> String {
+fn target_format_hint(
+    db: &dyn ty_module_resolver::Db,
+    python_config: PythonConfig,
+    target: TargetString<'_>,
+) -> String {
     let name = target.value(db);
-    if is_builtin_symbol(db, target) {
+    if is_builtin_symbol(db, resolver_environment(db, python_config), target) {
         format!("'{name}' is a Python builtin; use '{BUILTINS_MODULE}.{name}'")
     } else {
         "Expected format: 'module.path.SymbolName'".to_string()
@@ -490,7 +496,7 @@ fn validate_hydra_keywords(
 pub fn validate_document(
     parsed_content: &ParsedContent,
     extra_suppressions: &HashSet<DiagnosticRule>,
-    db: &dyn ruff_db::Db,
+    db: &dyn ty_module_resolver::Db,
     python_config: PythonConfig,
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();

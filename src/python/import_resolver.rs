@@ -1,13 +1,13 @@
-use super::cache::{InternedSearchPaths, TargetString, resolve_module_cached};
+use super::cache::{TargetString, resolve_module_cached};
 use super::extract::{
     extract_class_info, extract_function_signature, get_parsed_module, path_is_file,
 };
 use super::model::{ClassInfo, FunctionSignature};
-use ruff_python_ast::{self as ast, Expr, Stmt, visitor::Visitor};
+use ruff_python_ast::{self as ast, Expr, PythonVersion, Stmt, visitor::Visitor};
 use rustc_hash::FxHashSet;
-use std::cell::OnceCell;
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
+use ty_module_resolver::{ResolverEnvironment, system_module_search_paths};
 
 const MAX_IMPORT_DEPTH: usize = 10;
 
@@ -45,26 +45,25 @@ enum ImportInfo {
 }
 
 /// Context for import resolution operations
-pub struct ImportResolver<'db, 'sp> {
-    db: &'db dyn ruff_db::Db,
-    search_paths: &'sp [PathBuf],
-    /// Interned once per resolver, on first use. Interning clones and hashes the
-    /// whole search-path list, and many resolvers never resolve a module at all
-    /// (symbol found in the file, relative-only import).
-    interned_search_paths: OnceCell<InternedSearchPaths<'db>>,
+pub struct ImportResolver<'db> {
+    db: &'db dyn ty_module_resolver::Db,
+    environment: ResolverEnvironment<'db>,
     visited_files: HashSet<PathBuf>,
     depth: usize,
 }
 
-impl<'db, 'sp> ImportResolver<'db, 'sp> {
-    pub fn new(db: &'db dyn ruff_db::Db, search_paths: &'sp [PathBuf]) -> Self {
+impl<'db> ImportResolver<'db> {
+    pub fn new(db: &'db dyn ty_module_resolver::Db, environment: ResolverEnvironment<'db>) -> Self {
         Self {
             db,
-            search_paths,
-            interned_search_paths: OnceCell::new(),
+            environment,
             visited_files: HashSet::new(),
             depth: 0,
         }
+    }
+
+    fn python_version(&self) -> PythonVersion {
+        self.environment.python_version(self.db)
     }
 
     /// Try to find a module file given a base package path
@@ -100,20 +99,13 @@ impl<'db, 'sp> ImportResolver<'db, 'sp> {
         None
     }
 
-    /// Resolve a module path to a file path.
-    ///
-    /// Delegates to the memoised `resolve_module_cached` so that a module hit
-    /// once per `follow_import` hop is not re-probed on the filesystem, and so
-    /// there is a single copy of the resolution rules.
+    /// Resolve an absolute module name to a file path, through the memoised
+    /// `resolve_module_cached`.
     pub fn resolve_module_path(&self, module_path: &str) -> Option<PathBuf> {
-        let interned = *self
-            .interned_search_paths
-            .get_or_init(|| InternedSearchPaths::new(self.db, self.search_paths.to_vec()));
-
         resolve_module_cached(
             self.db,
             TargetString::new(self.db, module_path.to_string()),
-            interned,
+            self.environment,
         )
         .clone()
     }
@@ -144,10 +136,8 @@ impl<'db, 'sp> ImportResolver<'db, 'sp> {
         // that directory is inside a search root. Otherwise the import reached
         // past the top-level package, which Python rejects, so there is nothing
         // valid left to resolve against.
-        if !self
-            .search_paths
-            .iter()
-            .any(|search_path| current_dir.starts_with(search_path))
+        if !system_module_search_paths(self.db, self.environment)
+            .any(|search_path| current_dir.starts_with(search_path.as_std_path()))
         {
             return None;
         }
@@ -168,7 +158,7 @@ impl<'db, 'sp> ImportResolver<'db, 'sp> {
 
     /// Extract __all__ from a module
     fn extract_dunder_all(&mut self, file_path: &Path) -> Option<FxHashSet<String>> {
-        let parsed = get_parsed_module(self.db, file_path).ok()?;
+        let parsed = get_parsed_module(self.db, file_path, self.python_version()).ok()?;
         let mut dunder_all_finder = DunderAllFinder::default();
         dunder_all_finder.visit_body(parsed.suite());
         dunder_all_finder.names
@@ -180,7 +170,7 @@ impl<'db, 'sp> ImportResolver<'db, 'sp> {
         file_path: &Path,
         symbol_name: &str,
     ) -> Option<ImportInfo> {
-        let parsed = get_parsed_module(self.db, file_path).ok()?;
+        let parsed = get_parsed_module(self.db, file_path, self.python_version()).ok()?;
         let mut finder = ImportFinder {
             target_symbol: symbol_name.to_string(),
             result: None,
@@ -194,7 +184,7 @@ impl<'db, 'sp> ImportResolver<'db, 'sp> {
     /// import time, which is how a name can be a valid runtime export
     /// without being assigned anywhere in the module body.
     fn has_module_level_getattr(&mut self, file_path: &Path) -> bool {
-        let Ok(parsed) = get_parsed_module(self.db, file_path) else {
+        let Ok(parsed) = get_parsed_module(self.db, file_path, self.python_version()) else {
             return false;
         };
         parsed.suite().iter().any(|stmt| {
@@ -209,7 +199,7 @@ impl<'db, 'sp> ImportResolver<'db, 'sp> {
         file_path: &Path,
         symbol_name: &str,
     ) -> Option<ImportInfo> {
-        let parsed = get_parsed_module(self.db, file_path).ok()?;
+        let parsed = get_parsed_module(self.db, file_path, self.python_version()).ok()?;
         let mut typing_aliases: Option<FxHashSet<String>> = None;
         for stmt in parsed.suite() {
             let Stmt::If(if_stmt) = stmt else { continue };
@@ -245,7 +235,7 @@ impl<'db, 'sp> ImportResolver<'db, 'sp> {
 
     /// Extract all star imports from a module, as `(module, level)` pairs
     fn find_star_imports(&mut self, file_path: &Path) -> Vec<(String, u32)> {
-        let Ok(parsed) = get_parsed_module(self.db, file_path) else {
+        let Ok(parsed) = get_parsed_module(self.db, file_path, self.python_version()) else {
             return Vec::new();
         };
         let mut finder = StarImportFinder::default();
@@ -255,7 +245,7 @@ impl<'db, 'sp> ImportResolver<'db, 'sp> {
 
     /// Check if a class is directly defined in the file
     fn find_class_direct(&mut self, file_path: &Path, class_name: &str) -> Option<ClassInfo> {
-        extract_class_info(self.db, file_path, class_name).ok()
+        extract_class_info(self.db, file_path, class_name, self.python_version()).ok()
     }
 
     /// Check if a function is directly defined in the file
@@ -264,7 +254,7 @@ impl<'db, 'sp> ImportResolver<'db, 'sp> {
         file_path: &Path,
         function_name: &str,
     ) -> Option<FunctionSignature> {
-        extract_function_signature(self.db, file_path, function_name).ok()
+        extract_function_signature(self.db, file_path, function_name, self.python_version()).ok()
     }
 
     /// Resolve a symbol by following import chains.
@@ -571,9 +561,9 @@ fn extract_list_of_strings(expr: &Expr) -> Option<FxHashSet<String>> {
 mod tests {
     use super::*;
     use crate::database::HydraDatabase;
-    use crate::python::cache::ResolvedDefinition;
+    use crate::python::cache::{ResolvedDefinition, environment_for_roots};
     use crate::python::model::DefinitionInfo;
-    use crate::python::resolve::extract_definition_info;
+    use crate::python::test_support::extract_definition_info;
     use ruff_db::system::SystemPath;
     use std::fs;
     use tempfile::TempDir;
@@ -700,7 +690,7 @@ mod tests {
     fn resolve_lazy_export(root: &Path, symbol_name: &str) -> Option<(PathBuf, String)> {
         let db = HydraDatabase::new(SystemPath::new("/"));
         let search_paths = vec![root.to_path_buf()];
-        let mut resolver = ImportResolver::new(&db, &search_paths);
+        let mut resolver = ImportResolver::new(&db, environment_for_roots(&db, &search_paths));
         let init_file = root.join("example_pkg").join("__init__.py");
         resolver.resolve_symbol(&init_file, symbol_name)
     }
@@ -1229,7 +1219,7 @@ mod tests {
 
         let db = HydraDatabase::new(SystemPath::new("/"));
         let search_paths = vec![repo.clone(), repo.join("src")];
-        let resolver = ImportResolver::new(&db, &search_paths);
+        let resolver = ImportResolver::new(&db, environment_for_roots(&db, &search_paths));
         let importer = package.join("__init__.py");
 
         assert_eq!(
@@ -1257,7 +1247,7 @@ mod tests {
 
         let db = HydraDatabase::new(SystemPath::new("/"));
         let search_paths = vec![repo.clone()];
-        let resolver = ImportResolver::new(&db, &search_paths);
+        let resolver = ImportResolver::new(&db, environment_for_roots(&db, &search_paths));
         let importer = sub_package.join("__init__.py");
 
         assert_eq!(
@@ -1293,7 +1283,7 @@ mod tests {
 
         let db = HydraDatabase::new(SystemPath::new("/"));
         let search_paths = vec![repo.clone()];
-        let resolver = ImportResolver::new(&db, &search_paths);
+        let resolver = ImportResolver::new(&db, environment_for_roots(&db, &search_paths));
         let importer = repo.join("pkg").join("__init__.py");
 
         // `from ...outside import ExportedClass` reaches above the root.
@@ -1351,7 +1341,7 @@ mod tests {
         db.write_file("/outside.py", "").expect("write outside");
 
         let search_paths = vec![PathBuf::from("/root")];
-        let resolver = ImportResolver::new(&db, &search_paths);
+        let resolver = ImportResolver::new(&db, environment_for_roots(&db, &search_paths));
 
         // Positive control: a guard that rejected everything would fail here.
         assert_eq!(

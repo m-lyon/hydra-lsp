@@ -1,14 +1,21 @@
-//! Finding the Python environment: site-packages discovery and the search
-//! paths built from it, including editable installs listed in `.pth` files.
+//! Finding the Python environment: the site-packages directories and Python
+//! version of the interpreter that Hydra will run under.
 
-use super::extract::read_source;
 use anyhow::Result;
-use ruff_db::files::directory_listing;
 use ruff_db::system::{OsSystem, SystemPath, SystemPathBuf};
-use std::path::{Path, PathBuf};
+use ruff_python_ast::PythonVersion;
+use std::path::Path;
 use ty_python_semantic::{PythonEnvironment, SysPrefixPathOrigin};
 
-/// Discover the Python environment and get site-packages paths
+/// What discovery found out about the interpreter.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DiscoveredEnvironment {
+    pub site_packages: Vec<SystemPathBuf>,
+    /// `None` when neither `pyvenv.cfg` nor the site-packages layout names it.
+    pub python_version: Option<PythonVersion>,
+}
+
+/// Discover the Python environment, its site-packages paths and its version.
 ///
 /// This uses `ty` Python environment discovery with the following priority:
 /// 1. Configured Python interpreter from LSP initialization (highest priority)
@@ -23,7 +30,7 @@ use ty_python_semantic::{PythonEnvironment, SysPrefixPathOrigin};
 pub(super) fn discover_python_environment(
     workspace_root: Option<&Path>,
     python_path: Option<&str>,
-) -> Result<Vec<SystemPathBuf>> {
+) -> Result<DiscoveredEnvironment> {
     // OsSystem requires an absolute CWD. Use workspace_root when provided;
     // fall back to the process's current directory otherwise.
     let cwd_buf = if let Some(root) = workspace_root {
@@ -61,114 +68,33 @@ pub(super) fn discover_python_environment(
             .ok_or_else(|| anyhow::anyhow!("No Python environment found"))?
     };
 
-    // Get site-packages directories from the discovered environment
     let site_packages_paths = env.site_packages_paths(&system)?;
+    // The same order ty uses: the venv's own metadata, then the layout.
+    let python_version = env
+        .python_version_from_metadata()
+        .cloned()
+        .or_else(|| site_packages_paths.python_version_from_layout())
+        .map(|version| version.version);
 
-    // Convert SitePackagesPaths to Vec<SystemPathBuf> for compatibility
-    Ok(site_packages_paths.into_vec())
-}
-
-/// Build search paths from discovered site-packages
-pub(super) fn build_search_paths(
-    db: &dyn ruff_db::Db,
-    workspace_root: Option<&Path>,
-    site_packages_paths: &Vec<SystemPathBuf>,
-) -> Vec<PathBuf> {
-    let mut search_paths = Vec::new();
-
-    // Add workspace root first (highest priority for first-party code)
-    if let Some(root) = workspace_root {
-        search_paths.push(PathBuf::from(root));
-    }
-
-    // Add current directory
-    search_paths.push(PathBuf::from("."));
-
-    // Add site-packages paths AND process .pth files for editable installs
-    for sys_path in site_packages_paths {
-        let site_packages = sys_path.as_std_path().to_path_buf();
-
-        // Process .pth files in this site-packages directory
-        let editable_paths = parse_pth_files(db, &site_packages);
-
-        search_paths.push(site_packages);
-        search_paths.extend(editable_paths);
-    }
-
-    search_paths
-}
-
-/// Parse all .pth files in a site-packages directory and extract editable install paths.
-///
-/// This follows the Python site module specification:
-/// - Empty lines and lines beginning with `#` are skipped
-/// - Lines starting with `import ` or `import\t` are executed, not treated as paths
-/// - All other lines are treated as directories to add to `sys.path`
-///
-/// See: https://docs.python.org/3/library/site.html
-pub(super) fn parse_pth_files(db: &dyn ruff_db::Db, site_packages: &Path) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-
-    // Listing through salsa makes this scan depend on the directory's own
-    // revision, which `File::sync_path` on a created or deleted `.pth` bumps.
-    let Some(directory) = SystemPath::from_std_path(site_packages) else {
-        return paths;
-    };
-    let Ok(listing) = directory_listing(db, directory) else {
-        return paths;
-    };
-
-    // The listing is sorted by name, the order the Python spec asks for.
-    let pth_files = listing
-        .iter()
-        .filter(|(name, _)| Path::new(name).extension().is_some_and(|ext| ext == "pth"))
-        .map(|(name, _)| site_packages.join(name));
-
-    for pth_file in pth_files {
-        let Ok(contents) = read_source(db, &pth_file) else {
-            continue;
-        };
-        for line in contents.as_str().lines() {
-            let line = line.trim_end();
-
-            // Skip empty lines, comments, and import statements
-            if line.is_empty()
-                || line.starts_with('#')
-                || line.starts_with("import ")
-                || line.starts_with("import\t")
-            {
-                continue;
-            }
-
-            // Resolve relative paths relative to site-packages
-            let path = if Path::new(line).is_absolute() {
-                PathBuf::from(line)
-            } else {
-                site_packages.join(line)
-            };
-
-            // We resolve symlinks only here, where the search-path list is
-            // first built, and keep every path lexical after this point (the
-            // same approach `ty` takes). Falls back to the original path if
-            // resolution fails (e.g. the dir was just deleted).
-            if path.is_dir() {
-                let canonical = std::fs::canonicalize(&path).unwrap_or(path);
-                paths.push(canonical);
-            }
-        }
-    }
-
-    paths
+    Ok(DiscoveredEnvironment {
+        site_packages: site_packages_paths.into_vec(),
+        python_version,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::python::cache::{InternedSearchPaths, TargetString, resolve_module_cached};
+    use crate::database::HydraDatabase;
+    use crate::python::cache::{
+        PythonConfig, TargetString, build_resolver_environment, resolve_module_cached,
+        resolver_environment,
+    };
     use crate::python::extract::extract_class_info;
-    use crate::python::resolve::extract_definition_info;
+    use std::path::PathBuf;
+    use ty_module_resolver::ResolverEnvironment;
 
-    use crate::python::test_support::{get_simple_test_dir, test_db};
+    use crate::python::test_support::{extract_definition_info, get_simple_test_dir, test_db};
 
     // ==================== Environment discovery and module resolution tests ====================
 
@@ -630,80 +556,53 @@ mod tests {
     // These tests verify that the configured Python interpreter from LSP initialization
     // takes priority over auto-discovery
 
+    /// Resolve `module` with `examples_dir` as the workspace and `interpreter`
+    /// configured, the way the server builds its environment.
+    fn resolve_with_interpreter(interpreter: Option<&str>, module: &str) -> Option<PathBuf> {
+        let examples_dir = get_simple_test_dir();
+        let db = test_db();
+        let config = PythonConfig::new(
+            &db,
+            Some(examples_dir.to_string_lossy().into_owned()),
+            interpreter.map(str::to_string),
+        );
+        let mid = TargetString::new(&db, module.to_string());
+        resolve_module_cached(&db, mid, resolver_environment(&db, config)).clone()
+    }
+
+    fn system_python() -> PathBuf {
+        which::which("python3")
+            .or_else(|_| which::which("python"))
+            .expect("Python not found in PATH")
+    }
+
     #[test]
     #[ignore = "Requires Python in PATH"]
     fn test_configured_interpreter_takes_priority() {
-        // This test verifies that when a Python interpreter is explicitly configured
-        // via LSP initialization, it is used instead of auto-discovery
-        let examples_dir = get_simple_test_dir();
-
-        // Get the current system Python
-        let system_python = which::which("python3")
-            .or_else(|_| which::which("python"))
-            .expect("Python not found in PATH");
-
-        let system_python_str = system_python.to_str().unwrap();
-
-        // Resolve a module with explicit interpreter configuration
-        let db = test_db();
-        let site_packages =
-            discover_python_environment(Some(examples_dir.as_ref()), Some(system_python_str))
-                .unwrap_or_default();
-        let search_paths = build_search_paths(&db, Some(examples_dir.as_ref()), &site_packages);
-        let mid = TargetString::new(&db, "my_module".to_string());
-        let spid = InternedSearchPaths::new(&db, search_paths);
-        let result_with_config = resolve_module_cached(&db, mid, spid).clone();
-
-        // Should succeed using the configured interpreter
+        let python = system_python();
         assert!(
-            result_with_config.is_some(),
+            resolve_with_interpreter(python.to_str(), "my_module").is_some(),
             "Module resolution should succeed with configured interpreter"
         );
     }
 
     #[test]
     fn test_auto_discovery_when_no_interpreter_configured() {
-        // This test verifies that when no Python interpreter is configured,
-        // the system falls back to auto-discovery
-        let examples_dir = get_simple_test_dir();
-        let db = test_db();
-        let search_paths = vec![examples_dir.clone(), PathBuf::from(".")];
-        let mid = TargetString::new(&db, "my_module".to_string());
-        let spid = InternedSearchPaths::new(&db, search_paths);
-        let result = resolve_module_cached(&db, mid, spid).clone();
-
-        // Should still succeed using auto-discovery
         assert!(
-            result.is_some(),
+            resolve_with_interpreter(None, "my_module").is_some(),
             "Module resolution should succeed with auto-discovery"
         );
     }
 
     #[test]
     #[ignore = "Requires Python in PATH"]
-    fn test_extract_definition_with_configured_interpreter() {
-        // Test that definition extraction uses configured interpreter
-        let examples_dir = get_simple_test_dir();
-
-        // Get the current system Python
-        let system_python = which::which("python3")
-            .or_else(|_| which::which("python"))
-            .ok();
-
-        let system_python_str = system_python.as_ref().and_then(|p| p.to_str());
-
-        // Extract definition with configured interpreter
-        let site_packages =
-            discover_python_environment(Some(examples_dir.as_ref()), system_python_str)
-                .unwrap_or_default();
-        let db = test_db();
-        let search_paths = build_search_paths(&db, Some(examples_dir.as_ref()), &site_packages);
-        let result = extract_definition_info(&db, "my_module.simple_function", &search_paths);
-
+    fn test_configured_interpreter_reports_its_version() {
+        let python = system_python();
+        let discovered =
+            discover_python_environment(None, python.to_str()).expect("discover the interpreter");
         assert!(
-            result.is_ok(),
-            "Definition extraction should work with configured interpreter: {:?}",
-            result.err()
+            discovered.python_version.is_some(),
+            "a real interpreter's version should be discoverable, got {discovered:?}"
         );
     }
 
@@ -726,40 +625,7 @@ mod tests {
         );
     }
 
-    #[test]
-    #[ignore = "Requires Python in PATH"]
-    fn test_resolve_module_priority_order() {
-        // This test documents the priority order:
-        // 1. Configured interpreter (highest priority)
-        // 2. Auto-discovered environment (fallback)
-        let examples_dir = get_simple_test_dir();
-
-        // Test with configured interpreter (priority 1)
-        if let Ok(python_path) = which::which("python3").or_else(|_| which::which("python")) {
-            let db = test_db();
-            let site_packages =
-                discover_python_environment(Some(examples_dir.as_ref()), python_path.to_str())
-                    .unwrap_or_default();
-            let search_paths = build_search_paths(&db, Some(examples_dir.as_ref()), &site_packages);
-            let mid = TargetString::new(&db, "my_module".to_string());
-            let spid = InternedSearchPaths::new(&db, search_paths);
-            let result_configured = resolve_module_cached(&db, mid, spid).clone();
-            assert!(
-                result_configured.is_some(),
-                "Should resolve with configured interpreter"
-            );
-        }
-
-        // Test with auto-discovery (priority 2)
-        let db = test_db();
-        let search_paths = vec![examples_dir.clone(), PathBuf::from(".")];
-        let mid = TargetString::new(&db, "my_module".to_string());
-        let spid = InternedSearchPaths::new(&db, search_paths);
-        let result_auto = resolve_module_cached(&db, mid, spid).clone();
-        assert!(result_auto.is_some(), "Should resolve with auto-discovery");
-    }
-
-    // ==================== .pth file parsing tests ====================
+    // ==================== editable installs ====================
 
     fn get_editable_test_dir() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -768,51 +634,56 @@ mod tests {
             .join("editable")
     }
 
-    #[test]
-    fn test_parse_pth_files_basic() {
-        // Test parsing .pth files from the editable test workspace
+    /// The editable fixture's workspace and site-packages, as a resolver
+    /// environment.
+    fn editable_environment(db: &HydraDatabase) -> ResolverEnvironment<'_> {
         let workspace_dir = get_editable_test_dir();
         let site_packages = workspace_dir.join("site-packages");
-        let db = test_db();
-
-        let paths = parse_pth_files(&db, &site_packages);
-
-        // Should find the path from _editable_package.pth
-        assert!(!paths.is_empty(), "Should find paths from .pth files");
-
-        // The path should point to the src directory
-        let has_src_path = paths.iter().any(|p| p.ends_with("src"));
-        assert!(has_src_path, "Should find src path from .pth file");
+        build_resolver_environment(
+            db,
+            vec![SystemPathBuf::from_path_buf(workspace_dir).unwrap()],
+            vec![SystemPathBuf::from_path_buf(site_packages).unwrap()],
+            PythonVersion::latest_ty(),
+        )
     }
 
     #[test]
-    fn test_parse_pth_files_nonexistent_dir() {
-        // Test that parsing .pth files from nonexistent directory returns empty
-        let nonexistent = PathBuf::from("/nonexistent/path/site-packages");
+    fn test_pth_file_lists_the_editable_root() {
         let db = test_db();
-        let paths = parse_pth_files(&db, &nonexistent);
-        assert!(paths.is_empty(), "Should return empty for nonexistent dir");
+        let environment = editable_environment(&db);
+
+        let editables: Vec<_> = ty_module_resolver::editable_search_paths(&db, environment)
+            .map(|path| path.as_std_path().to_path_buf())
+            .collect();
+
+        assert_eq!(
+            editables,
+            vec![std::fs::canonicalize(get_editable_test_dir().join("src")).unwrap()],
+        );
+    }
+
+    #[test]
+    fn test_missing_site_packages_has_no_editables() {
+        let db = test_db();
+        let environment = build_resolver_environment(
+            &db,
+            Vec::new(),
+            vec![SystemPathBuf::from("/nonexistent/path/site-packages")],
+            PythonVersion::latest_ty(),
+        );
+        assert_eq!(
+            ty_module_resolver::editable_search_paths(&db, environment).count(),
+            0
+        );
     }
 
     #[test]
     fn test_resolve_editable_module() {
-        // Test resolving a module from an editable install via .pth file
-        let workspace_dir = get_editable_test_dir();
-        let site_packages = workspace_dir.join("site-packages");
         let db = test_db();
-
-        // Build search paths manually with site-packages that has .pth files
-        let mut search_paths = vec![workspace_dir.clone()];
-        search_paths.push(site_packages.clone());
-        search_paths.extend(parse_pth_files(&db, &site_packages));
-
-        // The editable_package should now be resolvable
         let mid = TargetString::new(&db, "editable_package.lib".to_string());
-        let spid = InternedSearchPaths::new(&db, search_paths);
-        let result = resolve_module_cached(&db, mid, spid).clone();
+        let result = resolve_module_cached(&db, mid, editable_environment(&db)).clone();
 
-        assert!(result.is_some(), "Should resolve editable_package.lib");
-        let path = result.unwrap();
+        let path = result.expect("Should resolve editable_package.lib");
         assert!(
             path.ends_with("lib.py"),
             "Should resolve to lib.py: {:?}",
@@ -822,26 +693,20 @@ mod tests {
 
     #[test]
     fn test_extract_definition_from_editable_package() {
-        // Test extracting class definition from an editable package via .pth resolution
-        let workspace_dir = get_editable_test_dir();
-        let site_packages = workspace_dir.join("site-packages");
         let db = test_db();
-
-        // Build search paths manually with site-packages that has .pth files
-        let mut search_paths = vec![workspace_dir.clone()];
-        search_paths.push(site_packages.clone());
-        search_paths.extend(parse_pth_files(&db, &site_packages));
-
-        // Resolve the module first
         let mid = TargetString::new(&db, "editable_package.lib".to_string());
-        let spid = InternedSearchPaths::new(&db, search_paths);
-        let module_path = resolve_module_cached(&db, mid, spid)
+        let module_path = resolve_module_cached(&db, mid, editable_environment(&db))
             .clone()
             .expect("Should resolve module");
 
         // Extract the class info (salsa-cached)
-        let class_info = extract_class_info(&db, &module_path, "EditableModel")
-            .expect("Should extract class info");
+        let class_info = extract_class_info(
+            &db,
+            &module_path,
+            "EditableModel",
+            PythonVersion::latest_ty(),
+        )
+        .expect("Should extract class info");
 
         assert_eq!(class_info.name, "EditableModel");
         assert!(class_info.docstring.is_some());

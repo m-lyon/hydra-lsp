@@ -1,20 +1,25 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use super::env::{build_search_paths, discover_python_environment};
+use super::env::{DiscoveredEnvironment, discover_python_environment};
 use super::extract::{
     extract_class_attribute, extract_class_info, module_defines_top_level, normalize_path_for_key,
 };
-use super::import_resolver::{ImportResolver, join_module_parts};
+use super::import_resolver::ImportResolver;
 use super::model::{ClassAttributeInfo, DefinitionInfo, FunctionSignature, ResolveError};
 use super::resolve::{base_class_name, extract_definition_info, resolve_base_class};
 use super::typeshed::{
-    BUILTINS_MODULE, is_runtime_builtin_name, is_vendored_module, stdlib_search_root,
-    vendored_module_name,
+    BUILTINS_MODULE, is_runtime_builtin_name, is_vendored_module, is_vendored_path,
+    vendored_module_name, vendored_sentinel_path,
 };
-use ruff_db::files::FileRootKind;
-use ruff_db::system::SystemPathBuf;
+use ruff_db::files::{File, FilePath, FileRootKind};
+use ruff_db::system::{SystemPath, SystemPathBuf};
+use ruff_python_ast::PythonVersion;
 use tracing::debug;
+use ty_module_resolver::{
+    ModuleName, ResolverEnvironment, SearchPath, SearchPathSettings, UseDefaultStrategy,
+    resolve_module_confident,
+};
 
 /// Salsa input for Python environment configuration.
 ///
@@ -69,18 +74,6 @@ fn parse_class_key(key: &str) -> Option<(&Path, &str)> {
 /// docstring or attributes of their own, so MRO walks skip them.
 const TYPE_ONLY_BASES: &[&str] = &["object", "ABC", "Protocol", "Generic"];
 
-/// Interned search-path list used as a salsa cache key for module resolution.
-///
-/// Salsa interns by value, so calls with equal `Vec<PathBuf>` values share a
-/// single allocation and use cheap identity comparison as the cache key.
-/// In practice all targets within one workspace session share the same search
-/// paths (derived from the workspace root and site-packages), so there is
-/// typically only one live `InternedSearchPaths` value in the database.
-#[salsa::interned]
-pub struct InternedSearchPaths {
-    pub paths: Vec<PathBuf>,
-}
-
 /// Successfully resolved Python definition data.
 #[derive(Clone)]
 pub struct ResolvedDefinition {
@@ -120,130 +113,167 @@ impl PartialEq for CachedDefinitionResult {
 
 impl Eq for CachedDefinitionResult {}
 
-/// Cached site-packages discovery for a Python environment.
+/// Cached Python environment discovery for a `PythonConfig`.
 ///
-/// Wraps `discover_python_environment` with salsa caching.
-/// The result is cached and only recomputed when `PythonConfig`'s `workspace_root`
-/// or `interpreter` fields change — both are salsa inputs, so invalidation is
-/// automatic.
-///
-/// Also registers each discovered directory as a `SearchPath` file root
-/// so library files get `Durability::HIGH`: project-file edits don't invalidate
-/// library-derived memos.
-#[salsa::tracked]
-pub fn site_packages_paths(db: &dyn ruff_db::Db, config: PythonConfig) -> Vec<SystemPathBuf> {
+/// Recomputed only when `PythonConfig`'s `workspace_root` or `interpreter`
+/// change. Also registers each site-packages directory as a `SearchPath` file
+/// root so library files get `Durability::HIGH`: project-file edits don't
+/// invalidate library-derived memos.
+#[salsa::tracked(returns(ref))]
+pub fn discovered_environment(db: &dyn ruff_db::Db, config: PythonConfig) -> DiscoveredEnvironment {
     let workspace_root = config.workspace_root(db).as_deref().map(Path::new);
     let interpreter = config.interpreter(db);
-    let paths =
+    let discovered =
         discover_python_environment(workspace_root, interpreter.as_deref()).unwrap_or_default();
-    for path in &paths {
+    for path in &discovered.site_packages {
         db.files()
             .try_add_root(db, path.as_path(), FileRootKind::SearchPath);
     }
-    paths
+    discovered
 }
 
-/// Cached module-resolution search-path list for a Python environment config.
+/// The module-resolution environment for a `PythonConfig`: the workspace as
+/// the first-party root, the discovered site-packages, and the interpreter's
+/// Python version (the latest ty knows when discovery could not tell).
 ///
-/// Builds the ordered search-path list that module resolution walks:
-/// `[workspace_root, ".", site_packages_0, pth_paths_0…, site_packages_1, …]`.
-///
-/// Recomputes when `PythonConfig`'s `workspace_root` or `interpreter` fields
-/// change, and — via `parse_pth_files`'s dependency (called within
-/// `build_search_paths`) on each site-packages directory listing —
-/// when a `.pth` file is created or deleted in a site-packages directory.
-#[salsa::tracked]
-pub fn search_paths_for_config(db: &dyn ruff_db::Db, config: PythonConfig) -> Vec<PathBuf> {
-    let workspace_root = config.workspace_root(db).as_deref().map(Path::new);
-    let site_packages = site_packages_paths(db, config);
-
-    build_search_paths(db, workspace_root, site_packages)
+/// Editable installs are not part of this value. `ty_module_resolver` reads
+/// the `.pth` files lazily through salsa, so creating, editing or deleting one
+/// invalidates only the resolutions that depend on it.
+#[salsa::tracked(returns(copy))]
+pub fn resolver_environment(
+    db: &dyn ty_module_resolver::Db,
+    config: PythonConfig,
+) -> ResolverEnvironment<'_> {
+    let discovered = discovered_environment(db, config);
+    let cwd = db.system().current_directory();
+    let workspace_root = match config.workspace_root(db) {
+        Some(root) => SystemPath::absolute(root, cwd),
+        None => cwd.to_path_buf(),
+    };
+    build_resolver_environment(
+        db,
+        vec![workspace_root],
+        discovered.site_packages.clone(),
+        discovered
+            .python_version
+            .unwrap_or_else(PythonVersion::latest_ty),
+    )
 }
 
-/// Cached module path → file path resolution.
+/// Build a resolver environment from explicit roots. Directories that do not
+/// exist are skipped.
+pub fn build_resolver_environment(
+    db: &dyn ty_module_resolver::Db,
+    src_roots: Vec<SystemPathBuf>,
+    site_packages: Vec<SystemPathBuf>,
+    python_version: PythonVersion,
+) -> ResolverEnvironment<'_> {
+    let settings = SearchPathSettings {
+        src_roots,
+        site_packages_paths: site_packages,
+        ..SearchPathSettings::empty()
+    };
+    let Ok(search_paths) =
+        settings.to_search_paths(db.system(), db.vendored(), &UseDefaultStrategy);
+    ResolverEnvironment::new(db, python_version, search_paths)
+}
+
+/// A resolver environment whose first-party roots are `roots`, in order, with
+/// no site-packages. Relative roots are taken against the database's current
+/// directory.
+#[doc(hidden)]
+pub fn environment_for_roots<'db>(
+    db: &'db dyn ty_module_resolver::Db,
+    roots: &[PathBuf],
+) -> ResolverEnvironment<'db> {
+    let cwd = db.system().current_directory();
+    let src_roots = roots
+        .iter()
+        .filter_map(|root| SystemPath::from_std_path(root))
+        .map(|root| SystemPath::absolute(root, cwd))
+        .collect();
+    build_resolver_environment(db, src_roots, Vec::new(), PythonVersion::latest_ty())
+}
+
+/// The path a resolved module file is reported under. Files in the vendored
+/// typeshed archive get a sentinel path, see [`super::typeshed`].
+fn module_file_path(db: &dyn ruff_db::Db, file: File) -> Option<PathBuf> {
+    match file.path(db) {
+        FilePath::System(path) => Some(path.as_std_path().to_path_buf()),
+        FilePath::Vendored(path) => Some(vendored_sentinel_path(path)),
+        FilePath::SystemVirtual(_) => None,
+    }
+}
+
+/// Cached module path → file path resolution, through `ty_module_resolver`.
 ///
-/// Validates the name, then probes each search root in order
-/// with `ImportResolver::find_module_file`. Salsa memoises the result, so the
-/// filesystem scan for a given `(module_path, search_paths)` pair is performed
-/// at most once per revision. The primary beneficiaries are
-/// `resolve_class_attribute_chain`, which probes O(k) progressively shorter
-/// prefixes of a dotted target (k = dot-count), and
-/// `ImportResolver::resolve_module_path`, which runs once per import hop. On a
-/// second hover for any symbol in the same module, all those probes become
-/// O(1) cache lookups.
+/// Resolution follows the typing spec's order: first-party roots, then the
+/// stdlib stubs, then site-packages and the editable installs their `.pth`
+/// files list. Stubs are preferred over sources, `<name>-stubs` packages over
+/// `<name>`, and a regular package hides namespace portions of the same name.
 ///
-/// Returns `None` when the module cannot be resolved, including when the name
-/// is empty, has an empty dot-separated part, or is not a plain dotted module name.
+/// Returns `None` when the module cannot be resolved, when the name is not a
+/// valid absolute module name, and for a namespace package, which has no file
+/// to point at. A module answered by the stdlib stubs is only kept for
+/// `builtins`, see [`is_vendored_module`].
+///
 /// Uses `lru = 1024` to bound memory across large workspaces.
-///
-/// When nothing on the real search path matches, resolution falls through to
-/// the vendored typeshed stubs for `builtins`, see [`is_vendored_module`].
 #[salsa::tracked(lru = 1024)]
 pub fn resolve_module_cached<'db>(
-    db: &'db dyn ruff_db::Db,
+    db: &'db dyn ty_module_resolver::Db,
     module_path: TargetString<'db>,
-    search_paths: InternedSearchPaths<'db>,
+    environment: ResolverEnvironment<'db>,
 ) -> Option<PathBuf> {
     let module_path_str = module_path.value(db);
-    let search_paths = search_paths.paths(db);
+    let module_name = ModuleName::new(module_path_str)?;
+    let module = resolve_module_confident(db, environment, &module_name)?;
 
-    // An empty part means a leading, trailing or doubled dot. Hydra cannot
-    // instantiate such a target, and `join_module_parts` would skip the part
-    // and resolve the name as if the extra dot were not there.
-    if module_path_str.split('.').any(str::is_empty) {
+    if module
+        .search_path(db)
+        .is_some_and(SearchPath::is_standard_library)
+        && !is_vendored_module(module_path_str)
+    {
         return None;
     }
 
-    let relative_path = join_module_parts(Path::new(""), module_path_str)?;
-
-    for search_path in search_paths {
-        // `find_module_file` covers both shapes a module can take: a package
-        // directory with an `__init__` file, and a plain `.py`/`.pyi` file.
-        let package_path = search_path.join(&relative_path);
-        if let Some(found_path) = ImportResolver::find_module_file(db, &package_path) {
-            return Some(found_path);
-        }
-    }
-
-    if is_vendored_module(module_path_str) {
-        return ImportResolver::find_module_file(db, &stdlib_search_root().join(&relative_path));
-    }
-
-    None
+    module_file_path(db, module.file(db)?)
 }
 
 /// Whether the runtime module `module` exposes `symbol`, according to its
 /// vendored stub.
 #[salsa::tracked(returns(copy))]
 pub fn vendored_module_exposes<'db>(
-    db: &'db dyn ruff_db::Db,
+    db: &'db dyn ty_module_resolver::Db,
+    environment: ResolverEnvironment<'db>,
     module: TargetString<'db>,
     symbol: TargetString<'db>,
 ) -> bool {
-    let module = module.value(db);
-    // The same gate `resolve_module_cached` applies, so the two don't disagree
-    // about what the archive exposes.
-    if !is_vendored_module(module) {
-        return false;
-    }
     let symbol = symbol.value(db);
     if symbol.is_empty() || symbol.contains('.') || !is_runtime_builtin_name(symbol) {
         return false;
     }
-    let Some(relative) = join_module_parts(Path::new(""), module) else {
+    let Some(stub) = resolve_module_cached(db, module, environment).clone() else {
         return false;
     };
-    let Some(stub) = ImportResolver::find_module_file(db, &stdlib_search_root().join(relative))
-    else {
+    if !is_vendored_path(&stub) {
         return false;
-    };
+    }
 
-    module_defines_top_level(db, &stub, symbol)
+    module_defines_top_level(db, &stub, symbol, environment.python_version(db))
 }
 
 /// Whether `name` is a symbol the runtime `builtins` module exposes.
-pub fn is_builtin_symbol<'db>(db: &'db dyn ruff_db::Db, name: TargetString<'db>) -> bool {
-    vendored_module_exposes(db, TargetString::new(db, BUILTINS_MODULE.to_string()), name)
+pub fn is_builtin_symbol<'db>(
+    db: &'db dyn ty_module_resolver::Db,
+    environment: ResolverEnvironment<'db>,
+    name: TargetString<'db>,
+) -> bool {
+    vendored_module_exposes(
+        db,
+        environment,
+        TargetString::new(db, BUILTINS_MODULE.to_string()),
+        name,
+    )
 }
 
 /// Cached extraction of Python definition info for a `_target_` string.
@@ -259,7 +289,7 @@ pub fn is_builtin_symbol<'db>(db: &'db dyn ruff_db::Db, name: TargetString<'db>)
 /// so the bound is set well above typical workspace sizes to avoid thrashing.
 #[salsa::tracked(returns(clone), no_eq, lru = 1024)]
 pub fn cached_definition_info<'db>(
-    db: &'db dyn ruff_db::Db,
+    db: &'db dyn ty_module_resolver::Db,
     config: PythonConfig,
     target: TargetString<'db>,
 ) -> CachedDefinitionResult {
@@ -269,8 +299,8 @@ pub fn cached_definition_info<'db>(
         "cached_definition_info: executing (cache miss)"
     );
 
-    let search_paths = search_paths_for_config(db, config);
-    let mut result = extract_definition_info(db, target_str, search_paths);
+    let environment = resolver_environment(db, config);
+    let mut result = extract_definition_info(db, target_str, environment);
 
     if let Ok(def) = &result
         && let Some(module) = vendored_module_name(&def.file_path)
@@ -280,6 +310,7 @@ pub fn cached_definition_info<'db>(
             .and_then(|rest| rest.split('.').next())
         && !vendored_module_exposes(
             db,
+            environment,
             TargetString::new(db, module.clone()),
             TargetString::new(db, root_symbol.to_string()),
         )
@@ -295,7 +326,7 @@ pub fn cached_definition_info<'db>(
 
 /// Cached docstring + `__init__` resolution for a class, walking its MRO.
 ///
-/// Salsa memoises each `(class_key, search_paths)` pair, so parent classes
+/// Salsa memoises each `(class_key, environment)` pair, so parent classes
 /// shared across different child classes are resolved at most once per revision.
 /// The own class properties take priority; parent properties fill in only what
 /// is missing.
@@ -408,20 +439,19 @@ impl Eq for CachedClassAttribute {}
 /// returning empty docs rather than panicking.
 #[salsa::tracked(returns(clone), lru = 512, cycle_result = class_parent_docs_cycle)]
 pub fn class_parent_docs<'db>(
-    db: &'db dyn ruff_db::Db,
+    db: &'db dyn ty_module_resolver::Db,
     class_key: TargetString<'db>,
-    search_paths: InternedSearchPaths<'db>,
+    environment: ResolverEnvironment<'db>,
 ) -> ClassParentDocs {
     let Some((file_path, class_name)) = parse_class_key(class_key.value(db)) else {
         return ClassParentDocs::new(None, None, None, true);
     };
-    let search_paths_vec = search_paths.paths(db);
+    let python_version = environment.python_version(db);
 
-    let class_info = match extract_class_info(db, file_path, class_name) {
+    let class_info = match extract_class_info(db, file_path, class_name, python_version) {
         Ok(class_info) => class_info,
         Err(_) => {
-            return match ImportResolver::new(db, search_paths_vec)
-                .resolve_symbol(file_path, class_name)
+            return match ImportResolver::new(db, environment).resolve_symbol(file_path, class_name)
             {
                 Some((resolved_file, resolved_name)) => {
                     if normalize_path_for_key(db, &resolved_file) == file_path
@@ -430,7 +460,7 @@ pub fn class_parent_docs<'db>(
                         return ClassParentDocs::new(None, None, None, false);
                     }
                     let resolved_key = self::class_key(db, &resolved_file, &resolved_name);
-                    class_parent_docs(db, resolved_key, search_paths)
+                    class_parent_docs(db, resolved_key, environment)
                 }
                 None => ClassParentDocs::new(None, None, None, false),
             };
@@ -456,7 +486,7 @@ pub fn class_parent_docs<'db>(
             continue;
         }
         let Some((parent_file, parent_class_name)) =
-            resolve_base_class(db, base_class, file_path, search_paths_vec)
+            resolve_base_class(db, base_class, file_path, environment)
         else {
             all_bases_resolved = false;
             continue;
@@ -468,7 +498,7 @@ pub fn class_parent_docs<'db>(
         // Symlink resolution already happened at root construction; see
         // `normalize_path_for_key`.
         let parent_key = self::class_key(db, &parent_file, &parent_class_name);
-        let parent_docs = class_parent_docs(db, parent_key, search_paths);
+        let parent_docs = class_parent_docs(db, parent_key, environment);
         all_bases_resolved &= parent_docs.all_bases_resolved();
 
         if docstring.is_none() {
@@ -489,10 +519,10 @@ pub fn class_parent_docs<'db>(
 }
 
 fn class_parent_docs_cycle(
-    _db: &dyn ruff_db::Db,
+    _db: &dyn ty_module_resolver::Db,
     _id: salsa::Id,
     _class_key: TargetString,
-    _search_paths: InternedSearchPaths,
+    _environment: ResolverEnvironment,
 ) -> ClassParentDocs {
     ClassParentDocs::new(None, None, None, true)
 }
@@ -501,23 +531,26 @@ fn class_parent_docs_cycle(
 ///
 /// `class_key` encodes `"canonical_file_path::ClassName"`;
 /// `attribute_key` is the bare attribute name (interned for deduplication).
-/// Each `(class_key, attribute_key, search_paths)` triple is memoised, so
+/// Each `(class_key, attribute_key, environment)` triple is memoised, so
 /// shared parent classes are looked up at most once per revision.
 ///
 /// `cycle_result` handles circular inheritance gracefully.
 #[salsa::tracked(returns(clone), lru = 512, cycle_result = class_parent_attribute_cycle)]
 pub fn class_parent_attribute<'db>(
-    db: &'db dyn ruff_db::Db,
+    db: &'db dyn ty_module_resolver::Db,
     class_key: TargetString<'db>,
     attribute_key: TargetString<'db>,
-    search_paths: InternedSearchPaths<'db>,
+    environment: ResolverEnvironment<'db>,
 ) -> CachedClassAttribute {
     let Some((file_path, class_name)) = parse_class_key(class_key.value(db)) else {
         return CachedClassAttribute::not_found();
     };
     let attribute_name = attribute_key.value(db);
+    let python_version = environment.python_version(db);
 
-    if let Ok(attr_info) = extract_class_attribute(db, file_path, class_name, attribute_name) {
+    if let Ok(attr_info) =
+        extract_class_attribute(db, file_path, class_name, attribute_name, python_version)
+    {
         return CachedClassAttribute::found(
             attr_info,
             file_path.to_path_buf(),
@@ -525,11 +558,9 @@ pub fn class_parent_attribute<'db>(
         );
     }
 
-    let Ok(class_info) = extract_class_info(db, file_path, class_name) else {
+    let Ok(class_info) = extract_class_info(db, file_path, class_name, python_version) else {
         return CachedClassAttribute::not_found();
     };
-
-    let search_paths_vec = search_paths.paths(db);
 
     for base_class in &class_info.base_classes {
         // Bases that exist only for the type system carry no attributes of
@@ -538,7 +569,7 @@ pub fn class_parent_attribute<'db>(
             continue;
         }
         let Some((parent_file, parent_class_name)) =
-            resolve_base_class(db, base_class, file_path, search_paths_vec)
+            resolve_base_class(db, base_class, file_path, environment)
         else {
             continue;
         };
@@ -547,7 +578,7 @@ pub fn class_parent_attribute<'db>(
         // inputs. Symlink resolution already happened at root construction;
         // see `normalize_path_for_key`.
         let parent_key = self::class_key(db, &parent_file, &parent_class_name);
-        let result = class_parent_attribute(db, parent_key, attribute_key, search_paths);
+        let result = class_parent_attribute(db, parent_key, attribute_key, environment);
         if result.get().is_some() {
             return result;
         }
@@ -557,11 +588,11 @@ pub fn class_parent_attribute<'db>(
 }
 
 fn class_parent_attribute_cycle(
-    _db: &dyn ruff_db::Db,
+    _db: &dyn ty_module_resolver::Db,
     _id: salsa::Id,
     _class_key: TargetString,
     _attribute_key: TargetString,
-    _search_paths: InternedSearchPaths,
+    _environment: ResolverEnvironment,
 ) -> CachedClassAttribute {
     CachedClassAttribute::not_found()
 }
@@ -571,11 +602,9 @@ mod tests {
     use super::*;
     use crate::database::HydraDatabase;
     use crate::database::tests::TestDb;
-    use crate::python::env::parse_pth_files;
+    use crate::python::typeshed::stdlib_search_root;
     use ruff_db::Db;
-    use ruff_db::system::SystemPath;
     use salsa::Setter;
-    use std::path::Path;
 
     #[test]
     fn test_parse_class_key_splits_on_the_last_separator() {
@@ -596,17 +625,17 @@ mod tests {
         );
     }
 
-    #[salsa::interned]
-    struct SitePackagesPath {
-        path: String,
-    }
-
-    #[salsa::tracked]
-    fn tracked_pth_paths<'db>(
-        db: &'db dyn ruff_db::Db,
-        site_packages: SitePackagesPath<'db>,
-    ) -> Vec<PathBuf> {
-        parse_pth_files(db, Path::new(site_packages.path(db)))
+    /// The editable roots the `.pth` files in `site_packages` list.
+    fn editables(db: &HydraDatabase, site_packages: &Path) -> Vec<PathBuf> {
+        let environment = build_resolver_environment(
+            db,
+            Vec::new(),
+            vec![SystemPathBuf::from_path_buf(site_packages.to_path_buf()).unwrap()],
+            PythonVersion::latest_ty(),
+        );
+        ty_module_resolver::editable_search_paths(db, environment)
+            .map(|path| path.as_std_path().to_path_buf())
+            .collect()
     }
 
     fn examples_dir() -> PathBuf {
@@ -620,72 +649,99 @@ mod tests {
     }
 
     #[test]
-    fn test_site_packages_paths_no_config() {
+    fn test_discovered_environment_no_config() {
         let db = real_fs_db();
         let config = PythonConfig::new(&db, None, None);
         // Should not panic; returns whatever the current-dir discovery finds (possibly empty).
-        let paths = site_packages_paths(&db, config);
-        // Result is a Vec<SystemPathBuf>; we can't assert a specific value since it
-        // depends on the active Python environment, but the call must succeed.
-        let _ = paths.len();
+        // We can't assert a specific value since it depends on the active
+        // Python environment, but the call must succeed.
+        let _ = discovered_environment(&db, config);
     }
 
     #[test]
-    fn test_site_packages_paths_cache_hit() {
+    fn test_discovered_environment_cache_hit() {
         let db = real_fs_db();
         let examples = examples_dir();
         let config = PythonConfig::new(&db, Some(examples.to_string_lossy().to_string()), None);
-        let result1 = site_packages_paths(&db, config);
-        let result2 = site_packages_paths(&db, config);
-        // Pointer equality: salsa returns the same Arc on a cache hit.
+        let result1 = discovered_environment(&db, config);
+        let result2 = discovered_environment(&db, config);
+        // Pointer equality: salsa returns the same value on a cache hit.
         assert!(std::ptr::eq(result1 as *const _, result2 as *const _));
     }
 
     #[test]
-    fn test_site_packages_paths_invalidation_on_interpreter_change() {
+    fn test_discovered_environment_invalidation_on_interpreter_change() {
         let mut db = real_fs_db();
         let examples = examples_dir();
         let config = PythonConfig::new(&db, Some(examples.to_string_lossy().to_string()), None);
-        let result1 = site_packages_paths(&db, config).clone();
+        let _ = discovered_environment(&db, config);
 
-        // Changing the interpreter invalidates the memo.
+        // Changing the interpreter invalidates the memo: a nonexistent
+        // interpreter fails discovery, so the result is empty.
         config
             .set_interpreter(&mut db)
             .to(Some("/nonexistent/python".to_string()));
-        let result2 = site_packages_paths(&db, config).clone();
-
-        // Results may differ (nonexistent interpreter → empty) — the important
-        // thing is that the query ran again rather than returning the cached value.
-        // We can't assert pointer inequality after a clone, but we can assert the
-        // new result is empty (nonexistent interpreter → discovery fails → empty).
-        assert!(result2.is_empty());
-        // Original result is unaffected (already cloned).
-        drop(result1);
+        assert_eq!(
+            discovered_environment(&db, config),
+            &DiscoveredEnvironment::default()
+        );
     }
 
     #[test]
-    fn test_search_paths_for_config_contains_workspace_root() {
+    fn test_resolver_environment_puts_the_workspace_root_first() {
         let db = real_fs_db();
         let examples = examples_dir();
         let config = PythonConfig::new(&db, Some(examples.to_string_lossy().to_string()), None);
-        let paths = search_paths_for_config(&db, config);
-        assert!(
-            paths.iter().any(|p| p == &examples),
-            "workspace root should appear first in search paths"
+        let environment = resolver_environment(&db, config);
+        let first = ty_module_resolver::system_module_search_paths(&db, environment).next();
+        assert_eq!(
+            first.map(SystemPath::as_std_path),
+            Some(examples.as_path()),
+            "workspace root should be the first search path"
         );
-        assert!(
-            paths.iter().position(|p| p == &examples) == Some(0),
-            "workspace root should be at index 0"
+    }
+
+    /// Without a discoverable version the parser falls back to the latest one.
+    #[test]
+    fn test_resolver_environment_defaults_to_the_latest_version() {
+        let db = real_fs_db();
+        let config = PythonConfig::new(
+            &db,
+            Some(examples_dir().to_string_lossy().to_string()),
+            Some("/nonexistent/python".to_string()),
+        );
+        assert_eq!(
+            resolver_environment(&db, config).python_version(&db),
+            PythonVersion::latest_ty()
         );
     }
 
     #[test]
-    fn test_search_paths_for_config_cache_hit() {
+    fn test_resolver_environment_uses_the_venv_version() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let venv = std::fs::canonicalize(tmp.path()).unwrap();
+        let site_packages = if cfg!(target_os = "windows") {
+            std::fs::write(venv.join("python.exe"), "").unwrap();
+            venv.join(r"Lib\site-packages")
+        } else {
+            std::fs::create_dir_all(venv.join("bin")).unwrap();
+            std::fs::write(venv.join("bin/python"), "").unwrap();
+            venv.join("lib/python3.9/site-packages")
+        };
+        std::fs::create_dir_all(&site_packages).unwrap();
+        std::fs::write(
+            venv.join("pyvenv.cfg"),
+            format!("home = {}\nversion = 3.9.18\n", venv.display()),
+        )
+        .unwrap();
+
         let db = real_fs_db();
-        let config = PythonConfig::new(&db, None, None);
-        let r1 = search_paths_for_config(&db, config);
-        let r2 = search_paths_for_config(&db, config);
-        assert!(std::ptr::eq(r1 as *const _, r2 as *const _));
+        let venv = venv.to_string_lossy().into_owned();
+        let config = PythonConfig::new(&db, Some(venv.clone()), Some(venv));
+        assert_eq!(
+            resolver_environment(&db, config).python_version(&db),
+            PythonVersion::PY39
+        );
     }
 
     #[test]
@@ -874,11 +930,7 @@ mod tests {
             .expect("set initial pth mtime");
 
         let mut db = real_fs_db();
-        let site_packages_str = site_packages.to_string_lossy().to_string();
-        let result1 = {
-            let site_packages_key = SitePackagesPath::new(&db, site_packages_str.clone());
-            tracked_pth_paths(&db, site_packages_key).clone()
-        };
+        let result1 = editables(&db, &site_packages);
         assert_eq!(result1.len(), 1);
         assert_eq!(
             std::fs::canonicalize(&result1[0]).expect("canonicalize returned editable path"),
@@ -892,10 +944,7 @@ mod tests {
         let sys_path = SystemPath::from_std_path(&pth_file).unwrap();
         File::sync_path(&mut db, sys_path);
 
-        let result2 = {
-            let site_packages_key = SitePackagesPath::new(&db, site_packages_str);
-            tracked_pth_paths(&db, site_packages_key).clone()
-        };
+        let result2 = editables(&db, &site_packages);
         assert!(result2.is_empty());
     }
 
@@ -915,15 +964,11 @@ mod tests {
         let site_packages_sys = SystemPath::from_std_path(&site_packages).unwrap();
 
         // Register the site-packages directory as a `FileRoot`, exactly as
-        // `site_packages_paths` does in production.
+        // `discovered_environment` does in production.
         db.files()
             .try_add_root(&db, site_packages_sys, FileRootKind::SearchPath);
 
-        let site_packages_str = site_packages.to_string_lossy().to_string();
-        let result1 = {
-            let site_packages_key = SitePackagesPath::new(&db, site_packages_str.clone());
-            tracked_pth_paths(&db, site_packages_key).clone()
-        };
+        let result1 = editables(&db, &site_packages);
         assert!(result1.is_empty());
 
         // Create a `.pth` file and sync it, exactly as
@@ -933,10 +978,7 @@ mod tests {
         fs::write(&pth_file, "../src\n").expect("write pth");
         File::sync_path(&mut db, SystemPath::from_std_path(&pth_file).unwrap());
 
-        let result2 = {
-            let site_packages_key = SitePackagesPath::new(&db, site_packages_str);
-            tracked_pth_paths(&db, site_packages_key).clone()
-        };
+        let result2 = editables(&db, &site_packages);
         assert_eq!(result2.len(), 1);
         assert_eq!(
             std::fs::canonicalize(&result2[0]).expect("canonicalize returned editable path"),
@@ -1095,7 +1137,7 @@ mod tests {
         let mut db = real_fs_db();
 
         let r1 = {
-            let sp = InternedSearchPaths::new(&db, vec![workspace.to_path_buf()]);
+            let sp = environment_for_roots(&db, &[workspace.to_path_buf()]);
             // The LSP keys the MRO walk off the lexically-normalized path (the
             // form the client reports on watch events); no symlink resolution.
             let child_lexical = normalize_path_for_key(&db, &child);
@@ -1126,7 +1168,7 @@ mod tests {
         File::sync_path(&mut db, SystemPath::from_std_path(&gp_lexical).unwrap());
 
         let r2 = {
-            let sp = InternedSearchPaths::new(&db, vec![workspace.to_path_buf()]);
+            let sp = environment_for_roots(&db, &[workspace.to_path_buf()]);
             // The LSP keys the MRO walk off the lexically-normalized path (the
             // form the client reports on watch events); no symlink resolution.
             let child_lexical = normalize_path_for_key(&db, &child);
@@ -1160,7 +1202,7 @@ mod tests {
 
         let mut db = real_fs_db();
         let r1 = {
-            let sp = InternedSearchPaths::new(&db, vec![workspace.to_path_buf()]);
+            let sp = environment_for_roots(&db, &[workspace.to_path_buf()]);
             // The LSP keys the MRO walk off the lexically-normalized path (the
             // form the client reports on watch events); no symlink resolution.
             let child_lexical = normalize_path_for_key(&db, &child);
@@ -1184,7 +1226,7 @@ mod tests {
         File::sync_path(&mut db, SystemPath::from_std_path(&gp_lexical).unwrap());
 
         let r2 = {
-            let sp = InternedSearchPaths::new(&db, vec![workspace.to_path_buf()]);
+            let sp = environment_for_roots(&db, &[workspace.to_path_buf()]);
             // The LSP keys the MRO walk off the lexically-normalized path (the
             // form the client reports on watch events); no symlink resolution.
             let child_lexical = normalize_path_for_key(&db, &child);
@@ -1213,7 +1255,7 @@ mod tests {
 
         let mut db = real_fs_db();
         let r1 = {
-            let sp = InternedSearchPaths::new(&db, vec![workspace.to_path_buf()]);
+            let sp = environment_for_roots(&db, &[workspace.to_path_buf()]);
             // The LSP keys the MRO walk off the lexically-normalized path (the
             // form the client reports on watch events); no symlink resolution.
             let child_lexical = normalize_path_for_key(&db, &child);
@@ -1237,7 +1279,7 @@ mod tests {
         File::sync_path(&mut db, SystemPath::from_std_path(&gp_lexical).unwrap());
 
         let r2 = {
-            let sp = InternedSearchPaths::new(&db, vec![workspace.to_path_buf()]);
+            let sp = environment_for_roots(&db, &[workspace.to_path_buf()]);
             // The LSP keys the MRO walk off the lexically-normalized path (the
             // form the client reports on watch events); no symlink resolution.
             let child_lexical = normalize_path_for_key(&db, &child);
@@ -1266,7 +1308,7 @@ mod tests {
 
         let mut db = real_fs_db();
         let r1 = {
-            let sp = InternedSearchPaths::new(&db, vec![workspace.to_path_buf()]);
+            let sp = environment_for_roots(&db, &[workspace.to_path_buf()]);
             // The LSP keys the MRO walk off the lexically-normalized path (the
             // form the client reports on watch events); no symlink resolution.
             let child_lexical = normalize_path_for_key(&db, &child);
@@ -1289,7 +1331,7 @@ mod tests {
         File::sync_path(&mut db, SystemPath::from_std_path(&gp_lexical).unwrap());
 
         let r2 = {
-            let sp = InternedSearchPaths::new(&db, vec![workspace.to_path_buf()]);
+            let sp = environment_for_roots(&db, &[workspace.to_path_buf()]);
             // The LSP keys the MRO walk off the lexically-normalized path (the
             // form the client reports on watch events); no symlink resolution.
             let child_lexical = normalize_path_for_key(&db, &child);
@@ -1337,7 +1379,7 @@ mod tests {
         let mut db = real_fs_db();
         let child_via_link = link_ws.join("child.py");
         let query = |db: &HydraDatabase| {
-            let sp = InternedSearchPaths::new(db, vec![link_ws.clone()]);
+            let sp = environment_for_roots(db, std::slice::from_ref(&link_ws));
             let child_lexical = normalize_path_for_key(db, &child_via_link);
             let child_key = TargetString::new(db, format!("{}::Child", child_lexical.display()));
             class_parent_docs(db, child_key, sp)
@@ -1385,7 +1427,7 @@ mod tests {
         // First lookup: the module file does not exist yet.
         let result1 = {
             let mid = TargetString::new(&db, "new_module".to_string());
-            let spid = InternedSearchPaths::new(&db, search_paths.clone());
+            let spid = environment_for_roots(&db, &search_paths);
             resolve_module_cached(&db, mid, spid).clone()
         };
         assert!(
@@ -1404,7 +1446,7 @@ mod tests {
         // Second lookup: the create must now be observed.
         let result2 = {
             let mid = TargetString::new(&db, "new_module".to_string());
-            let spid = InternedSearchPaths::new(&db, search_paths);
+            let spid = environment_for_roots(&db, &search_paths);
             resolve_module_cached(&db, mid, spid).clone()
         };
         assert!(
@@ -1438,7 +1480,7 @@ mod tests {
         let search_paths = vec![PathBuf::from("/root")];
         let resolve = |module: &str| {
             let mid = TargetString::new(&db, module.to_string());
-            let spid = InternedSearchPaths::new(&db, search_paths.clone());
+            let spid = environment_for_roots(&db, &search_paths);
             resolve_module_cached(&db, mid, spid).clone()
         };
 
@@ -1492,7 +1534,7 @@ mod tests {
     /// Resolve `module` against `search_paths` on a fresh database.
     fn resolve_on(db: &TestDb, search_paths: Vec<PathBuf>, module: &str) -> Option<PathBuf> {
         let mid = TargetString::new(db, module.to_string());
-        let spid = InternedSearchPaths::new(db, search_paths);
+        let spid = environment_for_roots(db, &search_paths);
         resolve_module_cached(db, mid, spid).clone()
     }
 
@@ -1516,10 +1558,10 @@ mod tests {
         );
     }
 
-    /// A real `builtins` on the search path is what Python itself would import,
-    /// so it must win over the stub.
+    /// `builtins` is compiled into the interpreter, so Python never imports a
+    /// `builtins.py` from the search path, and neither does resolution.
     #[test]
-    fn test_workspace_builtins_shadows_the_vendored_stub() {
+    fn test_workspace_builtins_does_not_shadow_the_vendored_stub() {
         use ruff_db::system::DbWithWritableSystem;
 
         let mut db = TestDb::new();
@@ -1528,14 +1570,17 @@ mod tests {
 
         assert_eq!(
             resolve_on(&db, vec![PathBuf::from("/root")], "builtins"),
-            Some(PathBuf::from("/root/builtins.py")),
+            Some(stdlib_search_root().join("builtins.pyi")),
         );
     }
 
     #[test]
     fn test_is_builtin_symbol() {
         let db = TestDb::new();
-        let check = |name: &str| is_builtin_symbol(&db, TargetString::new(&db, name.to_string()));
+        let environment = environment_for_roots(&db, &[]);
+        let check = |name: &str| {
+            is_builtin_symbol(&db, environment, TargetString::new(&db, name.to_string()))
+        };
 
         assert!(check("len"), "a builtin function");
         assert!(check("dict"), "a builtin class");
@@ -1580,13 +1625,14 @@ mod tests {
 
         fn resolve(&self, module: &str) -> Option<PathBuf> {
             let db = HydraDatabase::new(SystemPath::from_std_path(&self.workspace).unwrap());
-            let site_packages =
-                vec![SystemPathBuf::from_path_buf(self.site_packages.clone()).unwrap()];
-            let search_paths =
-                crate::python::env::build_search_paths(&db, Some(&self.workspace), &site_packages);
+            let environment = build_resolver_environment(
+                &db,
+                vec![SystemPathBuf::from_path_buf(self.workspace.clone()).unwrap()],
+                vec![SystemPathBuf::from_path_buf(self.site_packages.clone()).unwrap()],
+                PythonVersion::latest_ty(),
+            );
             let mid = TargetString::new(&db, module.to_string());
-            let spid = InternedSearchPaths::new(&db, search_paths);
-            resolve_module_cached(&db, mid, spid).clone()
+            resolve_module_cached(&db, mid, environment).clone()
         }
     }
 
@@ -1615,37 +1661,25 @@ mod tests {
         );
     }
 
+    /// The stdlib is ahead of site-packages on `sys.path`, so Python imports
+    /// the stdlib `enum`, which stays unresolved like any other stdlib target.
     #[test]
     fn test_site_packages_module_named_like_the_stdlib() {
         let layout = Layout::new();
         layout.write(&layout.site_packages.join("enum.py"), "");
 
-        assert_eq!(
-            layout.resolve("enum"),
-            Some(layout.site_packages.join("enum.py"))
-        );
+        assert_eq!(layout.resolve("enum"), None);
     }
 
+    /// Typeshed ships `typing_extensions` among its stdlib stubs and ty never
+    /// lets anything shadow it, so an installed copy is not reached. Python
+    /// would import the installed copy, so this is a known gap.
     #[test]
     fn test_site_packages_typing_extensions() {
         let layout = Layout::new();
         layout.write(&layout.site_packages.join("typing_extensions.py"), "");
 
-        assert_eq!(
-            layout.resolve("typing_extensions"),
-            Some(layout.site_packages.join("typing_extensions.py"))
-        );
-    }
-
-    #[test]
-    fn test_workspace_builtins_module() {
-        let layout = Layout::new();
-        layout.write(&layout.workspace.join("builtins.py"), "");
-
-        assert_eq!(
-            layout.resolve("builtins"),
-            Some(layout.workspace.join("builtins.py"))
-        );
+        assert_eq!(layout.resolve("typing_extensions"), None);
     }
 
     #[test]
@@ -1716,12 +1750,11 @@ mod tests {
             layout.resolve("pkg"),
             Some(layout.site_packages.join("pkg").join("__init__.py"))
         );
-        assert_eq!(
-            layout.resolve("pkg.sub"),
-            Some(layout.workspace.join("pkg").join("sub.py"))
-        );
+        assert_eq!(layout.resolve("pkg.sub"), None);
     }
 
+    /// A PEP 561 `<name>-stubs` package is preferred over `<name>` itself, as
+    /// a `.pyi` is over the `.py` beside it.
     #[test]
     fn test_stub_only_package() {
         let layout = Layout::new();
@@ -1733,7 +1766,7 @@ mod tests {
 
         assert_eq!(
             layout.resolve("acme"),
-            Some(layout.site_packages.join("acme").join("__init__.py"))
+            Some(layout.site_packages.join("acme-stubs").join("__init__.pyi"))
         );
     }
 
@@ -1771,7 +1804,7 @@ mod tests {
         let db = test_db();
         let search_paths = vec![examples_dir.clone(), PathBuf::from(".")];
         let mid = TargetString::new(&db, "my_module".to_string());
-        let spid = InternedSearchPaths::new(&db, search_paths);
+        let spid = environment_for_roots(&db, &search_paths);
         let result = resolve_module_cached(&db, mid, spid).clone();
         assert!(result.is_some());
         assert!(result.unwrap().ends_with("my_module.py"));
@@ -1783,7 +1816,7 @@ mod tests {
         let db = test_db();
         let search_paths = vec![examples_dir.clone(), PathBuf::from(".")];
         let mid = TargetString::new(&db, "test_package".to_string());
-        let spid = InternedSearchPaths::new(&db, search_paths);
+        let spid = environment_for_roots(&db, &search_paths);
         let result = resolve_module_cached(&db, mid, spid).clone();
         assert!(result.is_some());
         assert!(result.unwrap().ends_with("__init__.py"));
@@ -1795,7 +1828,7 @@ mod tests {
         let db = test_db();
         let search_paths = vec![examples_dir.clone(), PathBuf::from(".")];
         let mid = TargetString::new(&db, "test_package.submodule".to_string());
-        let spid = InternedSearchPaths::new(&db, search_paths);
+        let spid = environment_for_roots(&db, &search_paths);
         let result = resolve_module_cached(&db, mid, spid).clone();
         assert!(result.is_some());
         assert!(result.unwrap().ends_with("submodule.py"));
@@ -1807,7 +1840,7 @@ mod tests {
         let db = test_db();
         let search_paths = vec![examples_dir.clone(), PathBuf::from(".")];
         let mid = TargetString::new(&db, "nonexistent_module".to_string());
-        let spid = InternedSearchPaths::new(&db, search_paths);
+        let spid = environment_for_roots(&db, &search_paths);
         let result = resolve_module_cached(&db, mid, spid).clone();
         assert!(result.is_none());
     }
