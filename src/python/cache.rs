@@ -1545,6 +1545,222 @@ mod tests {
         assert!(!check("builtins.len"), "a dotted name is not a bare name");
     }
 
+    // ==================== resolution order ====================
+    //
+    // Pins where a module name lands when more than one search root could
+    // answer it, in the shape production builds: a workspace, a site-packages
+    // directory and the editable installs its `.pth` files list.
+
+    /// A workspace and a site-packages directory on disk, each starting empty.
+    struct Layout {
+        _tmp: tempfile::TempDir,
+        workspace: PathBuf,
+        site_packages: PathBuf,
+    }
+
+    impl Layout {
+        fn new() -> Self {
+            let tmp = tempfile::TempDir::new().expect("tempdir");
+            let root = std::fs::canonicalize(tmp.path()).expect("canonicalize tempdir");
+            let workspace = root.join("workspace");
+            let site_packages = root.join("venv").join("site-packages");
+            std::fs::create_dir_all(&workspace).expect("create workspace");
+            std::fs::create_dir_all(&site_packages).expect("create site-packages");
+            Self {
+                _tmp: tmp,
+                workspace,
+                site_packages,
+            }
+        }
+
+        fn write(&self, path: &Path, contents: &str) {
+            std::fs::create_dir_all(path.parent().expect("has a parent")).expect("create dirs");
+            std::fs::write(path, contents).expect("write file");
+        }
+
+        fn resolve(&self, module: &str) -> Option<PathBuf> {
+            let db = HydraDatabase::new(SystemPath::from_std_path(&self.workspace).unwrap());
+            let site_packages =
+                vec![SystemPathBuf::from_path_buf(self.site_packages.clone()).unwrap()];
+            let search_paths =
+                crate::python::env::build_search_paths(&db, Some(&self.workspace), &site_packages);
+            let mid = TargetString::new(&db, module.to_string());
+            let spid = InternedSearchPaths::new(&db, search_paths);
+            resolve_module_cached(&db, mid, spid).clone()
+        }
+    }
+
+    #[test]
+    fn test_workspace_module_shadows_site_packages() {
+        let layout = Layout::new();
+        layout.write(&layout.workspace.join("shared.py"), "");
+        layout.write(&layout.site_packages.join("shared.py"), "");
+
+        assert_eq!(
+            layout.resolve("shared"),
+            Some(layout.workspace.join("shared.py"))
+        );
+    }
+
+    /// The workspace is ahead of the stdlib on `sys.path`, so a first-party
+    /// module named like a stdlib module is what Python imports.
+    #[test]
+    fn test_workspace_module_shadows_a_stdlib_name() {
+        let layout = Layout::new();
+        layout.write(&layout.workspace.join("json.py"), "");
+
+        assert_eq!(
+            layout.resolve("json"),
+            Some(layout.workspace.join("json.py"))
+        );
+    }
+
+    #[test]
+    fn test_site_packages_module_named_like_the_stdlib() {
+        let layout = Layout::new();
+        layout.write(&layout.site_packages.join("enum.py"), "");
+
+        assert_eq!(
+            layout.resolve("enum"),
+            Some(layout.site_packages.join("enum.py"))
+        );
+    }
+
+    #[test]
+    fn test_site_packages_typing_extensions() {
+        let layout = Layout::new();
+        layout.write(&layout.site_packages.join("typing_extensions.py"), "");
+
+        assert_eq!(
+            layout.resolve("typing_extensions"),
+            Some(layout.site_packages.join("typing_extensions.py"))
+        );
+    }
+
+    #[test]
+    fn test_workspace_builtins_module() {
+        let layout = Layout::new();
+        layout.write(&layout.workspace.join("builtins.py"), "");
+
+        assert_eq!(
+            layout.resolve("builtins"),
+            Some(layout.workspace.join("builtins.py"))
+        );
+    }
+
+    #[test]
+    fn test_builtins_without_a_shadow_is_the_vendored_stub() {
+        let layout = Layout::new();
+        assert_eq!(
+            layout.resolve("builtins"),
+            Some(stdlib_search_root().join("builtins.pyi"))
+        );
+    }
+
+    #[test]
+    fn test_stdlib_targets_stay_unresolved() {
+        let layout = Layout::new();
+        assert_eq!(layout.resolve("collections"), None);
+        assert_eq!(layout.resolve("os.path"), None);
+    }
+
+    #[test]
+    fn test_editable_install_resolves_after_site_packages() {
+        let layout = Layout::new();
+        let editable = layout.site_packages.parent().unwrap().join("editable_src");
+        layout.write(&editable.join("editable_pkg").join("__init__.py"), "");
+        layout.write(&layout.site_packages.join("shadowed.py"), "");
+        layout.write(&editable.join("shadowed.py"), "");
+        layout.write(
+            &layout.site_packages.join("_editable.pth"),
+            &format!("{}\n", editable.display()),
+        );
+
+        assert_eq!(
+            layout.resolve("editable_pkg"),
+            Some(editable.join("editable_pkg").join("__init__.py"))
+        );
+        assert_eq!(
+            layout.resolve("shadowed"),
+            Some(layout.site_packages.join("shadowed.py"))
+        );
+    }
+
+    #[test]
+    fn test_namespace_package_spanning_two_roots() {
+        let layout = Layout::new();
+        layout.write(&layout.workspace.join("ns").join("first.py"), "");
+        layout.write(&layout.site_packages.join("ns").join("second.py"), "");
+
+        assert_eq!(
+            layout.resolve("ns.first"),
+            Some(layout.workspace.join("ns").join("first.py"))
+        );
+        assert_eq!(
+            layout.resolve("ns.second"),
+            Some(layout.site_packages.join("ns").join("second.py"))
+        );
+        // A namespace package has no file of its own to point at.
+        assert_eq!(layout.resolve("ns"), None);
+    }
+
+    /// A regular package anywhere on the path hides the namespace portions of
+    /// the same name, so Python never looks inside the workspace `pkg/` here.
+    #[test]
+    fn test_regular_package_in_a_later_root_and_namespace_portion_earlier() {
+        let layout = Layout::new();
+        layout.write(&layout.workspace.join("pkg").join("sub.py"), "");
+        layout.write(&layout.site_packages.join("pkg").join("__init__.py"), "");
+
+        assert_eq!(
+            layout.resolve("pkg"),
+            Some(layout.site_packages.join("pkg").join("__init__.py"))
+        );
+        assert_eq!(
+            layout.resolve("pkg.sub"),
+            Some(layout.workspace.join("pkg").join("sub.py"))
+        );
+    }
+
+    #[test]
+    fn test_stub_only_package() {
+        let layout = Layout::new();
+        layout.write(&layout.site_packages.join("acme").join("__init__.py"), "");
+        layout.write(
+            &layout.site_packages.join("acme-stubs").join("__init__.pyi"),
+            "",
+        );
+
+        assert_eq!(
+            layout.resolve("acme"),
+            Some(layout.site_packages.join("acme").join("__init__.py"))
+        );
+    }
+
+    #[test]
+    fn test_package_shadows_module_of_the_same_name() {
+        let layout = Layout::new();
+        layout.write(&layout.workspace.join("thing.py"), "");
+        layout.write(&layout.workspace.join("thing").join("__init__.py"), "");
+
+        assert_eq!(
+            layout.resolve("thing"),
+            Some(layout.workspace.join("thing").join("__init__.py"))
+        );
+    }
+
+    #[test]
+    fn test_stub_next_to_source_is_preferred() {
+        let layout = Layout::new();
+        layout.write(&layout.workspace.join("typed.py"), "");
+        layout.write(&layout.workspace.join("typed.pyi"), "");
+
+        assert_eq!(
+            layout.resolve("typed"),
+            Some(layout.workspace.join("typed.pyi"))
+        );
+    }
+
     use crate::python::test_support::{get_simple_test_dir, test_db};
 
     // ==================== resolve_module_cached tests ====================
