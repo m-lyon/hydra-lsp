@@ -7,11 +7,12 @@ use super::model::{
 };
 use super::typeshed::{is_vendored_path, to_vendored_path};
 use anyhow::{Context, Result};
+use ruff_db::PythonFile;
 use ruff_db::files::{File, system_path_to_file, vendored_path_to_file};
 use ruff_db::parsed::{ParsedModuleRef, parsed_module};
 use ruff_db::source::{SourceText, source_text};
 use ruff_db::system::SystemPath;
-use ruff_python_ast::{self as ast, Expr, Stmt, visitor::Visitor};
+use ruff_python_ast::{self as ast, Expr, PythonVersion, Stmt, visitor::Visitor};
 use ruff_source_file::{LineIndex, PositionEncoding};
 use ruff_text_size::TextRange;
 use std::path::{Path, PathBuf};
@@ -76,6 +77,10 @@ pub(super) fn read_source(db: &dyn ruff_db::Db, path: &Path) -> Result<SourceTex
 pub(super) fn get_parsed_module(db: &dyn ruff_db::Db, path: &Path) -> Result<ParsedModuleRef> {
     let file = path_to_file(db, path)
         .with_context(|| format!("could not resolve file: {}", path.display()))?;
+    // The interpreter's version is not plumbed through yet, so every file is
+    // parsed as the latest dialect. It only affects which syntax the parser
+    // reports as unsupported, which nothing here reads.
+    let file = PythonFile::new(db, file, PythonVersion::latest_ty());
     Ok(parsed_module(db, file).load(db))
 }
 

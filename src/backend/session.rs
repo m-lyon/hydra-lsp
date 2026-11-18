@@ -1,11 +1,8 @@
 //! The analysis session: the salsa database behind its lock, snapshots of it for
 //! the pools, and the per-document inputs.
 
-use ruff_db::Db;
-use ruff_db::files::Files;
 use ruff_db::system::SystemPath;
 use salsa::Setter;
-use std::collections::HashSet;
 use tower_lsp::jsonrpc::{Error, Result};
 use tower_lsp::lsp_types::Url;
 
@@ -43,36 +40,6 @@ impl Session {
             db: self.db.lock().clone(),
             python_config: self.python_config,
         }
-    }
-
-    /// Bump the enclosing site-packages `FileRoot` revision for each changed
-    /// directory so `parse_pth_files` re-scans it — but only when the directory
-    /// is actually a registered library root (i.e. one of the resolver's
-    /// site-packages search paths).
-    ///
-    /// Returns the number of directories actually bumped.
-    pub(super) fn bump_site_packages_pth_roots(
-        &self,
-        directories: &HashSet<std::path::PathBuf>,
-    ) -> usize {
-        if directories.is_empty() {
-            return 0;
-        }
-        let mut db = self.db.lock();
-        let mut bumped = 0usize;
-        for directory in directories {
-            let Some(sys_path) = SystemPath::from_std_path(directory) else {
-                continue;
-            };
-            // Only registered roots have a revision to bump; `root()` returns
-            // `None` for directories that aren't library search paths, so this
-            // naturally gates on site-packages membership.
-            if db.files().root(&*db, sys_path).is_some() {
-                Files::touch_root(&mut *db, sys_path);
-                bumped += 1;
-            }
-        }
-        bumped
     }
 }
 
@@ -267,8 +234,6 @@ impl HydraLspBackend {
 mod tests {
     use super::*;
 
-    // --- Test D: site-packages gating in bump_site_packages_pth_roots ---
-
     /// Build a minimal on-disk venv so `discover_python_environment` returns a
     /// real site-packages directory, and register its `FileRoot`s exactly as
     /// production does (via `python_cache::site_packages_paths`). Discovery uses
@@ -307,14 +272,10 @@ mod tests {
             Some(venv.to_string_lossy().into_owned()),
             Some(venv.to_string_lossy().into_owned()),
         );
-        // Register the discovered site-packages directories as `FileRoot`s,
-        // exactly as the resolver does on its first query. Without this the
-        // event side has no root to bump. Discovery canonicalizes the sys.prefix
-        // (e.g. macOS `/var` → `/private/var`), so the registered root path is
-        // the canonical one — return that so the simulated watch events route to
-        // it lexically, exactly as real events (fired under the canonical root
-        // the watcher registered) do.
-        python_cache::site_packages_paths(&db, python_config);
+        // Discovery canonicalizes the sys.prefix (e.g. macOS `/var` →
+        // `/private/var`), so return the canonical path: simulated watch
+        // events then name the same directory the resolver listed, exactly as
+        // real events do.
         let site_packages = std::fs::canonicalize(&site_packages).expect("canonicalize venv");
         let session = Session {
             db: parking_lot::Mutex::new(db),
@@ -323,86 +284,32 @@ mod tests {
         (session, site_packages, tmp)
     }
 
-    /// A `.pth` change in the real site-packages dir bumps its root; a change in
-    /// an unrelated directory in the same batch is skipped. Unrelated `.pth`
-    /// files have no registered root, so they never trigger invalidation.
+    /// Syncing a created or deleted `.pth`, as `did_change_watched_files`
+    /// does, is enough for the search paths to pick up the change.
     #[test]
-    fn bump_tracks_only_registered_site_packages_roots() {
-        let (session, site_packages, _tmp) = session_with_real_venv();
-        let unrelated = site_packages.parent().unwrap().join("not-site-packages");
-        std::fs::create_dir_all(&unrelated).unwrap();
+    fn syncing_a_pth_file_refreshes_search_paths() {
+        use ruff_db::files::File;
 
-        let mut dirs = HashSet::new();
-        dirs.insert(site_packages);
-        dirs.insert(unrelated);
+        let (session, site_packages, tmp) = session_with_real_venv();
+        let editable = std::fs::canonicalize(tmp.path())
+            .unwrap()
+            .join("editable_src");
+        std::fs::create_dir_all(&editable).unwrap();
+        let pth = site_packages.join("editable.pth");
+        let pth_sys = SystemPath::from_std_path(&pth).unwrap();
 
-        let bumped = session.bump_site_packages_pth_roots(&dirs);
-        assert_eq!(bumped, 1, "only the registered site-packages root bumps");
-    }
-
-    /// A `.pth` change with no registered root bumps nothing — an unrelated
-    /// `foo.pth` anywhere in the watched tree is inert.
-    #[test]
-    fn bump_skips_unrelated_dir_entirely() {
-        let (session, site_packages, _tmp) = session_with_real_venv();
-        let unrelated = site_packages.parent().unwrap().join("scratch");
-        std::fs::create_dir_all(&unrelated).unwrap();
-
-        let mut dirs = HashSet::new();
-        dirs.insert(unrelated);
-
-        assert_eq!(session.bump_site_packages_pth_roots(&dirs), 0);
-    }
-
-    /// Repeated `.pth` events for the same real dir bump the root revision each
-    /// time so `parse_pth_files` re-scans.
-    #[test]
-    fn bump_bumps_root_revision_across_repeated_events() {
-        let (session, site_packages, _tmp) = session_with_real_venv();
-        let mut dirs = HashSet::new();
-        dirs.insert(site_packages.clone());
-
-        let sys_path = SystemPath::from_std_path(&site_packages).unwrap();
-        let rev0 = {
+        let has_editable = |session: &Session| {
             let db = session.db.lock();
-            db.files().root(&*db, sys_path).unwrap().revision(&*db)
+            python_cache::search_paths_for_config(&*db, session.python_config).contains(&editable)
         };
+        assert!(!has_editable(&session));
 
-        assert_eq!(session.bump_site_packages_pth_roots(&dirs), 1);
-        let rev1 = {
-            let db = session.db.lock();
-            db.files().root(&*db, sys_path).unwrap().revision(&*db)
-        };
+        std::fs::write(&pth, format!("{}\n", editable.display())).unwrap();
+        File::sync_path(&mut *session.db.lock(), pth_sys);
+        assert!(has_editable(&session), "a created .pth must be picked up");
 
-        assert_eq!(session.bump_site_packages_pth_roots(&dirs), 1);
-        let rev2 = {
-            let db = session.db.lock();
-            db.files().root(&*db, sys_path).unwrap().revision(&*db)
-        };
-
-        assert!(
-            rev1 != rev0 && rev2 != rev1,
-            "each event must bump the root revision so the directory scan is recomputed"
-        );
-    }
-
-    /// Routing is lexical, so a candidate path differing from the registered
-    /// root only by a trailing separator must still match (`SystemPath::absolute`
-    /// strips the trailing separator before the prefix-tree lookup). Regression
-    /// guard for the path symmetry the `.pth` invalidation relies on.
-    #[test]
-    fn bump_matches_site_packages_despite_trailing_separator() {
-        let (session, site_packages, _tmp) = session_with_real_venv();
-        let mut with_sep = site_packages.into_os_string();
-        with_sep.push(std::path::MAIN_SEPARATOR.to_string());
-
-        let mut dirs = HashSet::new();
-        dirs.insert(std::path::PathBuf::from(with_sep));
-
-        assert_eq!(
-            session.bump_site_packages_pth_roots(&dirs),
-            1,
-            "a trailing-separator variant of the site-packages path must still match"
-        );
+        std::fs::remove_file(&pth).unwrap();
+        File::sync_path(&mut *session.db.lock(), pth_sys);
+        assert!(!has_editable(&session), "a deleted .pth must be dropped");
     }
 }
