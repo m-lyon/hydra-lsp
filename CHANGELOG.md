@@ -4,6 +4,8 @@
 
 - Updated the ruff and ty crates to the revision behind ty 0.0.104, and salsa to 0.28.5.
 - Python environment discovery now falls back to a `python3` or `python` on `PATH`, recognises Pixi environments, ignores an empty `VIRTUAL_ENV`, and skips a broken `.venv` instead of failing.
+- Module resolution now uses ty's resolver. A `<package>-stubs` package is preferred over the package it types, and a regular package hides namespace-package directories of the same name, as Python does. A `builtins.py` in the workspace no longer shadows the builtins stub, and a site-packages module named like a stdlib module is no longer resolved, since Python imports the stdlib one. An installed `typing_extensions` is no longer resolved either.
+- Python files are now parsed for the interpreter's Python version, read from `pyvenv.cfg` or the site-packages layout.
 
 ## [0.7.0]
 
@@ -12,8 +14,6 @@
 - Parameter validation is split into one check per rule, over a single parameter-kind model.
 - Diagnostics now carry `hydrust` as their `source`, in place of `hydra-lsp`. The pull-diagnostics identifier is renamed to match.
 - `yaml-syntax-error` is now a diagnostic rule.
-- Module resolution now uses ty's resolver. A `<package>-stubs` package is preferred over the package it types, and a regular package hides namespace-package directories of the same name, as Python does. A `builtins.py` in the workspace no longer shadows the builtins stub, and a site-packages module named like a stdlib module is no longer resolved, since Python imports the stdlib one. An installed `typing_extensions` is no longer resolved either.
-- Python files are now parsed for the interpreter's Python version, read from `pyvenv.cfg` or the site-packages layout.
 
 ## [0.6.1]
 
