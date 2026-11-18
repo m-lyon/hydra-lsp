@@ -59,6 +59,9 @@ impl ruff_db::Db for HydraDatabase {
 }
 
 #[salsa::db]
+impl ty_module_resolver::Db for HydraDatabase {}
+
+#[salsa::db]
 impl salsa::Database for HydraDatabase {}
 
 impl HydraDatabase {
@@ -156,6 +159,9 @@ pub mod tests {
             &mut self.system
         }
     }
+
+    #[salsa::db]
+    impl ty_module_resolver::Db for TestDb {}
 
     #[salsa::db]
     impl salsa::Database for TestDb {}
