@@ -448,6 +448,10 @@ impl ParsedContent {
             }
         };
         let resolved = match context {
+            // Hydra control keywords support completion, not Python signature help.
+            ParameterContext::Keyword(key) if HYDRA_KEYWORDS.contains(&key.as_str()) => {
+                return None;
+            }
             ParameterContext::Keyword(key) => ResolvedParameterContext::Keyword(key.clone()),
             ParameterContext::Positional(index) => positional(*index),
             ParameterContext::InlinePositional {
@@ -975,6 +979,22 @@ impl YamlParser {
                     }
                     param_index += 1;
                 }
+            }
+        }
+
+        for (key, keyword) in [
+            (PARTIAL_KEY, hydra_obj.partial.as_ref().map(|hp| hp.line)),
+            (
+                RECURSIVE_KEY,
+                hydra_obj.recursive.as_ref().map(|hp| hp.line),
+            ),
+            (CONVERT_KEY, hydra_obj.convert.as_ref().map(|hp| hp.line)),
+        ] {
+            if let Some(line) = keyword {
+                param_line_map.insert(
+                    line,
+                    (target_idx, ParameterContext::Keyword(key.to_string())),
+                );
             }
         }
 
@@ -3715,6 +3735,79 @@ model:
                 assert_eq!(partial, "25");
             }
             _ => panic!("expected ParameterValue, got {:?}", ctx),
+        }
+    }
+
+    #[test]
+    fn test_completion_context_at_hydra_keyword_values() {
+        for (key, value, partial) in [
+            (PARTIAL_KEY, "true", "t"),
+            (RECURSIVE_KEY, "false", "f"),
+            (CONVERT_KEY, "partial", "par"),
+            (PARTIAL_KEY, "t", "t"),
+            (CONVERT_KEY, "", ""),
+        ] {
+            let line = format!("  {key}: {value}");
+            let content = format!("model:\n  _target_: myproject.Model\n{line}\n");
+            let parsed = YamlParser::parse(&content).unwrap();
+            assert!(
+                parsed
+                    .target_for_parameter_line(Position::new(2, 5))
+                    .is_none()
+            );
+            let key_context = parsed
+                .completion_context_at(Position::new(2, 5), &line)
+                .unwrap();
+            match key_context {
+                CompletionContext::ParameterKey { target, partial } => {
+                    assert_eq!(target, "myproject.Model");
+                    assert_eq!(partial, &key[..3]);
+                }
+                other => panic!("expected ParameterKey, got {other:?}"),
+            }
+            let column = 2 + key.len() + 2 + partial.len();
+            let context = parsed
+                .completion_context_at(Position::new(2, column as u32), &line)
+                .unwrap_or_else(|| panic!("missing completion context for {line:?}"));
+            match context {
+                CompletionContext::ParameterValue {
+                    target,
+                    parameter,
+                    partial: actual,
+                } => {
+                    assert_eq!(target, "myproject.Model");
+                    assert_eq!(parameter, key);
+                    assert_eq!(actual, partial);
+                }
+                other => panic!("expected ParameterValue, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_completion_context_at_nested_hydra_keywords() {
+        let content = "model:\n  _target_: myproject.Outer\n  _partial_: true\n  child:\n    _target_: myproject.Inner\n    _recursive_: false\n    _convert_: all\n";
+        let parsed = YamlParser::parse(content).unwrap();
+        for (line_number, target, key) in [
+            (2, "myproject.Outer", PARTIAL_KEY),
+            (5, "myproject.Inner", RECURSIVE_KEY),
+            (6, "myproject.Inner", CONVERT_KEY),
+        ] {
+            let line = content.lines().nth(line_number).unwrap();
+            let context = parsed
+                .completion_context_at(Position::new(line_number as u32, line.len() as u32), line)
+                .unwrap();
+            match context {
+                CompletionContext::ParameterValue {
+                    target: actual,
+                    parameter,
+                    ..
+                } => {
+                    assert_eq!(actual, target);
+                    assert_eq!(parameter, key);
+                }
+                other => panic!("expected ParameterValue, got {other:?}"),
+            }
         }
     }
 
