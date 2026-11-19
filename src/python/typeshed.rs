@@ -140,6 +140,13 @@ pub fn is_vendored_module(module_path: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('.'))
 }
 
+/// Whether `module_path` is a PyPI package that the vendored stdlib stubs
+/// answer for anyway. ty never lets an installed copy shadow these, but Hydra
+/// imports the installed copy, and fails to import it when it is missing.
+pub fn is_installed_from_pypi(module_path: &str) -> bool {
+    module_path == "typing_extensions"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

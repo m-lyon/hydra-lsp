@@ -9,8 +9,8 @@ use super::import_resolver::ImportResolver;
 use super::model::{ClassAttributeInfo, DefinitionInfo, FunctionSignature, ResolveError};
 use super::resolve::{base_class_name, extract_definition_info, resolve_base_class};
 use super::typeshed::{
-    BUILTINS_MODULE, is_runtime_builtin_name, is_vendored_module, is_vendored_path,
-    vendored_module_name, vendored_sentinel_path,
+    BUILTINS_MODULE, is_installed_from_pypi, is_runtime_builtin_name, is_vendored_module,
+    is_vendored_path, vendored_module_name, vendored_sentinel_path,
 };
 use ruff_db::files::{File, FilePath, FileRootKind};
 use ruff_db::system::{SystemPath, SystemPathBuf};
@@ -18,7 +18,7 @@ use ruff_python_ast::PythonVersion;
 use tracing::debug;
 use ty_module_resolver::{
     ModuleName, ResolverEnvironment, SearchPath, SearchPathSettings, UseDefaultStrategy,
-    resolve_module_confident,
+    resolve_module_confident, system_module_search_paths,
 };
 
 /// Salsa input for Python environment configuration.
@@ -233,6 +233,11 @@ pub fn resolve_module_cached<'db>(
         .is_some_and(SearchPath::is_standard_library)
         && !is_vendored_module(module_path_str)
     {
+        if is_installed_from_pypi(module_path_str) {
+            return system_module_search_paths(db, environment).find_map(|root| {
+                ImportResolver::find_module_file(db, &root.as_std_path().join(module_path_str))
+            });
+        }
         return None;
     }
 
@@ -1671,14 +1676,24 @@ mod tests {
         assert_eq!(layout.resolve("enum"), None);
     }
 
-    /// Typeshed ships `typing_extensions` among its stdlib stubs and ty never
-    /// lets anything shadow it, so an installed copy is not reached. Python
-    /// would import the installed copy, so this is a known gap.
+    /// ty always answers `typing_extensions` from its stdlib stubs, but Hydra
+    /// imports the installed copy.
     #[test]
     fn test_site_packages_typing_extensions() {
         let layout = Layout::new();
         layout.write(&layout.site_packages.join("typing_extensions.py"), "");
 
+        assert_eq!(
+            layout.resolve("typing_extensions"),
+            Some(layout.site_packages.join("typing_extensions.py"))
+        );
+    }
+
+    /// Without an installed copy Hydra cannot import `typing_extensions`, even
+    /// though the stdlib stubs include it.
+    #[test]
+    fn test_missing_typing_extensions_is_unresolved() {
+        let layout = Layout::new();
         assert_eq!(layout.resolve("typing_extensions"), None);
     }
 
