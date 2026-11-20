@@ -60,13 +60,30 @@ pub(super) fn path_is_file(db: &dyn ruff_db::Db, path: &Path) -> bool {
 /// The returned `SourceText` is `Arc`-backed; callers should bind it to a
 /// local and call `.as_str()` to get a borrowed `&str`.
 pub(super) fn read_source(db: &dyn ruff_db::Db, path: &Path) -> Result<SourceText> {
-    let file = path_to_file(db, path)
-        .with_context(|| format!("could not resolve file: {}", path.display()))?;
+    let file = resolve_file(db, path)?;
     let source = source_text(db, file);
     if let Some(err) = source.read_error() {
         anyhow::bail!("failed to read {}: {}", path.display(), err);
     }
     Ok(source)
+}
+
+fn resolve_file(db: &dyn ruff_db::Db, path: &Path) -> Result<File> {
+    path_to_file(db, path).with_context(|| format!("could not resolve file: {}", path.display()))
+}
+
+/// Run `find` over the parsed module at `path` and its source text, through
+/// the salsa-tracked reads.
+fn find_in_module<T>(
+    db: &dyn ruff_db::Db,
+    path: &Path,
+    python_version: PythonVersion,
+    find: impl FnOnce(&[Stmt], &str) -> Option<T>,
+    not_found: impl FnOnce() -> anyhow::Error,
+) -> Result<T> {
+    let source = read_source(db, path)?;
+    let parsed = get_parsed_module(db, path, python_version)?;
+    find(parsed.suite(), source.as_str()).ok_or_else(not_found)
 }
 
 /// Parse a Python source file through ruff_db's salsa-tracked `parsed_module`.
@@ -79,9 +96,7 @@ pub(super) fn get_parsed_module(
     path: &Path,
     python_version: PythonVersion,
 ) -> Result<ParsedModuleRef> {
-    let file = path_to_file(db, path)
-        .with_context(|| format!("could not resolve file: {}", path.display()))?;
-    let file = PythonFile::new(db, file, python_version);
+    let file = PythonFile::new(db, resolve_file(db, path)?, python_version);
     Ok(parsed_module(db, file).load(db))
 }
 
@@ -115,18 +130,21 @@ pub fn extract_function_signature(
     function_name: &str,
     python_version: PythonVersion,
 ) -> Result<FunctionSignature> {
-    let source = read_source(db, path)?;
-    let parsed = get_parsed_module(db, path, python_version)?;
-
-    let mut visitor = FunctionExtractor {
-        target_name: function_name.to_string(),
-        result: None,
-        source: source.as_str().to_string(),
-    };
-    visitor.visit_body(parsed.suite());
-    visitor
-        .result
-        .ok_or_else(|| anyhow::anyhow!("Function '{}' not found", function_name))
+    find_in_module(
+        db,
+        path,
+        python_version,
+        |suite, source| {
+            let mut visitor = FunctionExtractor {
+                target_name: function_name,
+                result: None,
+                source,
+            };
+            visitor.visit_body(suite);
+            visitor.result
+        },
+        || anyhow::anyhow!("Function '{}' not found", function_name),
+    )
 }
 
 /// Whether `name` is bound at module scope in the module at `path`.
@@ -177,18 +195,21 @@ pub fn extract_class_info(
     class_name: &str,
     python_version: PythonVersion,
 ) -> Result<ClassInfo> {
-    let source = read_source(db, path)?;
-    let parsed = get_parsed_module(db, path, python_version)?;
-
-    let mut visitor = ClassExtractor {
-        target_name: class_name.to_string(),
-        result: None,
-        source: source.as_str().to_string(),
-    };
-    visitor.visit_body(parsed.suite());
-    visitor
-        .result
-        .ok_or_else(|| anyhow::anyhow!("Class '{}' not found", class_name))
+    find_in_module(
+        db,
+        path,
+        python_version,
+        |suite, source| {
+            let mut visitor = ClassExtractor {
+                target_name: class_name,
+                result: None,
+                source,
+            };
+            visitor.visit_body(suite);
+            visitor.result
+        },
+        || anyhow::anyhow!("Class '{}' not found", class_name),
+    )
 }
 
 /// Extract method information from source code via salsa-cached parsing.
@@ -199,23 +220,28 @@ pub(super) fn extract_method_info(
     method_name: &str,
     python_version: PythonVersion,
 ) -> Result<MethodInfo> {
-    let source = read_source(db, path)?;
-    let parsed = get_parsed_module(db, path, python_version)?;
-
-    let mut visitor = MethodExtractor {
-        class_name: class_name.to_string(),
-        method_name: method_name.to_string(),
-        result: None,
-        source: source.as_str().to_string(),
-    };
-    visitor.visit_body(parsed.suite());
-    visitor.result.ok_or_else(|| {
-        anyhow::anyhow!(
-            "Method '{}' not found in class '{}'",
-            method_name,
-            class_name
-        )
-    })
+    find_in_module(
+        db,
+        path,
+        python_version,
+        |suite, source| {
+            let mut visitor = MethodExtractor {
+                class_name,
+                method_name,
+                result: None,
+                source,
+            };
+            visitor.visit_body(suite);
+            visitor.result
+        },
+        || {
+            anyhow::anyhow!(
+                "Method '{}' not found in class '{}'",
+                method_name,
+                class_name
+            )
+        },
+    )
 }
 
 /// Extract class attribute from source code via salsa-cached parsing.
@@ -246,13 +272,13 @@ pub(super) fn extract_class_attribute(
 }
 
 /// Visitor to extract function signatures from AST
-struct FunctionExtractor {
-    target_name: String,
+struct FunctionExtractor<'s> {
+    target_name: &'s str,
     result: Option<FunctionSignature>,
-    source: String,
+    source: &'s str,
 }
 
-impl<'a> Visitor<'a> for FunctionExtractor {
+impl<'a> Visitor<'a> for FunctionExtractor<'_> {
     /// Matching is done per *body* rather than per statement so that the
     /// sibling declarations are in scope: a name declared more than once, or
     /// decorated with `@overload`, is overloaded, and this is only discernible through
@@ -264,7 +290,8 @@ impl<'a> Visitor<'a> for FunctionExtractor {
         if body.iter().any(|stmt| {
             matches!(stmt, Stmt::FunctionDef(func_def) if func_def.name.as_str() == self.target_name)
         }) {
-            self.result = extract_declared_signature(body, &self.target_name, &self.source);
+            self.result = extract_declared_signature(body, self.target_name, self.source)
+                .map(|(_, signature)| signature);
             return;
         }
         for stmt in body {
@@ -286,13 +313,13 @@ impl<'a> Visitor<'a> for FunctionExtractor {
 }
 
 /// Visitor to extract class information from AST
-struct ClassExtractor {
-    target_name: String,
-    source: String,
+struct ClassExtractor<'s> {
+    target_name: &'s str,
+    source: &'s str,
     result: Option<ClassInfo>,
 }
 
-impl<'a> Visitor<'a> for ClassExtractor {
+impl<'a> Visitor<'a> for ClassExtractor<'_> {
     fn visit_stmt(&mut self, stmt: &'a Stmt) {
         if self.result.is_some() {
             return; // Already found
@@ -301,7 +328,7 @@ impl<'a> Visitor<'a> for ClassExtractor {
         if let Stmt::ClassDef(class_def) = stmt
             && class_def.name.as_str() == self.target_name
         {
-            self.result = Some(extract_class_info_from_def(class_def, &self.source));
+            self.result = Some(extract_class_info_from_def(class_def, self.source));
             return;
         }
 
@@ -311,11 +338,11 @@ impl<'a> Visitor<'a> for ClassExtractor {
 }
 
 /// Visitor to extract a specific method from a class
-struct MethodExtractor {
-    class_name: String,
-    method_name: String,
+struct MethodExtractor<'s> {
+    class_name: &'s str,
+    method_name: &'s str,
     result: Option<MethodInfo>,
-    source: String,
+    source: &'s str,
 }
 
 /// Visitor to extract class attribute assignments from a class definition
@@ -370,7 +397,7 @@ impl<'a> Visitor<'a> for ClassAttributeExtractor {
     }
 }
 
-impl<'a> Visitor<'a> for MethodExtractor {
+impl<'a> Visitor<'a> for MethodExtractor<'_> {
     fn visit_stmt(&mut self, stmt: &'a Stmt) {
         if self.result.is_some() {
             return; // Already found
@@ -378,35 +405,21 @@ impl<'a> Visitor<'a> for MethodExtractor {
 
         if let Stmt::ClassDef(class_def) = stmt
             && class_def.name.as_str() == self.class_name
+            && let Some((declaration, signature)) =
+                extract_declared_signature(&class_def.body, self.method_name, self.source)
         {
-            // Look for the method within the class body
-            for class_stmt in &class_def.body {
-                if let Stmt::FunctionDef(func_def) = class_stmt
-                    && func_def.name.as_str() == self.method_name
-                    && let Some((declaration, is_overloaded)) =
-                        resolve_declaration(&class_def.body, &self.method_name)
-                {
-                    let mut signature =
-                        extract_function_signature_from_def(declaration, &self.source);
-                    signature.is_overloaded = is_overloaded;
-                    signature.overloads =
-                        overload_signatures(&class_def.body, &self.method_name, &self.source);
+            // Decorators come from the declaration actually chosen.
+            let (is_classmethod, is_staticmethod) =
+                check_method_decorators(&declaration.decorator_list);
 
-                    // Check decorators for @classmethod or @staticmethod, on the
-                    // declaration actually chosen rather than on this statement.
-                    let (is_classmethod, is_staticmethod) =
-                        check_method_decorators(&declaration.decorator_list);
-
-                    self.result = Some(MethodInfo {
-                        class_name: self.class_name.clone(),
-                        method_name: self.method_name.clone(),
-                        signature,
-                        is_classmethod,
-                        is_staticmethod,
-                    });
-                    return;
-                }
-            }
+            self.result = Some(MethodInfo {
+                class_name: self.class_name.to_string(),
+                method_name: self.method_name.to_string(),
+                signature,
+                is_classmethod,
+                is_staticmethod,
+            });
+            return;
         }
 
         // Continue walking to find nested classes
@@ -444,18 +457,18 @@ fn resolve_declaration<'a>(
     }
 }
 
-/// The signature of `name` as declared in `body`, resolved through any
-/// `@overload` set.
-fn extract_declared_signature(
-    body: &[Stmt],
+/// The declaration of `name` in `body` and its signature, resolved through
+/// any `@overload` set.
+fn extract_declared_signature<'a>(
+    body: &'a [Stmt],
     name: &str,
     source: &str,
-) -> Option<FunctionSignature> {
+) -> Option<(&'a ast::StmtFunctionDef, FunctionSignature)> {
     let (func_def, is_overloaded) = resolve_declaration(body, name)?;
     let mut signature = extract_function_signature_from_def(func_def, source);
     signature.is_overloaded = is_overloaded;
     signature.overloads = overload_signatures(body, name, source);
-    Some(signature)
+    Some((func_def, signature))
 }
 
 /// The signature of every `@overload` declaration of `name` in `body`, in
@@ -560,8 +573,10 @@ fn extract_class_info_from_def(class_def: &ast::StmtClassDef, source: &str) -> C
     // Extract base classes
     let base_classes: Vec<String> = class_def.bases().iter().map(expr_to_string).collect();
 
-    let init_signature = extract_declared_signature(&class_def.body, "__init__", source);
-    let new_signature = extract_declared_signature(&class_def.body, "__new__", source);
+    let init_signature = extract_declared_signature(&class_def.body, "__init__", source)
+        .map(|(_, signature)| signature);
+    let new_signature = extract_declared_signature(&class_def.body, "__new__", source)
+        .map(|(_, signature)| signature);
 
     ClassInfo {
         name: class_def.name.to_string(),

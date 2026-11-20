@@ -3,7 +3,7 @@
 
 use super::cache::{
     ResolvedDefinition, TargetString, class_key, class_parent_attribute, class_parent_docs,
-    resolve_module_cached,
+    resolve_module_by_name,
 };
 use super::extract::{extract_class_info, extract_function_signature, extract_method_info};
 use super::import_resolver::ImportResolver;
@@ -27,18 +27,10 @@ enum ClassAttributeChainResult {
     },
 }
 
-/// Split a `_target_` string into module path and symbol name
+/// Split a dotted path at its last dot, into module path and symbol name.
 /// Example: "myproject.models.MyClass" -> ("myproject.models", "MyClass")
-fn split_target(target: &str) -> Result<(String, String)> {
-    let parts: Vec<&str> = target.split('.').collect();
-    if parts.len() < 2 {
-        anyhow::bail!("Invalid _target_ format: '{}'", target);
-    }
-
-    let symbol_name = parts.last().unwrap().to_string();
-    let module_path = parts[..parts.len() - 1].join(".");
-
-    Ok((module_path, symbol_name))
+fn split_target(target: &str) -> Option<(&str, &str)> {
+    target.rsplit_once('.')
 }
 
 /// Resolve an attribute chain through classes.
@@ -60,7 +52,7 @@ fn resolve_attribute_chain<'db>(
 
     let mut current_file = file_path.to_path_buf();
     let mut current_class = starting_class.to_string();
-    let mut resolver = ImportResolver::new(db, environment);
+    let resolver = ImportResolver::new(db, environment);
     let python_version = environment.python_version(db);
 
     // Process all but the last attribute (which might be a method)
@@ -83,11 +75,21 @@ fn resolve_attribute_chain<'db>(
         match cached_attr.get() {
             Some((attr_info, _attr_file, _attr_class)) => {
                 // The value could be a simple name or a dotted path
-                let value_parts: Vec<&str> = attr_info.value.split('.').collect();
+                if let Some((module_path, class_name)) = split_target(&attr_info.value) {
+                    if let Some(resolved_file) = resolver.resolve_module_path(module_path) {
+                        current_file = resolved_file;
+                        current_class = class_name.to_string();
+                        continue;
+                    }
 
-                if value_parts.len() == 1 {
+                    anyhow::bail!(
+                        "Could not resolve module path '{}' from attribute '{}'",
+                        module_path,
+                        attr
+                    );
+                } else {
                     // Simple name - look for it in the same file first
-                    let new_class_name = value_parts[0];
+                    let new_class_name = attr_info.value.as_str();
 
                     // Try direct lookup in current file
                     if extract_class_info(db, &current_file, new_class_name, python_version).is_ok()
@@ -108,23 +110,6 @@ fn resolve_attribute_chain<'db>(
                     anyhow::bail!(
                         "Could not resolve class '{}' from attribute '{}'",
                         new_class_name,
-                        attr
-                    );
-                } else {
-                    // Dotted path like "module.Class"
-                    let module_path = value_parts[..value_parts.len() - 1].join(".");
-                    let class_name = value_parts[value_parts.len() - 1];
-
-                    // Try to resolve the module
-                    if let Some(resolved_file) = resolver.resolve_module_path(&module_path) {
-                        current_file = resolved_file;
-                        current_class = class_name.to_string();
-                        continue;
-                    }
-
-                    anyhow::bail!(
-                        "Could not resolve module path '{}' from attribute '{}'",
-                        module_path,
                         attr
                     );
                 }
@@ -163,22 +148,16 @@ pub(super) fn resolve_base_class<'db>(
 ) -> Option<(PathBuf, String)> {
     let base_class_expr = base_class_name(base_class_expr);
 
-    // Check if it's a qualified name (contains a dot)
-    if let Some(dot_pos) = base_class_expr.rfind('.') {
-        // Qualified name like `module.ClassName`
-        let module_path = &base_class_expr[..dot_pos];
-        let class_name = &base_class_expr[dot_pos + 1..];
-
-        // Cached lookup: base-class resolution for the same parent module is
-        // shared across the MRO walk and across sibling hover requests.
-        let module_path_id = TargetString::new(db, module_path.to_string());
-        if let Some(file_path) = resolve_module_cached(db, module_path_id, environment).clone() {
-            return Some((file_path, class_name.to_string()));
-        }
+    // Qualified name like `module.ClassName`. The cached lookup is shared
+    // across the MRO walk and across sibling hover requests.
+    if let Some((module_path, class_name)) = split_target(base_class_expr)
+        && let Some(file_path) = resolve_module_by_name(db, module_path, environment)
+    {
+        return Some((file_path, class_name.to_string()));
     }
 
     // Simple name - try to resolve through imports in the current file
-    let mut resolver = ImportResolver::new(db, environment);
+    let resolver = ImportResolver::new(db, environment);
     if let Some(resolved) = resolver.resolve_symbol(current_file, base_class_expr) {
         return Some(resolved);
     }
@@ -231,16 +210,11 @@ fn extract_class_info_with_imports<'db>(
     if class_info.docstring.is_none() || class_info.init_signature.is_none() {
         let class_key = class_key(db, &resolved_file, &class_info.name);
         let parent_docs = class_parent_docs(db, class_key, environment);
-
-        if class_info.docstring.is_none() {
-            class_info.docstring = parent_docs.docstring().cloned();
-        }
-        if class_info.init_signature.is_none() {
-            class_info.init_signature = parent_docs.init().cloned();
-        }
-        if class_info.new_signature.is_none() {
-            class_info.new_signature = parent_docs.new_signature().cloned();
-        }
+        parent_docs.fill_missing(
+            &mut class_info.docstring,
+            &mut class_info.init_signature,
+            &mut class_info.new_signature,
+        );
         class_info.unresolved_base_classes = !parent_docs.all_bases_resolved();
     }
 
@@ -294,7 +268,7 @@ fn with_reexports<'db, T>(
         return Ok((found, file_path.to_path_buf()));
     }
 
-    let mut resolver = ImportResolver::new(db, environment);
+    let resolver = ImportResolver::new(db, environment);
     let Some((resolved_file, resolved_name)) = resolver.resolve_symbol(file_path, name) else {
         return Err(not_found());
     };
@@ -310,16 +284,16 @@ pub fn extract_definition_info<'db>(
     target: &str,
     environment: ResolverEnvironment<'db>,
 ) -> std::result::Result<ResolvedDefinition, ResolveError> {
-    let Ok((module_path, symbol_name)) = split_target(target) else {
+    let Some((module_path, symbol_name)) = split_target(target) else {
         return Err(ResolveError::InvalidFormat(target.to_string()));
     };
+    let (module_path, symbol_name) = (module_path.to_string(), symbol_name.to_string());
 
     // Track whether we found the module but not the symbol
     let mut module_found = false;
 
     // First try standard resolution: module.symbol where symbol is a function or class
-    let module_path_id = TargetString::new(db, module_path.clone());
-    if let Some(file_path) = resolve_module_cached(db, module_path_id, environment).clone() {
+    if let Some(file_path) = resolve_module_by_name(db, &module_path, environment) {
         module_found = true;
 
         // Try to extract as function first (with import resolution)
@@ -435,8 +409,7 @@ fn resolve_class_attribute_chain<'db>(
 
         // Cached salsa lookup: same (module_path, environment) → cache hit on
         // second hover for any symbol in the same module.
-        let module_path_id = TargetString::new(db, module_path);
-        let Some(file_path) = resolve_module_cached(db, module_path_id, environment).clone() else {
+        let Some(file_path) = resolve_module_by_name(db, &module_path, environment) else {
             continue;
         };
 
@@ -592,28 +565,28 @@ mod tests {
 
     #[test]
     fn test_split_target() {
-        let (module, symbol) = split_target("myproject.models.MyClass").unwrap();
-        assert_eq!(module, "myproject.models");
-        assert_eq!(symbol, "MyClass");
+        assert_eq!(
+            split_target("myproject.models.MyClass"),
+            Some(("myproject.models", "MyClass"))
+        );
     }
 
     #[test]
     fn test_split_target_short() {
-        let (module, symbol) = split_target("module.Class").unwrap();
-        assert_eq!(module, "module");
-        assert_eq!(symbol, "Class");
+        assert_eq!(split_target("module.Class"), Some(("module", "Class")));
     }
 
     #[test]
     fn test_split_target_invalid() {
-        assert!(split_target("InvalidTarget").is_err());
+        assert_eq!(split_target("InvalidTarget"), None);
     }
 
     #[test]
     fn test_split_target_deeply_nested() {
-        let (module, symbol) = split_target("a.b.c.d.e.FinalClass").unwrap();
-        assert_eq!(module, "a.b.c.d.e");
-        assert_eq!(symbol, "FinalClass");
+        assert_eq!(
+            split_target("a.b.c.d.e.FinalClass"),
+            Some(("a.b.c.d.e", "FinalClass"))
+        );
     }
 
     // ==================== inherited class tests ====================
@@ -933,10 +906,7 @@ mod tests {
     // ==================== Re-export resolution tests ====================
 
     fn get_reexport_test_dir() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests")
-            .join("workspace")
-            .join("reexport")
+        crate::python::test_support::fixture_dir("reexport")
     }
 
     #[test]
@@ -1728,5 +1698,47 @@ def plain(value, /, other, *, flag=False):
             format_function(&plain).contains("plain(value, /, other, *, flag = False)"),
             "both the positional-only `/` and the keyword-only `*` must be shown"
         );
+    }
+
+    /// Each hop of an attribute chain starts a fresh import walk. Here the
+    /// second hop passes through `pkg/b.py` and `pkg/__init__.py` again, which
+    /// the first hop already visited.
+    #[test]
+    fn test_attribute_chain_revisits_files_of_an_earlier_hop() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("pkg");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(
+            pkg.join("__init__.py"),
+            "from .b import Mid\nfrom .c import Inner\n",
+        )
+        .unwrap();
+        std::fs::write(
+            pkg.join("a.py"),
+            "from pkg import Mid\n\nclass Outer:\n    mid = Mid\n",
+        )
+        .unwrap();
+        std::fs::write(
+            pkg.join("b.py"),
+            "from pkg import Inner\n\nclass Mid:\n    inner = Inner\n",
+        )
+        .unwrap();
+        std::fs::write(
+            pkg.join("c.py"),
+            "class Inner:\n    \"\"\"Inner doc.\"\"\"\n",
+        )
+        .unwrap();
+
+        let resolved = extract_definition_info(
+            &test_db(),
+            "pkg.a.Outer.mid.inner",
+            &[dir.path().to_path_buf()],
+        )
+        .expect("the chain should resolve");
+        match resolved.definition_info {
+            DefinitionInfo::Class(class_info) => assert_eq!(class_info.name, "Inner"),
+            other => panic!("expected a class, got {other:?}"),
+        }
+        assert_eq!(resolved.file_path, pkg.join("c.py"));
     }
 }

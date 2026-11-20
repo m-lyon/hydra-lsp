@@ -184,7 +184,7 @@ impl HydraLspBackend {
         uri: &Url,
         context: &'static str,
     ) -> Option<ParsedYaml> {
-        let input = *self.document_inputs.get(uri)?;
+        let input = self.document_input(uri)?;
         self.with_session(context, |s| {
             let db = s.db.lock();
             if yaml_cache::is_hydra_file(&*db, input) {
@@ -194,6 +194,13 @@ impl HydraLspBackend {
             }
         })
         .flatten()
+    }
+
+    /// The `DocumentInput` for `uri`. The shard guard is released before this
+    /// returns, so a caller can take the db lock next without inverting the
+    /// lock order `get_or_create_input` uses.
+    pub(super) fn document_input(&self, uri: &Url) -> Option<DocumentInput> {
+        self.document_inputs.get(uri).map(|entry| *entry)
     }
 
     /// Get or create a `DocumentInput` for a given URI.

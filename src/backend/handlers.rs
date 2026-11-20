@@ -381,8 +381,7 @@ impl LanguageServer for HydraLspBackend {
         // reuse on a subsequent `did_open` for the same URI. Salsa exposes
         // no input-deletion API, so this is the minimum-footprint
         // equivalent (matches `ruff_db::files::VirtualFile::close`).
-        let input = self.document_inputs.get(&uri).map(|entry| *entry);
-        if let Some(input) = input {
+        if let Some(input) = self.document_input(&uri) {
             self.with_session("closing documents", |s| {
                 let mut db = s.db.lock();
                 input.close(&mut *db);
@@ -440,16 +439,7 @@ impl LanguageServer for HydraLspBackend {
                     DefinitionInfo::Class(class_info) => format_class(&class_info),
                     DefinitionInfo::Method(method_info) => format_method(&method_info),
                 };
-                let range = Range {
-                    start: Position {
-                        line: hydra_object.target.line,
-                        character: hydra_object.target.value_start,
-                    },
-                    end: Position {
-                        line: hydra_object.target.line,
-                        character: hydra_object.target_value_end(),
-                    },
-                };
+                let range = hydra_object.target_range();
 
                 Ok(Some(Hover {
                     contents: HoverContents::Markup(MarkupContent {
@@ -476,7 +466,7 @@ impl LanguageServer for HydraLspBackend {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
 
-        let Some(input) = self.document_inputs.get(&uri).map(|e| *e) else {
+        let Some(input) = self.document_input(&uri) else {
             return Ok(None);
         };
 
@@ -731,16 +721,10 @@ impl LanguageServer for HydraLspBackend {
             .into_iter()
             .map(|(start_line, start_col, end_line, end_col)| Location {
                 uri: target_uri.clone(),
-                range: Range {
-                    start: Position {
-                        line: start_line,
-                        character: start_col,
-                    },
-                    end: Position {
-                        line: end_line,
-                        character: end_col,
-                    },
-                },
+                range: Range::new(
+                    Position::new(start_line, start_col),
+                    Position::new(end_line, end_col),
+                ),
             })
             .collect();
         let result = Ok(Some(if locations.len() == 1 {
@@ -763,7 +747,7 @@ impl LanguageServer for HydraLspBackend {
             return Ok(None);
         }
         let uri = params.text_document.uri;
-        let Some(input) = self.document_inputs.get(&uri).map(|e| *e) else {
+        let Some(input) = self.document_input(&uri) else {
             return Ok(None);
         };
 
@@ -832,11 +816,9 @@ impl LanguageServer for HydraLspBackend {
         if !self.settings.read().features.diagnostics {
             return Ok(empty_full_report());
         }
-        let Some(input_ref) = self.document_inputs.get(&uri) else {
+        let Some(input) = self.document_input(&uri) else {
             return Ok(empty_full_report());
         };
-        let input = *input_ref;
-        drop(input_ref);
 
         let Some(SessionSnapshot {
             db: db_snapshot,

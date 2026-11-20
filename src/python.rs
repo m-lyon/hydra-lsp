@@ -12,14 +12,25 @@ pub mod typeshed;
 pub(crate) mod test_support {
     use crate::database::HydraDatabase;
     use ruff_db::system::SystemPath;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
-    /// The `tests/workspace/simple` fixture directory.
-    pub(crate) fn get_simple_test_dir() -> PathBuf {
+    /// The `tests/workspace/<name>` fixture directory.
+    pub(crate) fn fixture_dir(name: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests")
             .join("workspace")
-            .join("simple")
+            .join(name)
+    }
+
+    /// The `tests/workspace/simple` fixture directory.
+    pub(crate) fn get_simple_test_dir() -> PathBuf {
+        fixture_dir("simple")
+    }
+
+    /// Write `contents` to `path`, creating the parent directories first.
+    pub(crate) fn write_file(path: &Path, contents: &str) {
+        std::fs::create_dir_all(path.parent().expect("path has a parent")).expect("create dirs");
+        std::fs::write(path, contents).expect("write file");
     }
 
     /// Build a fresh `HydraDatabase` for tests. Each call is a clean db so

@@ -121,9 +121,7 @@ impl HydraLspBackend {
     fn publish_diagnostics_for_document(&self, uri: &Url) {
         // Callers (`did_open`, `did_change`) always create the input first, so a
         // missing entry is a programmer error rather than a runtime concern.
-        // Copy the input out so the shard guard drops before the db lock is
-        // taken (see the `document_inputs` lock order).
-        let Some(input) = self.document_inputs.get(uri).map(|entry| *entry) else {
+        let Some(input) = self.document_input(uri) else {
             debug_assert!(
                 false,
                 "publish_diagnostics_for_document called for {} with no DocumentInput; \

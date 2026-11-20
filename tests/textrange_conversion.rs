@@ -255,7 +255,7 @@ def test_function(x: int) -> int:
     let test_file = workspace_dir.join("test_module.py");
     fs::write(&test_file, source).unwrap();
 
-    let db = HydraDatabase::new(SystemPath::new("/"));
+    let db = test_db();
     let search_paths = vec![workspace_root.to_path_buf(), PathBuf::from(".")];
     let def_info = extract_definition_info(
         &db,
@@ -297,7 +297,7 @@ class TestClass:
     let test_file = workspace_dir.join("test_class_module.py");
     fs::write(&test_file, source).unwrap();
 
-    let db = HydraDatabase::new(SystemPath::new("/"));
+    let db = test_db();
     let search_paths = vec![workspace_root.to_path_buf(), PathBuf::from(".")];
     let def_info = extract_definition_info(
         &db,

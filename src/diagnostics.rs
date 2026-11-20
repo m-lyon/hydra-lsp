@@ -22,17 +22,25 @@ pub(crate) fn create_diagnostic(
     code: Option<DiagnosticRule>,
     message: String,
 ) -> Diagnostic {
+    diagnostic_in(
+        Range::new(
+            Position::new(line, start_char),
+            Position::new(line, end_char),
+        ),
+        severity,
+        code,
+        message,
+    )
+}
+
+fn diagnostic_in(
+    range: Range,
+    severity: DiagnosticSeverity,
+    code: Option<DiagnosticRule>,
+    message: String,
+) -> Diagnostic {
     Diagnostic {
-        range: Range {
-            start: Position {
-                line,
-                character: start_char,
-            },
-            end: Position {
-                line,
-                character: end_char,
-            },
-        },
+        range,
         severity: Some(severity),
         code: code.map(|c| tower_lsp::lsp_types::NumberOrString::String(c.to_string())),
         source: Some(DIAGNOSTIC_SOURCE.to_string()),
@@ -65,11 +73,9 @@ fn validate_target(
                 }
                 ResolveError::UnresolvedModule(_) | ResolveError::Other(_) => err.to_string(),
             };
-            if !file_suppressions.contains(&rule) && !hydra_obj.suppressed_rules.contains(&rule) {
-                diagnostics.push(create_diagnostic(
-                    hydra_obj.target.line,
-                    hydra_obj.target.value_start,
-                    hydra_obj.target_value_end(),
+            if !hydra_obj.rule_suppressed(rule, file_suppressions) {
+                diagnostics.push(diagnostic_in(
+                    hydra_obj.target_range(),
                     DiagnosticSeverity::ERROR,
                     Some(rule),
                     msg,
@@ -167,7 +173,7 @@ impl<'a> CallCheck<'a> {
 
     /// Whether `rule` is off for the whole file or this node.
     fn rule_suppressed(&self, rule: DiagnosticRule) -> bool {
-        self.file_suppressions.contains(&rule) || self.hydra_obj.suppressed_rules.contains(&rule)
+        self.hydra_obj.rule_suppressed(rule, self.file_suppressions)
     }
 
     /// Whether `rule` is off for `arg`, which may also suppress it itself.
@@ -337,11 +343,8 @@ fn check_missing_arguments(check: &CallCheck, diagnostics: &mut Vec<Diagnostic>)
                     param.name, check.display_name
                 )
             };
-            let hydra_obj = check.hydra_obj;
-            diagnostics.push(create_diagnostic(
-                hydra_obj.target.line,
-                hydra_obj.target.value_start,
-                hydra_obj.target_value_end(),
+            diagnostics.push(diagnostic_in(
+                check.hydra_obj.target_range(),
                 DiagnosticSeverity::ERROR,
                 Some(rule),
                 message,
@@ -448,11 +451,7 @@ fn validate_hydra_keywords(
     hydra_obj: &HydraObject,
     file_suppressions: &HashSet<DiagnosticRule>,
 ) -> Vec<Diagnostic> {
-    if file_suppressions.contains(&DiagnosticRule::InvalidHydraParameter)
-        || hydra_obj
-            .suppressed_rules
-            .contains(&DiagnosticRule::InvalidHydraParameter)
-    {
+    if hydra_obj.rule_suppressed(DiagnosticRule::InvalidHydraParameter, file_suppressions) {
         return Vec::new();
     }
 
@@ -565,21 +564,15 @@ mod tests {
     use crate::python::model::ParameterInfo;
     use crate::yaml_parser::{HydraParameter, Parameter, YamlValue};
     use hashlink::LinkedHashMap;
-    use ruff_db::system::SystemPath;
     use std::collections::HashMap;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
 
-    fn get_simple_test_dir() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests")
-            .join("workspace")
-            .join("simple")
-    }
+    use crate::python::test_support::{get_simple_test_dir, test_db};
 
     /// Build a fresh salsa db + PythonConfig for tests. Uses `HydraDatabase`
     /// (not `TestDb`) so analyzer file reads can hit the real workspace files.
     fn test_env(workspace_root: Option<&Path>) -> (HydraDatabase, PythonConfig) {
-        let db = HydraDatabase::new(SystemPath::new("/"));
+        let db = test_db();
         let workspace = workspace_root.map(|p| p.to_string_lossy().to_string());
         let config = PythonConfig::new(&db, workspace, None);
         (db, config)
