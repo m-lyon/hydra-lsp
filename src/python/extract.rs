@@ -466,36 +466,34 @@ fn overload_signatures(body: &[Stmt], name: &str, source: &str) -> Vec<FunctionS
 
 /// Check for `@overload`, however `typing.overload` was imported.
 fn has_overload_decorator(decorators: &[ast::Decorator]) -> bool {
-    has_decorator(decorators, "overload")
+    has_decorator(decorators, "overload", None)
 }
 
 /// Check for `@type_check_only`, however `typing.type_check_only` was imported.
 fn has_type_check_only_decorator(decorators: &[ast::Decorator]) -> bool {
-    has_decorator(decorators, "type_check_only")
+    has_decorator(decorators, "type_check_only", None)
 }
 
-/// Whether any decorator names `name`, qualified or not.
-fn has_decorator(decorators: &[ast::Decorator], name: &str) -> bool {
-    decorators.iter().any(|decorator| {
-        let decorator = expr_to_string(&decorator.expression);
-        decorator == name || decorator.ends_with(&format!(".{name}"))
+/// Match a decorator name, restricting the attribute form when a qualifier is given.
+fn has_decorator(decorators: &[ast::Decorator], name: &str, qualifier: Option<&str>) -> bool {
+    decorators.iter().any(|decorator| match &decorator.expression {
+        Expr::Name(expression) => expression.id.as_str() == name,
+        Expr::Attribute(attribute) => {
+            attribute.attr.as_str() == name
+                && qualifier.is_none_or(|qualifier| {
+                    matches!(attribute.value.as_ref(), Expr::Name(module) if module.id.as_str() == qualifier)
+                })
+        }
+        _ => false,
     })
 }
 
 /// Check if a function has @classmethod or @staticmethod decorators
 fn check_method_decorators(decorators: &[ast::Decorator]) -> (bool, bool) {
-    let mut is_classmethod = false;
-    let mut is_staticmethod = false;
-
-    for decorator in decorators {
-        match expr_to_string(&decorator.expression).as_str() {
-            "classmethod" | "builtins.classmethod" => is_classmethod = true,
-            "staticmethod" | "builtins.staticmethod" => is_staticmethod = true,
-            _ => {}
-        }
-    }
-
-    (is_classmethod, is_staticmethod)
+    (
+        has_decorator(decorators, "classmethod", Some("builtins")),
+        has_decorator(decorators, "staticmethod", Some("builtins")),
+    )
 }
 
 /// Convert a TextRange to line/column position
@@ -672,36 +670,6 @@ mod tests {
     use super::*;
 
     use crate::python::test_support::{get_simple_test_dir, test_db};
-
-    #[test]
-    fn test_extract_qualified_method_decorators() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("methods.py");
-        std::fs::write(
-            &path,
-            "\
-import builtins
-
-class Factory:
-    @builtins.staticmethod
-    def make(value): ...
-
-    @builtins.classmethod
-    def from_value(cls, value): ...
-
-    @other.staticmethod
-    def custom(self, value): ...
-",
-        )
-        .unwrap();
-
-        let db = test_db();
-        let kinds = ["make", "from_value", "custom"].map(|name| {
-            let method = extract_method_info(&db, &path, "Factory", name).unwrap();
-            (method.is_classmethod, method.is_staticmethod)
-        });
-        assert_eq!(kinds, [(false, true), (true, false), (false, false)]);
-    }
 
     // ==================== extract_function_signature tests ====================
 
@@ -884,5 +852,19 @@ class Factory:
 
         let result = extract_class_info(&db, &test_file, "NonexistentClass");
         assert!(result.is_err());
+    }
+
+    // ==================== extract_method_info tests ====================
+
+    #[test]
+    fn test_extract_qualified_method_decorators() {
+        let path = get_simple_test_dir().join("class_methods.py");
+        let db = test_db();
+
+        let kinds = ["make", "from_value", "custom"].map(|name| {
+            let method = extract_method_info(&db, &path, "QualifiedFactory", name).unwrap();
+            (method.is_classmethod, method.is_staticmethod)
+        });
+        assert_eq!(kinds, [(false, true), (true, false), (false, false)]);
     }
 }
