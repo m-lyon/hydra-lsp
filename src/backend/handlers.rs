@@ -874,10 +874,6 @@ impl LanguageServer for HydraLspBackend {
     }
 }
 
-/// Sync a watched path. When it was created or deleted, its ancestors are
-/// synced too: a new `pkg/sub/mod.py` also adds `pkg` to its parent's listing,
-/// and the client reports no event for the directories. Only directories some
-/// query already read cost a `stat`.
 fn sync_watched_path(db: &mut dyn ruff_db::Db, path: &SystemPath, created_or_deleted: bool) {
     File::sync_path(db, path);
     if created_or_deleted {

@@ -1,6 +1,3 @@
-//! Finding the Python environment: the site-packages directories and Python
-//! version of the interpreter that Hydra will run under.
-
 use anyhow::Result;
 use ruff_db::system::{OsSystem, SystemPath, SystemPathBuf};
 use ruff_python_ast::PythonVersion;

@@ -74,9 +74,6 @@ pub(super) fn read_source(db: &dyn ruff_db::Db, path: &Path) -> Result<SourceTex
 /// Returns the salsa-cached `ParsedModuleRef` (LRU 200). Callers that also need
 /// the raw source text should call `read_source` separately — both are cache hits
 /// for the same revision.
-///
-/// The version is part of the parse's salsa key, so callers pass the resolver
-/// environment's version: any other value parses the same file a second time.
 pub(super) fn get_parsed_module(
     db: &dyn ruff_db::Db,
     path: &Path,

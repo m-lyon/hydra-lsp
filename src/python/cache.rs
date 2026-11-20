@@ -205,19 +205,6 @@ fn module_file_path(db: &dyn ruff_db::Db, file: File) -> Option<PathBuf> {
     }
 }
 
-/// Cached module path → file path resolution, through `ty_module_resolver`.
-///
-/// Resolution follows the typing spec's order: first-party roots, then the
-/// stdlib stubs, then site-packages and the editable installs their `.pth`
-/// files list. Stubs are preferred over sources, `<name>-stubs` packages over
-/// `<name>`, and a regular package hides namespace portions of the same name.
-///
-/// Returns `None` when the module cannot be resolved, when the name is not a
-/// valid absolute module name, and for a namespace package, which has no file
-/// to point at. A module answered by the stdlib stubs is only kept for
-/// `builtins`, see [`is_vendored_module`].
-///
-/// Uses `lru = 1024` to bound memory across large workspaces.
 #[salsa::tracked(lru = 1024)]
 pub fn resolve_module_cached<'db>(
     db: &'db dyn ty_module_resolver::Db,
