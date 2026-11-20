@@ -6,6 +6,7 @@
 - Python environment discovery now falls back to a `python3` or `python` on `PATH`, recognises Pixi environments, ignores an empty `VIRTUAL_ENV`, and skips a broken `.venv` instead of failing.
 - Module resolution now uses ty's resolver. A `<package>-stubs` package is preferred over the package it types, and a regular package hides namespace-package directories of the same name, as Python does. A `builtins.py` in the workspace no longer shadows the builtins stub, and a site-packages module named like a stdlib module is no longer resolved, since Python imports the stdlib one.
 - Python files are now parsed for the interpreter's Python version, read from `pyvenv.cfg` or the site-packages layout.
+- Recognise `@builtins.staticmethod` and `@builtins.classmethod` when resolving Python method targets.
 
 ## [0.7.0]
 

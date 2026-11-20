@@ -1,5 +1,8 @@
 """Test module for classmethod and staticmethod support."""
 
+import builtins
+from types import SimpleNamespace
+
 
 class ModelFactory:
     """A factory class with classmethods and staticmethods."""
@@ -118,3 +121,17 @@ class NestedTwice:
 
 class InheritedNested(NestedTwice):
     """A class that inherits from a class with nested classmethods and staticmethods."""
+
+
+other = SimpleNamespace(staticmethod=lambda method: method)
+
+
+class QualifiedFactory:
+    @builtins.staticmethod
+    def make(value): ...
+
+    @builtins.classmethod
+    def from_value(cls, value): ...
+
+    @other.staticmethod
+    def custom(self, value): ...
