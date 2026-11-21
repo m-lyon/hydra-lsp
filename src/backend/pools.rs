@@ -20,9 +20,6 @@ use super::HydraLspBackend;
 ///   whose revision was superseded. Callers should silently drop the result;
 ///   the superseding edit will recompute it.
 /// - `Panicked` is a genuine bug worth logging.
-///
-/// A job whose [`PoolJob`] was dropped also unwinds as `Cancelled`, but nobody
-/// is left to read it.
 #[derive(Debug)]
 pub(crate) enum PoolOutcome<R> {
     Completed(R),
@@ -69,10 +66,8 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// `f` queries through `db`, which should be a snapshot of its own: dropping the
 /// job before it resolves cancels that handle's [`CancellationToken`], so a
 /// request tower-lsp abandons (on `$/cancelRequest`) stops at salsa's next
-/// cancellation check instead of running to the end for nobody. `f` runs inside
-/// one `attach` because salsa clears the token whenever the outermost attached
-/// scope exits, and every top-level query call would otherwise be one: a cancel
-/// landing during one call would be cleared before the next could see it.
+/// cancellation. `f` runs inside one `attach` because salsa clears the token
+/// whenever the outermost attached scope exits.
 ///
 /// `f` is run inside `catch_unwind` and its result is delivered as a
 /// [`PoolOutcome`], distinguishing normal completion, salsa cancellation, and a
@@ -120,16 +115,6 @@ where
 
 /// A job handed to a pool by [`spawn_on_pool`]. Awaiting it gives the job's
 /// outcome; dropping it first cancels the job.
-///
-/// Complements revision cancellation rather than replacing it: a write still has
-/// to unwind every handle so it can take the database, which the token cannot
-/// do. The token only reaches the one handle, so dropping a hover leaves a
-/// concurrent diagnostics pull running.
-///
-/// Cancellation is checked at salsa's own checkpoints and is disabled inside a
-/// cycle-recovering query (the two class-parent queries in `python::cache`), so
-/// a job stops when it next reaches a checkpoint outside one. A job blocked on a
-/// query another thread is computing waits for it.
 pub(super) struct PoolJob<R> {
     rx: oneshot::Receiver<PoolOutcome<R>>,
     /// Taken once the job resolves, so a finished job is not cancelled on drop.
