@@ -570,15 +570,15 @@ mod tests {
     use std::path::Path;
 
     use crate::python::test_support::{
-        get_simple_test_dir, sig_for, sig_param, system_path, test_db,
+        filesystem_root, get_simple_test_dir, sig_for, sig_param, system_path, test_db,
     };
 
     /// Build a fresh salsa db + PythonConfig for tests. Uses `HydraDatabase`
     /// (not `TestDb`) so analyzer file reads can hit the real workspace files.
     fn test_env(workspace_root: Option<&Path>) -> (HydraDatabase, PythonConfig) {
         let db = test_db();
-        let workspace = workspace_root.unwrap_or(Path::new("/"));
-        let config = PythonConfig::new(&db, system_path(workspace), None);
+        let workspace = workspace_root.map_or_else(filesystem_root, system_path);
+        let config = PythonConfig::new(&db, workspace, None);
         (db, config)
     }
 

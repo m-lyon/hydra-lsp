@@ -616,8 +616,8 @@ mod tests {
     use crate::database::tests::TestDb;
     use crate::python::model::ParameterKind;
     use crate::python::test_support::{
-        canonicalize, get_simple_test_dir, sig_for, sig_param, system_path, test_db, write_file,
-        write_venv,
+        canonicalize, filesystem_root, get_simple_test_dir, sig_for, sig_param, system_path,
+        test_db, write_file, write_venv,
     };
     use crate::python::typeshed::stdlib_search_root;
     use ruff_db::Db;
@@ -824,7 +824,7 @@ mod tests {
         // Change workspace root — invalidates all cached lookups
         config
             .set_workspace_root(&mut db)
-            .to(SystemPathBuf::from("/nonexistent/path"));
+            .to(filesystem_root().join("nonexistent/path"));
 
         let result2 = {
             let target = TargetString::new(&db, "my_module.DataLoader".to_string());
