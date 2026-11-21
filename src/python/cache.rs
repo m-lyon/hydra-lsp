@@ -28,8 +28,6 @@ use tracing::debug;
 /// invalidation for watched Python source and `.pth` files is handled
 /// separately via `ruff_db::files::File::sync_path` in the LSP backend, which
 /// also bumps the parent directory when a file is created or deleted.
-///
-/// Construct it with [`PythonConfig::frozen`].
 #[salsa::input]
 pub struct PythonConfig {
     /// Workspace root directory path.
@@ -40,15 +38,8 @@ pub struct PythonConfig {
 }
 
 impl PythonConfig {
-    /// Create a config whose fields can never change.
-    ///
-    /// A config lives as long as its database: the LSP builds a new database
-    /// and config when a session is initialized and never edits either. Salsa
-    /// records no dependency edges on `NEVER_CHANGE` inputs, so the queries
-    /// that read the config (`site_packages_paths`, `search_paths_for_config`
-    /// and every lookup built on them) skip that bookkeeping and never need
-    /// revalidating against it. Calling a setter on the result panics; to
-    /// change the environment, build a new config.
+    /// Create a config with salsa `Durability::NEVER_CHANGE` so that queries reading it
+    /// never need revalidating.
     pub fn frozen(
         db: &dyn salsa::Database,
         workspace_root: Option<String>,
