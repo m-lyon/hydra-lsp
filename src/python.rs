@@ -12,7 +12,7 @@ pub(crate) mod typeshed;
 pub(crate) mod test_support {
     use super::model::{FunctionSignature, ParameterInfo, ParameterKind, SourceRange};
     use crate::database::HydraDatabase;
-    use ruff_db::system::{SystemPath, SystemPathBuf};
+    use ruff_db::system::SystemPathBuf;
     use std::path::{Path, PathBuf};
 
     /// The `tests/workspace/<name>` fixture directory.
@@ -64,10 +64,27 @@ pub(crate) mod test_support {
         SystemPathBuf::from_path_buf(path.to_path_buf()).expect("UTF-8 path")
     }
 
+    /// `path` canonicalized the way ty does it. On Windows this drops the
+    /// `\\?\` prefix that `std::fs::canonicalize` adds.
+    pub(crate) fn canonicalize(path: &Path) -> PathBuf {
+        let canonical = std::fs::canonicalize(path).expect("canonicalize path");
+        system_path(&canonical)
+            .simplified()
+            .as_std_path()
+            .to_path_buf()
+    }
+
+    /// The root of the filesystem the tests run on: `/`, or the current drive's
+    /// root on Windows. `OsSystem` needs an absolute current directory.
+    pub(crate) fn filesystem_root() -> SystemPathBuf {
+        let cwd = std::env::current_dir().expect("current directory");
+        system_path(cwd.ancestors().last().expect("an absolute path has a root"))
+    }
+
     /// Build a fresh `HydraDatabase` for tests. Each call is a clean db so
     /// tests don't share salsa caches.
     pub(crate) fn test_db() -> HydraDatabase {
-        HydraDatabase::new(SystemPath::new("/"))
+        HydraDatabase::new(&filesystem_root())
     }
 
     /// A parameter with no annotation or default.

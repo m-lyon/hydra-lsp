@@ -70,7 +70,7 @@ mod tests {
     use ty_module_resolver::ResolverEnvironment;
 
     use crate::python::test_support::{
-        extract_definition_info, get_simple_test_dir, system_path, test_db,
+        canonicalize, extract_definition_info, get_simple_test_dir, system_path, test_db,
     };
 
     // ==================== Python Interpreter Priority Tests ====================
@@ -176,7 +176,7 @@ mod tests {
 
         assert_eq!(
             editables,
-            vec![std::fs::canonicalize(get_editable_test_dir().join("src")).unwrap()],
+            vec![canonicalize(&get_editable_test_dir().join("src"))],
         );
     }
 

@@ -169,14 +169,14 @@ pub mod tests {
     #[test]
     fn test_hydra_database_creation() {
         use ruff_db::Db;
-        let db = super::HydraDatabase::new(ruff_db::system::SystemPath::new("/tmp"));
+        let db = crate::python::test_support::test_db();
         // Verify the database is functional
         let _files = db.files();
     }
 
     #[test]
     fn test_hydra_database_memory_usage() {
-        let mut db = super::HydraDatabase::new(ruff_db::system::SystemPath::new("/tmp"));
+        let mut db = crate::python::test_support::test_db();
         // Should not panic — verifies salsa_unstable feature works
         db.log_memory_usage();
     }
@@ -211,7 +211,7 @@ pub mod tests {
     fn test_hydra_database_clone() {
         use crate::yaml_cache::{DocumentInput, is_hydra_file};
 
-        let db = super::HydraDatabase::new(ruff_db::system::SystemPath::new("/tmp"));
+        let db = crate::python::test_support::test_db();
         let input = DocumentInput::new(&db, "# @hydra\n_target_: a.B\n".to_string(), 1);
         let _ = is_hydra_file(&db, input);
 

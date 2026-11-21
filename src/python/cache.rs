@@ -616,7 +616,8 @@ mod tests {
     use crate::database::tests::TestDb;
     use crate::python::model::ParameterKind;
     use crate::python::test_support::{
-        get_simple_test_dir, sig_for, sig_param, system_path, test_db, write_file, write_venv,
+        canonicalize, get_simple_test_dir, sig_for, sig_param, system_path, test_db, write_file,
+        write_venv,
     };
     use crate::python::typeshed::stdlib_search_root;
     use ruff_db::Db;
@@ -705,7 +706,7 @@ mod tests {
     #[test]
     fn test_resolver_environment_uses_the_venv_version() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
-        let venv = std::fs::canonicalize(tmp.path()).unwrap();
+        let venv = canonicalize(tmp.path());
         write_venv(&venv, "3.9.18");
 
         let db = test_db();
@@ -898,7 +899,7 @@ mod tests {
         use tempfile::TempDir;
 
         let tmp = TempDir::new().expect("tempdir");
-        let tmp_path = fs::canonicalize(tmp.path()).expect("canonicalize tempdir");
+        let tmp_path = canonicalize(tmp.path());
         let site_packages = tmp_path.join("site-packages");
         let editable_src = tmp_path.join("src");
         fs::create_dir_all(&site_packages).expect("create site-packages dir");
@@ -912,10 +913,7 @@ mod tests {
         let mut db = test_db();
         let result1 = editables(&db, &site_packages);
         assert_eq!(result1.len(), 1);
-        assert_eq!(
-            std::fs::canonicalize(&result1[0]).expect("canonicalize returned editable path"),
-            std::fs::canonicalize(&editable_src).expect("canonicalize expected editable path"),
-        );
+        assert_eq!(canonicalize(&result1[0]), canonicalize(&editable_src),);
 
         fs::write(&pth_file, "../missing\n").expect("write updated pth");
         set_file_mtime(&pth_file, FileTime::from_unix_time(2_000_000, 0))
@@ -935,7 +933,7 @@ mod tests {
         use tempfile::TempDir;
 
         let tmp = TempDir::new().expect("tempdir");
-        let tmp_path = fs::canonicalize(tmp.path()).expect("canonicalize tempdir");
+        let tmp_path = canonicalize(tmp.path());
         let site_packages = tmp_path.join("site-packages");
         let editable_src = tmp_path.join("src");
         fs::create_dir_all(&site_packages).expect("create site-packages dir");
@@ -961,10 +959,7 @@ mod tests {
 
         let result2 = editables(&db, &site_packages);
         assert_eq!(result2.len(), 1);
-        assert_eq!(
-            std::fs::canonicalize(&result2[0]).expect("canonicalize returned editable path"),
-            std::fs::canonicalize(&editable_src).expect("canonicalize expected editable path"),
-        );
+        assert_eq!(canonicalize(&result2[0]), canonicalize(&editable_src),);
     }
 
     /// An editable install of the workspace itself must not turn workspace
@@ -976,7 +971,7 @@ mod tests {
         use tempfile::TempDir;
 
         let tmp = TempDir::new().expect("tempdir");
-        let tmp_path = fs::canonicalize(tmp.path()).expect("canonicalize tempdir");
+        let tmp_path = canonicalize(tmp.path());
         let workspace = tmp_path.join("workspace");
         let src = workspace.join("src");
         let site_packages = tmp_path.join("site-packages");
@@ -1563,7 +1558,7 @@ mod tests {
     impl Layout {
         fn new() -> Self {
             let tmp = tempfile::TempDir::new().expect("tempdir");
-            let root = std::fs::canonicalize(tmp.path()).expect("canonicalize tempdir");
+            let root = canonicalize(tmp.path());
             let workspace = root.join("workspace");
             let site_packages = root.join("venv").join("site-packages");
             std::fs::create_dir_all(&workspace).expect("create workspace");

@@ -251,7 +251,7 @@ mod tests {
         // `/private/var`), so return the canonical path: simulated watch
         // events then name the same directory the resolver listed, exactly as
         // real events do.
-        let site_packages = std::fs::canonicalize(&site_packages).expect("canonicalize venv");
+        let site_packages = crate::python::test_support::canonicalize(&site_packages);
         let session = Session {
             db: parking_lot::Mutex::new(db),
             python_config,
@@ -266,9 +266,7 @@ mod tests {
         use ruff_db::files::File;
 
         let (session, site_packages, tmp) = session_with_real_venv();
-        let editable = std::fs::canonicalize(tmp.path())
-            .unwrap()
-            .join("editable_src");
+        let editable = crate::python::test_support::canonicalize(tmp.path()).join("editable_src");
         std::fs::create_dir_all(&editable).unwrap();
         let pth = site_packages.join("editable.pth");
         let pth_sys = SystemPath::from_std_path(&pth).unwrap();
