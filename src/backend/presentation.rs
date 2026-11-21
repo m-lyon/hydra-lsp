@@ -5,7 +5,8 @@ use tower_lsp::lsp_types::*;
 
 use crate::python::format::render_params;
 use crate::python::model::{
-    DefaultStyle, DefinitionInfo, FunctionSignature, ParameterInfo, ParameterKind,
+    DefaultStyle, DefinitionInfo, FunctionSignature, ParameterInfo, ParameterKind, SourcePosition,
+    SourceRange,
 };
 use crate::yaml_parser::ResolvedParameterContext;
 
@@ -42,33 +43,31 @@ fn build_signature_params<'a>(
     (param_strs.join(", "), param_infos, filtered)
 }
 
-/// Where go-to-definition lands for a target, as
-/// `(start_line, start_col, end_line, end_col)` ranges in one file.
+impl From<SourceRange> for Range {
+    fn from(range: SourceRange) -> Self {
+        let position = |p: SourcePosition| Position::new(p.line, p.column);
+        Range::new(position(range.start), position(range.end))
+    }
+}
+
+/// Where go-to-definition lands for a target, as ranges in one file.
 ///
 /// An overloaded function or method lands on each of its (already narrowed)
 /// overloads.
-pub(super) fn definition_positions(definition_info: &DefinitionInfo) -> Vec<(u32, u32, u32, u32)> {
+pub(super) fn definition_ranges(definition_info: &DefinitionInfo) -> Vec<SourceRange> {
     let signature = match definition_info {
         DefinitionInfo::Function(sig) => sig,
         DefinitionInfo::Method(method_info) => &method_info.signature,
-        DefinitionInfo::Class(_) => return vec![definition_info.position()],
+        DefinitionInfo::Class(_) => return vec![definition_info.range()],
     };
     if signature.overloads.is_empty() {
-        return vec![definition_info.position()];
+        return vec![definition_info.range()];
     }
-    let position = |sig: &FunctionSignature| {
-        (
-            sig.start_line,
-            sig.start_column,
-            sig.end_line,
-            sig.end_column,
-        )
-    };
-    let mut positions: Vec<_> = signature.overloads.iter().map(position).collect();
+    let mut ranges: Vec<_> = signature.overloads.iter().map(|sig| sig.range).collect();
     if !signature.is_overloaded {
-        positions.push(position(signature));
+        ranges.push(signature.range);
     }
-    positions
+    ranges
 }
 
 /// Returns the index in `params` of the parameter that the cursor is on, or

@@ -1,17 +1,18 @@
-pub mod cache;
-pub mod env;
-pub mod extract;
-pub mod format;
+pub(crate) mod cache;
+mod env;
+mod extract;
+pub(crate) mod format;
 mod import_resolver;
-pub mod model;
-pub mod resolve;
-pub mod typeshed;
+pub(crate) mod model;
+mod resolve;
+pub(crate) mod typeshed;
 
 /// Helpers shared by the unit tests of the modules above.
 #[cfg(test)]
 pub(crate) mod test_support {
+    use super::model::{FunctionSignature, ParameterInfo, ParameterKind, SourceRange};
     use crate::database::HydraDatabase;
-    use ruff_db::system::SystemPath;
+    use ruff_db::system::{SystemPath, SystemPathBuf};
     use std::path::{Path, PathBuf};
 
     /// The `tests/workspace/<name>` fixture directory.
@@ -33,10 +34,63 @@ pub(crate) mod test_support {
         std::fs::write(path, contents).expect("write file");
     }
 
+    /// Write a minimal virtual environment at `venv`: an interpreter file, a
+    /// site-packages directory and a `pyvenv.cfg` naming `version`, such as
+    /// `3.9.18`. Returns the site-packages directory.
+    pub(crate) fn write_venv(venv: &Path, version: &str) -> PathBuf {
+        let minor = version.split('.').take(2).collect::<Vec<_>>().join(".");
+        let (exe, site_packages) = if cfg!(target_os = "windows") {
+            (
+                venv.join(r"Scripts\python.exe"),
+                venv.join(r"Lib\site-packages"),
+            )
+        } else {
+            (
+                venv.join("bin/python"),
+                venv.join(format!("lib/python{minor}/site-packages")),
+            )
+        };
+        write_file(&exe, "");
+        std::fs::create_dir_all(&site_packages).expect("create site-packages");
+        write_file(
+            &venv.join("pyvenv.cfg"),
+            &format!("home = {}\nversion = {version}\n", venv.display()),
+        );
+        site_packages
+    }
+
+    /// `path` as a `SystemPathBuf`.
+    pub(crate) fn system_path(path: &Path) -> SystemPathBuf {
+        SystemPathBuf::from_path_buf(path.to_path_buf()).expect("UTF-8 path")
+    }
+
     /// Build a fresh `HydraDatabase` for tests. Each call is a clean db so
     /// tests don't share salsa caches.
     pub(crate) fn test_db() -> HydraDatabase {
         HydraDatabase::new(SystemPath::new("/"))
+    }
+
+    /// A parameter with no annotation or default.
+    pub(crate) fn sig_param(name: &str, kind: ParameterKind) -> ParameterInfo {
+        ParameterInfo {
+            name: name.to_string(),
+            kind,
+            type_annotation: None,
+            default_value: None,
+        }
+    }
+
+    /// A plain signature for `name`, with no return type, docstring or overloads.
+    pub(crate) fn sig_for(name: &str, parameters: Vec<ParameterInfo>) -> FunctionSignature {
+        FunctionSignature {
+            name: name.to_string(),
+            parameters,
+            return_type: None,
+            docstring: None,
+            is_overloaded: false,
+            overloads: Vec::new(),
+            range: SourceRange::default(),
+        }
     }
 
     /// `extract_definition_info` with `roots` as the first-party search roots.
@@ -48,7 +102,7 @@ pub(crate) mod test_support {
         super::resolve::extract_definition_info(
             db,
             target,
-            super::cache::environment_for_roots(db, roots),
+            super::cache::resolver_environment_for_roots(db, roots),
         )
     }
 }

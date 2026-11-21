@@ -1,15 +1,14 @@
 use anyhow::Result;
 use ruff_db::system::{OsSystem, SystemPath, SystemPathBuf};
 use ruff_python_ast::PythonVersion;
-use std::path::Path;
 use ty_python_semantic::{PythonEnvironment, SysPrefixPathOrigin};
 
 /// What discovery found out about the interpreter.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct DiscoveredEnvironment {
-    pub site_packages: Vec<SystemPathBuf>,
+pub(super) struct DiscoveredEnvironment {
+    pub(super) site_packages: Vec<SystemPathBuf>,
     /// `None` when neither `pyvenv.cfg` nor the site-packages layout names it.
-    pub python_version: Option<PythonVersion>,
+    pub(super) python_version: Option<PythonVersion>,
 }
 
 /// Discover the Python environment, its site-packages paths and its version.
@@ -25,35 +24,15 @@ pub struct DiscoveredEnvironment {
 /// The configured interpreter is always preferred if provided, as it represents
 /// the user's explicit choice via LSP configuration.
 pub(super) fn discover_python_environment(
-    workspace_root: Option<&Path>,
-    python_path: Option<&str>,
+    workspace_root: &SystemPath,
+    interpreter: Option<&SystemPath>,
 ) -> Result<DiscoveredEnvironment> {
-    // OsSystem requires an absolute CWD. Use workspace_root when provided;
-    // fall back to the process's current directory otherwise.
-    let cwd_buf = if let Some(root) = workspace_root {
-        SystemPath::from_std_path(root)
-            .ok_or_else(|| anyhow::anyhow!("Invalid workspace root path"))?
-            .to_path_buf()
-    } else {
-        SystemPathBuf::from_path_buf(
-            std::env::current_dir()
-                .map_err(|e| anyhow::anyhow!("Cannot determine current directory: {e}"))?,
-        )
-        .map_err(|p| anyhow::anyhow!("Current directory is not valid UTF-8: {}", p.display()))?
-    };
-    let cwd = cwd_buf.as_path();
-    let system = OsSystem::new(cwd);
+    let system = OsSystem::new(workspace_root);
 
-    // Use the same path as project root for environment discovery
-    let project_root = cwd;
-
-    let env = if let Some(python_path_str) = python_path {
+    let env = if let Some(interpreter) = interpreter {
         // User provided a specific Python path (highest priority - from LSP configuration)
         // This could be an executable or sys.prefix directory
-        let python_sys_path = SystemPath::from_std_path(Path::new(python_path_str))
-            .ok_or_else(|| anyhow::anyhow!("Invalid Python path"))?;
-
-        PythonEnvironment::new(python_sys_path, SysPrefixPathOrigin::Editor, &system)?
+        PythonEnvironment::new(interpreter, SysPrefixPathOrigin::Editor, &system)?
     } else {
         // Auto-discover Python environment with built-in priority:
         // 1. Activated virtual environment (VIRTUAL_ENV)
@@ -61,8 +40,8 @@ pub(super) fn discover_python_environment(
         // 3. Working directory virtual environment (.venv)
         // 4. Active base Conda environment
         // 5. A Python interpreter on PATH
-        PythonEnvironment::discover(Some(project_root), &system)?
-            .ok_or_else(|| anyhow::anyhow!("No Python environment found"))?
+        PythonEnvironment::discover(Some(workspace_root), &system)?
+            .ok_or_else(|| anyhow::anyhow!("no Python environment found"))?
     };
 
     let site_packages_paths = env.site_packages_paths(&system)?;
@@ -84,13 +63,15 @@ mod tests {
     use super::*;
     use crate::database::HydraDatabase;
     use crate::python::cache::{
-        PythonConfig, build_resolver_environment, resolve_module_by_name, resolver_environment,
+        PythonConfig, resolve_module_by_name, resolver_environment, resolver_environment_from_parts,
     };
     use crate::python::extract::extract_class_info;
     use std::path::PathBuf;
     use ty_module_resolver::ResolverEnvironment;
 
-    use crate::python::test_support::{extract_definition_info, get_simple_test_dir, test_db};
+    use crate::python::test_support::{
+        extract_definition_info, get_simple_test_dir, system_path, test_db,
+    };
 
     // ==================== Python Interpreter Priority Tests ====================
     // These tests verify that the configured Python interpreter from LSP initialization
@@ -103,8 +84,8 @@ mod tests {
         let db = test_db();
         let config = PythonConfig::new(
             &db,
-            Some(examples_dir.to_string_lossy().into_owned()),
-            interpreter.map(str::to_string),
+            system_path(&examples_dir),
+            interpreter.map(SystemPathBuf::from),
         );
         resolve_module_by_name(&db, module, resolver_environment(&db, config))
     }
@@ -137,8 +118,9 @@ mod tests {
     #[ignore = "Requires Python in PATH"]
     fn test_configured_interpreter_reports_its_version() {
         let python = system_python();
-        let discovered =
-            discover_python_environment(None, python.to_str()).expect("discover the interpreter");
+        let cwd = system_path(&std::env::current_dir().unwrap());
+        let discovered = discover_python_environment(&cwd, Some(&system_path(&python)))
+            .expect("discover the interpreter");
         assert!(
             discovered.python_version.is_some(),
             "a real interpreter's version should be discoverable, got {discovered:?}"
@@ -175,7 +157,7 @@ mod tests {
     fn editable_environment(db: &HydraDatabase) -> ResolverEnvironment<'_> {
         let workspace_dir = get_editable_test_dir();
         let site_packages = workspace_dir.join("site-packages");
-        build_resolver_environment(
+        resolver_environment_from_parts(
             db,
             vec![SystemPathBuf::from_path_buf(workspace_dir).unwrap()],
             vec![SystemPathBuf::from_path_buf(site_packages).unwrap()],
@@ -201,7 +183,7 @@ mod tests {
     #[test]
     fn test_missing_site_packages_has_no_editables() {
         let db = test_db();
-        let environment = build_resolver_environment(
+        let environment = resolver_environment_from_parts(
             &db,
             Vec::new(),
             vec![SystemPathBuf::from("/nonexistent/path/site-packages")],

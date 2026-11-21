@@ -9,7 +9,7 @@ use super::import_resolver::{ImportResolver, find_module_file};
 use super::model::{ClassAttributeInfo, DefinitionInfo, FunctionSignature, ResolveError};
 use super::resolve::{base_class_name, extract_definition_info, resolve_base_class};
 use super::typeshed::{
-    BUILTINS_MODULE, is_installed_from_pypi, is_runtime_builtin_name, is_vendored_module,
+    BUILTINS_MODULE, is_builtins_module, is_runtime_builtin_name, is_stubbed_pypi_package,
     is_vendored_path, vendored_module_name, vendored_sentinel_path,
 };
 use ruff_db::files::{File, FilePath, FileRootKind};
@@ -24,8 +24,8 @@ use ty_module_resolver::{
 /// Salsa input for Python environment configuration.
 ///
 /// In the LSP backend, this is created during `initialize()` alongside the
-/// analysis database, using the workspace root from LSP init params (or a
-/// current-directory fallback) plus any configured Python interpreter.
+/// analysis database, using the workspace root from LSP init params (or the
+/// server's current directory) plus any configured Python interpreter.
 ///
 /// This input participates in the cache key for Python definition lookups, so
 /// changing its values invalidates cached module-resolution results. Per-file
@@ -35,10 +35,10 @@ use ty_module_resolver::{
 #[salsa::input]
 pub struct PythonConfig {
     /// Workspace root directory path.
-    pub workspace_root: Option<String>,
+    pub workspace_root: SystemPathBuf,
 
     /// Configured Python interpreter path.
-    pub interpreter: Option<String>,
+    pub interpreter: Option<SystemPathBuf>,
 }
 
 /// Interned target string for cache key deduplication.
@@ -51,23 +51,32 @@ pub struct TargetString {
     pub value: String,
 }
 
-/// The salsa key for a class: `"<normalized file path>::<ClassName>"`.
+/// The salsa key for a class: the file it is defined in and its name.
 ///
-/// The path is normalized lexically (see `normalize_path_for_key`), so the
-/// key stays a pure function of salsa inputs.
-pub(crate) fn class_key<'db>(
-    db: &'db dyn ruff_db::Db,
-    file: &Path,
-    class: &str,
-) -> TargetString<'db> {
-    let normalized = normalize_path_for_key(db, file);
-    TargetString::new(db, format!("{}::{}", normalized.display(), class))
+/// Build it with [`class_key`], which normalizes the path.
+#[salsa::interned]
+pub(super) struct ClassKey {
+    pub file: PathBuf,
+    pub class: String,
 }
 
-/// Split a key built by [`class_key`] back into its file and class name.
-fn parse_class_key(key: &str) -> Option<(&Path, &str)> {
-    let (file, class) = key.rsplit_once("::")?;
-    Some((Path::new(file), class))
+/// The [`ClassKey`] for `class` in `file`. The path is normalized lexically
+/// (see `normalize_path_for_key`), so the key stays a pure function of salsa
+/// inputs.
+pub(super) fn class_key<'db>(db: &'db dyn ruff_db::Db, file: &Path, class: &str) -> ClassKey<'db> {
+    ClassKey::new(db, normalize_path_for_key(db, file), class.to_string())
+}
+
+/// An interned dotted module name, such as `pkg.models`.
+#[salsa::interned]
+pub(super) struct ModuleRef {
+    pub name: String,
+}
+
+/// An interned bare symbol or attribute name.
+#[salsa::interned]
+pub(super) struct SymbolName {
+    pub value: String,
 }
 
 /// Bases that exist only for the type system: they carry no constructor,
@@ -79,7 +88,7 @@ const TYPE_ONLY_BASES: &[&str] = &["object", "ABC", "Protocol", "Generic"];
 pub struct ResolvedDefinition {
     pub definition_info: DefinitionInfo,
     pub file_path: PathBuf,
-    pub module_path: String,
+    pub module_name: String,
     pub symbol_name: String,
 }
 
@@ -88,11 +97,11 @@ pub struct ResolvedDefinition {
 /// Uses Arc + pointer-based equality (same pattern as `ParsedYaml`)
 /// to satisfy salsa's Update requirements without expensive deep comparison.
 #[derive(Clone)]
-pub struct CachedDefinitionResult {
+pub struct DefinitionResult {
     inner: Arc<Result<ResolvedDefinition, ResolveError>>,
 }
 
-impl CachedDefinitionResult {
+impl DefinitionResult {
     fn from_result(result: Result<ResolvedDefinition, ResolveError>) -> Self {
         Self {
             inner: Arc::new(result),
@@ -105,13 +114,13 @@ impl CachedDefinitionResult {
     }
 }
 
-impl PartialEq for CachedDefinitionResult {
+impl PartialEq for DefinitionResult {
     fn eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
     }
 }
 
-impl Eq for CachedDefinitionResult {}
+impl Eq for DefinitionResult {}
 
 /// Cached Python environment discovery for a `PythonConfig`.
 ///
@@ -120,8 +129,11 @@ impl Eq for CachedDefinitionResult {}
 /// root so library files get `Durability::HIGH`: project-file edits don't
 /// invalidate library-derived memos.
 #[salsa::tracked(returns(ref))]
-pub fn discovered_environment(db: &dyn ruff_db::Db, config: PythonConfig) -> DiscoveredEnvironment {
-    let workspace_root = config.workspace_root(db).as_deref().map(Path::new);
+pub(super) fn discovered_environment(
+    db: &dyn ruff_db::Db,
+    config: PythonConfig,
+) -> DiscoveredEnvironment {
+    let workspace_root = config.workspace_root(db);
     let interpreter = config.interpreter(db);
     let discovered =
         discover_python_environment(workspace_root, interpreter.as_deref()).unwrap_or_default();
@@ -140,19 +152,16 @@ pub fn discovered_environment(db: &dyn ruff_db::Db, config: PythonConfig) -> Dis
 /// the `.pth` files lazily through salsa, so creating, editing or deleting one
 /// invalidates only the resolutions that depend on it.
 #[salsa::tracked(returns(copy))]
-pub fn resolver_environment(
+pub(crate) fn resolver_environment(
     db: &dyn ty_module_resolver::Db,
     config: PythonConfig,
 ) -> ResolverEnvironment<'_> {
     let discovered = discovered_environment(db, config);
     let cwd = db.system().current_directory();
-    let workspace_root = match config.workspace_root(db) {
-        Some(root) => SystemPath::absolute(root, cwd),
-        None => cwd.to_path_buf(),
-    };
+    let workspace_root = SystemPath::absolute(config.workspace_root(db), cwd);
     db.files()
         .try_add_root(db, &workspace_root, FileRootKind::Project);
-    build_resolver_environment(
+    resolver_environment_from_parts(
         db,
         vec![workspace_root],
         discovered.site_packages.clone(),
@@ -164,7 +173,7 @@ pub fn resolver_environment(
 
 /// Build a resolver environment from explicit roots. Directories that do not
 /// exist are skipped.
-pub fn build_resolver_environment(
+pub(super) fn resolver_environment_from_parts(
     db: &dyn ty_module_resolver::Db,
     src_roots: Vec<SystemPathBuf>,
     site_packages: Vec<SystemPathBuf>,
@@ -183,18 +192,18 @@ pub fn build_resolver_environment(
 /// A resolver environment whose first-party roots are `roots`, in order, with
 /// no site-packages. Relative roots are taken against the database's current
 /// directory.
-#[doc(hidden)]
-pub fn environment_for_roots<'db>(
+#[cfg(test)]
+pub(super) fn resolver_environment_for_roots<'db>(
     db: &'db dyn ty_module_resolver::Db,
     roots: &[PathBuf],
 ) -> ResolverEnvironment<'db> {
     let cwd = db.system().current_directory();
     let src_roots = roots
         .iter()
-        .filter_map(|root| SystemPath::from_std_path(root))
+        .map(|root| SystemPath::from_std_path(root).expect("search root is UTF-8"))
         .map(|root| SystemPath::absolute(root, cwd))
         .collect();
-    build_resolver_environment(db, src_roots, Vec::new(), PythonVersion::latest_ty())
+    resolver_environment_from_parts(db, src_roots, Vec::new(), PythonVersion::latest_ty())
 }
 
 /// The path a resolved module file is reported under. Files in the vendored
@@ -207,31 +216,31 @@ fn module_file_path(db: &dyn ruff_db::Db, file: File) -> Option<PathBuf> {
     }
 }
 
-/// [`resolve_module_cached`] for a module name given as a string.
+/// [`resolved_module_file`] for a module name given as a string.
 pub(super) fn resolve_module_by_name<'db>(
     db: &'db dyn ty_module_resolver::Db,
     module: &str,
     environment: ResolverEnvironment<'db>,
 ) -> Option<PathBuf> {
-    resolve_module_cached(db, TargetString::new(db, module.to_string()), environment).clone()
+    resolved_module_file(db, ModuleRef::new(db, module.to_string()), environment).clone()
 }
 
 #[salsa::tracked(lru = 1024)]
-pub fn resolve_module_cached<'db>(
+pub(super) fn resolved_module_file<'db>(
     db: &'db dyn ty_module_resolver::Db,
-    module_path: TargetString<'db>,
+    module: ModuleRef<'db>,
     environment: ResolverEnvironment<'db>,
 ) -> Option<PathBuf> {
-    let module_path_str = module_path.value(db);
+    let module_path_str = module.name(db);
     let module_name = ModuleName::new(module_path_str)?;
     let module = resolve_module_confident(db, environment, &module_name)?;
 
     if module
         .search_path(db)
         .is_some_and(SearchPath::is_standard_library)
-        && !is_vendored_module(module_path_str)
+        && !is_builtins_module(module_path_str)
     {
-        if is_installed_from_pypi(module_path_str) {
+        if is_stubbed_pypi_package(module_path_str) {
             return system_module_search_paths(db, environment)
                 .find_map(|root| find_module_file(db, &root.as_std_path().join(module_path_str)));
         }
@@ -244,17 +253,17 @@ pub fn resolve_module_cached<'db>(
 /// Whether the runtime module `module` exposes `symbol`, according to its
 /// vendored stub.
 #[salsa::tracked(returns(copy))]
-pub fn vendored_module_exposes<'db>(
+pub(super) fn vendored_module_exposes<'db>(
     db: &'db dyn ty_module_resolver::Db,
+    module: ModuleRef<'db>,
+    symbol: SymbolName<'db>,
     environment: ResolverEnvironment<'db>,
-    module: TargetString<'db>,
-    symbol: TargetString<'db>,
 ) -> bool {
     let symbol = symbol.value(db);
     if symbol.is_empty() || symbol.contains('.') || !is_runtime_builtin_name(symbol) {
         return false;
     }
-    let Some(stub) = resolve_module_cached(db, module, environment).clone() else {
+    let Some(stub) = resolved_module_file(db, module, environment).clone() else {
         return false;
     };
     if !is_vendored_path(&stub) {
@@ -265,16 +274,16 @@ pub fn vendored_module_exposes<'db>(
 }
 
 /// Whether `name` is a symbol the runtime `builtins` module exposes.
-pub fn is_builtin_symbol<'db>(
+pub(crate) fn is_builtin_symbol<'db>(
     db: &'db dyn ty_module_resolver::Db,
+    name: &str,
     environment: ResolverEnvironment<'db>,
-    name: TargetString<'db>,
 ) -> bool {
     vendored_module_exposes(
         db,
+        ModuleRef::new(db, BUILTINS_MODULE.to_string()),
+        SymbolName::new(db, name.to_string()),
         environment,
-        TargetString::new(db, BUILTINS_MODULE.to_string()),
-        name,
     )
 }
 
@@ -290,15 +299,15 @@ pub fn is_builtin_symbol<'db>(
 /// Hydra projects often reference many `_target_` strings (e.g. one per config),
 /// so the bound is set well above typical workspace sizes to avoid thrashing.
 #[salsa::tracked(returns(clone), no_eq, lru = 1024)]
-pub fn cached_definition_info<'db>(
+pub fn resolved_definition<'db>(
     db: &'db dyn ty_module_resolver::Db,
     config: PythonConfig,
     target: TargetString<'db>,
-) -> CachedDefinitionResult {
+) -> DefinitionResult {
     let target_str = target.value(db);
     debug!(
         target = target_str,
-        "cached_definition_info: executing (cache miss)"
+        "resolved_definition: executing (cache miss)"
     );
 
     let environment = resolver_environment(db, config);
@@ -312,18 +321,18 @@ pub fn cached_definition_info<'db>(
             .and_then(|rest| rest.split('.').next())
         && !vendored_module_exposes(
             db,
+            ModuleRef::new(db, module.clone()),
+            SymbolName::new(db, root_symbol.to_string()),
             environment,
-            TargetString::new(db, module.clone()),
-            TargetString::new(db, root_symbol.to_string()),
         )
     {
-        result = Err(ResolveError::Other(format!(
-            "Symbol '{}' not found in module '{}'",
-            root_symbol, module
-        )));
+        result = Err(ResolveError::UnresolvedSymbol {
+            module,
+            symbol: root_symbol.to_string(),
+        });
     }
 
-    CachedDefinitionResult::from_result(result)
+    DefinitionResult::from_result(result)
 }
 
 /// Cached docstring + `__init__` resolution for a class, walking its MRO.
@@ -333,29 +342,29 @@ pub fn cached_definition_info<'db>(
 /// The own class properties take priority; parent properties fill in only what
 /// is missing.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct ResolvedClassDocs {
+struct ClassMembers {
     docstring: Option<String>,
-    init: Option<FunctionSignature>,
+    init_signature: Option<FunctionSignature>,
     new_signature: Option<FunctionSignature>,
     all_bases_resolved: bool,
 }
 
 #[derive(Clone, Debug)]
-pub struct ClassParentDocs {
-    inner: Arc<ResolvedClassDocs>,
+pub(super) struct InheritedClassMembers {
+    inner: Arc<ClassMembers>,
 }
 
-impl ClassParentDocs {
+impl InheritedClassMembers {
     fn new(
         docstring: Option<String>,
-        init: Option<FunctionSignature>,
+        init_signature: Option<FunctionSignature>,
         new_signature: Option<FunctionSignature>,
         all_bases_resolved: bool,
     ) -> Self {
         Self {
-            inner: Arc::new(ResolvedClassDocs {
+            inner: Arc::new(ClassMembers {
                 docstring,
-                init,
+                init_signature,
                 new_signature,
                 all_bases_resolved,
             }),
@@ -368,13 +377,13 @@ impl ClassParentDocs {
     }
 
     /// Resolved `__init__` signature — from the class itself or the nearest ancestor.
-    pub fn init(&self) -> Option<&FunctionSignature> {
-        self.inner.init.as_ref()
+    pub fn init_signature(&self) -> Option<&FunctionSignature> {
+        self.inner.init_signature.as_ref()
     }
 
     /// Resolved `__new__` signature — from the class itself or the nearest ancestor.
     ///
-    /// Only meaningful when [`init`](Self::init) is `None`; see
+    /// Only meaningful when [`init_signature`](Self::init_signature) is `None`; see
     /// [`ClassInfo::new_signature`](crate::python::model::ClassInfo::new_signature).
     pub fn new_signature(&self) -> Option<&FunctionSignature> {
         self.inner.new_signature.as_ref()
@@ -393,7 +402,7 @@ impl ClassParentDocs {
         new_signature: &mut Option<FunctionSignature>,
     ) {
         fill(docstring, self.docstring());
-        fill(init, self.init());
+        fill(init, self.init_signature());
         fill(new_signature, self.new_signature());
     }
 }
@@ -404,12 +413,14 @@ fn fill<T: Clone>(slot: &mut Option<T>, from: Option<&T>) {
     }
 }
 
+/// The key of each base class in `base_classes` that the MRO walks visit, or
+/// `None` for a base that did not resolve.
 fn parent_keys<'db, 'a>(
     db: &'db dyn ty_module_resolver::Db,
-    base_classes: &'a [String],
     file_path: &'a Path,
+    base_classes: &'a [String],
     environment: ResolverEnvironment<'db>,
-) -> impl Iterator<Item = Option<TargetString<'db>>> + 'a
+) -> impl Iterator<Item = Option<ClassKey<'db>>> + 'a
 where
     'db: 'a,
 {
@@ -417,31 +428,39 @@ where
         .iter()
         .filter(|base| !TYPE_ONLY_BASES.contains(&base_class_name(base)))
         .map(move |base| {
-            let (file, name) = resolve_base_class(db, base, file_path, environment)?;
-            Some(class_key(db, &file, &name))
+            let base = resolve_base_class(db, file_path, base, environment)?;
+            Some(class_key(db, &base.file, &base.name))
         })
 }
 
-impl PartialEq for ClassParentDocs {
+impl PartialEq for InheritedClassMembers {
     /// Value equality (deep-compares the resolved docstring and `__init__`).
     fn eq(&self, other: &Self) -> bool {
         self.inner == other.inner
     }
 }
-impl Eq for ClassParentDocs {}
+impl Eq for InheritedClassMembers {}
+
+/// A class attribute and the class in the MRO that assigns it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct InheritedAttribute {
+    pub info: ClassAttributeInfo,
+    pub file: PathBuf,
+    pub class: String,
+}
 
 /// Cached result of looking up a class attribute by walking the MRO.
 ///
 /// `None` inner value means the attribute was not found on the class or any parent.
 #[derive(Clone, Debug)]
-pub struct CachedClassAttribute {
-    inner: Arc<Option<(ClassAttributeInfo, PathBuf, String)>>,
+pub(super) struct ClassAttributeLookup {
+    inner: Arc<Option<InheritedAttribute>>,
 }
 
-impl CachedClassAttribute {
-    fn found(attr_info: ClassAttributeInfo, file_path: PathBuf, class_name: String) -> Self {
+impl ClassAttributeLookup {
+    fn found(info: ClassAttributeInfo, file: PathBuf, class: String) -> Self {
         Self {
-            inner: Arc::new(Some((attr_info, file_path, class_name))),
+            inner: Arc::new(Some(InheritedAttribute { info, file, class })),
         }
     }
 
@@ -451,56 +470,52 @@ impl CachedClassAttribute {
         }
     }
 
-    /// Returns a reference to `(ClassAttributeInfo, file_path, class_name)` if found.
-    pub fn get(&self) -> Option<&(ClassAttributeInfo, PathBuf, String)> {
+    /// The attribute, if the class or a parent assigns it.
+    pub fn get(&self) -> Option<&InheritedAttribute> {
         self.inner.as_ref().as_ref()
     }
 }
 
-impl PartialEq for CachedClassAttribute {
+impl PartialEq for ClassAttributeLookup {
     /// Value equality (deep-compares the resolved attribute, file path, and class).
     fn eq(&self, other: &Self) -> bool {
         self.inner == other.inner
     }
 }
-impl Eq for CachedClassAttribute {}
+impl Eq for ClassAttributeLookup {}
 
 /// Cached docstring + `__init__` resolution for one class, including its MRO.
 ///
-/// `class_key` encodes `"canonical_file_path::ClassName"`. The query calls
-/// `extract_class_info` for the class itself and, for any missing property,
+/// The query calls `extract_class_info` for the class itself and, for any missing property,
 /// recursively invokes itself for each parent (MRO order, left-to-right).
 /// Salsa memoises every node independently, so a grandparent shared by two
 /// sibling classes is resolved only once per revision.
 ///
 /// `cycle_result` handles circular inheritance (invalid Python) gracefully by
 /// returning empty docs rather than panicking.
-#[salsa::tracked(returns(clone), lru = 512, cycle_result = class_parent_docs_cycle)]
-pub fn class_parent_docs<'db>(
+#[salsa::tracked(returns(clone), lru = 512, cycle_result = inherited_class_members_cycle)]
+pub(super) fn inherited_class_members<'db>(
     db: &'db dyn ty_module_resolver::Db,
-    class_key: TargetString<'db>,
+    class_key: ClassKey<'db>,
     environment: ResolverEnvironment<'db>,
-) -> ClassParentDocs {
-    let Some((file_path, class_name)) = parse_class_key(class_key.value(db)) else {
-        return ClassParentDocs::new(None, None, None, true);
-    };
+) -> InheritedClassMembers {
+    let file_path = class_key.file(db).as_path();
+    let class_name = class_key.class(db).as_str();
     let python_version = environment.python_version(db);
 
     let class_info = match extract_class_info(db, file_path, class_name, python_version) {
-        Ok(class_info) => class_info,
-        Err(_) => {
+        Some(class_info) => class_info,
+        None => {
             return match ImportResolver::new(db, environment).resolve_symbol(file_path, class_name)
             {
-                Some((resolved_file, resolved_name)) => {
-                    if normalize_path_for_key(db, &resolved_file) == file_path
-                        && resolved_name == class_name
-                    {
-                        return ClassParentDocs::new(None, None, None, false);
+                Some(resolved) => {
+                    let resolved_key = self::class_key(db, &resolved.file, &resolved.name);
+                    if resolved_key == class_key {
+                        return InheritedClassMembers::new(None, None, None, false);
                     }
-                    let resolved_key = self::class_key(db, &resolved_file, &resolved_name);
-                    class_parent_docs(db, resolved_key, environment)
+                    inherited_class_members(db, resolved_key, environment)
                 }
-                None => ClassParentDocs::new(None, None, None, false),
+                None => InheritedClassMembers::new(None, None, None, false),
             };
         }
     };
@@ -510,19 +525,19 @@ pub fn class_parent_docs<'db>(
     let mut new_signature = class_info.new_signature;
 
     if docstring.is_some() && init.is_some() {
-        return ClassParentDocs::new(docstring, init, new_signature, true);
+        return InheritedClassMembers::new(docstring, init, new_signature, true);
     }
 
     // Tracks whether the walk saw the whole hierarchy. Only meaningful when it
     // finds no `__init__`.
     let mut all_bases_resolved = true;
 
-    for parent_key in parent_keys(db, &class_info.base_classes, file_path, environment) {
+    for parent_key in parent_keys(db, file_path, &class_info.base_classes, environment) {
         let Some(parent_key) = parent_key else {
             all_bases_resolved = false;
             continue;
         };
-        let parent_docs = class_parent_docs(db, parent_key, environment);
+        let parent_docs = inherited_class_members(db, parent_key, environment);
         all_bases_resolved &= parent_docs.all_bases_resolved();
         parent_docs.fill_missing(&mut docstring, &mut init, &mut new_signature);
         if docstring.is_some() && init.is_some() {
@@ -530,71 +545,68 @@ pub fn class_parent_docs<'db>(
         }
     }
 
-    ClassParentDocs::new(docstring, init, new_signature, all_bases_resolved)
+    InheritedClassMembers::new(docstring, init, new_signature, all_bases_resolved)
 }
 
-fn class_parent_docs_cycle(
+fn inherited_class_members_cycle(
     _db: &dyn ty_module_resolver::Db,
     _id: salsa::Id,
-    _class_key: TargetString,
+    _class_key: ClassKey,
     _environment: ResolverEnvironment,
-) -> ClassParentDocs {
-    ClassParentDocs::new(None, None, None, true)
+) -> InheritedClassMembers {
+    InheritedClassMembers::new(None, None, None, true)
 }
 
 /// Cached class-attribute lookup, walking the MRO when not found directly.
 ///
-/// `class_key` encodes `"canonical_file_path::ClassName"`;
-/// `attribute_key` is the bare attribute name (interned for deduplication).
 /// Each `(class_key, attribute_key, environment)` triple is memoised, so
 /// shared parent classes are looked up at most once per revision.
 ///
 /// `cycle_result` handles circular inheritance gracefully.
 #[salsa::tracked(returns(clone), lru = 512, cycle_result = class_parent_attribute_cycle)]
-pub fn class_parent_attribute<'db>(
+pub(super) fn class_parent_attribute<'db>(
     db: &'db dyn ty_module_resolver::Db,
-    class_key: TargetString<'db>,
-    attribute_key: TargetString<'db>,
+    class_key: ClassKey<'db>,
+    attribute_key: SymbolName<'db>,
     environment: ResolverEnvironment<'db>,
-) -> CachedClassAttribute {
-    let Some((file_path, class_name)) = parse_class_key(class_key.value(db)) else {
-        return CachedClassAttribute::not_found();
-    };
+) -> ClassAttributeLookup {
+    let file_path = class_key.file(db).as_path();
+    let class_name = class_key.class(db).as_str();
     let attribute_name = attribute_key.value(db);
     let python_version = environment.python_version(db);
 
-    if let Ok(attr_info) =
+    if let Some(attr_info) =
         extract_class_attribute(db, file_path, class_name, attribute_name, python_version)
     {
-        return CachedClassAttribute::found(
+        return ClassAttributeLookup::found(
             attr_info,
             file_path.to_path_buf(),
             class_name.to_string(),
         );
     }
 
-    let Ok(class_info) = extract_class_info(db, file_path, class_name, python_version) else {
-        return CachedClassAttribute::not_found();
+    let Some(class_info) = extract_class_info(db, file_path, class_name, python_version) else {
+        return ClassAttributeLookup::not_found();
     };
 
-    for parent_key in parent_keys(db, &class_info.base_classes, file_path, environment).flatten() {
+    for parent_key in parent_keys(db, file_path, &class_info.base_classes, environment).flatten() {
         let result = class_parent_attribute(db, parent_key, attribute_key, environment);
         if result.get().is_some() {
             return result;
         }
     }
 
-    CachedClassAttribute::not_found()
+    ClassAttributeLookup::not_found()
 }
 
 fn class_parent_attribute_cycle(
     _db: &dyn ty_module_resolver::Db,
     _id: salsa::Id,
-    _class_key: TargetString,
-    _attribute_key: TargetString,
+    _class_key: ClassKey,
+    _attribute_key: SymbolName,
     _environment: ResolverEnvironment,
-) -> CachedClassAttribute {
-    CachedClassAttribute::not_found()
+) -> ClassAttributeLookup {
+    ClassAttributeLookup::not_found()
 }
 
 #[cfg(test)]
@@ -602,33 +614,26 @@ mod tests {
     use super::*;
     use crate::database::HydraDatabase;
     use crate::database::tests::TestDb;
-    use crate::python::test_support::{get_simple_test_dir, test_db, write_file};
+    use crate::python::model::ParameterKind;
+    use crate::python::test_support::{
+        get_simple_test_dir, sig_for, sig_param, system_path, test_db, write_file, write_venv,
+    };
     use crate::python::typeshed::stdlib_search_root;
     use ruff_db::Db;
     use salsa::Setter;
 
     #[test]
-    fn test_parse_class_key_splits_on_the_last_separator() {
-        assert_eq!(
-            parse_class_key("/work/a::b/models.py::Model"),
-            Some((Path::new("/work/a::b/models.py"), "Model"))
-        );
-        assert_eq!(parse_class_key("no-separator"), None);
-    }
-
-    #[test]
-    fn test_class_key_round_trips() {
+    fn test_class_key_normalizes_the_file() {
         let db = test_db();
         let key = class_key(&db, Path::new("/work/pkg/../models.py"), "Model");
-        assert_eq!(
-            parse_class_key(key.value(&db)),
-            Some((Path::new("/work/models.py"), "Model"))
-        );
+        assert_eq!(key.file(&db), Path::new("/work/models.py"));
+        assert_eq!(key.class(&db), "Model");
+        assert!(key == class_key(&db, Path::new("/work/models.py"), "Model"));
     }
 
     /// The editable roots the `.pth` files in `site_packages` list.
     fn editables(db: &HydraDatabase, site_packages: &Path) -> Vec<PathBuf> {
-        let environment = build_resolver_environment(
+        let environment = resolver_environment_from_parts(
             db,
             Vec::new(),
             vec![SystemPathBuf::from_path_buf(site_packages.to_path_buf()).unwrap()],
@@ -640,20 +645,10 @@ mod tests {
     }
 
     #[test]
-    fn test_discovered_environment_no_config() {
-        let db = test_db();
-        let config = PythonConfig::new(&db, None, None);
-        // Should not panic; returns whatever the current-dir discovery finds (possibly empty).
-        // We can't assert a specific value since it depends on the active
-        // Python environment, but the call must succeed.
-        let _ = discovered_environment(&db, config);
-    }
-
-    #[test]
     fn test_discovered_environment_cache_hit() {
         let db = test_db();
         let examples = get_simple_test_dir();
-        let config = PythonConfig::new(&db, Some(examples.to_string_lossy().to_string()), None);
+        let config = PythonConfig::new(&db, system_path(&examples), None);
         let result1 = discovered_environment(&db, config);
         let result2 = discovered_environment(&db, config);
         // Pointer equality: salsa returns the same value on a cache hit.
@@ -664,14 +659,14 @@ mod tests {
     fn test_discovered_environment_invalidation_on_interpreter_change() {
         let mut db = test_db();
         let examples = get_simple_test_dir();
-        let config = PythonConfig::new(&db, Some(examples.to_string_lossy().to_string()), None);
+        let config = PythonConfig::new(&db, system_path(&examples), None);
         let _ = discovered_environment(&db, config);
 
         // Changing the interpreter invalidates the memo: a nonexistent
         // interpreter fails discovery, so the result is empty.
         config
             .set_interpreter(&mut db)
-            .to(Some("/nonexistent/python".to_string()));
+            .to(Some(SystemPathBuf::from("/nonexistent/python")));
         assert_eq!(
             discovered_environment(&db, config),
             &DiscoveredEnvironment::default()
@@ -682,7 +677,7 @@ mod tests {
     fn test_resolver_environment_puts_the_workspace_root_first() {
         let db = test_db();
         let examples = get_simple_test_dir();
-        let config = PythonConfig::new(&db, Some(examples.to_string_lossy().to_string()), None);
+        let config = PythonConfig::new(&db, system_path(&examples), None);
         let environment = resolver_environment(&db, config);
         let first = ty_module_resolver::system_module_search_paths(&db, environment).next();
         assert_eq!(
@@ -698,8 +693,8 @@ mod tests {
         let db = test_db();
         let config = PythonConfig::new(
             &db,
-            Some(get_simple_test_dir().to_string_lossy().to_string()),
-            Some("/nonexistent/python".to_string()),
+            system_path(&get_simple_test_dir()),
+            Some(SystemPathBuf::from("/nonexistent/python")),
         );
         assert_eq!(
             resolver_environment(&db, config).python_version(&db),
@@ -711,24 +706,11 @@ mod tests {
     fn test_resolver_environment_uses_the_venv_version() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let venv = std::fs::canonicalize(tmp.path()).unwrap();
-        let site_packages = if cfg!(target_os = "windows") {
-            std::fs::write(venv.join("python.exe"), "").unwrap();
-            venv.join(r"Lib\site-packages")
-        } else {
-            std::fs::create_dir_all(venv.join("bin")).unwrap();
-            std::fs::write(venv.join("bin/python"), "").unwrap();
-            venv.join("lib/python3.9/site-packages")
-        };
-        std::fs::create_dir_all(&site_packages).unwrap();
-        std::fs::write(
-            venv.join("pyvenv.cfg"),
-            format!("home = {}\nversion = 3.9.18\n", venv.display()),
-        )
-        .unwrap();
+        write_venv(&venv, "3.9.18");
 
         let db = test_db();
-        let venv = venv.to_string_lossy().into_owned();
-        let config = PythonConfig::new(&db, Some(venv.clone()), Some(venv));
+        let venv = system_path(&venv);
+        let config = PythonConfig::new(&db, venv.clone(), Some(venv));
         assert_eq!(
             resolver_environment(&db, config).python_version(&db),
             PythonVersion::PY39
@@ -738,21 +720,27 @@ mod tests {
     #[test]
     fn test_python_config_fields() {
         let db = TestDb::new();
-        let config = PythonConfig::new(&db, Some("/workspace".to_string()), None);
-        assert_eq!(config.workspace_root(&db).as_deref(), Some("/workspace"));
+        let config = PythonConfig::new(&db, SystemPathBuf::from("/workspace"), None);
+        assert_eq!(
+            config.workspace_root(&db).as_path(),
+            SystemPath::new("/workspace")
+        );
         assert_eq!(config.interpreter(&db).as_deref(), None);
     }
 
     #[test]
     fn test_python_config_update() {
         let mut db = TestDb::new();
-        let config = PythonConfig::new(&db, None, None);
+        let config = PythonConfig::new(&db, SystemPathBuf::from("/workspace"), None);
         assert!(config.interpreter(&db).is_none());
 
         config
             .set_interpreter(&mut db)
-            .to(Some("/usr/bin/python3".to_string()));
-        assert_eq!(config.interpreter(&db).as_deref(), Some("/usr/bin/python3"));
+            .to(Some(SystemPathBuf::from("/usr/bin/python3")));
+        assert_eq!(
+            config.interpreter(&db).as_deref(),
+            Some(SystemPath::new("/usr/bin/python3"))
+        );
     }
 
     #[test]
@@ -774,9 +762,9 @@ mod tests {
     fn test_cached_definition_info_valid_target() {
         let db = test_db();
         let workspace = get_simple_test_dir();
-        let config = PythonConfig::new(&db, Some(workspace.to_string_lossy().to_string()), None);
+        let config = PythonConfig::new(&db, system_path(&workspace), None);
         let target = TargetString::new(&db, "my_module.DataLoader".to_string());
-        let result = cached_definition_info(&db, config, target);
+        let result = resolved_definition(&db, config, target);
 
         let def = result.get().expect("should resolve DataLoader");
         assert_eq!(def.symbol_name, "DataLoader");
@@ -787,9 +775,9 @@ mod tests {
     fn test_cached_definition_info_invalid_target() {
         let db = TestDb::new();
         let workspace = get_simple_test_dir();
-        let config = PythonConfig::new(&db, Some(workspace.to_string_lossy().to_string()), None);
+        let config = PythonConfig::new(&db, system_path(&workspace), None);
         let target = TargetString::new(&db, "nonexistent.Module".to_string());
-        let result = cached_definition_info(&db, config, target);
+        let result = resolved_definition(&db, config, target);
         assert!(result.get().is_err());
     }
 
@@ -797,11 +785,11 @@ mod tests {
     fn test_cached_definition_info_cache_hit() {
         let db = test_db();
         let workspace = get_simple_test_dir();
-        let config = PythonConfig::new(&db, Some(workspace.to_string_lossy().to_string()), None);
+        let config = PythonConfig::new(&db, system_path(&workspace), None);
         let target = TargetString::new(&db, "my_module.DataLoader".to_string());
 
-        let result1 = cached_definition_info(&db, config, target);
-        let result2 = cached_definition_info(&db, config, target);
+        let result1 = resolved_definition(&db, config, target);
+        let result2 = resolved_definition(&db, config, target);
 
         // Same input, no changes — should be pointer-equal (cache hit)
         assert!(result1 == result2);
@@ -811,9 +799,9 @@ mod tests {
     fn test_cached_definition_info_function_target() {
         let db = test_db();
         let workspace = get_simple_test_dir();
-        let config = PythonConfig::new(&db, Some(workspace.to_string_lossy().to_string()), None);
+        let config = PythonConfig::new(&db, system_path(&workspace), None);
         let target = TargetString::new(&db, "my_module.create_model".to_string());
-        let result = cached_definition_info(&db, config, target);
+        let result = resolved_definition(&db, config, target);
 
         let def = result.get().expect("should resolve create_model");
         assert_eq!(def.symbol_name, "create_model");
@@ -824,22 +812,22 @@ mod tests {
     fn test_cached_definition_info_invalidation_on_config_change() {
         let mut db = test_db();
         let workspace = get_simple_test_dir();
-        let config = PythonConfig::new(&db, Some(workspace.to_string_lossy().to_string()), None);
+        let config = PythonConfig::new(&db, system_path(&workspace), None);
 
         let result1 = {
             let target = TargetString::new(&db, "my_module.DataLoader".to_string());
-            cached_definition_info(&db, config, target)
+            resolved_definition(&db, config, target)
         };
         assert!(result1.get().is_ok());
 
         // Change workspace root — invalidates all cached lookups
         config
             .set_workspace_root(&mut db)
-            .to(Some("/nonexistent/path".to_string()));
+            .to(SystemPathBuf::from("/nonexistent/path"));
 
         let result2 = {
             let target = TargetString::new(&db, "my_module.DataLoader".to_string());
-            cached_definition_info(&db, config, target)
+            resolved_definition(&db, config, target)
         };
         // Result pointer should differ (recomputed, not from cache)
         assert!(result1 != result2);
@@ -871,10 +859,10 @@ mod tests {
             .expect("set initial mtime");
 
         let mut db = test_db();
-        let config = PythonConfig::new(&db, Some(workspace.to_string_lossy().to_string()), None);
+        let config = PythonConfig::new(&db, system_path(workspace), None);
         let result1 = {
             let target = TargetString::new(&db, "watched_module.WatchedClass".to_string());
-            cached_definition_info(&db, config, target)
+            resolved_definition(&db, config, target)
         };
         assert!(result1.get().is_ok(), "should resolve WatchedClass");
 
@@ -894,7 +882,7 @@ mod tests {
 
         let result2 = {
             let target = TargetString::new(&db, "watched_module.WatchedClass".to_string());
-            cached_definition_info(&db, config, target)
+            resolved_definition(&db, config, target)
         };
         assert!(
             result1 != result2,
@@ -910,8 +898,9 @@ mod tests {
         use tempfile::TempDir;
 
         let tmp = TempDir::new().expect("tempdir");
-        let site_packages = tmp.path().join("site-packages");
-        let editable_src = tmp.path().join("src");
+        let tmp_path = fs::canonicalize(tmp.path()).expect("canonicalize tempdir");
+        let site_packages = tmp_path.join("site-packages");
+        let editable_src = tmp_path.join("src");
         fs::create_dir_all(&site_packages).expect("create site-packages dir");
         fs::create_dir_all(&editable_src).expect("create editable src dir");
 
@@ -946,8 +935,9 @@ mod tests {
         use tempfile::TempDir;
 
         let tmp = TempDir::new().expect("tempdir");
-        let site_packages = tmp.path().join("site-packages");
-        let editable_src = tmp.path().join("src");
+        let tmp_path = fs::canonicalize(tmp.path()).expect("canonicalize tempdir");
+        let site_packages = tmp_path.join("site-packages");
+        let editable_src = tmp_path.join("src");
         fs::create_dir_all(&site_packages).expect("create site-packages dir");
         fs::create_dir_all(&editable_src).expect("create editable src dir");
 
@@ -1000,14 +990,14 @@ mod tests {
         .expect("write pth");
 
         let db = test_db();
-        let config = PythonConfig::new(&db, Some(workspace.to_string_lossy().to_string()), None);
+        let config = PythonConfig::new(&db, system_path(&workspace), None);
         let _ = resolver_environment(&db, config);
 
         // A lookup that misses the static paths makes ty compute the dynamic
         // ones, which is where it registers roots for editable installs.
         let workspace_sys = SystemPathBuf::from_path_buf(workspace.clone()).unwrap();
         let site_packages_sys = SystemPathBuf::from_path_buf(site_packages.clone()).unwrap();
-        let environment = build_resolver_environment(
+        let environment = resolver_environment_from_parts(
             &db,
             vec![workspace_sys],
             vec![site_packages_sys],
@@ -1027,8 +1017,9 @@ mod tests {
     #[test]
     fn test_cached_definition_result_equality() {
         // Two separately-created results should not be pointer-equal
-        let r1 = CachedDefinitionResult::from_result(Err(ResolveError::Other("err".into())));
-        let r2 = CachedDefinitionResult::from_result(Err(ResolveError::Other("err".into())));
+        let err = || Err(ResolveError::InvalidFormat("err".into()));
+        let r1 = DefinitionResult::from_result(err());
+        let r2 = DefinitionResult::from_result(err());
         assert!(r1 != r2);
 
         // Cloned result should be pointer-equal
@@ -1038,7 +1029,7 @@ mod tests {
 
     // ---- Backdating regression tests for the recursive MRO queries ----
     //
-    // `class_parent_docs` / `class_parent_attribute` are recursive, so each query
+    // `inherited_class_members` / `class_parent_attribute` are recursive, so each query
     // is its own memoised dependent. Their result types must compare by *value*
     // or salsa can never backdate, and any edit to a file in an MRO chain re-runs the
     // entire chain even when the resolved result is identical. These tests lock in
@@ -1046,25 +1037,10 @@ mod tests {
 
     /// Minimal `FunctionSignature` with `param_count` positional parameters.
     fn test_sig(name: &str, param_count: usize) -> FunctionSignature {
-        FunctionSignature {
-            name: name.to_string(),
-            parameters: (0..param_count)
-                .map(|i| crate::python::model::ParameterInfo {
-                    name: format!("p{i}"),
-                    kind: crate::python::model::ParameterKind::PositionalOrKeyword,
-                    type_annotation: None,
-                    default_value: None,
-                })
-                .collect(),
-            return_type: None,
-            docstring: None,
-            is_overloaded: false,
-            overloads: Vec::new(),
-            start_line: 1,
-            start_column: 1,
-            end_line: 2,
-            end_column: 1,
-        }
+        let parameters = (0..param_count)
+            .map(|i| sig_param(&format!("p{i}"), ParameterKind::PositionalOrKeyword))
+            .collect();
+        sig_for(name, parameters)
     }
 
     #[test]
@@ -1072,13 +1048,13 @@ mod tests {
         // Two independently-allocated results with identical contents must be
         // equal so salsa can backdate. Under the old `Arc::ptr_eq` impl these
         // were always `!=`.
-        let a = ClassParentDocs::new(
+        let a = InheritedClassMembers::new(
             Some("doc".to_string()),
             Some(test_sig("__init__", 1)),
             None,
             true,
         );
-        let b = ClassParentDocs::new(
+        let b = InheritedClassMembers::new(
             Some("doc".to_string()),
             Some(test_sig("__init__", 1)),
             None,
@@ -1088,14 +1064,14 @@ mod tests {
 
         // Differing contents must compare unequal — guards against false
         // negatives (failing to invalidate on a real change).
-        let diff_doc = ClassParentDocs::new(
+        let diff_doc = InheritedClassMembers::new(
             Some("other".to_string()),
             Some(test_sig("__init__", 1)),
             None,
             true,
         );
         assert_ne!(a, diff_doc, "different docstring must compare unequal");
-        let diff_init = ClassParentDocs::new(
+        let diff_init = InheritedClassMembers::new(
             Some("doc".to_string()),
             Some(test_sig("__init__", 2)),
             None,
@@ -1113,23 +1089,23 @@ mod tests {
             name: "factory".to_string(),
             value: v.to_string(),
         };
-        let a = CachedClassAttribute::found(attr("Foo"), PathBuf::from("/p.py"), "C".to_string());
-        let b = CachedClassAttribute::found(attr("Foo"), PathBuf::from("/p.py"), "C".to_string());
+        let a = ClassAttributeLookup::found(attr("Foo"), PathBuf::from("/p.py"), "C".to_string());
+        let b = ClassAttributeLookup::found(attr("Foo"), PathBuf::from("/p.py"), "C".to_string());
         assert_eq!(a, b, "equal contents must compare equal (value equality)");
 
         // Each component participates in equality (no false negatives).
         let diff_value =
-            CachedClassAttribute::found(attr("Bar"), PathBuf::from("/p.py"), "C".to_string());
+            ClassAttributeLookup::found(attr("Bar"), PathBuf::from("/p.py"), "C".to_string());
         assert_ne!(
             a, diff_value,
             "different attribute value must compare unequal"
         );
         let diff_path =
-            CachedClassAttribute::found(attr("Foo"), PathBuf::from("/q.py"), "C".to_string());
+            ClassAttributeLookup::found(attr("Foo"), PathBuf::from("/q.py"), "C".to_string());
         assert_ne!(a, diff_path, "different file path must compare unequal");
 
-        let n1 = CachedClassAttribute::not_found();
-        let n2 = CachedClassAttribute::not_found();
+        let n1 = ClassAttributeLookup::not_found();
+        let n2 = ClassAttributeLookup::not_found();
         assert_eq!(n1, n2, "two not-found results must compare equal");
         assert_ne!(a, n1, "found vs not-found must compare unequal");
     }
@@ -1182,9 +1158,9 @@ mod tests {
         let mut db = test_db();
 
         let r1 = {
-            let sp = environment_for_roots(&db, &[workspace.to_path_buf()]);
+            let sp = resolver_environment_for_roots(&db, &[workspace.to_path_buf()]);
             let child_key = class_key(&db, &child, "Child");
-            class_parent_docs(&db, child_key, sp)
+            inherited_class_members(&db, child_key, sp)
         };
         // Prove the MRO walk really resolved through to GrandParent — otherwise
         // a trivially-empty result could make this test pass for the wrong reason.
@@ -1194,7 +1170,7 @@ mod tests {
             "Child must inherit GrandParent's docstring via the MRO"
         );
         assert_eq!(
-            r1.init().map(|s| s.parameters.len()),
+            r1.init_signature().map(|s| s.parameters.len()),
             Some(2),
             "Child must inherit GrandParent's __init__(self, a) — 2 params incl. self"
         );
@@ -1206,9 +1182,9 @@ mod tests {
         sync_lexical(&mut db, &gp);
 
         let r2 = {
-            let sp = environment_for_roots(&db, &[workspace.to_path_buf()]);
+            let sp = resolver_environment_for_roots(&db, &[workspace.to_path_buf()]);
             let child_key = class_key(&db, &child, "Child");
-            class_parent_docs(&db, child_key, sp)
+            inherited_class_members(&db, child_key, sp)
         };
 
         // Backdating: GrandParent re-executed but produced a value-equal result,
@@ -1236,11 +1212,11 @@ mod tests {
 
         let mut db = test_db();
         let r1 = {
-            let sp = environment_for_roots(&db, &[workspace.to_path_buf()]);
+            let sp = resolver_environment_for_roots(&db, &[workspace.to_path_buf()]);
             let child_key = class_key(&db, &child, "Child");
-            class_parent_docs(&db, child_key, sp)
+            inherited_class_members(&db, child_key, sp)
         };
-        assert_eq!(r1.init().map(|s| s.parameters.len()), Some(2));
+        assert_eq!(r1.init_signature().map(|s| s.parameters.len()), Some(2));
 
         // Genuinely change GrandParent's __init__ signature: the inherited
         // result MUST update (no false negative).
@@ -1253,12 +1229,12 @@ mod tests {
         sync_lexical(&mut db, &gp);
 
         let r2 = {
-            let sp = environment_for_roots(&db, &[workspace.to_path_buf()]);
+            let sp = resolver_environment_for_roots(&db, &[workspace.to_path_buf()]);
             let child_key = class_key(&db, &child, "Child");
-            class_parent_docs(&db, child_key, sp)
+            inherited_class_members(&db, child_key, sp)
         };
         assert_eq!(
-            r2.init().map(|s| s.parameters.len()),
+            r2.init_signature().map(|s| s.parameters.len()),
             Some(3),
             "a real __init__ change must propagate through the MRO"
         );
@@ -1278,13 +1254,13 @@ mod tests {
 
         let mut db = test_db();
         let r1 = {
-            let sp = environment_for_roots(&db, &[workspace.to_path_buf()]);
+            let sp = resolver_environment_for_roots(&db, &[workspace.to_path_buf()]);
             let child_key = class_key(&db, &child, "Child");
-            let attr_key = TargetString::new(&db, "factory".to_string());
+            let attr_key = SymbolName::new(&db, "factory".to_string());
             class_parent_attribute(&db, child_key, attr_key, sp)
         };
         assert_eq!(
-            r1.get().map(|(a, _, _)| a.value.as_str()),
+            r1.get().map(|a| a.info.value.as_str()),
             Some("SomeFactory"),
             "Child must inherit GrandParent's `factory` attribute via the MRO"
         );
@@ -1295,9 +1271,9 @@ mod tests {
         sync_lexical(&mut db, &gp);
 
         let r2 = {
-            let sp = environment_for_roots(&db, &[workspace.to_path_buf()]);
+            let sp = resolver_environment_for_roots(&db, &[workspace.to_path_buf()]);
             let child_key = class_key(&db, &child, "Child");
-            let attr_key = TargetString::new(&db, "factory".to_string());
+            let attr_key = SymbolName::new(&db, "factory".to_string());
             class_parent_attribute(&db, child_key, attr_key, sp)
         };
         assert!(
@@ -1320,15 +1296,12 @@ mod tests {
 
         let mut db = test_db();
         let r1 = {
-            let sp = environment_for_roots(&db, &[workspace.to_path_buf()]);
+            let sp = resolver_environment_for_roots(&db, &[workspace.to_path_buf()]);
             let child_key = class_key(&db, &child, "Child");
-            let attr_key = TargetString::new(&db, "factory".to_string());
+            let attr_key = SymbolName::new(&db, "factory".to_string());
             class_parent_attribute(&db, child_key, attr_key, sp)
         };
-        assert_eq!(
-            r1.get().map(|(a, _, _)| a.value.as_str()),
-            Some("SomeFactory")
-        );
+        assert_eq!(r1.get().map(|a| a.info.value.as_str()), Some("SomeFactory"));
 
         // Change the attribute's value: the inherited result MUST update.
         fs::write(&gp, "class GrandParent:\n    factory = OtherFactory\n").expect("write gp v2");
@@ -1336,13 +1309,13 @@ mod tests {
         sync_lexical(&mut db, &gp);
 
         let r2 = {
-            let sp = environment_for_roots(&db, &[workspace.to_path_buf()]);
+            let sp = resolver_environment_for_roots(&db, &[workspace.to_path_buf()]);
             let child_key = class_key(&db, &child, "Child");
-            let attr_key = TargetString::new(&db, "factory".to_string());
+            let attr_key = SymbolName::new(&db, "factory".to_string());
             class_parent_attribute(&db, child_key, attr_key, sp)
         };
         assert_eq!(
-            r2.get().map(|(a, _, _)| a.value.as_str()),
+            r2.get().map(|a| a.info.value.as_str()),
             Some("OtherFactory"),
             "a real attribute change must propagate through the MRO"
         );
@@ -1380,14 +1353,14 @@ mod tests {
         let mut db = test_db();
         let child_via_link = link_ws.join("child.py");
         let query = |db: &HydraDatabase| {
-            let sp = environment_for_roots(db, std::slice::from_ref(&link_ws));
+            let sp = resolver_environment_for_roots(db, std::slice::from_ref(&link_ws));
             let child_key = class_key(db, &child_via_link, "Child");
-            class_parent_docs(db, child_key, sp)
+            inherited_class_members(db, child_key, sp)
         };
 
         let r1 = query(&db);
         assert_eq!(
-            r1.init().map(|s| s.parameters.len()),
+            r1.init_signature().map(|s| s.parameters.len()),
             Some(2),
             "Child must inherit GrandParent's __init__(self, a) via the symlinked workspace"
         );
@@ -1404,7 +1377,7 @@ mod tests {
 
         let r2 = query(&db);
         assert_eq!(
-            r2.init().map(|s| s.parameters.len()),
+            r2.init_signature().map(|s| s.parameters.len()),
             Some(3),
             "a real __init__ change must invalidate the MRO memo even when the \
              workspace is reached through a symlink"
@@ -1524,7 +1497,7 @@ mod tests {
         search_paths: &[PathBuf],
         module: &str,
     ) -> Option<PathBuf> {
-        resolve_module_by_name(db, module, environment_for_roots(db, search_paths))
+        resolve_module_by_name(db, module, resolver_environment_for_roots(db, search_paths))
     }
 
     #[test]
@@ -1563,10 +1536,8 @@ mod tests {
     #[test]
     fn test_is_builtin_symbol() {
         let db = TestDb::new();
-        let environment = environment_for_roots(&db, &[]);
-        let check = |name: &str| {
-            is_builtin_symbol(&db, environment, TargetString::new(&db, name.to_string()))
-        };
+        let environment = resolver_environment_for_roots(&db, &[]);
+        let check = |name: &str| is_builtin_symbol(&db, name, environment);
 
         assert!(check("len"), "a builtin function");
         assert!(check("dict"), "a builtin class");
@@ -1606,7 +1577,7 @@ mod tests {
 
         fn resolve(&self, module: &str) -> Option<PathBuf> {
             let db = HydraDatabase::new(SystemPath::from_std_path(&self.workspace).unwrap());
-            let environment = build_resolver_environment(
+            let environment = resolver_environment_from_parts(
                 &db,
                 vec![SystemPathBuf::from_path_buf(self.workspace.clone()).unwrap()],
                 vec![SystemPathBuf::from_path_buf(self.site_packages.clone()).unwrap()],
@@ -1784,7 +1755,7 @@ mod tests {
         );
     }
 
-    // ==================== resolve_module_cached tests ====================
+    // ==================== resolved_module_file tests ====================
 
     #[test]
     fn test_resolve_module_simple() {

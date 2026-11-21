@@ -246,7 +246,7 @@ thing:
 }
 
 /// Wiring in typeshed makes the whole stdlib reachable; issue #34 deliberately
-/// ships only `builtins` (see `python::typeshed::is_vendored_module`). This
+/// ships only `builtins` (see `python::typeshed::is_builtins_module`). This
 /// pins the gate so widening it is a conscious change.
 #[tokio::test]
 async fn test_other_stdlib_modules_are_still_unresolved() {

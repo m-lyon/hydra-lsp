@@ -13,7 +13,9 @@ mod yaml_parser;
 pub use backend::{HydraLspBackend, HydrustCapabilities, NegotiatedFeatures};
 pub use database::HydraDatabase;
 pub use diagnostics::validate_document;
-pub use python::cache::{PythonConfig, TargetString, cached_definition_info};
+pub use python::cache::{
+    DefinitionResult, PythonConfig, ResolvedDefinition, TargetString, resolved_definition,
+};
 pub use python::format::render_params;
 pub use python::model::{
     ClassInfo, DefaultStyle, DefinitionInfo, FunctionSignature, MethodInfo, ParameterInfo,
@@ -22,11 +24,3 @@ pub use python::model::{
 pub use rules::DiagnosticRule;
 pub use server::serve;
 pub use yaml_parser::{CompletionContext, HydraObject, SemanticTokenType, YamlParser};
-
-// Only called by tests
-#[doc(hidden)]
-pub use python::cache::environment_for_roots;
-#[doc(hidden)]
-pub use python::extract::{extract_class_info, extract_function_signature};
-#[doc(hidden)]
-pub use python::resolve::extract_definition_info;

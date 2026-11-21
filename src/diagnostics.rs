@@ -1,5 +1,5 @@
 use crate::python::cache::{
-    PythonConfig, TargetString, cached_definition_info, is_builtin_symbol, resolver_environment,
+    PythonConfig, TargetString, is_builtin_symbol, resolved_definition, resolver_environment,
 };
 use crate::python::model::{
     DefinitionInfo, FunctionSignature, ParameterInfo, ParameterKind, ResolveError,
@@ -52,26 +52,28 @@ fn diagnostic_in(
 /// Validate a Hydra `_target_` entry. Returns diagnostics and optionally the resolved
 /// DefinitionInfo.
 ///
-/// Routes through `cached_definition_info`.
+/// Routes through `resolved_definition`.
 fn validate_target(
-    hydra_obj: &HydraObject,
     db: &dyn ty_module_resolver::Db,
-    python_config: PythonConfig,
+    hydra_obj: &HydraObject,
     file_suppressions: &HashSet<DiagnosticRule>,
+    python_config: PythonConfig,
 ) -> (Vec<Diagnostic>, Option<DefinitionInfo>) {
     let mut diagnostics = Vec::new();
 
     let target = TargetString::new(db, hydra_obj.target.value.clone());
-    let cached = cached_definition_info(db, python_config, target);
+    let cached = resolved_definition(db, python_config, target);
     match cached.get() {
         Ok(def) => (diagnostics, Some(def.definition_info.clone())),
         Err(err) => {
             let rule = err.rule();
             let msg = match err {
                 ResolveError::InvalidFormat(_) => {
-                    format!("{}. {}", err, target_format_hint(db, python_config, target))
+                    format!("{}. {}", err, target_format_hint(db, target, python_config))
                 }
-                ResolveError::UnresolvedModule(_) | ResolveError::Other(_) => err.to_string(),
+                ResolveError::UnresolvedModule(_) | ResolveError::UnresolvedSymbol { .. } => {
+                    err.to_string()
+                }
             };
             if !hydra_obj.rule_suppressed(rule, file_suppressions) {
                 diagnostics.push(diagnostic_in(
@@ -95,18 +97,18 @@ impl ResolveError {
         match self {
             ResolveError::InvalidFormat(_) => DiagnosticRule::InvalidHydraParameter,
             ResolveError::UnresolvedModule(_) => DiagnosticRule::UnresolvedImport,
-            ResolveError::Other(_) => DiagnosticRule::UnresolvedReference,
+            ResolveError::UnresolvedSymbol { .. } => DiagnosticRule::UnresolvedReference,
         }
     }
 }
 
 fn target_format_hint(
     db: &dyn ty_module_resolver::Db,
-    python_config: PythonConfig,
     target: TargetString<'_>,
+    python_config: PythonConfig,
 ) -> String {
     let name = target.value(db);
-    if is_builtin_symbol(db, resolver_environment(db, python_config), target) {
+    if is_builtin_symbol(db, name, resolver_environment(db, python_config)) {
         format!("'{name}' is a Python builtin; use '{BUILTINS_MODULE}.{name}'")
     } else {
         "Expected format: 'module.path.SymbolName'".to_string()
@@ -487,33 +489,33 @@ fn validate_hydra_keywords(
 /// Validate all targets in a document.
 ///
 /// Takes a salsa database and `PythonConfig` so target resolution shares the
-/// cached_definition_info LRU with the rest of the LSP.
+/// resolved_definition LRU with the rest of the LSP.
 ///
-/// `extra_suppressions` is unioned with the file's own suppressions so the
+/// `disabled_rules` is unioned with the file's own suppressions so the
 /// caller can inject globally-disabled rules (e.g. from user settings) without
 /// mutating the cached `ParsedContent`.
 pub fn validate_document(
-    parsed_content: &ParsedContent,
-    extra_suppressions: &HashSet<DiagnosticRule>,
     db: &dyn ty_module_resolver::Db,
+    parsed_content: &ParsedContent,
+    disabled_rules: &HashSet<DiagnosticRule>,
     python_config: PythonConfig,
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
 
-    let suppressions: HashSet<DiagnosticRule> = if extra_suppressions.is_empty() {
+    let suppressions: HashSet<DiagnosticRule> = if disabled_rules.is_empty() {
         parsed_content.file_suppressions.clone()
     } else {
         parsed_content
             .file_suppressions
             .iter()
             .copied()
-            .chain(extra_suppressions.iter().copied())
+            .chain(disabled_rules.iter().copied())
             .collect()
     };
 
     for target in &parsed_content.hydra_objects {
         let (target_diagnostics, definition_info) =
-            validate_target(target, db, python_config, &suppressions);
+            validate_target(db, target, &suppressions, python_config);
         diagnostics.extend(target_diagnostics);
 
         // Try to resolve the target and validate parameters. `None` here means
@@ -567,14 +569,16 @@ mod tests {
     use std::collections::HashMap;
     use std::path::Path;
 
-    use crate::python::test_support::{get_simple_test_dir, test_db};
+    use crate::python::test_support::{
+        get_simple_test_dir, sig_for, sig_param, system_path, test_db,
+    };
 
     /// Build a fresh salsa db + PythonConfig for tests. Uses `HydraDatabase`
     /// (not `TestDb`) so analyzer file reads can hit the real workspace files.
     fn test_env(workspace_root: Option<&Path>) -> (HydraDatabase, PythonConfig) {
         let db = test_db();
-        let workspace = workspace_root.map(|p| p.to_string_lossy().to_string());
-        let config = PythonConfig::new(&db, workspace, None);
+        let workspace = workspace_root.unwrap_or(Path::new("/"));
+        let config = PythonConfig::new(&db, system_path(workspace), None);
         (db, config)
     }
 
@@ -652,7 +656,11 @@ mod tests {
     #[test]
     fn test_resolve_error_rule_other() {
         assert_eq!(
-            ResolveError::Other("Symbol 'X' not found in module 'm'".to_string()).rule(),
+            ResolveError::UnresolvedSymbol {
+                module: "m".to_string(),
+                symbol: "X".to_string(),
+            }
+            .rule(),
             DiagnosticRule::UnresolvedReference
         );
     }
@@ -663,31 +671,16 @@ mod tests {
     fn test_validate_missing_required_param() {
         let hydra_obj = build_hydra_object("my.Class", Vec::new(), 0, 0, 0, false);
 
-        let signature = FunctionSignature {
-            name: "Class".to_string(),
-            parameters: vec![
+        let signature = sig_for(
+            "Class",
+            vec![
+                sig_param("self", ParameterKind::PositionalOrKeyword),
                 ParameterInfo {
-                    name: "self".to_string(),
-                    kind: ParameterKind::PositionalOrKeyword,
-                    type_annotation: None,
-                    default_value: None,
-                },
-                ParameterInfo {
-                    name: "required_param".to_string(),
-                    kind: ParameterKind::PositionalOrKeyword,
                     type_annotation: Some("int".to_string()),
-                    default_value: None,
+                    ..sig_param("required_param", ParameterKind::PositionalOrKeyword)
                 },
             ],
-            return_type: None,
-            docstring: None,
-            is_overloaded: false,
-            overloads: Vec::new(),
-            start_line: 1,
-            start_column: 1,
-            end_line: 1,
-            end_column: 1,
-        };
+        );
 
         let diagnostics = validate_parameters(
             &hydra_obj,
@@ -715,23 +708,10 @@ mod tests {
         let params = vec![make_param("unknown_param", YamlValue::Null, 1)];
         let hydra_obj = build_hydra_object("my.Class", params, 0, 0, 0, false);
 
-        let signature = FunctionSignature {
-            name: "Class".to_string(),
-            parameters: vec![ParameterInfo {
-                name: "self".to_string(),
-                kind: ParameterKind::PositionalOrKeyword,
-                type_annotation: None,
-                default_value: None,
-            }],
-            return_type: None,
-            docstring: None,
-            is_overloaded: false,
-            overloads: Vec::new(),
-            start_line: 1,
-            start_column: 1,
-            end_line: 1,
-            end_column: 1,
-        };
+        let signature = sig_for(
+            "Class",
+            vec![sig_param("self", ParameterKind::PositionalOrKeyword)],
+        );
 
         let diagnostics = validate_parameters(
             &hydra_obj,
@@ -755,31 +735,13 @@ mod tests {
         let params = vec![make_param("any_param", YamlValue::Null, 1)];
         let hydra_obj = build_hydra_object("my.Class", params, 0, 0, 0, false);
 
-        let signature = FunctionSignature {
-            name: "Class".to_string(),
-            parameters: vec![
-                ParameterInfo {
-                    name: "self".to_string(),
-                    kind: ParameterKind::PositionalOrKeyword,
-                    type_annotation: None,
-                    default_value: None,
-                },
-                ParameterInfo {
-                    name: "**kwargs".to_string(),
-                    kind: ParameterKind::VarKeyword,
-                    type_annotation: None,
-                    default_value: None,
-                },
+        let signature = sig_for(
+            "Class",
+            vec![
+                sig_param("self", ParameterKind::PositionalOrKeyword),
+                sig_param("**kwargs", ParameterKind::VarKeyword),
             ],
-            return_type: None,
-            docstring: None,
-            is_overloaded: false,
-            overloads: Vec::new(),
-            start_line: 1,
-            start_column: 1,
-            end_line: 1,
-            end_column: 1,
-        };
+        );
 
         let diagnostics = validate_parameters(
             &hydra_obj,
@@ -802,31 +764,16 @@ mod tests {
         // cls should not be reported as a missing required parameter for classmethods
         let hydra_obj = build_hydra_object("my.Class.from_config", Vec::new(), 0, 0, 0, false);
 
-        let signature = FunctionSignature {
-            name: "from_config".to_string(),
-            parameters: vec![
+        let signature = sig_for(
+            "from_config",
+            vec![
+                sig_param("cls", ParameterKind::PositionalOrKeyword),
                 ParameterInfo {
-                    name: "cls".to_string(),
-                    kind: ParameterKind::PositionalOrKeyword,
-                    type_annotation: None,
-                    default_value: None,
-                },
-                ParameterInfo {
-                    name: "config_path".to_string(),
-                    kind: ParameterKind::PositionalOrKeyword,
                     type_annotation: Some("str".to_string()),
-                    default_value: None,
+                    ..sig_param("config_path", ParameterKind::PositionalOrKeyword)
                 },
             ],
-            return_type: None,
-            docstring: None,
-            is_overloaded: false,
-            overloads: Vec::new(),
-            start_line: 1,
-            start_column: 1,
-            end_line: 1,
-            end_column: 1,
-        };
+        );
 
         let diagnostics = validate_parameters(
             &hydra_obj,
@@ -865,31 +812,16 @@ mod tests {
         )];
         let hydra_obj = build_hydra_object("my.Class.from_config", params, 0, 0, 0, false);
 
-        let signature = FunctionSignature {
-            name: "from_config".to_string(),
-            parameters: vec![
+        let signature = sig_for(
+            "from_config",
+            vec![
+                sig_param("cls", ParameterKind::PositionalOrKeyword),
                 ParameterInfo {
-                    name: "cls".to_string(),
-                    kind: ParameterKind::PositionalOrKeyword,
-                    type_annotation: None,
-                    default_value: None,
-                },
-                ParameterInfo {
-                    name: "config_path".to_string(),
-                    kind: ParameterKind::PositionalOrKeyword,
                     type_annotation: Some("str".to_string()),
-                    default_value: None,
+                    ..sig_param("config_path", ParameterKind::PositionalOrKeyword)
                 },
             ],
-            return_type: None,
-            docstring: None,
-            is_overloaded: false,
-            overloads: Vec::new(),
-            start_line: 1,
-            start_column: 1,
-            end_line: 1,
-            end_column: 1,
-        };
+        );
 
         let diagnostics = validate_parameters(
             &hydra_obj,
@@ -910,31 +842,16 @@ mod tests {
         // Instance method using "this" instead of "self" should still be filtered
         let hydra_obj = build_hydra_object("my.Class", Vec::new(), 0, 0, 0, false);
 
-        let signature = FunctionSignature {
-            name: "__init__".to_string(),
-            parameters: vec![
+        let signature = sig_for(
+            "__init__",
+            vec![
+                sig_param("this", ParameterKind::PositionalOrKeyword),
                 ParameterInfo {
-                    name: "this".to_string(),
-                    kind: ParameterKind::PositionalOrKeyword,
-                    type_annotation: None,
-                    default_value: None,
-                },
-                ParameterInfo {
-                    name: "value".to_string(),
-                    kind: ParameterKind::PositionalOrKeyword,
                     type_annotation: Some("int".to_string()),
-                    default_value: None,
+                    ..sig_param("value", ParameterKind::PositionalOrKeyword)
                 },
             ],
-            return_type: None,
-            docstring: None,
-            is_overloaded: false,
-            overloads: Vec::new(),
-            start_line: 1,
-            start_column: 1,
-            end_line: 1,
-            end_column: 1,
-        };
+        );
 
         // "this" is the implicit first param, so it should be filtered
         let diagnostics = validate_parameters(
@@ -972,31 +889,16 @@ mod tests {
         )];
         let hydra_obj = build_hydra_object("my.Class.from_config", params, 0, 0, 0, false);
 
-        let signature = FunctionSignature {
-            name: "from_config".to_string(),
-            parameters: vec![
+        let signature = sig_for(
+            "from_config",
+            vec![
+                sig_param("klass", ParameterKind::PositionalOrKeyword),
                 ParameterInfo {
-                    name: "klass".to_string(),
-                    kind: ParameterKind::PositionalOrKeyword,
-                    type_annotation: None,
-                    default_value: None,
-                },
-                ParameterInfo {
-                    name: "config_path".to_string(),
-                    kind: ParameterKind::PositionalOrKeyword,
                     type_annotation: Some("str".to_string()),
-                    default_value: None,
+                    ..sig_param("config_path", ParameterKind::PositionalOrKeyword)
                 },
             ],
-            return_type: None,
-            docstring: None,
-            is_overloaded: false,
-            overloads: Vec::new(),
-            start_line: 1,
-            start_column: 1,
-            end_line: 1,
-            end_column: 1,
-        };
+        );
 
         // "klass" is the implicit first param, so it should be filtered
         let diagnostics = validate_parameters(
@@ -1018,23 +920,13 @@ mod tests {
         // Static methods have no implicit parameter to filter
         let hydra_obj = build_hydra_object("my.Class.create", Vec::new(), 0, 0, 0, false);
 
-        let signature = FunctionSignature {
-            name: "create".to_string(),
-            parameters: vec![ParameterInfo {
-                name: "value".to_string(),
-                kind: ParameterKind::PositionalOrKeyword,
+        let signature = sig_for(
+            "create",
+            vec![ParameterInfo {
                 type_annotation: Some("int".to_string()),
-                default_value: None,
+                ..sig_param("value", ParameterKind::PositionalOrKeyword)
             }],
-            return_type: None,
-            docstring: None,
-            is_overloaded: false,
-            overloads: Vec::new(),
-            start_line: 1,
-            start_column: 1,
-            end_line: 1,
-            end_column: 1,
-        };
+        );
 
         // No implicit param for static methods
         let diagnostics = validate_parameters(
@@ -1055,49 +947,21 @@ mod tests {
 
     // ==================== validate_target tests ====================
 
-    #[test]
-    fn test_validate_target_invalid_format() {
-        let hydra_obj = build_hydra_object(
-            "InvalidTarget",
-            Vec::new(),
-            0,
-            10,
-            10 + "_target_:".len() as u32 + 1,
-            false,
-        );
-
-        let (db, config) = test_env(None);
-        let (diagnostics, _definition_info) =
-            validate_target(&hydra_obj, &db, config, &HashSet::new());
-        assert_eq!(diagnostics.len(), 1);
-        assert!(diagnostics[0].message.contains("Invalid _target_ format"));
-        assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
-        assert_eq!(
-            diagnostics[0].code,
-            Some(tower_lsp::lsp_types::NumberOrString::String(
-                "invalid-hydra-parameter".to_string()
-            ))
-        );
+    /// The diagnostics `validate_target` reports for `target`, resolved
+    /// against the `simple` fixture workspace.
+    fn target_diagnostics(target: &str) -> Vec<Diagnostic> {
+        let value_start = 10 + "_target_:".len() as u32 + 1;
+        let hydra_obj = build_hydra_object(target, Vec::new(), 0, 10, value_start, false);
+        let (db, config) = test_env(Some(&get_simple_test_dir()));
+        validate_target(&db, &hydra_obj, &HashSet::new(), config).0
     }
 
-    #[test]
-    fn test_validate_target_module_not_found() {
-        let hydra_obj = build_hydra_object(
-            "nonexistent.module.Class",
-            Vec::new(),
-            0,
-            10,
-            10 + "_target_:".len() as u32 + 1,
-            false,
-        );
-
-        let resources_dir = get_simple_test_dir();
-        let (db, config) = test_env(Some(&resources_dir));
-        let (diagnostics, _definition_info) =
-            validate_target(&hydra_obj, &db, config, &HashSet::new());
-        assert_eq!(diagnostics.len(), 1);
+    /// Assert `diagnostics` is one error with code `rule` whose message
+    /// contains `text`.
+    fn assert_one_error(diagnostics: &[Diagnostic], rule: &str, text: &str) {
+        assert_eq!(diagnostics.len(), 1, "got {diagnostics:?}");
         assert!(
-            diagnostics[0].message.contains("Could not resolve module"),
+            diagnostics[0].message.contains(text),
             "Got message: {}",
             diagnostics[0].message
         );
@@ -1105,96 +969,48 @@ mod tests {
         assert_eq!(
             diagnostics[0].code,
             Some(tower_lsp::lsp_types::NumberOrString::String(
-                "unresolved-import".to_string()
+                rule.to_string()
             ))
+        );
+    }
+
+    #[test]
+    fn test_validate_target_invalid_format() {
+        assert_one_error(
+            &target_diagnostics("InvalidTarget"),
+            "invalid-hydra-parameter",
+            "Invalid _target_ format",
+        );
+    }
+
+    #[test]
+    fn test_validate_target_module_not_found() {
+        assert_one_error(
+            &target_diagnostics("nonexistent.module.Class"),
+            "unresolved-import",
+            "Could not resolve module",
         );
     }
 
     #[test]
     fn test_validate_target_symbol_not_found() {
-        let hydra_obj = build_hydra_object(
-            "my_module.NonExistentClass",
-            Vec::new(),
-            0,
-            10,
-            10 + "_target_:".len() as u32 + 1,
-            false,
-        );
-
-        let resources_dir = get_simple_test_dir();
-        let (db, config) = test_env(Some(&resources_dir));
-        let (diagnostics, _definition_info) =
-            validate_target(&hydra_obj, &db, config, &HashSet::new());
-        assert_eq!(diagnostics.len(), 1);
-        assert!(diagnostics[0].message.contains("Symbol"));
-        assert!(diagnostics[0].message.contains("not found"));
-        assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
-        assert_eq!(
-            diagnostics[0].code,
-            Some(tower_lsp::lsp_types::NumberOrString::String(
-                "unresolved-reference".to_string()
-            ))
+        assert_one_error(
+            &target_diagnostics("my_module.NonExistentClass"),
+            "unresolved-reference",
+            "Symbol 'NonExistentClass' not found in module 'my_module'",
         );
     }
 
     #[test]
     fn test_validate_target_valid_class() {
-        let hydra_obj = build_hydra_object(
-            "my_module.ClassWithInit",
-            Vec::new(),
-            0,
-            10,
-            10 + "_target_:".len() as u32 + 1,
-            false,
-        );
-
-        let resources_dir = get_simple_test_dir();
-        let (db, config) = test_env(Some(&resources_dir));
-        let (diagnostics, _definition_info) =
-            validate_target(&hydra_obj, &db, config, &HashSet::new());
-
-        assert!(
-            !diagnostics
-                .iter()
-                .any(|d| d.message.contains("Cannot resolve module")),
-            "Should not have module not found error"
-        );
-        assert!(
-            !diagnostics
-                .iter()
-                .any(|d| d.message.contains("Symbol") && d.message.contains("not found")),
-            "Should not have symbol not found error"
-        );
+        let diagnostics = target_diagnostics("my_module.ClassWithInit");
+        assert!(diagnostics.is_empty(), "got {diagnostics:?}");
     }
 
     #[test]
     fn test_validate_target_valid_function() {
-        let hydra_obj = build_hydra_object(
-            "my_module.simple_function",
-            Vec::new(),
-            0,
-            10,
-            10 + "_target_:".len() as u32 + 1,
-            false,
-        );
-
-        let resources_dir = get_simple_test_dir();
-        let (db, config) = test_env(Some(&resources_dir));
-        let (diagnostics, _definition_info) =
-            validate_target(&hydra_obj, &db, config, &HashSet::new());
-
-        assert!(
-            !diagnostics
-                .iter()
-                .any(|d| d.message.contains("Cannot resolve module")),
-            "Should not have module not found error"
-        );
-        assert!(
-            !diagnostics
-                .iter()
-                .any(|d| d.message.contains("Symbol") && d.message.contains("not found")),
-            "Should not have symbol not found error"
-        );
+        let diagnostics = target_diagnostics("my_module.simple_function");
+        assert!(diagnostics.is_empty(), "got {diagnostics:?}");
     }
 
     // ==================== validate_document tests ====================
@@ -1216,7 +1032,7 @@ mod tests {
 
         let resources_dir = get_simple_test_dir();
         let (db, config) = test_env(Some(&resources_dir));
-        let diagnostics = validate_document(&parsed_content, &HashSet::new(), &db, config);
+        let diagnostics = validate_document(&db, &parsed_content, &HashSet::new(), config);
 
         // Should have at least 2 errors (invalid format and module not found)
         let errors: Vec<_> = diagnostics
@@ -1269,7 +1085,7 @@ mod tests {
         };
 
         let (db, config) = test_env(Some(dir.path()));
-        let diagnostics = validate_document(&parsed_content, &HashSet::new(), &db, config);
+        let diagnostics = validate_document(&db, &parsed_content, &HashSet::new(), config);
         assert!(
             diagnostics.is_empty(),
             "`__new__(cls)` may not be the constructor Hydra calls, got: {:?}",
@@ -1311,7 +1127,7 @@ mod tests {
         };
 
         let (db, config) = test_env(Some(dir.path()));
-        let diagnostics = validate_document(&parsed_content, &HashSet::new(), &db, config);
+        let diagnostics = validate_document(&db, &parsed_content, &HashSet::new(), config);
         assert_eq!(
             codes(&diagnostics),
             vec![DiagnosticRule::UnknownArgument.as_code().to_string()],
@@ -1342,7 +1158,7 @@ mod tests {
 
         let resources_dir = get_simple_test_dir();
         let (db, config) = test_env(Some(&resources_dir));
-        let diagnostics = validate_document(&parsed_content, &HashSet::new(), &db, config);
+        let diagnostics = validate_document(&db, &parsed_content, &HashSet::new(), config);
 
         assert!(
             diagnostics.iter().any(|d| d.message.contains(CONVERT_KEY)),
@@ -1372,7 +1188,7 @@ mod tests {
 
         let resources_dir = get_simple_test_dir();
         let (db, config) = test_env(Some(&resources_dir));
-        let diagnostics = validate_document(&parsed_content, &HashSet::new(), &db, config);
+        let diagnostics = validate_document(&db, &parsed_content, &HashSet::new(), config);
 
         let missing_param_diag = diagnostics.iter().find(|d| {
             d.message.contains("Missing required parameter") && d.message.contains("name")
@@ -1411,7 +1227,7 @@ mod tests {
         };
 
         let (db, config) = test_env(Some(&resources_dir));
-        let diagnostics = validate_document(&parsed_content, &HashSet::new(), &db, config);
+        let diagnostics = validate_document(&db, &parsed_content, &HashSet::new(), config);
 
         assert!(
             !diagnostics
@@ -1433,31 +1249,16 @@ mod tests {
     fn test_partial_true_skips_missing_required_params() {
         let hydra_obj = build_hydra_object("my.Class", Vec::new(), 0, 0, 0, true);
 
-        let signature = FunctionSignature {
-            name: "Class".to_string(),
-            parameters: vec![
+        let signature = sig_for(
+            "Class",
+            vec![
+                sig_param("self", ParameterKind::PositionalOrKeyword),
                 ParameterInfo {
-                    name: "self".to_string(),
-                    kind: ParameterKind::PositionalOrKeyword,
-                    type_annotation: None,
-                    default_value: None,
-                },
-                ParameterInfo {
-                    name: "required_param".to_string(),
-                    kind: ParameterKind::PositionalOrKeyword,
                     type_annotation: Some("int".to_string()),
-                    default_value: None,
+                    ..sig_param("required_param", ParameterKind::PositionalOrKeyword)
                 },
             ],
-            return_type: None,
-            docstring: None,
-            is_overloaded: false,
-            overloads: Vec::new(),
-            start_line: 1,
-            start_column: 1,
-            end_line: 1,
-            end_column: 1,
-        };
+        );
 
         let diagnostics = validate_parameters(
             &hydra_obj,
@@ -1477,31 +1278,16 @@ mod tests {
     fn test_partial_false_reports_missing_required_params() {
         let hydra_obj = build_hydra_object("my.Class", Vec::new(), 0, 0, 0, false);
 
-        let signature = FunctionSignature {
-            name: "Class".to_string(),
-            parameters: vec![
+        let signature = sig_for(
+            "Class",
+            vec![
+                sig_param("self", ParameterKind::PositionalOrKeyword),
                 ParameterInfo {
-                    name: "self".to_string(),
-                    kind: ParameterKind::PositionalOrKeyword,
-                    type_annotation: None,
-                    default_value: None,
-                },
-                ParameterInfo {
-                    name: "required_param".to_string(),
-                    kind: ParameterKind::PositionalOrKeyword,
                     type_annotation: Some("int".to_string()),
-                    default_value: None,
+                    ..sig_param("required_param", ParameterKind::PositionalOrKeyword)
                 },
             ],
-            return_type: None,
-            docstring: None,
-            is_overloaded: false,
-            overloads: Vec::new(),
-            start_line: 1,
-            start_column: 1,
-            end_line: 1,
-            end_column: 1,
-        };
+        );
 
         let diagnostics = validate_parameters(
             &hydra_obj,
@@ -1526,20 +1312,13 @@ mod tests {
         ];
         let hydra_obj = build_hydra_object("my.Class", params, 0, 0, 0, true);
 
-        let signature = FunctionSignature {
-            name: "Class".to_string(),
-            parameters: vec![
+        let signature = sig_for(
+            "Class",
+            vec![
+                sig_param("self", ParameterKind::PositionalOrKeyword),
                 ParameterInfo {
-                    name: "self".to_string(),
-                    kind: ParameterKind::PositionalOrKeyword,
-                    type_annotation: None,
-                    default_value: None,
-                },
-                ParameterInfo {
-                    name: "required_param".to_string(),
-                    kind: ParameterKind::PositionalOrKeyword,
                     type_annotation: Some("int".to_string()),
-                    default_value: None,
+                    ..sig_param("required_param", ParameterKind::PositionalOrKeyword)
                 },
                 ParameterInfo {
                     name: "valid_param".to_string(),
@@ -1548,15 +1327,7 @@ mod tests {
                     default_value: Some("\"default\"".to_string()),
                 },
             ],
-            return_type: None,
-            docstring: None,
-            is_overloaded: false,
-            overloads: Vec::new(),
-            start_line: 1,
-            start_column: 1,
-            end_line: 1,
-            end_column: 1,
-        };
+        );
 
         let diagnostics = validate_parameters(
             &hydra_obj,
@@ -1584,29 +1355,6 @@ mod tests {
     }
 
     /// Build a parameter with no default for a synthetic signature.
-    fn sig_param(name: &str, kind: ParameterKind) -> ParameterInfo {
-        ParameterInfo {
-            name: name.to_string(),
-            kind,
-            type_annotation: None,
-            default_value: None,
-        }
-    }
-
-    fn sig_for(name: &str, parameters: Vec<ParameterInfo>) -> FunctionSignature {
-        FunctionSignature {
-            name: name.to_string(),
-            parameters,
-            return_type: None,
-            docstring: None,
-            is_overloaded: false,
-            overloads: Vec::new(),
-            start_line: 1,
-            start_column: 1,
-            end_line: 1,
-            end_column: 1,
-        }
-    }
 
     #[test]
     fn test_positional_only_passed_by_name_is_reported() {
@@ -1843,7 +1591,7 @@ mod tests {
         };
 
         let (db, config) = test_env(None);
-        let diagnostics = validate_document(&parsed_content, &HashSet::new(), &db, config);
+        let diagnostics = validate_document(&db, &parsed_content, &HashSet::new(), config);
 
         assert!(
             diagnostics.is_empty(),
@@ -1868,7 +1616,7 @@ mod tests {
         };
 
         let (db, config) = test_env(None);
-        let diagnostics = validate_document(&parsed_content, &HashSet::new(), &db, config);
+        let diagnostics = validate_document(&db, &parsed_content, &HashSet::new(), config);
 
         assert!(
             diagnostics.is_empty(),
@@ -1898,7 +1646,7 @@ mod tests {
         };
 
         let (db, config) = test_env(None);
-        let diagnostics = validate_document(&parsed_content, &HashSet::new(), &db, config);
+        let diagnostics = validate_document(&db, &parsed_content, &HashSet::new(), config);
         let keyword_diags: Vec<_> = diagnostics
             .iter()
             .filter(|d| d.message.contains("_recursive_"))
@@ -1932,7 +1680,7 @@ mod tests {
         };
 
         let (db, config) = test_env(None);
-        let diagnostics = validate_document(&parsed_content, &HashSet::new(), &db, config);
+        let diagnostics = validate_document(&db, &parsed_content, &HashSet::new(), config);
         let keyword_diags: Vec<_> = diagnostics
             .iter()
             .filter(|d| d.message.contains("_convert_"))
@@ -1970,7 +1718,7 @@ mod tests {
         };
 
         let (db, config) = test_env(None);
-        let diagnostics = validate_document(&parsed_content, &HashSet::new(), &db, config);
+        let diagnostics = validate_document(&db, &parsed_content, &HashSet::new(), config);
         let keyword_diags: Vec<_> = diagnostics
             .iter()
             .filter(|d| d.message.contains("_args_"))
@@ -2014,7 +1762,7 @@ mod tests {
         };
 
         let (db, config) = test_env(None);
-        let diagnostics = validate_document(&parsed_content, &HashSet::new(), &db, config);
+        let diagnostics = validate_document(&db, &parsed_content, &HashSet::new(), config);
         let keyword_diags: Vec<_> = diagnostics
             .iter()
             .filter(|d| {

@@ -14,6 +14,7 @@ use anyhow::Context;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use colored::Colorize;
 use ignore::WalkBuilder;
+use ruff_db::system::SystemPathBuf;
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
 use tracing::{Level, debug, error, info, warn};
 
@@ -272,8 +273,8 @@ fn run(args: &CheckCommand) -> anyhow::Result<i32> {
     let db = HydraDatabase::new(ruff_db::system::SystemPath::new(db_root));
     let python_config = PythonConfig::new(
         &db,
-        Some(workspace_root.to_string_lossy().to_string()),
-        python_interpreter.clone(),
+        SystemPathBuf::from(workspace_root.to_string_lossy().into_owned()),
+        python_interpreter.clone().map(SystemPathBuf::from),
     );
 
     let mut reports = Vec::with_capacity(targets.len());
@@ -619,7 +620,7 @@ fn check_target(
     }
 
     debug!("Running diagnostics...");
-    let diagnostics = validate_document(&parsed_content, disabled_rules, db, python_config);
+    let diagnostics = validate_document(db, &parsed_content, disabled_rules, python_config);
 
     CheckOutcome::Report(FileReport {
         path: target.display.clone(),
@@ -644,10 +645,10 @@ fn trace_target_resolution(
     );
 
     let target = hydrust::TargetString::new(db, hydra_object.target.value.clone());
-    let cached = hydrust::cached_definition_info(db, python_config, target);
+    let cached = hydrust::resolved_definition(db, python_config, target);
     match cached.get() {
         Ok(def) => {
-            eprintln!("  {} {}", "Module:".dimmed(), def.module_path);
+            eprintln!("  {} {}", "Module:".dimmed(), def.module_name);
             eprintln!("  {} {}", "Symbol:".dimmed(), def.symbol_name);
             eprintln!(
                 "  {} {}",
@@ -704,7 +705,9 @@ fn trace_target_resolution(
             ResolveError::InvalidFormat(_) | ResolveError::UnresolvedModule(_) => {
                 eprintln!("  {} {}", "Error:".red(), err)
             }
-            ResolveError::Other(_) => eprintln!("  {} {}", "Warning:".yellow(), err),
+            ResolveError::UnresolvedSymbol { .. } => {
+                eprintln!("  {} {}", "Warning:".yellow(), err)
+            }
         },
     }
 

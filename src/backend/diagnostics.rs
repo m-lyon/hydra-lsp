@@ -102,7 +102,7 @@ impl HydraLspBackend {
     /// possible here.
     fn compute_diagnostics(&self, input: DocumentInput) -> Option<Vec<Diagnostic>> {
         let disabled_rules = self.settings.read().disabled_rules.clone();
-        self.with_session("compute diagnostics", |s| {
+        self.with_session("compute_diagnostics", |s| {
             // Hold the lock across the whole compute: with no interleaved
             // `set_text`, the revision can't move under us, so `parsed_yaml`
             // and `validate_document` never observe a `salsa::Cancelled`.
@@ -150,7 +150,7 @@ pub(super) fn validate_input(
 ) -> Vec<Diagnostic> {
     let parsed_yaml = yaml_cache::parsed_yaml(db, input);
     match parsed_yaml.result() {
-        Ok(content) => diagnostics::validate_document(content, disabled_rules, db, python_config),
+        Ok(content) => diagnostics::validate_document(db, content, disabled_rules, python_config),
         // A document that fails to parse has no suppression comments to read,
         // so `disabledRules` is the only way to silence this one.
         Err(_) if disabled_rules.contains(&DiagnosticRule::YamlSyntaxError) => Vec::new(),

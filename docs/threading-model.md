@@ -133,7 +133,7 @@ that is not holding it. Adding threads does not help work that is queued on the
 lock.
 
 **The pools isolate threads, not work.** Both pools reach
-`python::cache::cached_definition_info`. When two requests want the same key,
+`python::cache::resolved_definition`. When two requests want the same key,
 salsa blocks one until the other finishes, regardless of which pool they came
 from. Separating the pools stops a diagnostics burst from occupying every thread
 and leaving a hover waiting; it does not stop them contending on shared queries.
@@ -160,14 +160,14 @@ Neither pool's useful width grows with cores:
 - **Latency = 2.** `semanticTokens/full` and `signatureHelp` fire together on an
   edit and are badly matched in cost — token extraction is nearly free once the
   document is parsed, while signature help can sit in a cold
-  `cached_definition_info` reading and parsing Python. Two threads stop the cheap
+  `resolved_definition` reading and parsing Python. Two threads stop the cheap
   one queueing behind the expensive one. A third would need a third concurrent
   request, and in practice that means hover, which happens when the pointer
   rests rather than while typing.
 - **Worker = 3.** The one real fan-out is re-validating every open Hydra
   document after a watched `.py` file changes. That fan-out is already well below
   the open-document count, because documents sharing a `_target_` share one
-  `cached_definition_info` key. Three rather than two because this pool absorbs
+  `resolved_definition` key. Three rather than two because this pool absorbs
   whole-workspace bursts while the latency pool only ever has one cursor position
   to answer for.
 
