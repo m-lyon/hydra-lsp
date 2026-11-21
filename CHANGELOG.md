@@ -8,6 +8,7 @@
 - Python files are now parsed for the interpreter's Python version, read from `pyvenv.cfg` or the site-packages layout.
 - Recognise `@builtins.staticmethod` and `@builtins.classmethod` when resolving Python method targets.
 - Fixed a class attribute chain target (`pkg.Outer.mid.inner`) that failed to resolve when a later step passed through a file an earlier step had already imported through.
+- A hover, signature help, go-to-definition, semantic tokens or diagnostics request the client cancels now stops its analysis, rather than running to the end and occupying a thread.
 
 ## [0.7.0]
 

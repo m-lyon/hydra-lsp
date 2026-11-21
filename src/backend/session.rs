@@ -84,7 +84,7 @@ impl HydraLspBackend {
         let workspace_root = SystemPathBuf::from(workspace_root);
         let db = HydraDatabase::new(&workspace_root);
         let python_config =
-            PythonConfig::new(&db, workspace_root, interpreter.map(SystemPathBuf::from));
+            PythonConfig::frozen(&db, workspace_root, interpreter.map(SystemPathBuf::from));
         *self.session.write() = Some(Session {
             db: parking_lot::Mutex::new(db),
             python_config,
@@ -246,7 +246,7 @@ mod tests {
 
         let db = HydraDatabase::new(SystemPath::new(venv.to_str().unwrap()));
         let venv_path = SystemPathBuf::from(venv.to_string_lossy().into_owned());
-        let python_config = PythonConfig::new(&db, venv_path.clone(), Some(venv_path));
+        let python_config = PythonConfig::frozen(&db, venv_path.clone(), Some(venv_path));
         // Discovery canonicalizes the sys.prefix (e.g. macOS `/var` →
         // `/private/var`), so return the canonical path: simulated watch
         // events then name the same directory the resolver listed, exactly as

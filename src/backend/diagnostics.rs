@@ -310,7 +310,7 @@ mod tests {
         let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
         let (proceed_tx, proceed_rx) = std::sync::mpsc::channel::<()>();
 
-        let rx = spawn_on_pool(&pool, move || {
+        let rx = spawn_on_pool(&pool, snapshot, move |db| {
             started_tx.send(()).expect("main receiver dropped");
             proceed_rx.recv().expect("main sender dropped");
             // Re-run the diagnostics-route parse until the concurrent writer
@@ -318,7 +318,7 @@ mod tests {
             // `salsa::Cancelled`. The bound + outer timeout keep a
             // mis-choreographed race from hanging.
             for _ in 0..100_000_000_u64 {
-                let _ = yaml_cache::parsed_yaml(&snapshot, input);
+                let _ = yaml_cache::parsed_yaml(db, input);
                 std::thread::yield_now();
             }
             panic!("cancellation flag was never observed");

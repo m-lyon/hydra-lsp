@@ -1081,6 +1081,109 @@ mod tests {
         assert_exported_class(&definition_info, &file_path, "_implementation.py");
     }
 
+    // ==================== PEP 810 `lazy` imports ====================
+    //
+    // `lazy import x` and `lazy from x import y` bind the same names as their
+    // eager forms and only defer loading, so re-exports through them resolve
+    // like ordinary imports. They are unrelated to the `__getattr__` lazy
+    // exports above.
+
+    /// Whether `example_pkg/__init__.py` under `root` parses to at least one
+    /// import with `is_lazy` set, so the tests below can't pass by accident
+    /// if the parser stops recognising the syntax.
+    fn package_init_has_lazy_import(root: &Path) -> bool {
+        let db = test_db();
+        let init_file = root.join("example_pkg").join("__init__.py");
+        let parsed =
+            parsed_python_module(&db, &init_file, PythonVersion::latest_ty()).expect("init parses");
+        parsed.suite().iter().any(|stmt| match stmt {
+            Stmt::Import(import) => import.is_lazy,
+            Stmt::ImportFrom(import_from) => import_from.is_lazy,
+            _ => false,
+        })
+    }
+
+    #[test]
+    fn test_lazy_from_import_reexport_resolves() {
+        let (_temp, root) = lazy_export_fixture(
+            "lazy from ._implementation import ExportedClass\n",
+            "ExportedClass",
+        );
+        assert!(package_init_has_lazy_import(&root));
+
+        let (file_path, symbol_name) =
+            resolve_lazy_export(&root, "ExportedClass").expect("lazy re-export should resolve");
+
+        assert!(
+            file_path.ends_with("_implementation.py"),
+            "got {file_path:?}"
+        );
+        assert_eq!(symbol_name, "ExportedClass");
+    }
+
+    #[test]
+    fn test_aliased_lazy_from_import_reexport_resolves() {
+        let (_temp, root) = lazy_export_fixture(
+            "lazy from ._implementation import _Hidden as ExportedClass\n",
+            "_Hidden",
+        );
+        assert!(package_init_has_lazy_import(&root));
+
+        let (file_path, symbol_name) =
+            resolve_lazy_export(&root, "ExportedClass").expect("aliased lazy re-export");
+
+        assert!(
+            file_path.ends_with("_implementation.py"),
+            "got {file_path:?}"
+        );
+        assert_eq!(symbol_name, "_Hidden");
+    }
+
+    #[test]
+    fn test_lazy_module_import_resolves_to_the_module() {
+        let (_temp, root) = lazy_export_fixture(
+            "lazy import example_pkg._implementation as impl\n",
+            "Unused",
+        );
+        assert!(package_init_has_lazy_import(&root));
+
+        let (file_path, symbol_name) =
+            resolve_lazy_export(&root, "impl").expect("lazy module import should resolve");
+
+        assert!(
+            file_path.ends_with("_implementation.py"),
+            "got {file_path:?}"
+        );
+        assert_eq!(symbol_name, "impl");
+    }
+
+    /// End-to-end through `extract_definition_info`, with the lazy import
+    /// in the middle of a two-hop chain.
+    #[test]
+    fn test_extract_definition_info_follows_lazy_reexport_chain() {
+        let (_temp, root) =
+            lazy_export_fixture("lazy from .shim import ExportedClass\n", "ExportedClass");
+        write_file(
+            &root.join("example_pkg").join("shim.py"),
+            "lazy from ._implementation import ExportedClass\n",
+        );
+        assert!(package_init_has_lazy_import(&root));
+
+        let db = test_db();
+        let search_paths = vec![root.clone()];
+
+        let ResolvedDefinition {
+            definition_info,
+            file_path,
+            symbol_name,
+            ..
+        } = extract_definition_info(&db, "example_pkg.ExportedClass", &search_paths)
+            .expect("the lazy re-export chain should resolve end-to-end");
+
+        assert_eq!(symbol_name, "ExportedClass");
+        assert_exported_class(&definition_info, &file_path, "_implementation.py");
+    }
+
     /// A file that only the workspace root contains still has to resolve
     /// against it once the nested site-packages root is preferred elsewhere.
     #[test]

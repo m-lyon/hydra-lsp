@@ -578,7 +578,7 @@ mod tests {
     fn test_env(workspace_root: Option<&Path>) -> (HydraDatabase, PythonConfig) {
         let db = test_db();
         let workspace = workspace_root.map_or_else(filesystem_root, system_path);
-        let config = PythonConfig::new(&db, workspace, None);
+        let config = PythonConfig::frozen(&db, workspace, None);
         (db, config)
     }
 

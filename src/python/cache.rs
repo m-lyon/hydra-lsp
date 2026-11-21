@@ -15,6 +15,7 @@ use super::typeshed::{
 use ruff_db::files::{File, FilePath, FileRootKind};
 use ruff_db::system::{SystemPath, SystemPathBuf};
 use ruff_python_ast::PythonVersion;
+use salsa::Durability;
 use tracing::debug;
 use ty_module_resolver::{
     ModuleName, ResolverEnvironment, SearchPath, SearchPathSettings, UseDefaultStrategy,
@@ -39,6 +40,20 @@ pub struct PythonConfig {
 
     /// Configured Python interpreter path.
     pub interpreter: Option<SystemPathBuf>,
+}
+
+impl PythonConfig {
+    /// Create a config with salsa `Durability::NEVER_CHANGE` so that queries reading it
+    /// never need revalidating.
+    pub fn frozen(
+        db: &dyn salsa::Database,
+        workspace_root: SystemPathBuf,
+        interpreter: Option<SystemPathBuf>,
+    ) -> Self {
+        Self::builder(workspace_root, interpreter)
+            .durability(Durability::NEVER_CHANGE)
+            .new(db)
+    }
 }
 
 /// Interned target string for cache key deduplication.
@@ -649,7 +664,7 @@ mod tests {
     fn test_discovered_environment_cache_hit() {
         let db = test_db();
         let examples = get_simple_test_dir();
-        let config = PythonConfig::new(&db, system_path(&examples), None);
+        let config = PythonConfig::frozen(&db, system_path(&examples), None);
         let result1 = discovered_environment(&db, config);
         let result2 = discovered_environment(&db, config);
         // Pointer equality: salsa returns the same value on a cache hit.
@@ -660,6 +675,8 @@ mod tests {
     fn test_discovered_environment_invalidation_on_interpreter_change() {
         let mut db = test_db();
         let examples = get_simple_test_dir();
+        // Mutable on purpose: production configs are frozen, but the queries
+        // must still recompute if a config ever changes.
         let config = PythonConfig::new(&db, system_path(&examples), None);
         let _ = discovered_environment(&db, config);
 
@@ -678,7 +695,7 @@ mod tests {
     fn test_resolver_environment_puts_the_workspace_root_first() {
         let db = test_db();
         let examples = get_simple_test_dir();
-        let config = PythonConfig::new(&db, system_path(&examples), None);
+        let config = PythonConfig::frozen(&db, system_path(&examples), None);
         let environment = resolver_environment(&db, config);
         let first = ty_module_resolver::system_module_search_paths(&db, environment).next();
         assert_eq!(
@@ -692,7 +709,7 @@ mod tests {
     #[test]
     fn test_resolver_environment_defaults_to_the_latest_version() {
         let db = test_db();
-        let config = PythonConfig::new(
+        let config = PythonConfig::frozen(
             &db,
             system_path(&get_simple_test_dir()),
             Some(SystemPathBuf::from("/nonexistent/python")),
@@ -711,7 +728,7 @@ mod tests {
 
         let db = test_db();
         let venv = system_path(&venv);
-        let config = PythonConfig::new(&db, venv.clone(), Some(venv));
+        let config = PythonConfig::frozen(&db, venv.clone(), Some(venv));
         assert_eq!(
             resolver_environment(&db, config).python_version(&db),
             PythonVersion::PY39
@@ -721,7 +738,7 @@ mod tests {
     #[test]
     fn test_python_config_fields() {
         let db = TestDb::new();
-        let config = PythonConfig::new(&db, SystemPathBuf::from("/workspace"), None);
+        let config = PythonConfig::frozen(&db, SystemPathBuf::from("/workspace"), None);
         assert_eq!(
             config.workspace_root(&db).as_path(),
             SystemPath::new("/workspace")
@@ -730,18 +747,13 @@ mod tests {
     }
 
     #[test]
-    fn test_python_config_update() {
+    #[should_panic]
+    fn test_frozen_python_config_rejects_setters() {
         let mut db = TestDb::new();
-        let config = PythonConfig::new(&db, SystemPathBuf::from("/workspace"), None);
-        assert!(config.interpreter(&db).is_none());
-
+        let config = PythonConfig::frozen(&db, SystemPathBuf::from("/workspace"), None);
         config
             .set_interpreter(&mut db)
             .to(Some(SystemPathBuf::from("/usr/bin/python3")));
-        assert_eq!(
-            config.interpreter(&db).as_deref(),
-            Some(SystemPath::new("/usr/bin/python3"))
-        );
     }
 
     #[test]
@@ -763,7 +775,7 @@ mod tests {
     fn test_cached_definition_info_valid_target() {
         let db = test_db();
         let workspace = get_simple_test_dir();
-        let config = PythonConfig::new(&db, system_path(&workspace), None);
+        let config = PythonConfig::frozen(&db, system_path(&workspace), None);
         let target = TargetString::new(&db, "my_module.DataLoader".to_string());
         let result = resolved_definition(&db, config, target);
 
@@ -776,7 +788,7 @@ mod tests {
     fn test_cached_definition_info_invalid_target() {
         let db = TestDb::new();
         let workspace = get_simple_test_dir();
-        let config = PythonConfig::new(&db, system_path(&workspace), None);
+        let config = PythonConfig::frozen(&db, system_path(&workspace), None);
         let target = TargetString::new(&db, "nonexistent.Module".to_string());
         let result = resolved_definition(&db, config, target);
         assert!(result.get().is_err());
@@ -786,7 +798,7 @@ mod tests {
     fn test_cached_definition_info_cache_hit() {
         let db = test_db();
         let workspace = get_simple_test_dir();
-        let config = PythonConfig::new(&db, system_path(&workspace), None);
+        let config = PythonConfig::frozen(&db, system_path(&workspace), None);
         let target = TargetString::new(&db, "my_module.DataLoader".to_string());
 
         let result1 = resolved_definition(&db, config, target);
@@ -800,7 +812,7 @@ mod tests {
     fn test_cached_definition_info_function_target() {
         let db = test_db();
         let workspace = get_simple_test_dir();
-        let config = PythonConfig::new(&db, system_path(&workspace), None);
+        let config = PythonConfig::frozen(&db, system_path(&workspace), None);
         let target = TargetString::new(&db, "my_module.create_model".to_string());
         let result = resolved_definition(&db, config, target);
 
@@ -813,6 +825,8 @@ mod tests {
     fn test_cached_definition_info_invalidation_on_config_change() {
         let mut db = test_db();
         let workspace = get_simple_test_dir();
+        // Mutable on purpose: production configs are frozen, but the queries
+        // must still recompute if a config ever changes.
         let config = PythonConfig::new(&db, system_path(&workspace), None);
 
         let result1 = {
@@ -860,7 +874,7 @@ mod tests {
             .expect("set initial mtime");
 
         let mut db = test_db();
-        let config = PythonConfig::new(&db, system_path(workspace), None);
+        let config = PythonConfig::frozen(&db, system_path(workspace), None);
         let result1 = {
             let target = TargetString::new(&db, "watched_module.WatchedClass".to_string());
             resolved_definition(&db, config, target)
@@ -985,7 +999,7 @@ mod tests {
         .expect("write pth");
 
         let db = test_db();
-        let config = PythonConfig::new(&db, system_path(&workspace), None);
+        let config = PythonConfig::frozen(&db, system_path(&workspace), None);
         let _ = resolver_environment(&db, config);
 
         // A lookup that misses the static paths makes ty compute the dynamic
