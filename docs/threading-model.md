@@ -145,6 +145,22 @@ queries unwind with `salsa::Cancelled`. `spawn_on_pool` catches that and reports
 diagnostics) so the client re-asks. During fast typing the pools are therefore
 bursty — a lot of started-and-abandoned work.
 
+**A dropped request cancels its own job.** On `$/cancelRequest` tower-lsp drops
+the handler future, and with it the `PoolJob` that `spawn_on_pool` returned.
+Dropping the job cancels the salsa `CancellationToken` of the snapshot the job
+queries through, so the job unwinds at its next cancellation check instead of
+holding a pool thread to the end. The job runs inside a single `attach`, because
+salsa clears the token each time the outermost attached scope exits, and a
+cancel that lands inside one top-level query call would otherwise be cleared
+before the next call checks. That reaches only the one snapshot, and needs
+no revision bump. It adds to revision cancellation rather than replacing it: a
+write still has to unwind every handle before it can take the database.
+
+The token is disabled while a cycle-recovering query runs
+(`class_parent_docs` and `class_parent_attribute` in `python::cache`), so a job
+inside one stops once it leaves. A job blocked on a query another thread is
+computing waits for that thread to finish.
+
 ## Design decisions, and the alternatives rejected
 
 ### Fixed default instead of scaling with cores
