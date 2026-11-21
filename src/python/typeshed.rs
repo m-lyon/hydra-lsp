@@ -9,22 +9,19 @@
 //!
 //! # Sentinel paths
 //!
-//! Module resolution throughout the crate uses `std::path::Path`, however the
-//! vendored stubs are not on disk. Rather than thread a `FilePath` enum through
-//! every resolver signature, vendored files are addressed by a sentinel path
-//! rooted at [`VENDORED_ROOT`]: `<typeshed>/stdlib/builtins.pyi`. Such a path
-//! is built and probed exactly like a real one — `ImportResolver`'s
-//! `find_module_file` walks the same `.pyi`-before-`.py` candidates against
-//! [`stdlib_search_root`] — and only the two functions that actually touch a
+//! Module resolution goes through `ty_module_resolver`, which hands back the
+//! vendored stub as a `File`, but the rest of the crate addresses files by
+//! `std::path::Path`. Rather than thread a `FilePath` enum through every
+//! signature, a vendored file is given a sentinel path rooted at
+//! [`VENDORED_ROOT`]: `<typeshed>/stdlib/builtins.pyi`
+//! ([`vendored_sentinel_path`]). Only the two functions that actually touch a
 //! file, `path_is_file` and `path_to_file` in `extract`, branch on
 //! [`is_vendored_path`] to reach the `VendoredFileSystem` instead of the OS.
 //!
-//! The root is *not* a member of the search-path list built by
-//! `build_search_paths`. `resolve_module_cached` consults it as a last resort,
-//! after every real root has missed, and only for a module [`is_vendored_module`]
-//! admits — so a workspace or site-packages `builtins` still shadows the stub,
-//! and the sentinel never leaks into consumers of the search paths such as the
-//! file watcher.
+//! The resolver puts the stdlib stubs after the first-party roots and before
+//! site-packages, as the typing spec orders them. `resolved_module_file` keeps
+//! a stub-backed module only when [`is_builtins_module`] is true for it, so the
+//! rest of the stdlib stays unresolved.
 //!
 //! `<typeshed>` is a relative single-component path containing characters that
 //! are illegal in Windows filenames, so it cannot collide with a real search
@@ -36,23 +33,30 @@ use ruff_db::vendored::{VendoredPath, VendoredPathBuf};
 use std::path::{Component, Path, PathBuf};
 
 /// First component of every sentinel path that addresses a vendored stub.
-pub const VENDORED_ROOT: &str = "<typeshed>";
+const VENDORED_ROOT: &str = "<typeshed>";
 
 /// The `builtins` module name. Hydra requires this prefix on a builtin target.
-pub const BUILTINS_MODULE: &str = "builtins";
+pub(crate) const BUILTINS_MODULE: &str = "builtins";
 
 /// The root that vendored stdlib stubs are resolved against.
 ///
 /// Typeshed's stdlib stubs live under `stdlib/` inside the archive, so the root
 /// is `<typeshed>/stdlib` and `builtins` resolves to
-/// `<typeshed>/stdlib/builtins.pyi`. `resolve_module_cached` probes it after
-/// every real search root has missed.
-pub fn stdlib_search_root() -> PathBuf {
+/// `<typeshed>/stdlib/builtins.pyi`.
+pub(super) fn stdlib_search_root() -> PathBuf {
     Path::new(VENDORED_ROOT).join("stdlib")
 }
 
+/// The sentinel path for a file in the vendored archive, the inverse of
+/// [`to_vendored_path`].
+pub(super) fn vendored_sentinel_path(path: &VendoredPath) -> PathBuf {
+    let mut sentinel = PathBuf::from(VENDORED_ROOT);
+    sentinel.extend(path.as_str().split('/'));
+    sentinel
+}
+
 /// Whether `path` addresses a file inside the vendored typeshed archive.
-pub fn is_vendored_path(path: &Path) -> bool {
+pub(crate) fn is_vendored_path(path: &Path) -> bool {
     path.components().next() == Some(Component::Normal(VENDORED_ROOT.as_ref()))
 }
 
@@ -60,23 +64,24 @@ pub fn is_vendored_path(path: &Path) -> bool {
 /// [`VendoredFileSystem`](ruff_db::vendored::VendoredFileSystem) understands.
 ///
 /// Returns `None` when `path` is not a sentinel path or is not valid UTF-8.
-pub fn to_vendored_path(path: &Path) -> Option<VendoredPathBuf> {
-    let relative = path.strip_prefix(VENDORED_ROOT).ok()?;
-    // The archive always uses `/` as its separator, regardless of host OS.
-    let mut vendored = String::new();
-    for component in relative.components() {
-        let Component::Normal(part) = component else {
-            return None;
-        };
-        if !vendored.is_empty() {
-            vendored.push('/');
-        }
-        vendored.push_str(part.to_str()?);
-    }
-    if vendored.is_empty() {
+pub(super) fn to_vendored_path(path: &Path) -> Option<VendoredPathBuf> {
+    let parts = normal_parts(path.strip_prefix(VENDORED_ROOT).ok()?)?;
+    if parts.is_empty() {
         return None;
     }
-    Some(VendoredPath::new(&vendored).to_path_buf())
+    // The archive always uses `/` as its separator, regardless of host OS.
+    Some(VendoredPath::new(&parts.join("/")).to_path_buf())
+}
+
+/// The components of `path` as UTF-8 strings, or `None` if any is not a plain
+/// name (a root, `.`, `..`) or not valid UTF-8.
+fn normal_parts(path: &Path) -> Option<Vec<&str>> {
+    path.components()
+        .map(|component| match component {
+            Component::Normal(part) => part.to_str(),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Whether `name` is one the runtime module actually exposes.
@@ -87,7 +92,7 @@ pub fn to_vendored_path(path: &Path) -> Option<VendoredPathBuf> {
 /// but does not name (`function`). Resolving those would let
 /// `_target_: builtins._SupportsRound1` through with no diagnostic at all, and
 /// Hydra would then fail with `AttributeError` at run time.
-pub fn is_runtime_builtin_name(name: &str) -> bool {
+pub(super) fn is_runtime_builtin_name(name: &str) -> bool {
     if !name.starts_with('_') {
         return true;
     }
@@ -101,15 +106,8 @@ pub fn is_runtime_builtin_name(name: &str) -> bool {
 /// Lets a caller that has only a resolved stub path recover which module it
 /// came from, rather than assuming the target's own prefix names it. Returns
 /// `None` for anything that is not a stub path under [`stdlib_search_root`].
-pub fn vendored_module_name(path: &Path) -> Option<String> {
-    let relative = path.strip_prefix(stdlib_search_root()).ok()?;
-    let mut parts: Vec<&str> = Vec::new();
-    for component in relative.components() {
-        let Component::Normal(part) = component else {
-            return None;
-        };
-        parts.push(part.to_str()?);
-    }
+pub(super) fn vendored_module_name(path: &Path) -> Option<String> {
+    let mut parts = normal_parts(path.strip_prefix(stdlib_search_root()).ok()?)?;
     // The last component carries the extension, and an `__init__` stub names
     // the package directory rather than a module of its own.
     let last = parts.pop()?;
@@ -125,16 +123,22 @@ pub fn vendored_module_name(path: &Path) -> Option<String> {
     Some(parts.join("."))
 }
 
-/// Whether module resolution may fall through to the vendored search root for
-/// `module_path`.
+/// Whether `module_path` is `builtins` or one of its submodules.
 ///
-/// Wiring in typeshed makes the whole stdlib reachable, but only builtins is relevant
-/// for hydra, therefore only `builtins` and its submodules are admitted.
-pub fn is_vendored_module(module_path: &str) -> bool {
+/// The resolver makes the whole stdlib reachable, but only builtins is relevant
+/// for Hydra, so these are the only stdlib modules `resolved_module_file` keeps.
+pub(super) fn is_builtins_module(module_path: &str) -> bool {
     module_path == BUILTINS_MODULE
         || module_path
             .strip_prefix(BUILTINS_MODULE)
             .is_some_and(|rest| rest.starts_with('.'))
+}
+
+/// Whether `module_path` is a PyPI package that the vendored stdlib stubs. ty doesn't
+/// let an installed copy shadow these, but Hydra imports the installed copy, and fails
+/// to import it when it is missing.
+pub(super) fn is_stubbed_pypi_package(module_path: &str) -> bool {
+    module_path == "typing_extensions"
 }
 
 #[cfg(test)]
@@ -154,6 +158,16 @@ mod tests {
         assert_eq!(
             to_vendored_path(&stub).unwrap().as_str(),
             "stdlib/builtins.pyi"
+        );
+    }
+
+    #[test]
+    fn archive_paths_round_trip_through_sentinels() {
+        let sentinel = vendored_sentinel_path(VendoredPath::new("stdlib/os/path.pyi"));
+        assert_eq!(sentinel, stdlib_search_root().join("os").join("path.pyi"));
+        assert_eq!(
+            to_vendored_path(&sentinel).unwrap().as_str(),
+            "stdlib/os/path.pyi"
         );
     }
 
@@ -207,10 +221,10 @@ mod tests {
 
     #[test]
     fn only_builtins_resolves_in_the_vendored_root() {
-        assert!(is_vendored_module("builtins"));
-        assert!(is_vendored_module("builtins.submodule"));
-        assert!(!is_vendored_module("datetime"));
-        assert!(!is_vendored_module("os.path"));
-        assert!(!is_vendored_module("builtinsish"));
+        assert!(is_builtins_module("builtins"));
+        assert!(is_builtins_module("builtins.submodule"));
+        assert!(!is_builtins_module("datetime"));
+        assert!(!is_builtins_module("os.path"));
+        assert!(!is_builtins_module("builtinsish"));
     }
 }

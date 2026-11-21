@@ -2,193 +2,138 @@
 //! class attribute chains and base classes across files.
 
 use super::cache::{
-    InternedSearchPaths, ResolvedDefinition, TargetString, class_key, class_parent_attribute,
-    class_parent_docs, resolve_module_cached,
+    ResolvedDefinition, SymbolName, class_key, class_parent_attribute, inherited_class_members,
+    resolve_module_by_name,
 };
 use super::extract::{extract_class_info, extract_function_signature, extract_method_info};
-use super::import_resolver::ImportResolver;
+use super::import_resolver::{ImportResolver, ResolvedSymbol};
 use super::model::{ClassInfo, DefinitionInfo, FunctionSignature, MethodInfo, ResolveError};
-use anyhow::Result;
 use std::path::{Path, PathBuf};
+use ty_module_resolver::ResolverEnvironment;
 
 /// Result of resolving a class attribute chain
-enum ClassAttributeChainResult<'sp> {
+enum ClassAttributeChainResult {
     /// Chain resolved to a method
     Method {
         file_path: PathBuf,
         class_name: String,
         method_name: String,
-        search_paths: &'sp [PathBuf],
     },
     /// Chain resolved to a class
     Class {
         file_path: PathBuf,
         class_name: String,
-        search_paths: &'sp [PathBuf],
     },
 }
 
-/// Split a `_target_` string into module path and symbol name
+/// Split a dotted path at its last dot, into module path and symbol name.
 /// Example: "myproject.models.MyClass" -> ("myproject.models", "MyClass")
-fn split_target(target: &str) -> Result<(String, String)> {
-    let parts: Vec<&str> = target.split('.').collect();
-    if parts.len() < 2 {
-        anyhow::bail!("Invalid _target_ format: '{}'", target);
-    }
-
-    let symbol_name = parts.last().unwrap().to_string();
-    let module_path = parts[..parts.len() - 1].join(".");
-
-    Ok((module_path, symbol_name))
+fn split_target(target: &str) -> Option<(&str, &str)> {
+    target.rsplit_once('.')
 }
 
 /// Resolve an attribute chain through classes.
 ///
 /// Given a starting class and an attribute chain like ["nested", "nested_class"],
-/// follows the chain by looking up each class attribute to find the final class/method.
-///
-/// Returns the final resolved class name and the remaining method name (if any).
-fn resolve_attribute_chain(
-    db: &dyn ruff_db::Db,
+/// follows the chain by looking up each class attribute to find the final
+/// class, or a method on it when the last attribute names one.
+fn resolve_attribute_chain<'db>(
+    db: &'db dyn ty_module_resolver::Db,
     file_path: &Path,
     starting_class: &str,
     attribute_chain: &[&str],
-    search_paths: &[PathBuf],
-) -> Result<(PathBuf, String, Option<String>)> {
-    if attribute_chain.is_empty() {
-        anyhow::bail!("Empty attribute chain");
-    }
-
+    environment: ResolverEnvironment<'db>,
+) -> Option<ClassAttributeChainResult> {
     let mut current_file = file_path.to_path_buf();
     let mut current_class = starting_class.to_string();
-    let mut resolver = ImportResolver::new(db, search_paths);
-    let interned_sp = InternedSearchPaths::new(db, search_paths.to_vec());
+    let resolver = ImportResolver::new(db, environment);
+    let python_version = environment.python_version(db);
 
-    // Process all but the last attribute (which might be a method)
     for (i, attr) in attribute_chain.iter().enumerate() {
         let is_last = i == attribute_chain.len() - 1;
 
-        // First, check if this is a method on the current class
-        if is_last && extract_method_info(db, &current_file, &current_class, attr).is_ok() {
-            return Ok((current_file, current_class, Some(attr.to_string())));
+        // The last attribute may be a method of the current class.
+        if is_last
+            && extract_method_info(db, &current_file, &current_class, attr, python_version)
+                .is_some()
+        {
+            return Some(ClassAttributeChainResult::Method {
+                file_path: current_file,
+                class_name: current_class,
+                method_name: attr.to_string(),
+            });
         }
 
-        // Try to get the attribute as a class attribute (with inheritance support).
-        // The salsa-tracked class_parent_attribute memoises each (class, attr) pair so
-        // shared parent classes are only walked once per revision.
+        // Otherwise it must be a class attribute, possibly inherited. The
+        // salsa-tracked class_parent_attribute memoises each (class, attr)
+        // pair so shared parent classes are only walked once per revision.
         let class_key = class_key(db, &current_file, &current_class);
-        let attr_key = TargetString::new(db, attr.to_string());
-        let cached_attr = class_parent_attribute(db, class_key, attr_key, interned_sp);
-        match cached_attr.get() {
-            Some((attr_info, _attr_file, _attr_class)) => {
-                // The value could be a simple name or a dotted path
-                let value_parts: Vec<&str> = attr_info.value.split('.').collect();
+        let attr_key = SymbolName::new(db, attr.to_string());
+        let cached_attr = class_parent_attribute(db, class_key, attr_key, environment);
+        let value = cached_attr.get()?.info.value.as_str();
 
-                if value_parts.len() == 1 {
-                    // Simple name - look for it in the same file first
-                    let new_class_name = value_parts[0];
-
-                    // Try direct lookup in current file
-                    if extract_class_info(db, &current_file, new_class_name).is_ok() {
-                        current_class = new_class_name.to_string();
-                        continue;
-                    }
-
-                    // Try resolving through imports
-                    if let Some((resolved_file, resolved_name)) =
-                        resolver.resolve_symbol(&current_file, new_class_name)
-                    {
-                        current_file = resolved_file;
-                        current_class = resolved_name;
-                        continue;
-                    }
-
-                    anyhow::bail!(
-                        "Could not resolve class '{}' from attribute '{}'",
-                        new_class_name,
-                        attr
-                    );
-                } else {
-                    // Dotted path like "module.Class"
-                    let module_path = value_parts[..value_parts.len() - 1].join(".");
-                    let class_name = value_parts[value_parts.len() - 1];
-
-                    // Try to resolve the module
-                    if let Some(resolved_file) = resolver.resolve_module_path(&module_path) {
-                        current_file = resolved_file;
-                        current_class = class_name.to_string();
-                        continue;
-                    }
-
-                    anyhow::bail!(
-                        "Could not resolve module path '{}' from attribute '{}'",
-                        module_path,
-                        attr
-                    );
-                }
-            }
-            None if is_last => {
-                anyhow::bail!(
-                    "Attribute or method '{}' not found in class '{}'",
-                    attr,
-                    current_class
-                );
-            }
-            None => {
-                anyhow::bail!(
-                    "Attribute '{}' not found in class '{}' or its parents",
-                    attr,
-                    current_class
-                );
-            }
+        // The value could be a simple name or a dotted path
+        if let Some((module_path, class_name)) = split_target(value) {
+            current_file = resolver.resolve_module_file(module_path)?;
+            current_class = class_name.to_string();
+        } else if extract_class_info(db, &current_file, value, python_version).is_some() {
+            // A simple name defined in the same file
+            current_class = value.to_string();
+        } else {
+            // A simple name imported into the file
+            let resolved = resolver.resolve_symbol(&current_file, value)?;
+            current_file = resolved.file;
+            current_class = resolved.name;
         }
     }
 
-    // Reached end of chain without finding a method
-    Ok((current_file, current_class, None))
+    Some(ClassAttributeChainResult::Class {
+        file_path: current_file,
+        class_name: current_class,
+    })
 }
 
-/// Resolve a base class expression to its file path and actual class name.
+/// Resolve a base class expression to the file and name of the class.
 ///
 /// This function handles:
 /// - Simple names: `ParentClass` - looks up in the current file's imports
 /// - Qualified names: `module.ClassName` - resolves the module path
-pub(super) fn resolve_base_class(
-    db: &dyn ruff_db::Db,
-    base_class_expr: &str,
+pub(super) fn resolve_base_class<'db>(
+    db: &'db dyn ty_module_resolver::Db,
     current_file: &Path,
-    search_paths: &[PathBuf],
-) -> Option<(PathBuf, String)> {
+    base_class_expr: &str,
+    environment: ResolverEnvironment<'db>,
+) -> Option<ResolvedSymbol> {
     let base_class_expr = base_class_name(base_class_expr);
 
-    // Check if it's a qualified name (contains a dot)
-    if let Some(dot_pos) = base_class_expr.rfind('.') {
-        // Qualified name like `module.ClassName`
-        let module_path = &base_class_expr[..dot_pos];
-        let class_name = &base_class_expr[dot_pos + 1..];
-
-        // Cached lookup: base-class resolution for the same parent module is
-        // shared across the MRO walk and across sibling hover requests.
-        let module_path_id = TargetString::new(db, module_path.to_string());
-        let search_paths_id = InternedSearchPaths::new(db, search_paths.to_vec());
-        if let Some(file_path) = resolve_module_cached(db, module_path_id, search_paths_id).clone()
-        {
-            return Some((file_path, class_name.to_string()));
-        }
+    // Qualified name like `module.ClassName`. The cached lookup is shared
+    // across the MRO walk and across sibling hover requests.
+    if let Some((module_path, class_name)) = split_target(base_class_expr)
+        && let Some(file) = resolve_module_by_name(db, module_path, environment)
+    {
+        return Some(ResolvedSymbol {
+            file,
+            name: class_name.to_string(),
+        });
     }
 
     // Simple name - try to resolve through imports in the current file
-    let mut resolver = ImportResolver::new(db, search_paths);
+    let resolver = ImportResolver::new(db, environment);
     if let Some(resolved) = resolver.resolve_symbol(current_file, base_class_expr) {
         return Some(resolved);
     }
 
     // Check if the class is defined in the same file
-    if extract_class_info(db, current_file, base_class_expr).is_ok() {
-        return Some((current_file.to_path_buf(), base_class_expr.to_string()));
-    }
-
-    None
+    extract_class_info(
+        db,
+        current_file,
+        base_class_expr,
+        environment.python_version(db),
+    )
+    .map(|_| ResolvedSymbol {
+        file: current_file.to_path_buf(),
+        name: base_class_expr.to_string(),
+    })
 }
 
 /// Extract class information, following re-exports if necessary.
@@ -196,206 +141,168 @@ pub(super) fn resolve_base_class(
 ///
 /// This also resolves missing properties (docstring, __init__) from parent classes
 /// when they are not defined in the child class.
-fn extract_class_info_with_imports(
-    db: &dyn ruff_db::Db,
+fn extract_class_info_with_imports<'db>(
+    db: &'db dyn ty_module_resolver::Db,
     file_path: &Path,
     class_name: &str,
-    search_paths: &[PathBuf],
-) -> Result<(ClassInfo, PathBuf)> {
-    let (mut class_info, resolved_file) = with_reexports(
-        db,
-        file_path,
-        class_name,
-        search_paths,
-        |file, name| extract_class_info(db, file, name),
-        || {
-            anyhow::anyhow!(
-                "Class '{}' not found in {} (also checked re-exports)",
-                class_name,
-                file_path.display()
-            )
-        },
-    )?;
+    environment: ResolverEnvironment<'db>,
+) -> Option<(ClassInfo, PathBuf)> {
+    let python_version = environment.python_version(db);
+    let (mut class_info, resolved_file) =
+        with_reexports(db, file_path, class_name, environment, |file, name| {
+            extract_class_info(db, file, name, python_version)
+        })?;
 
     // Resolve missing properties from parent classes via the memoised salsa query.
-    // class_parent_docs walks the MRO recursively and caches results per (class, search_paths),
+    // inherited_class_members walks the MRO recursively and caches results per (class, environment),
     // so shared parent classes across different child-class lookups are resolved only once.
     if class_info.docstring.is_none() || class_info.init_signature.is_none() {
         let class_key = class_key(db, &resolved_file, &class_info.name);
-        let interned_sp = InternedSearchPaths::new(db, search_paths.to_vec());
-        let parent_docs = class_parent_docs(db, class_key, interned_sp);
-
-        if class_info.docstring.is_none() {
-            class_info.docstring = parent_docs.docstring().cloned();
-        }
-        if class_info.init_signature.is_none() {
-            class_info.init_signature = parent_docs.init().cloned();
-        }
-        if class_info.new_signature.is_none() {
-            class_info.new_signature = parent_docs.new_signature().cloned();
-        }
-        class_info.unresolved_base_classes = !parent_docs.all_bases_resolved();
+        let parent_docs = inherited_class_members(db, class_key, environment);
+        parent_docs.fill_missing(
+            &mut class_info.docstring,
+            &mut class_info.init_signature,
+            &mut class_info.new_signature,
+        );
+        class_info.all_bases_resolved = parent_docs.all_bases_resolved();
     }
 
     if class_info.init_signature.is_none() {
         class_info.init_signature = class_info.new_signature.take();
     }
 
-    Ok((class_info, resolved_file))
+    Some((class_info, resolved_file))
 }
 
 /// Extract function signature, following re-exports if necessary.
 /// Returns the FunctionSignature and the file path where it was found.
-fn extract_function_signature_with_imports(
-    db: &dyn ruff_db::Db,
+fn extract_function_signature_with_imports<'db>(
+    db: &'db dyn ty_module_resolver::Db,
     file_path: &Path,
     function_name: &str,
-    search_paths: &[PathBuf],
-) -> Result<(FunctionSignature, PathBuf)> {
-    with_reexports(
-        db,
-        file_path,
-        function_name,
-        search_paths,
-        |file, name| extract_function_signature(db, file, name),
-        || {
-            anyhow::anyhow!(
-                "Function '{}' not found in {} (also checked re-exports)",
-                function_name,
-                file_path.display()
-            )
-        },
-    )
+    environment: ResolverEnvironment<'db>,
+) -> Option<(FunctionSignature, PathBuf)> {
+    let python_version = environment.python_version(db);
+    with_reexports(db, file_path, function_name, environment, |file, name| {
+        extract_function_signature(db, file, name, python_version)
+    })
 }
 
-/// Run `extract` for `name` in `file_path`, and if that fails, again where
-/// the file's imports say `name` really lives. Returns the result and the
-/// file it came from.
-///
-/// The in-file error is dropped. When the import chain resolves, the
-/// retry's error is returned as is; when it does not, `not_found` is.
-fn with_reexports<T>(
-    db: &dyn ruff_db::Db,
+/// Run `extract` for `name` in `file_path`, and if that finds nothing, again
+/// where the file's imports say `name` really lives. Returns the result and
+/// the file it came from.
+fn with_reexports<'db, T>(
+    db: &'db dyn ty_module_resolver::Db,
     file_path: &Path,
     name: &str,
-    search_paths: &[PathBuf],
-    extract: impl Fn(&Path, &str) -> Result<T>,
-    not_found: impl FnOnce() -> anyhow::Error,
-) -> Result<(T, PathBuf)> {
-    if let Ok(found) = extract(file_path, name) {
-        return Ok((found, file_path.to_path_buf()));
+    environment: ResolverEnvironment<'db>,
+    extract: impl Fn(&Path, &str) -> Option<T>,
+) -> Option<(T, PathBuf)> {
+    if let Some(found) = extract(file_path, name) {
+        return Some((found, file_path.to_path_buf()));
     }
 
-    let mut resolver = ImportResolver::new(db, search_paths);
-    let Some((resolved_file, resolved_name)) = resolver.resolve_symbol(file_path, name) else {
-        return Err(not_found());
-    };
-    let found = extract(&resolved_file, &resolved_name)?;
-    Ok((found, resolved_file))
+    let resolved = ImportResolver::new(db, environment).resolve_symbol(file_path, name)?;
+    let found = extract(&resolved.file, &resolved.name)?;
+    Some((found, resolved.file))
 }
 
 /// Extract definition info (function, class or method) from a target
-/// string, along with the file it was found in and the module path and
+/// string, along with the file it was found in and the module name and
 /// symbol name the target resolved to.
-pub fn extract_definition_info(
-    db: &dyn ruff_db::Db,
+pub(super) fn extract_definition_info<'db>(
+    db: &'db dyn ty_module_resolver::Db,
     target: &str,
-    search_paths: &[PathBuf],
-) -> std::result::Result<ResolvedDefinition, ResolveError> {
-    let Ok((module_path, symbol_name)) = split_target(target) else {
+    environment: ResolverEnvironment<'db>,
+) -> Result<ResolvedDefinition, ResolveError> {
+    let Some((module_name, symbol_name)) = split_target(target) else {
         return Err(ResolveError::InvalidFormat(target.to_string()));
+    };
+    let found = |definition_info, file_path, symbol_name| ResolvedDefinition {
+        definition_info,
+        file_path,
+        module_name: module_name.to_string(),
+        symbol_name,
     };
 
     // Track whether we found the module but not the symbol
     let mut module_found = false;
 
-    // Intern search paths once; reused for both the initial lookup and the
-    // attribute-chain probe that may follow.
-    let search_paths_id = InternedSearchPaths::new(db, search_paths.to_vec());
-
     // First try standard resolution: module.symbol where symbol is a function or class
-    let module_path_id = TargetString::new(db, module_path.clone());
-    if let Some(file_path) = resolve_module_cached(db, module_path_id, search_paths_id).clone() {
+    if let Some(file_path) = resolve_module_by_name(db, module_name, environment) {
         module_found = true;
 
         // Try to extract as function first (with import resolution)
-        if let Ok((func_sig, resolved_file)) =
-            extract_function_signature_with_imports(db, &file_path, &symbol_name, search_paths)
+        if let Some((func_sig, resolved_file)) =
+            extract_function_signature_with_imports(db, &file_path, symbol_name, environment)
         {
-            return Ok(ResolvedDefinition {
-                definition_info: DefinitionInfo::Function(func_sig),
-                file_path: resolved_file,
-                module_path,
-                symbol_name,
-            });
+            return Ok(found(
+                DefinitionInfo::Function(func_sig),
+                resolved_file,
+                symbol_name.to_string(),
+            ));
         }
 
         // Try to extract as class (with import resolution)
-        if let Ok((class_info, resolved_file)) =
-            extract_class_info_with_imports(db, &file_path, &symbol_name, search_paths)
+        if let Some((class_info, resolved_file)) =
+            extract_class_info_with_imports(db, &file_path, symbol_name, environment)
         {
-            return Ok(ResolvedDefinition {
-                definition_info: DefinitionInfo::Class(class_info),
-                file_path: resolved_file,
-                module_path,
-                symbol_name,
-            });
+            return Ok(found(
+                DefinitionInfo::Class(class_info),
+                resolved_file,
+                symbol_name.to_string(),
+            ));
         }
     }
 
     // Try to interpret as Class.method pattern (e.g., "my_module.MyClass.from_config")
     // or nested pattern (e.g., "my_module.OuterClass.nested.nested_class.method")
     // or nested class pattern (e.g., "my_module.OuterClass.nested.nested_class")
-    if let Some(result) = resolve_class_attribute_chain(db, target, search_paths) {
-        match result {
-            ClassAttributeChainResult::Method {
-                file_path: resolved_file,
-                class_name,
-                method_name,
-                search_paths,
-            } => {
-                if let Ok((method_info, final_file)) = extract_method_info_with_imports(
-                    db,
-                    &resolved_file,
-                    &class_name,
-                    &method_name,
-                    search_paths,
-                ) {
-                    return Ok(ResolvedDefinition {
-                        definition_info: DefinitionInfo::Method(method_info),
-                        file_path: final_file,
-                        module_path: module_path.clone(),
-                        symbol_name: format!("{}.{}", class_name, method_name),
-                    });
-                }
-            }
-            ClassAttributeChainResult::Class {
-                file_path: resolved_file,
-                class_name,
-                search_paths,
-            } => {
-                if let Ok((class_info, final_file)) =
-                    extract_class_info_with_imports(db, &resolved_file, &class_name, search_paths)
-                {
-                    return Ok(ResolvedDefinition {
-                        definition_info: DefinitionInfo::Class(class_info),
-                        file_path: final_file,
-                        module_path: module_path.clone(),
-                        symbol_name: class_name,
-                    });
-                }
+    match resolve_class_attribute_chain(db, target, environment) {
+        Some(ClassAttributeChainResult::Method {
+            file_path: resolved_file,
+            class_name,
+            method_name,
+        }) => {
+            if let Some((method_info, final_file)) = extract_method_info_with_imports(
+                db,
+                &resolved_file,
+                &class_name,
+                &method_name,
+                environment,
+            ) {
+                return Ok(found(
+                    DefinitionInfo::Method(method_info),
+                    final_file,
+                    format!("{}.{}", class_name, method_name),
+                ));
             }
         }
+        Some(ClassAttributeChainResult::Class {
+            file_path: resolved_file,
+            class_name,
+        }) => {
+            if let Some((class_info, final_file)) =
+                extract_class_info_with_imports(db, &resolved_file, &class_name, environment)
+            {
+                return Ok(found(
+                    DefinitionInfo::Class(class_info),
+                    final_file,
+                    class_name,
+                ));
+            }
+        }
+        None => {}
     }
 
     // Return appropriate error based on whether module was found
     if module_found {
-        Err(ResolveError::Other(format!(
-            "Symbol '{}' not found in module '{}'",
-            symbol_name, module_path
-        )))
+        Err(ResolveError::UnresolvedSymbol {
+            module: module_name.to_string(),
+            symbol: symbol_name.to_string(),
+        })
     } else {
-        Err(ResolveError::UnresolvedModule(module_path))
+        Err(ResolveError::UnresolvedModule(module_name.to_string()))
     }
 }
 
@@ -407,11 +314,11 @@ pub fn extract_definition_info(
 /// - Nested class: `module.OuterClass.nested_attr.nested_class`
 ///
 /// Returns either a Method or Class result depending on what the chain resolves to.
-fn resolve_class_attribute_chain<'sp>(
-    db: &dyn ruff_db::Db,
+fn resolve_class_attribute_chain<'db>(
+    db: &'db dyn ty_module_resolver::Db,
     target: &str,
-    search_paths: &'sp [PathBuf],
-) -> Option<ClassAttributeChainResult<'sp>> {
+    environment: ResolverEnvironment<'db>,
+) -> Option<ClassAttributeChainResult> {
     let parts: Vec<&str> = target.split('.').collect();
     if parts.len() < 3 {
         return None;
@@ -425,18 +332,15 @@ fn resolve_class_attribute_chain<'sp>(
     //   module="a.b.c", attr_chain=["D", "e", "f"] (D is a class, e.f is attr chain + method)
     //   etc.
 
-    // Intern the search-path list once so all loop iterations share the same key.
-    let search_paths_id = InternedSearchPaths::new(db, search_paths.to_vec());
+    let python_version = environment.python_version(db);
 
     for module_end_idx in (1..parts.len() - 1).rev() {
         let module_path = parts[..module_end_idx].join(".");
         let remaining_parts = &parts[module_end_idx..];
 
-        // Cached salsa lookup: same (module_path, search_paths) → cache hit on
+        // Cached salsa lookup: same (module_path, environment) → cache hit on
         // second hover for any symbol in the same module.
-        let module_path_id = TargetString::new(db, module_path);
-        let Some(file_path) = resolve_module_cached(db, module_path_id, search_paths_id).clone()
-        else {
+        let Some(file_path) = resolve_module_by_name(db, &module_path, environment) else {
             continue;
         };
 
@@ -444,46 +348,39 @@ fn resolve_class_attribute_chain<'sp>(
         let first_symbol = remaining_parts[0];
 
         // Check if this is a class
-        if let Ok((class_info, resolved_file)) =
-            extract_class_info_with_imports(db, &file_path, first_symbol, search_paths)
+        if let Some((class_info, resolved_file)) =
+            extract_class_info_with_imports(db, &file_path, first_symbol, environment)
         {
             if remaining_parts.len() == 2 {
                 // Simple case: Class.method
                 let method_name = remaining_parts[1];
                 // Check if method exists (salsa-cached)
-                if extract_method_info(db, &resolved_file, &class_info.name, method_name).is_ok() {
+                if extract_method_info(
+                    db,
+                    &resolved_file,
+                    &class_info.name,
+                    method_name,
+                    python_version,
+                )
+                .is_some()
+                {
                     return Some(ClassAttributeChainResult::Method {
                         file_path: resolved_file,
                         class_name: class_info.name,
                         method_name: method_name.to_string(),
-                        search_paths,
                     });
                 }
             } else if remaining_parts.len() > 2 {
                 // Nested case: Class.attr1.attr2...method_or_class
-                // Follow the attribute chain
                 let attribute_chain = &remaining_parts[1..];
-                if let Ok((final_file, final_class, method_name_opt)) = resolve_attribute_chain(
+                if let Some(result) = resolve_attribute_chain(
                     db,
                     &resolved_file,
                     &class_info.name,
                     attribute_chain,
-                    search_paths,
+                    environment,
                 ) {
-                    if let Some(method_name) = method_name_opt {
-                        return Some(ClassAttributeChainResult::Method {
-                            file_path: final_file,
-                            class_name: final_class,
-                            method_name,
-                            search_paths,
-                        });
-                    } else {
-                        return Some(ClassAttributeChainResult::Class {
-                            file_path: final_file,
-                            class_name: final_class,
-                            search_paths,
-                        });
-                    }
+                    return Some(result);
                 }
             }
         }
@@ -494,29 +391,18 @@ fn resolve_class_attribute_chain<'sp>(
 
 /// Extract method info, following re-exports if necessary.
 /// Returns the MethodInfo and the file path where it was found.
-fn extract_method_info_with_imports(
-    db: &dyn ruff_db::Db,
+fn extract_method_info_with_imports<'db>(
+    db: &'db dyn ty_module_resolver::Db,
     file_path: &Path,
     class_name: &str,
     method_name: &str,
-    search_paths: &[PathBuf],
-) -> Result<(MethodInfo, PathBuf)> {
+    environment: ResolverEnvironment<'db>,
+) -> Option<(MethodInfo, PathBuf)> {
+    let python_version = environment.python_version(db);
     // The class is what gets re-exported, so it is the name to follow.
-    with_reexports(
-        db,
-        file_path,
-        class_name,
-        search_paths,
-        |file, class| extract_method_info(db, file, class, method_name),
-        || {
-            anyhow::anyhow!(
-                "Method '{}' not found in class '{}' in {} (also checked re-exports)",
-                method_name,
-                class_name,
-                file_path.display()
-            )
-        },
-    )
+    with_reexports(db, file_path, class_name, environment, |file, class| {
+        extract_method_info(db, file, class, method_name, python_version)
+    })
 }
 
 /// The class named by a base-class expression, with any generic subscript
@@ -533,11 +419,28 @@ pub(super) fn base_class_name(base_class_expr: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::python::cache::resolver_environment_for_roots;
     use crate::python::extract::{module_defines_top_level, path_is_file, read_source};
     use crate::python::format::{format_class, format_function, format_method};
     use crate::python::model::ParameterKind;
+    use ruff_python_ast::PythonVersion;
 
-    use crate::python::test_support::{get_simple_test_dir, test_db};
+    use crate::python::test_support::{extract_definition_info, get_simple_test_dir, test_db};
+
+    /// `extract_class_info_with_imports` with `roots` as the search roots.
+    fn extract_class_info_with_imports(
+        db: &dyn ty_module_resolver::Db,
+        file_path: &Path,
+        class_name: &str,
+        roots: &[PathBuf],
+    ) -> Option<(ClassInfo, PathBuf)> {
+        super::extract_class_info_with_imports(
+            db,
+            file_path,
+            class_name,
+            resolver_environment_for_roots(db, roots),
+        )
+    }
 
     #[test]
     fn test_extract_definition_info_error_kinds() {
@@ -559,9 +462,10 @@ mod tests {
         );
         assert_eq!(
             resolve("my_module.NoSuchSymbolXyz"),
-            ResolveError::Other(
-                "Symbol 'NoSuchSymbolXyz' not found in module 'my_module'".to_string()
-            )
+            ResolveError::UnresolvedSymbol {
+                module: "my_module".to_string(),
+                symbol: "NoSuchSymbolXyz".to_string(),
+            }
         );
     }
 
@@ -569,28 +473,28 @@ mod tests {
 
     #[test]
     fn test_split_target() {
-        let (module, symbol) = split_target("myproject.models.MyClass").unwrap();
-        assert_eq!(module, "myproject.models");
-        assert_eq!(symbol, "MyClass");
+        assert_eq!(
+            split_target("myproject.models.MyClass"),
+            Some(("myproject.models", "MyClass"))
+        );
     }
 
     #[test]
     fn test_split_target_short() {
-        let (module, symbol) = split_target("module.Class").unwrap();
-        assert_eq!(module, "module");
-        assert_eq!(symbol, "Class");
+        assert_eq!(split_target("module.Class"), Some(("module", "Class")));
     }
 
     #[test]
     fn test_split_target_invalid() {
-        assert!(split_target("InvalidTarget").is_err());
+        assert_eq!(split_target("InvalidTarget"), None);
     }
 
     #[test]
     fn test_split_target_deeply_nested() {
-        let (module, symbol) = split_target("a.b.c.d.e.FinalClass").unwrap();
-        assert_eq!(module, "a.b.c.d.e");
-        assert_eq!(symbol, "FinalClass");
+        assert_eq!(
+            split_target("a.b.c.d.e.FinalClass"),
+            Some(("a.b.c.d.e", "FinalClass"))
+        );
     }
 
     // ==================== inherited class tests ====================
@@ -601,7 +505,13 @@ mod tests {
         let test_file = examples_dir.join("my_module.py");
 
         // First verify that direct extraction does NOT give us __init__
-        let direct_info = extract_class_info(&test_db(), &test_file, "ChildWithoutInit").unwrap();
+        let direct_info = extract_class_info(
+            &test_db(),
+            &test_file,
+            "ChildWithoutInit",
+            PythonVersion::latest_ty(),
+        )
+        .unwrap();
         assert_eq!(direct_info.name, "ChildWithoutInit");
         assert!(
             direct_info.init_signature.is_none(),
@@ -701,202 +611,130 @@ mod tests {
         );
     }
 
+    /// Resolve `target` against `dir`, panicking if it does not resolve.
+    fn resolve_in(dir: &Path, target: &str) -> DefinitionInfo {
+        extract_definition_info(&test_db(), target, &[dir.to_path_buf(), PathBuf::from(".")])
+            .unwrap_or_else(|e| panic!("{target} should resolve: {e:?}"))
+            .definition_info
+    }
+
+    fn resolve_class(dir: &Path, target: &str) -> ClassInfo {
+        match resolve_in(dir, target) {
+            DefinitionInfo::Class(class_info) => class_info,
+            other => panic!("expected a class, got {other:?}"),
+        }
+    }
+
+    /// Resolve `target`, a method, against the `simple` fixture.
+    fn resolve_method(target: &str) -> MethodInfo {
+        match resolve_in(&get_simple_test_dir(), target) {
+            DefinitionInfo::Method(method_info) => method_info,
+            other => panic!("expected a method, got {other:?}"),
+        }
+    }
+
+    fn param_names(sig: &FunctionSignature) -> Vec<&str> {
+        sig.parameters.iter().map(|p| p.name.as_str()).collect()
+    }
+
+    /// The method's class and method name, and its classmethod and
+    /// staticmethod flags.
+    fn method_shape(method: &MethodInfo) -> (&str, &str, bool, bool) {
+        (
+            method.class_name.as_str(),
+            method.method_name.as_str(),
+            method.is_classmethod,
+            method.is_staticmethod,
+        )
+    }
+
+    /// Write `source` to `name` in a new temporary directory.
+    fn temp_module(name: &str, source: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(name);
+        std::fs::write(&path, source).unwrap();
+        (dir, path)
+    }
+
     #[test]
     fn test_extract_definition_child_without_init() {
-        let examples_dir = get_simple_test_dir();
-
-        let result = extract_definition_info(
-            &test_db(),
-            "my_module.ChildWithoutInit",
-            &[examples_dir.clone(), PathBuf::from(".")],
-        );
-        assert!(result.is_ok());
-        let definition_info = result.unwrap().definition_info;
-
-        match definition_info {
-            DefinitionInfo::Class(class_info) => {
-                assert_eq!(class_info.name, "ChildWithoutInit");
-                assert!(
-                    class_info.init_signature.is_some(),
-                    "Should have inherited __init__"
-                );
-
-                let init_sig = class_info.init_signature.as_ref().unwrap();
-                // Should have inherited params from ParentWithInit
-                assert_eq!(init_sig.parameters.len(), 3);
-                assert_eq!(init_sig.parameters[1].name, "name");
-            }
-            _ => panic!("Expected Class definition"),
-        }
+        let class_info = resolve_class(&get_simple_test_dir(), "my_module.ChildWithoutInit");
+        assert_eq!(class_info.name, "ChildWithoutInit");
+        // Inherited from ParentWithInit.
+        let init_sig = class_info
+            .init_signature
+            .expect("Should have inherited __init__");
+        assert_eq!(init_sig.parameters.len(), 3);
+        assert_eq!(init_sig.parameters[1].name, "name");
     }
 
     #[test]
     fn test_extract_nested_inherited_classmethod() {
-        let examples_dir = get_simple_test_dir();
-
-        let result = extract_definition_info(
-            &test_db(),
-            "class_methods.InheritedNested.nested.nested_class.from_config",
-            &[examples_dir.clone(), PathBuf::from(".")],
+        let method =
+            resolve_method("class_methods.InheritedNested.nested.nested_class.from_config");
+        assert_eq!(
+            method_shape(&method),
+            ("ModelFactory", "from_config", true, false)
         );
-        assert!(
-            result.is_ok(),
-            "Should resolve classmethod: {:?}",
-            result.err()
-        );
-        let definition_info = result.unwrap().definition_info;
-
-        match definition_info {
-            DefinitionInfo::Method(method_info) => {
-                assert_eq!(method_info.class_name, "ModelFactory");
-                assert_eq!(method_info.method_name, "from_config");
-                assert!(method_info.is_classmethod);
-                assert!(!method_info.is_staticmethod);
-                // Check parameters: cls and config
-                assert_eq!(method_info.signature.parameters.len(), 2);
-                assert_eq!(method_info.signature.parameters[0].name, "cls");
-                assert_eq!(method_info.signature.parameters[1].name, "config");
-            }
-            _ => panic!("Expected Method definition, got {:?}", definition_info),
-        }
+        assert_eq!(param_names(&method.signature), ["cls", "config"]);
     }
 
     #[test]
     fn test_extract_nested_inherited_staticmethod() {
-        let workspace_dir = get_simple_test_dir();
-
-        let result = extract_definition_info(
-            &test_db(),
-            "class_methods.InheritedNested.nested.nested_class.compute_size",
-            &[workspace_dir.clone(), PathBuf::from(".")],
+        let method =
+            resolve_method("class_methods.InheritedNested.nested.nested_class.compute_size");
+        assert_eq!(
+            method_shape(&method),
+            ("ModelFactory", "compute_size", false, true)
         );
-
-        assert!(
-            result.is_ok(),
-            "Should resolve staticmethod: {:?}",
-            result.err()
-        );
-        let definition_info = result.unwrap().definition_info;
-
-        match definition_info {
-            DefinitionInfo::Method(method_info) => {
-                assert_eq!(method_info.class_name, "ModelFactory");
-                assert_eq!(method_info.method_name, "compute_size");
-                assert!(!method_info.is_classmethod);
-                assert!(method_info.is_staticmethod);
-                // Check parameters: dim1 and dim2
-                assert_eq!(method_info.signature.parameters.len(), 2);
-                assert_eq!(method_info.signature.parameters[0].name, "dim1");
-                assert_eq!(method_info.signature.parameters[1].name, "dim2");
-            }
-            _ => panic!("Expected Method definition, got {:?}", definition_info),
-        }
+        assert_eq!(param_names(&method.signature), ["dim1", "dim2"]);
     }
 
     #[test]
     fn test_extract_nested_inherited_init() {
-        let examples_dir = get_simple_test_dir();
-
-        let result = extract_definition_info(
-            &test_db(),
+        let class_info = resolve_class(
+            &get_simple_test_dir(),
             "class_methods.NestedTwice.nested.inherited_nested_class",
-            &[examples_dir.clone(), PathBuf::from(".")],
         );
-        assert!(
-            result.is_ok(),
-            "Should resolve classmethod: {:?}",
-            result.err()
-        );
-        let definition_info = result.unwrap().definition_info;
-
-        match definition_info {
-            DefinitionInfo::Class(class_info) => {
-                assert_eq!(class_info.name, "InheritedFactory");
-                assert!(
-                    class_info.init_signature.is_some(),
-                    "Should have inherited __init__"
-                );
-
-                let init_sig = class_info.init_signature.as_ref().unwrap();
-                // Should have inherited params from ModelFactory
-                assert_eq!(init_sig.parameters.len(), 3);
-                assert_eq!(init_sig.parameters[1].name, "input_dim");
-                assert_eq!(init_sig.parameters[2].name, "output_dim");
-            }
-            _ => panic!("Expected Class definition"),
-        }
+        assert_eq!(class_info.name, "InheritedFactory");
+        // Inherited from ModelFactory.
+        let init_sig = class_info
+            .init_signature
+            .expect("Should have inherited __init__");
+        assert_eq!(param_names(&init_sig), ["self", "input_dim", "output_dim"]);
     }
 
     // ==================== extract_definition_info tests ====================
 
     #[test]
     fn test_extract_definition_function() {
-        let examples_dir = get_simple_test_dir();
-
-        let result = extract_definition_info(
-            &test_db(),
-            "my_module.simple_function",
-            &[examples_dir.clone(), PathBuf::from(".")],
-        );
-        assert!(result.is_ok());
-        let definition_info = result.unwrap().definition_info;
-
-        match definition_info {
-            DefinitionInfo::Function(sig) => {
-                assert_eq!(sig.name, "simple_function");
-            }
-            _ => panic!("Expected Function definition"),
+        match resolve_in(&get_simple_test_dir(), "my_module.simple_function") {
+            DefinitionInfo::Function(sig) => assert_eq!(sig.name, "simple_function"),
+            other => panic!("expected a function, got {other:?}"),
         }
     }
 
     #[test]
     fn test_extract_definition_class() {
-        let examples_dir = get_simple_test_dir();
-
-        let result = extract_definition_info(
-            &test_db(),
-            "my_module.SimpleClass",
-            &[examples_dir.clone(), PathBuf::from(".")],
-        );
-        assert!(result.is_ok());
-        let definition_info = result.unwrap().definition_info;
-
-        match definition_info {
-            DefinitionInfo::Class(class_info) => {
-                assert_eq!(class_info.name, "SimpleClass");
-            }
-            _ => panic!("Expected Class definition"),
-        }
+        let class_info = resolve_class(&get_simple_test_dir(), "my_module.SimpleClass");
+        assert_eq!(class_info.name, "SimpleClass");
     }
 
     #[test]
     fn test_extract_definition_from_package() {
-        let examples_dir = get_simple_test_dir();
-
-        let result = extract_definition_info(
-            &test_db(),
+        let class_info = resolve_class(
+            &get_simple_test_dir(),
             "test_package.submodule.SubmoduleClass",
-            &[examples_dir.clone(), PathBuf::from(".")],
         );
-        assert!(result.is_ok());
-        let definition_info = result.unwrap().definition_info;
-
-        match definition_info {
-            DefinitionInfo::Class(class_info) => {
-                assert_eq!(class_info.name, "SubmoduleClass");
-            }
-            _ => panic!("Expected Class definition"),
-        }
+        assert_eq!(class_info.name, "SubmoduleClass");
     }
 
     #[test]
     fn test_extract_definition_nonexistent() {
-        let examples_dir = get_simple_test_dir();
-
         let result = extract_definition_info(
             &test_db(),
             "my_module.NonexistentSymbol",
-            &[examples_dir.clone(), PathBuf::from(".")],
+            &[get_simple_test_dir(), PathBuf::from(".")],
         );
         assert!(result.is_err());
     }
@@ -904,353 +742,126 @@ mod tests {
     // ==================== Re-export resolution tests ====================
 
     fn get_reexport_test_dir() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests")
-            .join("workspace")
-            .join("reexport")
+        crate::python::test_support::fixture_dir("reexport")
     }
 
+    /// `mylib/__init__.py` imports from `mylib.modules`, whose `__init__.py`
+    /// imports from `mylib.modules.linear`, which defines `Linear`.
     #[test]
     fn test_reexport_via_subpackage() {
-        // Test: mylib.Linear should resolve to mylib/modules/linear.py::Linear
-        // Path: mylib/__init__.py imports from mylib.modules
-        //       mylib/modules/__init__.py imports from mylib.modules.linear
-        //       mylib/modules/linear.py defines Linear
-        let workspace_dir = get_reexport_test_dir();
-
-        let result = extract_definition_info(
-            &test_db(),
-            "mylib.Linear",
-            &[workspace_dir.clone(), PathBuf::from(".")],
+        let class_info = resolve_class(&get_reexport_test_dir(), "mylib.Linear");
+        assert_eq!(class_info.name, "Linear");
+        let init = class_info.init_signature.expect("Linear has an __init__");
+        assert_eq!(
+            param_names(&init),
+            ["self", "in_features", "out_features", "bias"]
         );
-
-        assert!(
-            result.is_ok(),
-            "Should resolve Linear through re-export chain: {:?}",
-            result.err()
-        );
-        let definition_info = result.unwrap().definition_info;
-
-        match definition_info {
-            DefinitionInfo::Class(class_info) => {
-                assert_eq!(class_info.name, "Linear");
-                assert!(class_info.init_signature.is_some());
-                let init = class_info.init_signature.as_ref().unwrap();
-                // Check that it has the expected parameters: self, in_features, out_features, bias
-                assert_eq!(init.parameters.len(), 4);
-                assert_eq!(init.parameters[1].name, "in_features");
-                assert_eq!(init.parameters[2].name, "out_features");
-                assert_eq!(init.parameters[3].name, "bias");
-            }
-            _ => panic!("Expected Class definition"),
-        }
     }
 
+    /// `mylib/__init__.py` imports `OriginalClass as AliasedClass`.
     #[test]
     fn test_reexport_with_alias() {
-        // Test: mylib.AliasedClass should resolve to mylib/modules/linear.py::OriginalClass
-        // Path: mylib/__init__.py imports OriginalClass as AliasedClass
-        let workspace_dir = get_reexport_test_dir();
-
-        let result = extract_definition_info(
-            &test_db(),
-            "mylib.AliasedClass",
-            &[workspace_dir.clone(), PathBuf::from(".")],
-        );
-
-        assert!(
-            result.is_ok(),
-            "Should resolve AliasedClass through aliased re-export: {:?}",
-            result.err()
-        );
-        let definition_info = result.unwrap().definition_info;
-
-        match definition_info {
-            DefinitionInfo::Class(class_info) => {
-                // The actual class is OriginalClass, but we look it up via the alias
-                assert_eq!(class_info.name, "OriginalClass");
-            }
-            _ => panic!("Expected Class definition"),
-        }
+        let class_info = resolve_class(&get_reexport_test_dir(), "mylib.AliasedClass");
+        assert_eq!(class_info.name, "OriginalClass");
     }
 
+    /// `mylib/__init__.py` has `from mylib.star_module import *`, and
+    /// `star_module.py` lists `StarExportedClass` in `__all__`.
     #[test]
     fn test_reexport_via_star_import() {
-        // Test: mylib.StarExportedClass should resolve through star import
-        // Path: mylib/__init__.py has `from mylib.star_module import *`
-        //       mylib/star_module.py defines StarExportedClass and has __all__
-        let workspace_dir = get_reexport_test_dir();
-
-        let result = extract_definition_info(
-            &test_db(),
-            "mylib.StarExportedClass",
-            &[workspace_dir.clone(), PathBuf::from(".")],
-        );
-
-        assert!(
-            result.is_ok(),
-            "Should resolve StarExportedClass through star import: {:?}",
-            result.err()
-        );
-        let definition_info = result.unwrap().definition_info;
-
-        match definition_info {
-            DefinitionInfo::Class(class_info) => {
-                assert_eq!(class_info.name, "StarExportedClass");
-            }
-            _ => panic!("Expected Class definition"),
-        }
+        let class_info = resolve_class(&get_reexport_test_dir(), "mylib.StarExportedClass");
+        assert_eq!(class_info.name, "StarExportedClass");
     }
 
     #[test]
     fn test_direct_module_access() {
-        // Test: mylib.modules.linear.DirectClass should resolve directly
-        let workspace_dir = get_reexport_test_dir();
-
-        let result = extract_definition_info(
-            &test_db(),
-            "mylib.modules.linear.DirectClass",
-            &[workspace_dir.clone(), PathBuf::from(".")],
-        );
-
-        assert!(
-            result.is_ok(),
-            "Should resolve DirectClass directly: {:?}",
-            result.err()
-        );
-        let definition_info = result.unwrap().definition_info;
-
-        match definition_info {
-            DefinitionInfo::Class(class_info) => {
-                assert_eq!(class_info.name, "DirectClass");
-            }
-            _ => panic!("Expected Class definition"),
-        }
+        let class_info =
+            resolve_class(&get_reexport_test_dir(), "mylib.modules.linear.DirectClass");
+        assert_eq!(class_info.name, "DirectClass");
     }
 
+    /// `_PrivateClass` starts with `_` and is not in `__all__`, so a star
+    /// import does not export it.
     #[test]
     fn test_private_class_not_star_exported() {
-        // Test: _PrivateClass should NOT be accessible via star import
-        // because it starts with _ and is not in __all__
-        let workspace_dir = get_reexport_test_dir();
-
         let result = extract_definition_info(
             &test_db(),
             "mylib._PrivateClass",
-            &[workspace_dir.clone(), PathBuf::from(".")],
+            &[get_reexport_test_dir(), PathBuf::from(".")],
         );
-
-        assert!(
-            result.is_err(),
-            "Private class should not be accessible via star import"
-        );
+        assert!(result.is_err());
     }
 
     // ==================== classmethod and staticmethod tests ====================
 
     #[test]
     fn test_extract_classmethod() {
-        // Test: class_methods.ModelFactory.from_config should resolve to a classmethod
-        let workspace_dir = get_simple_test_dir();
-
-        let result = extract_definition_info(
-            &test_db(),
-            "class_methods.ModelFactory.from_config",
-            &[workspace_dir.clone(), PathBuf::from(".")],
+        let method = resolve_method("class_methods.ModelFactory.from_config");
+        assert_eq!(
+            method_shape(&method),
+            ("ModelFactory", "from_config", true, false)
         );
-
-        assert!(
-            result.is_ok(),
-            "Should resolve classmethod: {:?}",
-            result.err()
-        );
-        let definition_info = result.unwrap().definition_info;
-
-        match definition_info {
-            DefinitionInfo::Method(method_info) => {
-                assert_eq!(method_info.class_name, "ModelFactory");
-                assert_eq!(method_info.method_name, "from_config");
-                assert!(method_info.is_classmethod);
-                assert!(!method_info.is_staticmethod);
-                assert_eq!(method_info.signature.name, "from_config");
-                // Check parameters: cls and config
-                assert_eq!(method_info.signature.parameters.len(), 2);
-                assert_eq!(method_info.signature.parameters[0].name, "cls");
-                assert_eq!(method_info.signature.parameters[1].name, "config");
-            }
-            _ => panic!("Expected Method definition, got {:?}", definition_info),
-        }
+        assert_eq!(method.signature.name, "from_config");
+        assert_eq!(param_names(&method.signature), ["cls", "config"]);
     }
 
     #[test]
     fn test_extract_staticmethod() {
-        // Test: class_methods.ModelFactory.compute_size should resolve to a staticmethod
-        let workspace_dir = get_simple_test_dir();
-
-        let result = extract_definition_info(
-            &test_db(),
-            "class_methods.ModelFactory.compute_size",
-            &[workspace_dir.clone(), PathBuf::from(".")],
+        let method = resolve_method("class_methods.ModelFactory.compute_size");
+        assert_eq!(
+            method_shape(&method),
+            ("ModelFactory", "compute_size", false, true)
         );
-
-        assert!(
-            result.is_ok(),
-            "Should resolve staticmethod: {:?}",
-            result.err()
-        );
-        let definition_info = result.unwrap().definition_info;
-
-        match definition_info {
-            DefinitionInfo::Method(method_info) => {
-                assert_eq!(method_info.class_name, "ModelFactory");
-                assert_eq!(method_info.method_name, "compute_size");
-                assert!(!method_info.is_classmethod);
-                assert!(method_info.is_staticmethod);
-                assert_eq!(method_info.signature.name, "compute_size");
-                // Check parameters: dim1 and dim2
-                assert_eq!(method_info.signature.parameters.len(), 2);
-                assert_eq!(method_info.signature.parameters[0].name, "dim1");
-                assert_eq!(method_info.signature.parameters[1].name, "dim2");
-            }
-            _ => panic!("Expected Method definition, got {:?}", definition_info),
-        }
+        assert_eq!(method.signature.name, "compute_size");
+        assert_eq!(param_names(&method.signature), ["dim1", "dim2"]);
     }
 
     #[test]
     fn test_extract_classmethod_with_defaults() {
-        // Test: class_methods.ModelFactory.with_defaults has default parameter
-        let workspace_dir = get_simple_test_dir();
-
-        let result = extract_definition_info(
-            &test_db(),
-            "class_methods.ModelFactory.with_defaults",
-            &[workspace_dir.clone(), PathBuf::from(".")],
+        let method = resolve_method("class_methods.ModelFactory.with_defaults");
+        assert_eq!(
+            method_shape(&method),
+            ("ModelFactory", "with_defaults", true, false)
         );
-
-        assert!(
-            result.is_ok(),
-            "Should resolve classmethod: {:?}",
-            result.err()
-        );
-        let definition_info = result.unwrap().definition_info;
-
-        match definition_info {
-            DefinitionInfo::Method(method_info) => {
-                assert_eq!(method_info.class_name, "ModelFactory");
-                assert_eq!(method_info.method_name, "with_defaults");
-                assert!(method_info.is_classmethod);
-                // Check parameters: cls and output_dim (with default)
-                assert_eq!(method_info.signature.parameters.len(), 2);
-                assert_eq!(method_info.signature.parameters[1].name, "output_dim");
-                assert!(method_info.signature.parameters[1].has_default());
-            }
-            _ => panic!("Expected Method definition, got {:?}", definition_info),
-        }
+        assert_eq!(param_names(&method.signature), ["cls", "output_dim"]);
+        assert!(method.signature.parameters[1].has_default());
     }
 
     #[test]
     fn test_extract_classmethod_with_kwargs() {
-        // Test: class_methods.DataProcessor.create has **kwargs
-        let workspace_dir = get_simple_test_dir();
-
-        let result = extract_definition_info(
-            &test_db(),
-            "class_methods.DataProcessor.create",
-            &[workspace_dir.clone(), PathBuf::from(".")],
+        let method = resolve_method("class_methods.DataProcessor.create");
+        assert_eq!(
+            method_shape(&method),
+            ("DataProcessor", "create", true, false)
         );
-
-        assert!(
-            result.is_ok(),
-            "Should resolve classmethod: {:?}",
-            result.err()
+        assert_eq!(method.signature.parameters.len(), 3);
+        assert_eq!(method.signature.parameters[2].name, "kwargs");
+        assert_eq!(
+            method.signature.parameters[2].kind,
+            ParameterKind::VarKeyword
         );
-        let definition_info = result.unwrap().definition_info;
-
-        match definition_info {
-            DefinitionInfo::Method(method_info) => {
-                assert_eq!(method_info.class_name, "DataProcessor");
-                assert_eq!(method_info.method_name, "create");
-                assert!(method_info.is_classmethod);
-                // Check parameters: cls, name, **kwargs
-                assert_eq!(method_info.signature.parameters.len(), 3);
-                assert_eq!(method_info.signature.parameters[2].name, "kwargs");
-                assert_eq!(
-                    method_info.signature.parameters[2].kind,
-                    ParameterKind::VarKeyword
-                );
-            }
-            _ => panic!("Expected Method definition, got {:?}", definition_info),
-        }
     }
 
+    /// `NestedTwice.nested` is `NestedExample`, whose `nested_class` is
+    /// `ModelFactory`.
     #[test]
     fn test_extract_nested_classmethod() {
-        // Test: Nested class properties should resolve to a classmethod
-        // Path: NestedTwice.nested -> NestedExample, NestedExample.nested_class -> ModelFactory
-        // ModelFactory.from_config is a classmethod
-        let workspace_dir = get_simple_test_dir();
-
-        let result = extract_definition_info(
-            &test_db(),
-            "class_methods.NestedTwice.nested.nested_class.from_config",
-            &[workspace_dir.clone(), PathBuf::from(".")],
+        let method = resolve_method("class_methods.NestedTwice.nested.nested_class.from_config");
+        assert_eq!(
+            method_shape(&method),
+            ("ModelFactory", "from_config", true, false)
         );
-
-        assert!(
-            result.is_ok(),
-            "Should resolve classmethod: {:?}",
-            result.err()
-        );
-        let definition_info = result.unwrap().definition_info;
-
-        match definition_info {
-            DefinitionInfo::Method(method_info) => {
-                assert_eq!(method_info.class_name, "ModelFactory");
-                assert_eq!(method_info.method_name, "from_config");
-                assert!(method_info.is_classmethod);
-                assert!(!method_info.is_staticmethod);
-                // Check parameters: cls and config
-                assert_eq!(method_info.signature.parameters.len(), 2);
-                assert_eq!(method_info.signature.parameters[0].name, "cls");
-                assert_eq!(method_info.signature.parameters[1].name, "config");
-            }
-            _ => panic!("Expected Method definition, got {:?}", definition_info),
-        }
+        assert_eq!(param_names(&method.signature), ["cls", "config"]);
     }
 
     #[test]
     fn test_extract_nested_staticmethod() {
-        // Test: Nested class properties should resolve to a staticmethod
-        // Path: NestedTwice.nested -> NestedExample, NestedExample.nested_class -> ModelFactory
-        // ModelFactory.compute_size is a staticmethod
-        let workspace_dir = get_simple_test_dir();
-
-        let result = extract_definition_info(
-            &test_db(),
-            "class_methods.NestedTwice.nested.nested_class.compute_size",
-            &[workspace_dir.clone(), PathBuf::from(".")],
+        let method = resolve_method("class_methods.NestedTwice.nested.nested_class.compute_size");
+        assert_eq!(
+            method_shape(&method),
+            ("ModelFactory", "compute_size", false, true)
         );
-
-        assert!(
-            result.is_ok(),
-            "Should resolve staticmethod: {:?}",
-            result.err()
-        );
-        let definition_info = result.unwrap().definition_info;
-
-        match definition_info {
-            DefinitionInfo::Method(method_info) => {
-                assert_eq!(method_info.class_name, "ModelFactory");
-                assert_eq!(method_info.method_name, "compute_size");
-                assert!(!method_info.is_classmethod);
-                assert!(method_info.is_staticmethod);
-                // Check parameters: dim1 and dim2
-                assert_eq!(method_info.signature.parameters.len(), 2);
-                assert_eq!(method_info.signature.parameters[0].name, "dim1");
-                assert_eq!(method_info.signature.parameters[1].name, "dim2");
-            }
-            _ => panic!("Expected Method definition, got {:?}", definition_info),
-        }
+        assert_eq!(param_names(&method.signature), ["dim1", "dim2"]);
     }
 
     // ==================== vendored typeshed tests ====================
@@ -1277,7 +888,9 @@ mod tests {
     #[test]
     fn test_builtin_len_parameter_is_positional_only() {
         let db = test_db();
-        let sig = extract_function_signature(&db, &builtins_stub(), "len").unwrap();
+        let sig =
+            extract_function_signature(&db, &builtins_stub(), "len", PythonVersion::latest_ty())
+                .unwrap();
 
         assert!(!sig.is_overloaded);
         assert_eq!(sig.parameters.len(), 1);
@@ -1293,7 +906,9 @@ mod tests {
     #[test]
     fn test_builtin_open_is_overloaded() {
         let db = test_db();
-        let sig = extract_function_signature(&db, &builtins_stub(), "open").unwrap();
+        let sig =
+            extract_function_signature(&db, &builtins_stub(), "open", PythonVersion::latest_ty())
+                .unwrap();
 
         assert!(
             sig.is_overloaded,
@@ -1341,9 +956,7 @@ class Child(Base):
     def __new__(cls, *args, **kwargs):
         return super().__new__(cls)
 "#;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("inherit.py");
-        std::fs::write(&path, source).unwrap();
+        let (dir, path) = temp_module("inherit.py", source);
         let search_paths = vec![dir.path().to_path_buf()];
 
         let (class_info, _) =
@@ -1358,7 +971,8 @@ class Child(Base):
     #[test]
     fn test_builtin_dict_init_is_overloaded() {
         let db = test_db();
-        let class_info = extract_class_info(&db, &builtins_stub(), "dict").unwrap();
+        let class_info =
+            extract_class_info(&db, &builtins_stub(), "dict", PythonVersion::latest_ty()).unwrap();
 
         let init = class_info
             .init_signature
@@ -1396,11 +1010,10 @@ class Child(Base):
             "@overload\n",
             "def render(value: str) -> str: ...\n",
         );
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("stub.pyi");
-        std::fs::write(&path, source).unwrap();
+        let (_dir, path) = temp_module("stub.pyi", source);
 
-        let render = extract_function_signature(&db, &path, "render").unwrap();
+        let render =
+            extract_function_signature(&db, &path, "render", PythonVersion::latest_ty()).unwrap();
         assert!(render.is_overloaded);
     }
 
@@ -1422,9 +1035,7 @@ class Child(Base):
             "class Child(Base[int]):\n",
             "    pass\n",
         );
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("generic.py");
-        std::fs::write(&path, source).unwrap();
+        let (dir, path) = temp_module("generic.py", source);
         let search_paths = vec![dir.path().to_path_buf()];
 
         let (class_info, _) =
@@ -1437,7 +1048,7 @@ class Child(Base):
         let names: Vec<_> = init.parameters.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, vec!["self", "a", "b"]);
         assert!(
-            !class_info.unresolved_base_classes,
+            class_info.all_bases_resolved,
             "a resolvable generic base is not an unreadable MRO"
         );
     }
@@ -1454,18 +1065,20 @@ class Child(Base):
             "def without_varargs(a, *, key=1):\n",
             "    pass\n",
         );
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("markers.py");
-        std::fs::write(&path, source).unwrap();
+        let (_dir, path) = temp_module("markers.py", source);
 
-        let with_varargs = extract_function_signature(&db, &path, "with_varargs").unwrap();
+        let with_varargs =
+            extract_function_signature(&db, &path, "with_varargs", PythonVersion::latest_ty())
+                .unwrap();
         let rendered = format_function(&with_varargs);
         assert!(
             rendered.contains("with_varargs(a, *args, key = 1, **kw)"),
             "got:\n{rendered}"
         );
 
-        let without_varargs = extract_function_signature(&db, &path, "without_varargs").unwrap();
+        let without_varargs =
+            extract_function_signature(&db, &path, "without_varargs", PythonVersion::latest_ty())
+                .unwrap();
         let rendered = format_function(&without_varargs);
         assert!(
             rendered.contains("without_varargs(a, *, key = 1)"),
@@ -1486,16 +1099,14 @@ class Thing(Widget):
     def __new__(cls, *args, **kwargs):
         return super().__new__(cls)
 "#;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("uncertain.py");
-        std::fs::write(&path, source).unwrap();
+        let (dir, path) = temp_module("uncertain.py", source);
         let search_paths = vec![dir.path().to_path_buf()];
 
         let (class_info, _) =
             extract_class_info_with_imports(&db, &path, "Thing", &search_paths).unwrap();
 
         assert_eq!(class_info.init_signature.as_ref().unwrap().name, "__new__");
-        assert!(class_info.unresolved_base_classes);
+        assert!(!class_info.all_bases_resolved);
         assert!(class_info.constructor_is_uncertain());
     }
 
@@ -1512,16 +1123,14 @@ class Thing(Widget):
     def __new__(cls, size: int):
         return super().__new__(cls)
 "#;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("certain.py");
-        std::fs::write(&path, source).unwrap();
+        let (dir, path) = temp_module("certain.py", source);
         let search_paths = vec![dir.path().to_path_buf()];
 
         let (class_info, _) =
             extract_class_info_with_imports(&db, &path, "Thing", &search_paths).unwrap();
 
         assert_eq!(class_info.init_signature.as_ref().unwrap().name, "__new__");
-        assert!(!class_info.unresolved_base_classes);
+        assert!(class_info.all_bases_resolved);
         assert!(!class_info.constructor_is_uncertain());
     }
 
@@ -1583,7 +1192,7 @@ class Thing(Widget):
             extract_class_info_with_imports(&db, &path, "Thing", &search_paths).unwrap();
 
         assert_eq!(class_info.init_signature.as_ref().unwrap().name, "__new__");
-        assert!(class_info.unresolved_base_classes);
+        assert!(!class_info.all_bases_resolved);
         assert!(class_info.constructor_is_uncertain());
     }
 
@@ -1604,11 +1213,10 @@ class Widget:
     def value(self, new_value: int) -> None:
         self._value = new_value
 "#;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("prop.py");
-        std::fs::write(&path, source).unwrap();
+        let (_dir, path) = temp_module("prop.py", source);
 
-        let method = extract_method_info(&db, &path, "Widget", "value").unwrap();
+        let method =
+            extract_method_info(&db, &path, "Widget", "value", PythonVersion::latest_ty()).unwrap();
         assert!(!method.signature.is_overloaded);
         assert!(!format_method(&method).contains("@overload"));
     }
@@ -1616,14 +1224,24 @@ class Widget:
     #[test]
     fn test_module_defines_top_level_ignores_methods() {
         let db = test_db();
-        assert!(module_defines_top_level(&db, &builtins_stub(), "len"));
-        assert!(module_defines_top_level(&db, &builtins_stub(), "dict"));
+        assert!(module_defines_top_level(
+            &db,
+            &builtins_stub(),
+            "len",
+            PythonVersion::latest_ty()
+        ));
+        assert!(module_defines_top_level(
+            &db,
+            &builtins_stub(),
+            "dict",
+            PythonVersion::latest_ty()
+        ));
         assert!(
-            !module_defines_top_level(&db, &builtins_stub(), "count"),
+            !module_defines_top_level(&db, &builtins_stub(), "count", PythonVersion::latest_ty()),
             "`count` is a method of `list`, not a builtin"
         );
         assert!(
-            module_defines_top_level(&db, &builtins_stub(), "aiter"),
+            module_defines_top_level(&db, &builtins_stub(), "aiter", PythonVersion::latest_ty()),
             "typeshed guards `aiter` behind `if sys.version_info >= (3, 10):`"
         );
     }
@@ -1645,19 +1263,19 @@ def render(value):
 def plain(value, /, other, *, flag=False):
     """Not overloaded."""
 "#;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mod.py");
-        std::fs::write(&path, source).unwrap();
+        let (_dir, path) = temp_module("mod.py", source);
 
         // A `.py` overload set ends with the implementation, whose signature is
         // the one Hydra will call — so there is something definite to validate
         // against and the symbol is not reported as overloaded.
-        let render = extract_function_signature(&db, &path, "render").unwrap();
+        let render =
+            extract_function_signature(&db, &path, "render", PythonVersion::latest_ty()).unwrap();
         assert!(!render.is_overloaded);
         assert_eq!(render.docstring.as_deref(), Some("Render a value."));
         assert!(render.parameters[0].type_annotation.is_none());
 
-        let plain = extract_function_signature(&db, &path, "plain").unwrap();
+        let plain =
+            extract_function_signature(&db, &path, "plain", PythonVersion::latest_ty()).unwrap();
         assert!(!plain.is_overloaded);
         let kinds: Vec<_> = plain
             .parameters
@@ -1676,5 +1294,47 @@ def plain(value, /, other, *, flag=False):
             format_function(&plain).contains("plain(value, /, other, *, flag = False)"),
             "both the positional-only `/` and the keyword-only `*` must be shown"
         );
+    }
+
+    /// Each hop of an attribute chain starts a fresh import walk. Here the
+    /// second hop passes through `pkg/b.py` and `pkg/__init__.py` again, which
+    /// the first hop already visited.
+    #[test]
+    fn test_attribute_chain_revisits_files_of_an_earlier_hop() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("pkg");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(
+            pkg.join("__init__.py"),
+            "from .b import Mid\nfrom .c import Inner\n",
+        )
+        .unwrap();
+        std::fs::write(
+            pkg.join("a.py"),
+            "from pkg import Mid\n\nclass Outer:\n    mid = Mid\n",
+        )
+        .unwrap();
+        std::fs::write(
+            pkg.join("b.py"),
+            "from pkg import Inner\n\nclass Mid:\n    inner = Inner\n",
+        )
+        .unwrap();
+        std::fs::write(
+            pkg.join("c.py"),
+            "class Inner:\n    \"\"\"Inner doc.\"\"\"\n",
+        )
+        .unwrap();
+
+        let resolved = extract_definition_info(
+            &test_db(),
+            "pkg.a.Outer.mid.inner",
+            &[dir.path().to_path_buf()],
+        )
+        .expect("the chain should resolve");
+        match resolved.definition_info {
+            DefinitionInfo::Class(class_info) => assert_eq!(class_info.name, "Inner"),
+            other => panic!("expected a class, got {other:?}"),
+        }
+        assert_eq!(resolved.file_path, pkg.join("c.py"));
     }
 }

@@ -173,7 +173,7 @@ impl HydraLspBackend {
 ///   `semanticTokens/full` and `signatureHelp` fire together on an edit, and
 ///   they are badly matched in cost — token extraction is nearly free once the
 ///   document is parsed, while signature help can sit in a cold
-///   `cached_definition_info` reading and parsing Python. Two threads stop the
+///   `resolved_definition` reading and parsing Python. Two threads stop the
 ///   cheap one queueing behind the expensive one. A third would need a third
 ///   concurrent request, and that means hover, which happens when the pointer
 ///   rests rather than while typing.
@@ -181,7 +181,7 @@ impl HydraLspBackend {
 /// - Worker serves the one real fan-out in the server: after a watched `.py`
 ///   file changes, every open Hydra document is re-validated. That fan-out is
 ///   capped well below the open-document count, because documents sharing a
-///   `_target_` share one `cached_definition_info` key and salsa blocks the
+///   `_target_` share one `resolved_definition` key and salsa blocks the
 ///   duplicate callers rather than computing twice. Three threads rather than
 ///   two because this pool absorbs whole-workspace bursts while the latency
 ///   pool only ever has one cursor position to answer for, and because the

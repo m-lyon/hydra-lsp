@@ -66,7 +66,7 @@ pub struct HydraLspBackend {
     ///
     /// Separate from the worker pool so a diagnostics run cannot occupy every
     /// thread and leave a hover waiting. Note the isolation is over threads,
-    /// not over work: both pools reach `cached_definition_info`, and when two
+    /// not over work: both pools reach `resolved_definition`, and when two
     /// requests want the same key salsa blocks one until the other finishes,
     /// whichever pools they came from.
     ///

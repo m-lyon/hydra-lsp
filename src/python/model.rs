@@ -12,10 +12,21 @@ pub struct FunctionSignature {
     pub is_overloaded: bool,
     /// Every `@overload` declaration, in source order; empty if not overloaded.
     pub overloads: Vec<FunctionSignature>,
-    pub start_line: u32,
-    pub start_column: u32,
-    pub end_line: u32,
-    pub end_column: u32,
+    pub range: SourceRange,
+}
+
+/// A zero-based line and UTF-16 column in a source file.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SourcePosition {
+    pub line: u32,
+    pub column: u32,
+}
+
+/// The span of a definition in its source file.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SourceRange {
+    pub start: SourcePosition,
+    pub end: SourcePosition,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,11 +142,8 @@ pub struct ClassInfo {
     pub init_signature: Option<FunctionSignature>,
     /// The class's own `__new__`, when it declares one.
     pub new_signature: Option<FunctionSignature>,
-    pub unresolved_base_classes: bool,
-    pub start_line: u32,
-    pub start_column: u32,
-    pub end_line: u32,
-    pub end_column: u32,
+    pub all_bases_resolved: bool,
+    pub range: SourceRange,
 }
 
 impl ClassInfo {
@@ -144,7 +152,7 @@ impl ClassInfo {
     /// True only when `__new__` stood in for a missing `__init__` *and* part of
     /// the MRO could not be resolved.
     pub fn constructor_is_uncertain(&self) -> bool {
-        self.unresolved_base_classes
+        !self.all_bases_resolved
             && self
                 .init_signature
                 .as_ref()
@@ -177,9 +185,8 @@ pub enum ResolveError {
     InvalidFormat(String),
     /// No search path contains the target's module. Holds the module path.
     UnresolvedModule(String),
-    /// Anything else, e.g. the module resolved but the symbol was not found.
-    /// Holds the full message.
-    Other(String),
+    /// The module resolved, but `symbol` is not defined or exported there.
+    UnresolvedSymbol { module: String, symbol: String },
 }
 
 impl std::fmt::Display for ResolveError {
@@ -187,7 +194,9 @@ impl std::fmt::Display for ResolveError {
         match self {
             Self::InvalidFormat(target) => write!(f, "Invalid _target_ format: '{target}'"),
             Self::UnresolvedModule(module) => write!(f, "Could not resolve module: '{module}'"),
-            Self::Other(message) => f.write_str(message),
+            Self::UnresolvedSymbol { module, symbol } => {
+                write!(f, "Symbol '{symbol}' not found in module '{module}'")
+            }
         }
     }
 }
@@ -195,27 +204,12 @@ impl std::fmt::Display for ResolveError {
 impl std::error::Error for ResolveError {}
 
 impl DefinitionInfo {
-    /// Get the source location (start_line, start_col, end_line, end_col)
-    pub fn position(&self) -> (u32, u32, u32, u32) {
+    /// Where the definition sits in its file.
+    pub fn range(&self) -> SourceRange {
         match self {
-            DefinitionInfo::Function(sig) => (
-                sig.start_line,
-                sig.start_column,
-                sig.end_line,
-                sig.end_column,
-            ),
-            DefinitionInfo::Class(info) => (
-                info.start_line,
-                info.start_column,
-                info.end_line,
-                info.end_column,
-            ),
-            DefinitionInfo::Method(info) => (
-                info.signature.start_line,
-                info.signature.start_column,
-                info.signature.end_line,
-                info.signature.end_column,
-            ),
+            DefinitionInfo::Function(sig) => sig.range,
+            DefinitionInfo::Class(info) => info.range,
+            DefinitionInfo::Method(info) => info.signature.range,
         }
     }
 
@@ -384,12 +378,18 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_error_display_other() {
-        let message = format!(
-            "Symbol '{}' not found in module '{}'",
-            "Missing", "my_module"
+    fn test_resolve_error_display_unresolved_symbol() {
+        let error = ResolveError::UnresolvedSymbol {
+            module: "my_module".to_string(),
+            symbol: "Missing".to_string(),
+        };
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Symbol '{}' not found in module '{}'",
+                "Missing", "my_module"
+            )
         );
-        assert_eq!(ResolveError::Other(message.clone()).to_string(), message);
     }
 
     // ==================== implicit_param tests ====================
@@ -408,10 +408,7 @@ mod tests {
             docstring: None,
             is_overloaded: false,
             overloads: Vec::new(),
-            start_line: 0,
-            start_column: 0,
-            end_line: 0,
-            end_column: 0,
+            range: SourceRange::default(),
         });
         assert_eq!(def.implicit_param(), None);
     }
@@ -442,17 +439,11 @@ mod tests {
                 docstring: None,
                 is_overloaded: false,
                 overloads: Vec::new(),
-                start_line: 0,
-                start_column: 0,
-                end_line: 0,
-                end_column: 0,
+                range: SourceRange::default(),
             }),
             new_signature: None,
-            unresolved_base_classes: false,
-            start_line: 0,
-            start_column: 0,
-            end_line: 0,
-            end_column: 0,
+            all_bases_resolved: true,
+            range: SourceRange::default(),
         });
         assert_eq!(def.implicit_param(), Some("self"));
     }
@@ -475,17 +466,11 @@ mod tests {
                 docstring: None,
                 is_overloaded: false,
                 overloads: Vec::new(),
-                start_line: 0,
-                start_column: 0,
-                end_line: 0,
-                end_column: 0,
+                range: SourceRange::default(),
             }),
             new_signature: None,
-            unresolved_base_classes: false,
-            start_line: 0,
-            start_column: 0,
-            end_line: 0,
-            end_column: 0,
+            all_bases_resolved: true,
+            range: SourceRange::default(),
         });
         assert_eq!(def.implicit_param(), Some("this"));
     }
@@ -498,11 +483,8 @@ mod tests {
             docstring: None,
             init_signature: None,
             new_signature: None,
-            unresolved_base_classes: false,
-            start_line: 0,
-            start_column: 0,
-            end_line: 0,
-            end_column: 0,
+            all_bases_resolved: true,
+            range: SourceRange::default(),
         });
         assert_eq!(def.implicit_param(), None);
     }
@@ -524,10 +506,7 @@ mod tests {
                 docstring: None,
                 is_overloaded: false,
                 overloads: Vec::new(),
-                start_line: 0,
-                start_column: 0,
-                end_line: 0,
-                end_column: 0,
+                range: SourceRange::default(),
             },
             is_classmethod: false,
             is_staticmethod: false,
@@ -552,10 +531,7 @@ mod tests {
                 docstring: None,
                 is_overloaded: false,
                 overloads: Vec::new(),
-                start_line: 0,
-                start_column: 0,
-                end_line: 0,
-                end_column: 0,
+                range: SourceRange::default(),
             },
             is_classmethod: true,
             is_staticmethod: false,
@@ -580,10 +556,7 @@ mod tests {
                 docstring: None,
                 is_overloaded: false,
                 overloads: Vec::new(),
-                start_line: 0,
-                start_column: 0,
-                end_line: 0,
-                end_column: 0,
+                range: SourceRange::default(),
             },
             is_classmethod: true,
             is_staticmethod: false,
@@ -608,10 +581,7 @@ mod tests {
                 docstring: None,
                 is_overloaded: false,
                 overloads: Vec::new(),
-                start_line: 0,
-                start_column: 0,
-                end_line: 0,
-                end_column: 0,
+                range: SourceRange::default(),
             },
             is_classmethod: false,
             is_staticmethod: true,

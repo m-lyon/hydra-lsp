@@ -6,7 +6,7 @@
 //!
 //!   client CREATE/DELETE event
 //!     → `did_change_watched_files` (extension filter, `File::sync_path`)
-//!     → salsa invalidation of `resolve_module_cached`
+//!     → salsa invalidation of `resolved_module_file`
 //!     → goto-definition response
 //!
 //! The one thing they deliberately *cannot* cover is whether the editor's file
@@ -215,7 +215,7 @@ async fn test_watched_create_resolves_nested_module() {
 /// and a DELETE event arrives.
 ///
 /// Note this is a weaker guard than the create tests: even without the
-/// `resolve_module_cached` tracking fix, delete self-heals downstream — the
+/// `resolved_module_file` tracking fix, delete self-heals downstream — the
 /// definition extraction reads the module through salsa `source_text`, which
 /// `File::sync_path` invalidates, so extraction fails and goto returns nothing
 /// regardless. The test still locks in the correct end-to-end behavior.
@@ -244,4 +244,82 @@ async fn test_watched_delete_unresolves_module() {
         after.is_none(),
         "target should stop resolving after the module is deleted, got {after:?}"
     );
+}
+
+/// A venv in the workspace whose `.venv` entry is a symlink to `real_venv`,
+/// with an editable `.pth` in its site-packages that names no directory yet.
+/// The editable source lives in its own temp dir, outside every search root,
+/// so it only resolves through the `.pth`. Returns the editable source dir
+/// (keep the guard alive) and the `.pth` path relative to the workspace,
+/// through the symlink.
+#[cfg(unix)]
+fn symlinked_venv_with_editable(ctx: &TestContext) -> (tempfile::TempDir, std::path::PathBuf) {
+    let ws = ctx.workspace.path();
+    let real_venv = ws.join("real_venv");
+    let site_packages_rel = std::path::Path::new("lib/python3.11/site-packages");
+    fs::create_dir_all(real_venv.join("bin")).unwrap();
+    fs::write(real_venv.join("bin/python"), "").unwrap();
+    fs::create_dir_all(real_venv.join(site_packages_rel)).unwrap();
+    fs::write(
+        real_venv.join("pyvenv.cfg"),
+        format!("home = {}\nversion = 3.11\n", real_venv.display()),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(&real_venv, ws.join(".venv")).unwrap();
+
+    let src = tempfile::TempDir::new().unwrap();
+    fs::create_dir_all(src.path().join("editable_pkg")).unwrap();
+    fs::write(src.path().join("editable_pkg/__init__.py"), "").unwrap();
+    fs::write(
+        src.path().join("editable_pkg/lib.py"),
+        "class Thing:\n    pass\n",
+    )
+    .unwrap();
+
+    let pth_rel = std::path::Path::new(".venv")
+        .join(site_packages_rel)
+        .join("_editable.pth");
+    fs::write(ws.join(&pth_rel), "/nonexistent-editable-root\n").unwrap();
+    (src, pth_rel)
+}
+
+/// A `.pth` change in a venv reached through a symlink is picked up when the
+/// client reports it by its canonical path, the path ty resolves through.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_watched_pth_change_under_symlinked_venv() {
+    use filetime::{FileTime, set_file_mtime};
+
+    let mut ctx = TestContext::new(TestWorkspace::Simple);
+    let (src, pth_rel) = symlinked_venv_with_editable(&ctx);
+    let interpreter = ctx.workspace.path().join(".venv");
+    ctx.initialize_with_settings(serde_json::json!({
+        "pythonInterpreter": interpreter.to_str().unwrap()
+    }))
+    .await;
+
+    let yaml = "# @hydra\nnode:\n  _target_: editable_pkg.lib.Thing\n";
+    fs::write(ctx.workspace.path().join("pth_config.yaml"), yaml).unwrap();
+    ctx.open_document("pth_config.yaml", yaml.to_string()).await;
+    let pos = target_position(yaml, "editable_pkg.lib.Thing");
+
+    let before = goto(&mut ctx, "pth_config.yaml", pos).await;
+    assert!(
+        before.is_none(),
+        "should not resolve before the .pth names the source, got {before:?}"
+    );
+
+    let pth = ctx.workspace.path().join(&pth_rel);
+    fs::write(&pth, format!("{}\n", src.path().display())).unwrap();
+    set_file_mtime(&pth, FileTime::from_unix_time(2_000_000, 0)).unwrap();
+    ctx.notify::<DidChangeWatchedFiles>(DidChangeWatchedFilesParams {
+        changes: vec![FileEvent {
+            uri: Url::from_file_path(fs::canonicalize(&pth).unwrap()).unwrap(),
+            typ: FileChangeType::CHANGED,
+        }],
+    })
+    .await;
+
+    let after = goto(&mut ctx, "pth_config.yaml", pos).await;
+    assert_resolved_to(&after, "editable_pkg/lib.py");
 }
