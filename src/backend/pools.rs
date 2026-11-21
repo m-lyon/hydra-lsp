@@ -1,7 +1,12 @@
 //! The two rayon pools: how they are sized, how they are built, and how work is
 //! handed to them. `docs/threading-model.md` explains the sizing.
 
+use salsa::CancellationToken;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::OnceLock;
+use std::task::{Context, Poll};
+use tokio::sync::oneshot;
 use tower_lsp::jsonrpc::{Error, Result};
 use tower_lsp::lsp_types::MessageType;
 
@@ -18,7 +23,8 @@ use super::HydraLspBackend;
 #[derive(Debug)]
 pub(crate) enum PoolOutcome<R> {
     Completed(R),
-    /// Salsa cancelled the query (a concurrent write bumped the revision).
+    /// Salsa cancelled the query: a concurrent write bumped the revision, or
+    /// the request was dropped.
     Cancelled,
     /// The closure panicked for a non-cancellation reason. Carries a
     /// best-effort message extracted from the panic payload.
@@ -33,7 +39,7 @@ impl<R> PoolOutcome<R> {
     /// shut down), and every caller treats that the way it treats a superseded
     /// revision: the request is stale.
     pub(crate) fn from_received(
-        received: std::result::Result<Self, tokio::sync::oneshot::error::RecvError>,
+        received: std::result::Result<Self, oneshot::error::RecvError>,
     ) -> Self {
         received.unwrap_or(PoolOutcome::Cancelled)
     }
@@ -52,10 +58,16 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 
 /// Bridge a rayon thread-pool task to an async tokio context.
 ///
-/// Spawns `f` on `pool` and returns a receiver whose `.await` resolves when
-/// the task finishes. Unlike `tokio::task::spawn_blocking`, the closure runs
-/// on a caller-chosen rayon pool, which lets us separate latency-sensitive
-/// work (hover, goto_definition) from background work (diagnostics).
+/// Spawns `f` on `pool` and returns a [`PoolJob`] that resolves when the task
+/// finishes. Unlike `tokio::task::spawn_blocking`, the closure runs on a
+/// caller-chosen rayon pool, which lets us separate latency-sensitive work
+/// (hover, goto_definition) from background work (diagnostics).
+///
+/// `f` queries through `db`, which should be a snapshot of its own: dropping the
+/// job before it resolves cancels that handle's [`CancellationToken`], so a
+/// request tower-lsp abandons (on `$/cancelRequest`) stops at salsa's next
+/// cancellation. `f` runs inside one `attach` because salsa clears the token
+/// whenever the outermost attached scope exits.
 ///
 /// `f` is run inside `catch_unwind` and its result is delivered as a
 /// [`PoolOutcome`], distinguishing normal completion, salsa cancellation, and a
@@ -65,21 +77,28 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// The borrow of `pool` ends immediately after `pool.spawn` returns — before
 /// any `.await` suspension — so callers do not need to hold a reference across
 /// yield points.
-pub(super) fn spawn_on_pool<F, R>(
+pub(super) fn spawn_on_pool<Db, F, R>(
     pool: &OnceLock<rayon::ThreadPool>,
+    db: Db,
     f: F,
-) -> tokio::sync::oneshot::Receiver<PoolOutcome<R>>
+) -> PoolJob<R>
 where
-    F: FnOnce() -> R + Send + 'static,
+    Db: salsa::Database + Send + 'static,
+    F: FnOnce(&Db) -> R + Send + 'static,
     R: Send + 'static,
 {
-    let (tx, rx) = tokio::sync::oneshot::channel();
+    let (tx, rx) = oneshot::channel();
+    let job = PoolJob {
+        rx,
+        cancel: Some(db.cancellation_token()),
+    };
     let Some(pool) = pool.get() else {
-        // Sender dropped on return; receiver resolves to RecvError.
-        return rx;
+        // Sender dropped on return; the job resolves to RecvError.
+        return job;
     };
     pool.spawn(move || {
-        let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        let run = || db.attach(f);
+        let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
             Ok(r) => PoolOutcome::Completed(r),
             Err(payload) => {
                 if payload.downcast_ref::<salsa::Cancelled>().is_some() {
@@ -91,7 +110,33 @@ where
         };
         let _ = tx.send(outcome);
     });
-    rx
+    job
+}
+
+/// A job handed to a pool by [`spawn_on_pool`]. Awaiting it gives the job's
+/// outcome; dropping it first cancels the job.
+pub(super) struct PoolJob<R> {
+    rx: oneshot::Receiver<PoolOutcome<R>>,
+    /// Taken once the job resolves, so a finished job is not cancelled on drop.
+    cancel: Option<CancellationToken>,
+}
+
+impl<R> Future for PoolJob<R> {
+    type Output = std::result::Result<PoolOutcome<R>, oneshot::error::RecvError>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let received = std::task::ready!(Pin::new(&mut self.rx).poll(cx));
+        self.cancel = None;
+        Poll::Ready(received)
+    }
+}
+
+impl<R> Drop for PoolJob<R> {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            cancel.cancel();
+        }
+    }
 }
 
 impl HydraLspBackend {
@@ -430,7 +475,7 @@ pub(super) fn single_thread_pool() -> OnceLock<rayon::ThreadPool> {
 mod tests {
     use super::*;
     use crate::database::tests::TestDb;
-    use crate::yaml_cache::DocumentInput;
+    use crate::yaml_cache::{self, DocumentInput};
     use salsa::{Database as _, Setter};
     use std::cell::Cell;
     use std::time::Duration;
@@ -462,7 +507,7 @@ mod tests {
     #[tokio::test]
     async fn spawn_on_pool_completes_normally() {
         let pool = single_thread_pool();
-        let outcome = spawn_on_pool(&pool, || 42_i32)
+        let outcome = spawn_on_pool(&pool, TestDb::new(), |_| 42_i32)
             .await
             .expect("sender dropped");
         assert!(matches!(outcome, PoolOutcome::Completed(42)));
@@ -474,7 +519,7 @@ mod tests {
         // and abort the whole test process. Reaching the assertion at all is
         // the regression guard; the message check confirms payload capture.
         let pool = single_thread_pool();
-        let outcome = spawn_on_pool(&pool, || -> i32 { panic!("boom-42") })
+        let outcome = spawn_on_pool(&pool, TestDb::new(), |_| -> i32 { panic!("boom-42") })
             .await
             .expect("sender dropped");
         match outcome {
@@ -501,14 +546,14 @@ mod tests {
         let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
         let (proceed_tx, proceed_rx) = std::sync::mpsc::channel::<()>();
 
-        let rx = spawn_on_pool(&pool, move || {
+        let rx = spawn_on_pool(&pool, snapshot, move |db| {
             started_tx.send(()).expect("main receiver dropped");
             proceed_rx.recv().expect("main sender dropped");
             // Poll the cancellation checkpoint until the concurrent write sets
             // the flag; this unwinds with salsa::Cancelled once observed. The
             // bound + outer timeout keep a mis-choreographed race from hanging.
             for _ in 0..100_000_000_u64 {
-                snapshot.unwind_if_revision_cancelled();
+                db.unwind_if_revision_cancelled();
                 std::thread::yield_now();
             }
             panic!("cancellation flag was never observed");
@@ -531,6 +576,56 @@ mod tests {
             "expected Cancelled, got {outcome:?}"
         );
         writer.join().expect("writer thread panicked");
+    }
+
+    // --- Dropping a PoolJob cancels it ---
+
+    #[tokio::test]
+    async fn dropping_the_job_cancels_its_query() {
+        let pool = single_thread_pool();
+        let db = TestDb::new();
+        let input = DocumentInput::new(&db, "# @hydra\nmodel: {}\n".to_string(), 1);
+        let snapshot = db.clone();
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let (unwound_tx, unwound_rx) = std::sync::mpsc::channel();
+
+        let job = spawn_on_pool(&pool, snapshot, move |db| {
+            started_tx.send(()).expect("main receiver dropped");
+            let caught = salsa::Cancelled::catch(std::panic::AssertUnwindSafe(|| {
+                for _ in 0..100_000_000_u64 {
+                    let _ = yaml_cache::parsed_yaml(db, input);
+                    std::thread::yield_now();
+                }
+            }));
+            unwound_tx.send(caught).expect("main receiver dropped");
+        });
+
+        started_rx.recv().expect("worker never started");
+        // What tower-lsp does to a handler future on `$/cancelRequest`. No
+        // write happens, so only the token can stop the loop.
+        drop(job);
+        let caught = unwound_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the job was not cancelled");
+        assert!(
+            matches!(caught, Err(salsa::Cancelled::Local)),
+            "expected a local cancellation, got {caught:?}"
+        );
+        // The token belongs to the snapshot, so the original handle still runs.
+        let _ = yaml_cache::parsed_yaml(&db, input);
+    }
+
+    #[tokio::test]
+    async fn a_finished_job_is_not_cancelled_on_drop() {
+        let pool = single_thread_pool();
+        let db = TestDb::new();
+        let cancel = db.cancellation_token();
+        let outcome = spawn_on_pool(&pool, db, |_| ())
+            .await
+            .expect("sender dropped");
+        assert!(matches!(outcome, PoolOutcome::Completed(())));
+        assert!(!cancel.is_cancelled());
     }
 
     // --- Pool sizing ---
