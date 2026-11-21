@@ -575,7 +575,7 @@ mod tests {
     fn test_env(workspace_root: Option<&Path>) -> (HydraDatabase, PythonConfig) {
         let db = HydraDatabase::new(SystemPath::new("/"));
         let workspace = workspace_root.map(|p| p.to_string_lossy().to_string());
-        let config = PythonConfig::new(&db, workspace, None);
+        let config = PythonConfig::frozen(&db, workspace, None);
         (db, config)
     }
 

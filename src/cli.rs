@@ -270,7 +270,11 @@ fn run(args: &CheckCommand) -> anyhow::Result<i32> {
 
     let db_root = workspace_root.to_str().unwrap_or(".");
     let db = HydraDatabase::new(ruff_db::system::SystemPath::new(db_root));
-    let python_config = PythonConfig::new(
+    // A one-shot check never syncs files, so every file created from here on
+    // can be `NEVER_CHANGE`. This must come before the first file lookup:
+    // files created earlier keep their durability. Matches `ty check`.
+    ruff_db::Db::files(&db).freeze();
+    let python_config = PythonConfig::frozen(
         &db,
         Some(workspace_root.to_string_lossy().to_string()),
         python_interpreter.clone(),
