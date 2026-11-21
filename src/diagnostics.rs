@@ -1354,8 +1354,6 @@ mod tests {
             .collect()
     }
 
-    /// Build a parameter with no default for a synthetic signature.
-
     #[test]
     fn test_positional_only_passed_by_name_is_reported() {
         let hydra_obj = build_hydra_object(
