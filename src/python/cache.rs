@@ -14,6 +14,7 @@ use super::typeshed::{
 };
 use ruff_db::files::FileRootKind;
 use ruff_db::system::SystemPathBuf;
+use salsa::Durability;
 use tracing::debug;
 
 /// Salsa input for Python environment configuration.
@@ -34,6 +35,20 @@ pub struct PythonConfig {
 
     /// Configured Python interpreter path.
     pub interpreter: Option<String>,
+}
+
+impl PythonConfig {
+    /// Create a config with salsa `Durability::NEVER_CHANGE` so that queries reading it
+    /// never need revalidating.
+    pub fn frozen(
+        db: &dyn salsa::Database,
+        workspace_root: Option<String>,
+        interpreter: Option<String>,
+    ) -> Self {
+        Self::builder(workspace_root, interpreter)
+            .durability(Durability::NEVER_CHANGE)
+            .new(db)
+    }
 }
 
 /// Interned target string for cache key deduplication.
@@ -622,7 +637,7 @@ mod tests {
     #[test]
     fn test_site_packages_paths_no_config() {
         let db = real_fs_db();
-        let config = PythonConfig::new(&db, None, None);
+        let config = PythonConfig::frozen(&db, None, None);
         // Should not panic; returns whatever the current-dir discovery finds (possibly empty).
         let paths = site_packages_paths(&db, config);
         // Result is a Vec<SystemPathBuf>; we can't assert a specific value since it
@@ -634,7 +649,7 @@ mod tests {
     fn test_site_packages_paths_cache_hit() {
         let db = real_fs_db();
         let examples = examples_dir();
-        let config = PythonConfig::new(&db, Some(examples.to_string_lossy().to_string()), None);
+        let config = PythonConfig::frozen(&db, Some(examples.to_string_lossy().to_string()), None);
         let result1 = site_packages_paths(&db, config);
         let result2 = site_packages_paths(&db, config);
         // Pointer equality: salsa returns the same Arc on a cache hit.
@@ -645,6 +660,8 @@ mod tests {
     fn test_site_packages_paths_invalidation_on_interpreter_change() {
         let mut db = real_fs_db();
         let examples = examples_dir();
+        // Mutable on purpose: production configs are frozen, but the queries
+        // must still recompute if a config ever changes.
         let config = PythonConfig::new(&db, Some(examples.to_string_lossy().to_string()), None);
         let result1 = site_packages_paths(&db, config).clone();
 
@@ -667,7 +684,7 @@ mod tests {
     fn test_search_paths_for_config_contains_workspace_root() {
         let db = real_fs_db();
         let examples = examples_dir();
-        let config = PythonConfig::new(&db, Some(examples.to_string_lossy().to_string()), None);
+        let config = PythonConfig::frozen(&db, Some(examples.to_string_lossy().to_string()), None);
         let paths = search_paths_for_config(&db, config);
         assert!(
             paths.iter().any(|p| p == &examples),
@@ -682,7 +699,7 @@ mod tests {
     #[test]
     fn test_search_paths_for_config_cache_hit() {
         let db = real_fs_db();
-        let config = PythonConfig::new(&db, None, None);
+        let config = PythonConfig::frozen(&db, None, None);
         let r1 = search_paths_for_config(&db, config);
         let r2 = search_paths_for_config(&db, config);
         assert!(std::ptr::eq(r1 as *const _, r2 as *const _));
@@ -691,21 +708,19 @@ mod tests {
     #[test]
     fn test_python_config_fields() {
         let db = TestDb::new();
-        let config = PythonConfig::new(&db, Some("/workspace".to_string()), None);
+        let config = PythonConfig::frozen(&db, Some("/workspace".to_string()), None);
         assert_eq!(config.workspace_root(&db).as_deref(), Some("/workspace"));
         assert_eq!(config.interpreter(&db).as_deref(), None);
     }
 
     #[test]
-    fn test_python_config_update() {
+    #[should_panic]
+    fn test_frozen_python_config_rejects_setters() {
         let mut db = TestDb::new();
-        let config = PythonConfig::new(&db, None, None);
-        assert!(config.interpreter(&db).is_none());
-
+        let config = PythonConfig::frozen(&db, None, None);
         config
             .set_interpreter(&mut db)
             .to(Some("/usr/bin/python3".to_string()));
-        assert_eq!(config.interpreter(&db).as_deref(), Some("/usr/bin/python3"));
     }
 
     #[test]
@@ -727,7 +742,7 @@ mod tests {
     fn test_cached_definition_info_valid_target() {
         let db = real_fs_db();
         let workspace = examples_dir();
-        let config = PythonConfig::new(&db, Some(workspace.to_string_lossy().to_string()), None);
+        let config = PythonConfig::frozen(&db, Some(workspace.to_string_lossy().to_string()), None);
         let target = TargetString::new(&db, "my_module.DataLoader".to_string());
         let result = cached_definition_info(&db, config, target);
 
@@ -740,7 +755,7 @@ mod tests {
     fn test_cached_definition_info_invalid_target() {
         let db = TestDb::new();
         let workspace = examples_dir();
-        let config = PythonConfig::new(&db, Some(workspace.to_string_lossy().to_string()), None);
+        let config = PythonConfig::frozen(&db, Some(workspace.to_string_lossy().to_string()), None);
         let target = TargetString::new(&db, "nonexistent.Module".to_string());
         let result = cached_definition_info(&db, config, target);
         assert!(result.get().is_err());
@@ -750,7 +765,7 @@ mod tests {
     fn test_cached_definition_info_cache_hit() {
         let db = real_fs_db();
         let workspace = examples_dir();
-        let config = PythonConfig::new(&db, Some(workspace.to_string_lossy().to_string()), None);
+        let config = PythonConfig::frozen(&db, Some(workspace.to_string_lossy().to_string()), None);
         let target = TargetString::new(&db, "my_module.DataLoader".to_string());
 
         let result1 = cached_definition_info(&db, config, target);
@@ -764,7 +779,7 @@ mod tests {
     fn test_cached_definition_info_function_target() {
         let db = real_fs_db();
         let workspace = examples_dir();
-        let config = PythonConfig::new(&db, Some(workspace.to_string_lossy().to_string()), None);
+        let config = PythonConfig::frozen(&db, Some(workspace.to_string_lossy().to_string()), None);
         let target = TargetString::new(&db, "my_module.create_model".to_string());
         let result = cached_definition_info(&db, config, target);
 
@@ -777,6 +792,8 @@ mod tests {
     fn test_cached_definition_info_invalidation_on_config_change() {
         let mut db = real_fs_db();
         let workspace = examples_dir();
+        // Mutable on purpose: production configs are frozen, but the queries
+        // must still recompute if a config ever changes.
         let config = PythonConfig::new(&db, Some(workspace.to_string_lossy().to_string()), None);
 
         let result1 = {
@@ -824,7 +841,7 @@ mod tests {
             .expect("set initial mtime");
 
         let mut db = real_fs_db();
-        let config = PythonConfig::new(&db, Some(workspace.to_string_lossy().to_string()), None);
+        let config = PythonConfig::frozen(&db, Some(workspace.to_string_lossy().to_string()), None);
         let result1 = {
             let target = TargetString::new(&db, "watched_module.WatchedClass".to_string());
             cached_definition_info(&db, config, target)
