@@ -456,14 +456,99 @@ struct StarImportFinder {
 
 impl<'a> Visitor<'a> for StarImportFinder {
     fn visit_stmt(&mut self, stmt: &'a Stmt) {
-        if let Stmt::ImportFrom(import_from) = stmt {
-            for alias in &import_from.names {
-                if alias.name.as_str() == "*" {
-                    self.star_imports
-                        .push((from_module(import_from), import_from.level));
+        match stmt {
+            Stmt::ImportFrom(import_from) => {
+                for alias in &import_from.names {
+                    if alias.name.as_str() == "*" {
+                        self.star_imports
+                            .push((from_module(import_from), import_from.level));
+                    }
                 }
             }
+            // Stubs pick the module to re-export by platform, as `os/path.pyi`
+            // does between `ntpath` and `posixpath`.
+            Stmt::If(if_stmt) => {
+                let clauses = std::iter::once((Some(&*if_stmt.test), &if_stmt.body)).chain(
+                    if_stmt
+                        .elif_else_clauses
+                        .iter()
+                        .map(|clause| (clause.test.as_ref(), &clause.body)),
+                );
+                for (test, body) in clauses {
+                    match test.map_or(Some(true), host_platform_condition) {
+                        Some(false) => continue,
+                        Some(true) => {
+                            self.visit_body(body);
+                            break;
+                        }
+                        // A condition this cannot decide leaves both its body
+                        // and the later clauses possible.
+                        None => self.visit_body(body),
+                    }
+                }
+            }
+            _ => {}
         }
+    }
+}
+
+/// `sys.platform` as Python reports it on the platform hydrust runs on, which
+/// is where Hydra imports the module too.
+fn host_sys_platform() -> &'static str {
+    match std::env::consts::OS {
+        "windows" => "win32",
+        "macos" => "darwin",
+        other => other,
+    }
+}
+
+/// Whether `test`, a `sys.platform == "..."`, `sys.platform != "..."` or
+/// `sys.platform.startswith("...")` check, holds on the host platform. `None`
+/// for any other condition.
+fn host_platform_condition(test: &Expr) -> Option<bool> {
+    fn is_sys_platform(expr: &Expr) -> bool {
+        matches!(
+            expr,
+            Expr::Attribute(attribute)
+                if attribute.attr.as_str() == "platform"
+                    && matches!(&*attribute.value, Expr::Name(name) if name.id.as_str() == "sys")
+        )
+    }
+    fn string(expr: &Expr) -> Option<&str> {
+        match expr {
+            Expr::StringLiteral(literal) => Some(literal.value.to_str()),
+            _ => None,
+        }
+    }
+
+    let platform = host_sys_platform();
+    match test {
+        Expr::Compare(compare)
+            if compare.ops.len() == 1
+                && compare.operands.len() == 2
+                && is_sys_platform(&compare.operands[0]) =>
+        {
+            let value = string(&compare.operands[1])?;
+            match compare.ops[0] {
+                ast::CmpOp::Eq => Some(platform == value),
+                ast::CmpOp::NotEq => Some(platform != value),
+                _ => None,
+            }
+        }
+        Expr::Call(call) => {
+            let Expr::Attribute(method) = &*call.func else {
+                return None;
+            };
+            if method.attr.as_str() != "startswith"
+                || !is_sys_platform(&method.value)
+                || call.arguments.len() != 1
+            {
+                return None;
+            }
+            let prefix = string(call.arguments.args.first()?)?;
+            Some(platform.starts_with(prefix))
+        }
+        _ => None,
     }
 }
 
@@ -942,6 +1027,58 @@ mod tests {
     /// the remaining resolution paths. Here the name is a genuine re-export
     /// that the star import serves, so the fallback has to fall through
     /// instead of returning `None`.
+    /// Write `pkg/__init__.py` as `init`, with `win.py` and `posix.py` each
+    /// defining `join`, and return which of the two `pkg.join` resolves to.
+    fn platform_reexport(init: &str) -> String {
+        let temp = TempDir::new().expect("tempdir");
+        let pkg = temp.path().join("pkg");
+        write_file(&pkg.join("__init__.py"), init);
+        write_file(&pkg.join("win.py"), "def join(a, b):\n    pass\n");
+        write_file(&pkg.join("posix.py"), "def join(a, b):\n    pass\n");
+
+        let db = test_db();
+        let def = extract_definition_info(&db, "pkg.join", &[temp.path().to_path_buf()])
+            .expect("pkg.join should resolve");
+        let path = disk_path(&db, def.file);
+        path.file_stem().unwrap().to_string_lossy().into_owned()
+    }
+
+    fn host_module() -> &'static str {
+        if cfg!(windows) { "win" } else { "posix" }
+    }
+
+    /// `os/path.pyi` picks `ntpath` or `posixpath` by `sys.platform`; the
+    /// branch Hydra would take on this machine is the one followed.
+    #[test]
+    fn test_star_import_follows_the_host_platform_branch() {
+        let init = "import sys\n\
+                    if sys.platform == \"win32\":\n    from .win import *\n\
+                    else:\n    from .posix import *\n";
+        assert_eq!(platform_reexport(init), host_module());
+    }
+
+    #[test]
+    fn test_star_import_platform_branch_negated_and_startswith() {
+        let negated = "import sys\n\
+                       if sys.platform != \"win32\":\n    from .posix import *\n\
+                       else:\n    from .win import *\n";
+        assert_eq!(platform_reexport(negated), host_module());
+
+        let startswith = "import sys\n\
+                          if sys.platform.startswith(\"win\"):\n    from .win import *\n\
+                          else:\n    from .posix import *\n";
+        assert_eq!(platform_reexport(startswith), host_module());
+    }
+
+    /// A condition other than a platform check could hold, so its body is
+    /// still searched.
+    #[test]
+    fn test_star_import_under_an_undecided_condition_is_followed() {
+        let init = "import sys\n\
+                    if sys.version_info >= (3, 10):\n    from .posix import *\n";
+        assert_eq!(platform_reexport(init), "posix");
+    }
+
     #[test]
     fn test_unfollowable_type_checking_import_falls_through_to_star_import() {
         let (_temp, root) = lazy_export_fixture(

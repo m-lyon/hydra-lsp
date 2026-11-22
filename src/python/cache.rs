@@ -1927,6 +1927,20 @@ mod tests {
         assert_eq!(docstring(&info), Some("From the stub."));
     }
 
+    /// `os.path` is `ntpath` or `posixpath` at run time, and its stub
+    /// re-exports the host platform's one.
+    #[test]
+    fn test_os_path_function_resolves_through_the_platform_module() {
+        let layout = Layout::new();
+        let (_, typing, _) = layout.definition("os.path.join");
+        let expected = if cfg!(windows) {
+            "stdlib/ntpath.pyi"
+        } else {
+            "stdlib/posixpath.pyi"
+        };
+        assert_eq!(typing, vendored(expected));
+    }
+
     /// A stub-only module has no source, so its definition keeps the stub.
     #[test]
     fn test_compiled_in_definition_has_no_source() {
