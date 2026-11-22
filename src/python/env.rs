@@ -6,8 +6,6 @@ use ty_python_semantic::{PythonEnvironment, PythonVersionWithSource, SysPrefixPa
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct DiscoveredEnvironment {
     pub(super) site_packages: Vec<SystemPathBuf>,
-    /// The latest version ty knows, with a `Default` source, when neither
-    /// `pyvenv.cfg` nor the site-packages layout names it.
     pub(super) python_version: PythonVersionWithSource,
 }
 

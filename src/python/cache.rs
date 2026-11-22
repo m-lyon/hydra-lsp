@@ -164,7 +164,7 @@ pub(super) fn discovered_environment(
 
 /// The module-resolution environment for a `PythonConfig`: the workspace as
 /// the first-party root, the discovered site-packages, and the interpreter's
-/// Python version (see [`DiscoveredEnvironment::python_version`]).
+/// Python version.
 ///
 /// Editable installs are not part of this value. `ty_module_resolver` reads
 /// the `.pth` files lazily through salsa, so creating, editing or deleting one
@@ -187,9 +187,9 @@ pub(crate) fn resolver_environment(
     )
 }
 
-/// The ty `Program` for a `PythonConfig`. It wraps [`resolver_environment`], so
-/// ty resolves modules over the same search paths and parses files under the
-/// same `PythonFile` keys as hydrust does.
+/// The `ty_python_core::Program` for a `PythonConfig`. It wraps
+/// [`resolver_environment`], so ty resolves modules over the same search paths and
+/// parses files under the same `PythonFile` keys as hydrust does.
 #[salsa::tracked(returns(copy))]
 pub(crate) fn program(db: &dyn ty_python_core::Db, config: PythonConfig) -> Program<'_> {
     Program::new(
@@ -199,7 +199,6 @@ pub(crate) fn program(db: &dyn ty_python_core::Db, config: PythonConfig) -> Prog
     )
 }
 
-/// The Python version of a `PythonConfig`, and where it came from.
 pub(crate) fn python_version_with_source(
     db: &dyn ruff_db::Db,
     config: PythonConfig,
