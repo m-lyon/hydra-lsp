@@ -262,11 +262,12 @@ ordered:
     );
 }
 
-/// The `OrderedDict` stub has no docstring, so hover takes the one in the
-/// interpreter's own source.
+/// Hover on a stdlib target with an interpreter shows the class docstring.
+/// The `OrderedDict` stub has the same docstring as the source, so this does
+/// not show which of the two hover took.
 #[tokio::test]
 #[ignore = "Requires Python in PATH"]
-async fn test_stdlib_hover_takes_the_source_docstring() {
+async fn test_stdlib_hover_shows_the_docstring() {
     let content = r#"# @hydra
 ordered:
   _target_: collections.OrderedDict
@@ -275,7 +276,7 @@ ordered:
     let hover = hover_for("stdlib_target_hover.yaml", content, 2).await;
     assert!(
         hover.contains("Dictionary that remembers insertion order"),
-        "hover should show the docstring from collections/__init__.py, got:\n{hover}"
+        "hover should show the OrderedDict docstring, got:\n{hover}"
     );
 }
 

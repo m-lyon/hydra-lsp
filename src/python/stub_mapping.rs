@@ -39,7 +39,22 @@ pub(crate) fn definition_with_source<'db>(
     let mut definition = extract_definition_info(db, target, environment)?;
     if let Some((source, docstring)) = implementation(db, &definition, environment) {
         if let Some(docstring) = docstring {
-            definition.definition_info.fill_missing_docstring(docstring);
+            match &mut definition.definition_info {
+                // The implementation's own docstring wins over one the stub
+                // class only inherits from a base.
+                DefinitionInfo::Class(class)
+                    if extract_class_info(
+                        db,
+                        definition.file,
+                        &class.name,
+                        environment.python_version(db),
+                    )
+                    .is_some_and(|own| own.docstring.is_none()) =>
+                {
+                    class.docstring = Some(docstring);
+                }
+                info => info.fill_missing_docstring(docstring),
+            }
         }
         definition.source = Some(source);
     }

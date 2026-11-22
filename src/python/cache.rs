@@ -1866,12 +1866,12 @@ mod tests {
     }
 
     #[test]
-    fn test_stdlib_definition_takes_docs_and_location_from_source() {
+    fn test_stdlib_definition_takes_location_from_source_and_keeps_stub_docstring() {
         let layout = Layout::new();
         let source = layout.stdlib.join("collections").join("__init__.py");
         write_file(
             &source,
-            "class OrderedDict(dict):\n    'Dictionary that remembers insertion order'\n",
+            "class OrderedDict(dict):\n    'From the source.'\n",
         );
 
         let (info, typing, source_path) = layout.definition("collections.OrderedDict");
@@ -1931,6 +1931,24 @@ mod tests {
         let (info, _, source_path) = layout.definition("typed.Path.home");
         assert_eq!(source_path, Some(on_disk(&source)));
         assert_eq!(docstring(&info), Some("Return the home directory."));
+    }
+
+    /// The source's own docstring wins over one the stub class only inherits.
+    #[test]
+    fn test_source_docstring_wins_over_inherited_stub_docstring() {
+        let layout = Layout::new();
+        write_file(
+            &layout.workspace.join("typed.py"),
+            "class Base:\n    pass\nclass Child(Base):\n    'From the source.'\n",
+        );
+        write_file(
+            &layout.workspace.join("typed.pyi"),
+            "class Base:\n    'Base doc'\nclass Child(Base): ...\n",
+        );
+
+        let (info, _, source) = layout.definition("typed.Child");
+        assert!(source.is_some());
+        assert_eq!(docstring(&info), Some("From the source."));
     }
 
     /// A stub's own docstring wins over the source's, as in ty's hover.
