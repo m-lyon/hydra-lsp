@@ -254,9 +254,7 @@ impl<'db> ImportResolver<'db> {
     /// check around it. The name is `None` when the chain ends on a module.
     ///
     /// A file is entered at most once per walk, even on a different branch
-    /// of the search. Files are told apart by their lexical path, as ty does,
-    /// so a file reached again through a symlink is only stopped by the depth
-    /// limit.
+    /// of the search.
     fn resolve(
         &self,
         walk: &mut ImportWalk,

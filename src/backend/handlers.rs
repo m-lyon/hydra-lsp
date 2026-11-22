@@ -39,7 +39,7 @@ const WATCHED_PY_GLOB: &str = "**/*.{py,pyi,pth}";
 impl HydraLspBackend {
     /// Run Python definition lookup on a blocking thread using a database snapshot,
     /// and return what `project` takes from the definition there, while the
-    /// database is still at hand.
+    /// database snapshot is still available.
     ///
     /// Takes a `SessionSnapshot` (cheap — salsa shares cached data via Arc) and
     /// moves it to `tokio::task::spawn_blocking` so that expensive Python
