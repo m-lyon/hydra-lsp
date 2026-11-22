@@ -309,14 +309,17 @@ pub mod tests {
     fn test_testdb_infers_types() {
         use ruff_db::system::DbWithWritableSystem;
 
+        // Discovery runs on the real filesystem, which needs an absolute root.
+        let workspace = crate::python::test_support::filesystem_root().join("workspace");
+        let main = workspace.join("main.py");
+
         let mut db = TestDb::new();
-        db.write_file("/workspace/main.py", "value = len(\"ab\")\n")
+        db.write_file(&main, "value = len(\"ab\")\n")
             .expect("write file");
-        let config =
-            PythonConfig::frozen(&db, "/workspace".into(), Some("/nonexistent/python".into()));
+        let config = PythonConfig::frozen(&db, workspace, Some("/nonexistent/python".into()));
         db.set_python_config(config);
 
-        let file = ruff_db::files::system_path_to_file(&db, "/workspace/main.py").unwrap();
+        let file = ruff_db::files::system_path_to_file(&db, &main).unwrap();
         assert_eq!(assigned_types(&db, file), ["Literal[2]"]);
     }
 
