@@ -1,14 +1,14 @@
 use anyhow::Result;
 use ruff_db::system::{OsSystem, SystemPath, SystemPathBuf};
-use ruff_python_ast::PythonVersion;
-use ty_python_semantic::{PythonEnvironment, SysPrefixPathOrigin};
+use ty_python_semantic::{PythonEnvironment, PythonVersionWithSource, SysPrefixPathOrigin};
 
 /// What discovery found out about the interpreter.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct DiscoveredEnvironment {
     pub(super) site_packages: Vec<SystemPathBuf>,
-    /// `None` when neither `pyvenv.cfg` nor the site-packages layout names it.
-    pub(super) python_version: Option<PythonVersion>,
+    /// The latest version ty knows, with a `Default` source, when neither
+    /// `pyvenv.cfg` nor the site-packages layout names it.
+    pub(super) python_version: PythonVersionWithSource,
 }
 
 /// Discover the Python environment, its site-packages paths and its version.
@@ -50,7 +50,7 @@ pub(super) fn discover_python_environment(
         .python_version_from_metadata()
         .cloned()
         .or_else(|| site_packages_paths.python_version_from_layout())
-        .map(|version| version.version);
+        .unwrap_or_default();
 
     Ok(DiscoveredEnvironment {
         site_packages: site_packages_paths.into_vec(),
@@ -66,8 +66,10 @@ mod tests {
         PythonConfig, resolve_module_by_name, resolver_environment, resolver_environment_from_parts,
     };
     use crate::python::extract::extract_class_info;
+    use ruff_python_ast::PythonVersion;
     use std::path::PathBuf;
     use ty_module_resolver::ResolverEnvironment;
+    use ty_python_semantic::PythonVersionSource;
 
     use crate::python::test_support::{
         canonicalize, extract_definition_info, get_simple_test_dir, system_path, test_db,
@@ -122,7 +124,7 @@ mod tests {
         let discovered = discover_python_environment(&cwd, Some(&system_path(&python)))
             .expect("discover the interpreter");
         assert!(
-            discovered.python_version.is_some(),
+            discovered.python_version.source != PythonVersionSource::Default,
             "a real interpreter's version should be discoverable, got {discovered:?}"
         );
     }
