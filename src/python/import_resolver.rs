@@ -9,7 +9,9 @@ use ruff_db::system::{SystemPath, SystemPathBuf};
 use ruff_python_ast::{self as ast, Expr, PythonVersion, Stmt, visitor::Visitor};
 use rustc_hash::FxHashSet;
 use std::path::{Component, Path};
-use ty_module_resolver::{ResolverEnvironment, system_module_search_paths};
+use ty_module_resolver::{
+    ModuleResolveMode, ResolverEnvironment, search_paths, system_module_search_paths,
+};
 
 const MAX_IMPORT_DEPTH: usize = 10;
 
@@ -137,12 +139,24 @@ impl<'db> ImportResolver<'db> {
         // valid left to resolve against.
         if !system_module_search_paths(self.db, self.environment)
             .any(|search_path| current_dir.starts_with(search_path))
+            && !self.in_real_stdlib(current_dir)
         {
             return None;
         }
 
         let candidate = join_module_parts(current_dir, module.unwrap_or_default())?;
         find_module_file(self.db, &candidate)
+    }
+
+    /// Whether `dir` is inside the interpreter's stdlib, where the runtime
+    /// source behind a stdlib stub lives. Only runtime mode searches it.
+    fn in_real_stdlib(&self, dir: &SystemPath) -> bool {
+        // The probe need not exist. ty takes only `.pyi` names as being on a
+        // stdlib search path, the real one included.
+        let probe = dir.join("__init__.pyi");
+        search_paths(self.db, self.environment, ModuleResolveMode::Runtime)
+            .filter(|search_path| search_path.is_standard_library())
+            .any(|stdlib| stdlib.module_name_for_system_path(&probe).is_some())
     }
 
     /// The file an import of `module` at `level` names, as seen from `from`:

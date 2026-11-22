@@ -2,7 +2,8 @@
 //!
 //! Hydra instantiates builtins only through the `builtins.` prefix, and the
 //! signatures come from the typeshed stubs vendored into the binary rather than
-//! from any file in the workspace. These tests exercise that path through the
+//! from any file in the workspace. Other stdlib targets use the same stubs, with
+//! docstrings and locations from the interpreter's own source. These tests exercise that path through the
 //! server, against the real stub — see `tests/README.md` for the harness.
 
 mod common;
@@ -245,23 +246,71 @@ thing:
     );
 }
 
-/// Wiring in typeshed makes the whole stdlib reachable; issue #34 deliberately
-/// ships only `builtins` (see `python::typeshed::is_builtins_module`). This
-/// pins the gate so widening it is a conscious change.
+/// A stdlib module the interpreter has resolves from its stub, so Hydra's
+/// valid stdlib targets get no `unresolved-import`, and hover takes the
+/// docstring from the interpreter's own source.
 #[tokio::test]
-async fn test_other_stdlib_modules_are_still_unresolved() {
+#[ignore = "Requires Python in PATH"]
+async fn test_stdlib_target_resolves_with_its_source_docstring() {
     let content = r#"# @hydra
-now:
-  _target_: datetime.datetime
+ordered:
+  _target_: collections.OrderedDict
 "#;
-    let diagnostics = diagnostics_for("stdlib_gate.yaml", content).await;
-
+    let diagnostics = diagnostics_for("stdlib_target.yaml", content).await;
     assert!(
-        diagnostics
-            .iter()
-            .any(|d| extract_code(d) == "unresolved-import"),
-        "only builtins is resolved from the vendored stubs, got: {:?}",
+        diagnostics.is_empty(),
+        "collections.OrderedDict should resolve, got: {:?}",
         summarize(&diagnostics)
+    );
+
+    let hover = hover_for("stdlib_target_hover.yaml", content, 2).await;
+    assert!(
+        hover.contains("Dictionary that remembers insertion order"),
+        "hover should show the docstring from collections/__init__.py, got:\n{hover}"
+    );
+}
+
+/// Go-to-definition on a stdlib target opens the interpreter's `.py`, not the
+/// vendored stub, which has no file on disk.
+#[tokio::test]
+#[ignore = "Requires Python in PATH"]
+async fn test_goto_definition_on_stdlib_target_opens_its_source() {
+    let mut ctx = TestContext::new(TestWorkspace::Simple);
+    ctx.initialize().await;
+    let content = r#"# @hydra
+dump:
+  _target_: json.dumps
+"#;
+    ctx.open_document("stdlib_goto.yaml", content.to_string())
+        .await;
+
+    let res = ctx
+        .request::<request::GotoDefinition>(GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                position: Position {
+                    line: 2,
+                    character: 13,
+                },
+                text_document: TextDocumentIdentifier {
+                    uri: ctx.doc_uri("stdlib_goto.yaml"),
+                },
+            },
+            work_done_progress_params: WorkDoneProgressParams {
+                work_done_token: None,
+            },
+            partial_result_params: PartialResultParams {
+                partial_result_token: None,
+            },
+        })
+        .await;
+
+    let Some(GotoDefinitionResponse::Scalar(location)) = res else {
+        panic!("expected one location, got {res:?}");
+    };
+    assert!(
+        location.uri.path().ends_with("json/__init__.py"),
+        "got {}",
+        location.uri
     );
 }
 

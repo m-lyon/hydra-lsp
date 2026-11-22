@@ -14,11 +14,14 @@
 //!
 //! The resolver puts the stdlib stubs after the first-party roots and before
 //! site-packages, as the typing spec orders them. `resolved_module_file` keeps
-//! a stub-backed module only when [`is_builtins_module`] is true for it, so the
-//! rest of the stdlib stays unresolved.
+//! a stub-backed module only when the interpreter could import it: it is
+//! compiled in, like `builtins`, or the interpreter's stdlib has its source.
+//! Hover and go-to-definition then take docstrings and locations from that
+//! source.
 //!
 //! Nothing on disk corresponds to a vendored file, so `goto_definition` returns
-//! no location for one rather than handing the editor a URI it cannot open.
+//! no location for a compiled-in module rather than handing the editor a URI
+//! it cannot open.
 
 /// The `builtins` module name. Hydra requires this prefix on a builtin target.
 pub(crate) const BUILTINS_MODULE: &str = "builtins";
@@ -36,17 +39,6 @@ pub(super) fn is_runtime_builtin_name(name: &str) -> bool {
         return true;
     }
     name.starts_with("__") && name.ends_with("__") && name.len() > 4
-}
-
-/// Whether `module_path` is `builtins` or one of its submodules.
-///
-/// The resolver makes the whole stdlib reachable, but only builtins is relevant
-/// for Hydra, so these are the only stdlib modules `resolved_module_file` keeps.
-pub(super) fn is_builtins_module(module_path: &str) -> bool {
-    module_path == BUILTINS_MODULE
-        || module_path
-            .strip_prefix(BUILTINS_MODULE)
-            .is_some_and(|rest| rest.starts_with('.'))
 }
 
 /// Whether `module_path` is a PyPI package that the vendored stdlib stubs. ty doesn't
@@ -74,14 +66,5 @@ mod tests {
         assert!(!is_runtime_builtin_name("_SupportsRound1"));
         assert!(!is_runtime_builtin_name("_Opener"));
         assert!(!is_runtime_builtin_name("__"), "not a dunder name");
-    }
-
-    #[test]
-    fn only_builtins_resolves_in_the_vendored_root() {
-        assert!(is_builtins_module("builtins"));
-        assert!(is_builtins_module("builtins.submodule"));
-        assert!(!is_builtins_module("datetime"));
-        assert!(!is_builtins_module("os.path"));
-        assert!(!is_builtins_module("builtinsish"));
     }
 }

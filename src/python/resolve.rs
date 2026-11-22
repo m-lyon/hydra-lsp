@@ -2,14 +2,18 @@
 //! class attribute chains and base classes across files.
 
 use super::cache::{
-    ClassKey, ResolvedDefinition, SymbolName, class_parent_attribute, inherited_class_members,
-    resolve_module_by_name,
+    ClassKey, ResolvedDefinition, SourceDefinition, SymbolName, class_parent_attribute,
+    inherited_class_members, resolve_module_by_name,
 };
 use super::extract::{extract_class_info, extract_function_signature, extract_method_info};
 use super::import_resolver::{ImportResolver, ResolvedSymbol};
 use super::model::{ClassInfo, DefinitionInfo, FunctionSignature, MethodInfo, ResolveError};
 use ruff_db::files::File;
-use ty_module_resolver::ResolverEnvironment;
+use ty_module_resolver::{ResolverEnvironment, ResolverFile, stub_file_to_real_module};
+
+/// How many stubs a source lookup may pass through before giving up. A lookup
+/// in a runtime module can follow an absolute import back into a stub.
+const MAX_SOURCE_HOPS: usize = 3;
 
 /// Result of resolving a class attribute chain
 enum ClassAttributeChainResult {
@@ -206,7 +210,93 @@ fn with_reexports<'db, T>(
 /// Extract definition info (function, class or method) from a target
 /// string, along with the file it was found in and the module name and
 /// symbol name the target resolved to.
+///
+/// When that file is a stub, also find the definition in the runtime module
+/// behind it, and take its docstrings.
 pub(super) fn extract_definition_info<'db>(
+    db: &'db dyn ty_module_resolver::Db,
+    target: &str,
+    environment: ResolverEnvironment<'db>,
+) -> Result<ResolvedDefinition, ResolveError> {
+    let mut definition = extract_typing_definition(db, target, environment)?;
+    definition.source = source_definition(db, &definition, environment);
+    if let Some(source) = &definition.source {
+        definition
+            .definition_info
+            .adopt_docstrings(&source.definition_info);
+    }
+    Ok(definition)
+}
+
+/// The runtime module behind the stub `file`: the `.py` beside a `.pyi`, the
+/// package a `<name>-stubs` package stubs, or the interpreter's stdlib module
+/// for a typeshed stub. `None` when `file` is not a stub or nothing on disk
+/// implements it, as for a compiled-in module such as `builtins`.
+pub(super) fn runtime_file(
+    db: &dyn ty_module_resolver::Db,
+    file: File,
+    environment: ResolverEnvironment<'_>,
+) -> Option<File> {
+    if !file.is_stub(db) {
+        return None;
+    }
+    let module = stub_file_to_real_module(db, ResolverFile::new(db, file, environment))?;
+    module.file(db).filter(|file| !file.is_stub(db))
+}
+
+/// The definition `definition` describes, found again in the runtime module
+/// behind its stub.
+fn source_definition(
+    db: &dyn ty_module_resolver::Db,
+    definition: &ResolvedDefinition,
+    environment: ResolverEnvironment<'_>,
+) -> Option<SourceDefinition> {
+    let mut info = definition.definition_info.clone();
+    let mut file = runtime_file(db, definition.file, environment)?;
+    for _ in 0..MAX_SOURCE_HOPS {
+        let (found, found_file) = definition_like(db, file, &info, environment)?;
+        if !found_file.is_stub(db) {
+            return Some(SourceDefinition {
+                definition_info: found,
+                file: found_file,
+            });
+        }
+        info = found;
+        file = runtime_file(db, found_file, environment)?;
+    }
+    None
+}
+
+/// The definition of the same kind and name as `like` in `file`, following
+/// re-exports.
+fn definition_like<'db>(
+    db: &'db dyn ty_module_resolver::Db,
+    file: File,
+    like: &DefinitionInfo,
+    environment: ResolverEnvironment<'db>,
+) -> Option<(DefinitionInfo, File)> {
+    match like {
+        DefinitionInfo::Function(sig) => {
+            extract_function_signature_with_imports(db, file, &sig.name, environment)
+                .map(|(sig, file)| (DefinitionInfo::Function(sig), file))
+        }
+        DefinitionInfo::Class(class) => {
+            extract_class_info_with_imports(db, file, &class.name, environment)
+                .map(|(class, file)| (DefinitionInfo::Class(class), file))
+        }
+        DefinitionInfo::Method(method) => extract_method_info_with_imports(
+            db,
+            file,
+            &method.class_name,
+            &method.method_name,
+            environment,
+        )
+        .map(|(method, file)| (DefinitionInfo::Method(method), file)),
+    }
+}
+
+/// [`extract_definition_info`] in the typing view alone, which prefers stubs.
+fn extract_typing_definition<'db>(
     db: &'db dyn ty_module_resolver::Db,
     target: &str,
     environment: ResolverEnvironment<'db>,
@@ -217,6 +307,7 @@ pub(super) fn extract_definition_info<'db>(
     let found = |definition_info, file, symbol_name| ResolvedDefinition {
         definition_info,
         file,
+        source: None,
         module_name: module_name.to_string(),
         symbol_name,
     };

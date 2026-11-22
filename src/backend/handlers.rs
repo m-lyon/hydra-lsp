@@ -258,7 +258,8 @@ impl HydraLspBackend {
         // Extract definition info on a blocking thread (cached + non-blocking)
         let extract_result = self
             .spawn_definition_lookup(target_info.target.value.clone(), |db, def| {
-                (def.definition_info.clone(), def.file.path(db).clone())
+                let (definition_info, file) = def.navigation_target();
+                (definition_info.clone(), file.path(db).clone())
             })
             .await;
         let (file_path, ranges) = match extract_result {

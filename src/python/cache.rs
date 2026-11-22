@@ -7,9 +7,7 @@ use super::extract::{extract_class_attribute, extract_class_info, module_defines
 use super::import_resolver::{ImportResolver, find_module_file};
 use super::model::{ClassAttributeInfo, DefinitionInfo, FunctionSignature, ResolveError};
 use super::resolve::{base_class_name, extract_definition_info, resolve_base_class};
-use super::typeshed::{
-    BUILTINS_MODULE, is_builtins_module, is_runtime_builtin_name, is_stubbed_pypi_package,
-};
+use super::typeshed::{BUILTINS_MODULE, is_runtime_builtin_name, is_stubbed_pypi_package};
 use ruff_db::files::{File, FileRootKind};
 use ruff_db::system::{SystemPath, SystemPathBuf};
 use ruff_python_ast::PythonVersion;
@@ -17,7 +15,8 @@ use salsa::Durability;
 use tracing::debug;
 use ty_module_resolver::{
     ModuleName, ResolverEnvironment, ResolverFile, SearchPath, SearchPathSettings,
-    UseDefaultStrategy, file_to_module, resolve_module_confident, system_module_search_paths,
+    UseDefaultStrategy, file_to_module, resolve_module_confident, resolve_real_module_confident,
+    system_module_search_paths,
 };
 use ty_python_core::Program;
 use ty_python_core::platform::PythonPlatform;
@@ -92,12 +91,36 @@ pub(super) struct SymbolName {
 const TYPE_ONLY_BASES: &[&str] = &["object", "ABC", "Protocol", "Generic"];
 
 /// Successfully resolved Python definition data.
+///
+/// `definition_info` and `file` come from the typing view, which prefers a
+/// stub, so signatures are the ones a type checker sees. When `file` is a stub,
+/// `source` is the same definition in the runtime module behind it, and its
+/// docstrings have already been copied into `definition_info`.
 #[derive(Clone)]
 pub struct ResolvedDefinition {
     pub definition_info: DefinitionInfo,
     pub file: File,
+    pub source: Option<SourceDefinition>,
     pub module_name: String,
     pub symbol_name: String,
+}
+
+impl ResolvedDefinition {
+    /// The definition to navigate to: the runtime source when there is one,
+    /// otherwise the typing definition itself.
+    pub fn navigation_target(&self) -> (&DefinitionInfo, File) {
+        match &self.source {
+            Some(source) => (&source.definition_info, source.file),
+            None => (&self.definition_info, self.file),
+        }
+    }
+}
+
+/// A definition found in the runtime implementation behind a stub.
+#[derive(Clone)]
+pub struct SourceDefinition {
+    pub definition_info: DefinitionInfo,
+    pub file: File,
 }
 
 /// Cached result of `extract_definition_info`.
@@ -145,7 +168,11 @@ pub(super) fn discovered_environment(
     let interpreter = config.interpreter(db);
     let discovered =
         discover_python_environment(workspace_root, interpreter.as_deref()).unwrap_or_default();
-    for path in &discovered.site_packages {
+    for path in discovered
+        .site_packages
+        .iter()
+        .chain(discovered.real_stdlib.as_ref())
+    {
         db.files()
             .try_add_root(db, path.as_path(), FileRootKind::SearchPath);
     }
@@ -153,8 +180,8 @@ pub(super) fn discovered_environment(
 }
 
 /// The module-resolution environment for a `PythonConfig`: the workspace as
-/// the first-party root, the discovered site-packages, and the interpreter's
-/// Python version.
+/// the first-party root, the discovered site-packages and real stdlib, and the
+/// interpreter's Python version.
 ///
 /// Editable installs are not part of this value. `ty_module_resolver` reads
 /// the `.pth` files lazily through salsa, so creating, editing or deleting one
@@ -173,6 +200,7 @@ pub(crate) fn resolver_environment(
         db,
         vec![workspace_root],
         discovered.site_packages.clone(),
+        discovered.real_stdlib.clone(),
         discovered.python_version.version,
     )
 }
@@ -198,15 +226,20 @@ pub(crate) fn python_version_with_source(
 
 /// Build a resolver environment from explicit roots. Directories that do not
 /// exist are skipped.
+///
+/// `real_stdlib` is the interpreter's stdlib directory. ty searches it only in
+/// runtime mode, in place of the typeshed stubs.
 pub(super) fn resolver_environment_from_parts(
     db: &dyn ty_module_resolver::Db,
     src_roots: Vec<SystemPathBuf>,
     site_packages: Vec<SystemPathBuf>,
+    real_stdlib: Option<SystemPathBuf>,
     python_version: PythonVersion,
 ) -> ResolverEnvironment<'_> {
     let settings = SearchPathSettings {
         src_roots,
         site_packages_paths: site_packages,
+        real_stdlib_path: real_stdlib,
         ..SearchPathSettings::empty()
     };
     let Ok(search_paths) =
@@ -228,7 +261,7 @@ pub(super) fn resolver_environment_for_roots<'db>(
         .map(|root| SystemPath::from_std_path(root).expect("search root is UTF-8"))
         .map(|root| SystemPath::absolute(root, cwd))
         .collect();
-    resolver_environment_from_parts(db, src_roots, Vec::new(), PythonVersion::latest_ty())
+    resolver_environment_from_parts(db, src_roots, Vec::new(), None, PythonVersion::latest_ty())
 }
 
 /// [`resolved_module_file`] for a module name given as a string.
@@ -253,16 +286,38 @@ pub(super) fn resolved_module_file<'db>(
     if module
         .search_path(db)
         .is_some_and(SearchPath::is_standard_library)
-        && !is_builtins_module(module_path_str)
     {
         if is_stubbed_pypi_package(module_path_str) {
             return system_module_search_paths(db, environment)
                 .find_map(|root| find_module_file(db, &root.join(module_path_str)));
         }
-        return None;
+        if !stdlib_module_is_importable(db, &module_name, environment) {
+            return None;
+        }
     }
 
     module.file(db)
+}
+
+/// Whether Hydra could import the stdlib module `name`: it is compiled into
+/// the interpreter, like `builtins`, or the interpreter's stdlib has its
+/// source. A stub alone does not show that this interpreter has the module:
+/// typeshed covers every platform, and modules can be left out of a build.
+///
+/// When discovery found no stdlib directory, only compiled-in modules pass.
+fn stdlib_module_is_importable(
+    db: &dyn ty_module_resolver::Db,
+    name: &ModuleName,
+    environment: ResolverEnvironment<'_>,
+) -> bool {
+    let minor = environment.python_version(db).minor;
+    ruff_python_stdlib::sys::is_builtin_module(minor, name)
+        || resolve_real_module_confident(db, environment, name).is_some_and(|module| {
+            module.file(db).is_some()
+                && module
+                    .search_path(db)
+                    .is_some_and(SearchPath::is_standard_library)
+        })
 }
 
 /// Whether the runtime module `module` exposes `symbol`, according to its
@@ -328,7 +383,11 @@ pub fn resolved_definition<'db>(
     let environment = resolver_environment(db, config);
     let mut result = extract_definition_info(db, target_str, environment);
 
+    // A stub declares names its module does not have at run time, such as the
+    // typevars its annotations use. With no runtime source that defines the
+    // name, a private one is taken to be one of those.
     if let Ok(def) = &result
+        && def.source.is_none()
         && let Some(module) = vendored_module_name(db, def.file, environment)
         && let Some(root_symbol) = target_str
             .strip_prefix(&module)
@@ -652,7 +711,12 @@ mod tests {
 
     /// The path of the vendored `builtins` stub.
     fn builtins_stub() -> FilePath {
-        VendoredPathBuf::from("stdlib/builtins.pyi").into()
+        vendored("stdlib/builtins.pyi")
+    }
+
+    /// The path of the vendored typeshed file at `path`.
+    fn vendored(path: &str) -> FilePath {
+        VendoredPathBuf::from(path).into()
     }
 
     /// The path of the file at `path` on disk.
@@ -683,6 +747,7 @@ mod tests {
             db,
             Vec::new(),
             vec![SystemPathBuf::from_path_buf(site_packages.to_path_buf()).unwrap()],
+            None,
             PythonVersion::latest_ty(),
         );
         ty_module_resolver::editable_search_paths(db, environment)
@@ -1078,6 +1143,7 @@ mod tests {
             &db,
             vec![workspace_sys],
             vec![site_packages_sys],
+            None,
             PythonVersion::latest_ty(),
         );
         let missing = ModuleName::new("hydra_lsp_no_such_module").unwrap();
@@ -1635,11 +1701,13 @@ mod tests {
     // answer it, in the shape production builds: a workspace, a site-packages
     // directory and the editable installs its `.pth` files list.
 
-    /// A workspace and a site-packages directory on disk, each starting empty.
+    /// A workspace, a site-packages directory and an interpreter's stdlib
+    /// directory on disk, each starting empty.
     struct Layout {
         _tmp: tempfile::TempDir,
         workspace: PathBuf,
         site_packages: PathBuf,
+        stdlib: PathBuf,
     }
 
     impl Layout {
@@ -1648,24 +1716,61 @@ mod tests {
             let root = canonicalize(tmp.path());
             let workspace = root.join("workspace");
             let site_packages = root.join("venv").join("site-packages");
+            let stdlib = root.join("python").join("lib");
             std::fs::create_dir_all(&workspace).expect("create workspace");
             std::fs::create_dir_all(&site_packages).expect("create site-packages");
+            std::fs::create_dir_all(&stdlib).expect("create stdlib");
             Self {
                 _tmp: tmp,
                 workspace,
                 site_packages,
+                stdlib,
             }
         }
 
-        fn resolve(&self, module: &str) -> Option<FilePath> {
-            let db = HydraDatabase::new(SystemPath::from_std_path(&self.workspace).unwrap());
-            let environment = resolver_environment_from_parts(
-                &db,
-                vec![SystemPathBuf::from_path_buf(self.workspace.clone()).unwrap()],
-                vec![SystemPathBuf::from_path_buf(self.site_packages.clone()).unwrap()],
+        fn db(&self) -> HydraDatabase {
+            HydraDatabase::new(SystemPath::from_std_path(&self.workspace).unwrap())
+        }
+
+        fn environment<'db>(&self, db: &'db HydraDatabase) -> ResolverEnvironment<'db> {
+            resolver_environment_from_parts(
+                db,
+                vec![system_path(&self.workspace)],
+                vec![system_path(&self.site_packages)],
+                Some(system_path(&self.stdlib)),
                 PythonVersion::latest_ty(),
-            );
-            resolve_module_by_name(&db, module, environment).map(|file| file.path(&db).clone())
+            )
+        }
+
+        fn resolve(&self, module: &str) -> Option<FilePath> {
+            let db = self.db();
+            resolve_module_by_name(&db, module, self.environment(&db))
+                .map(|file| file.path(&db).clone())
+        }
+
+        /// The definition `target` resolves to, with the path of its typing
+        /// file and of its runtime source, if any.
+        fn definition(&self, target: &str) -> (DefinitionInfo, FilePath, Option<FilePath>) {
+            let db = self.db();
+            let def = extract_definition_info(&db, target, self.environment(&db))
+                .unwrap_or_else(|err| panic!("{target} should resolve: {err}"));
+            let source = def.source.as_ref().map(|source| {
+                assert_eq!(
+                    def.navigation_target().1,
+                    source.file,
+                    "navigation goes to the source"
+                );
+                source.file.path(&db).clone()
+            });
+            (def.definition_info, def.file.path(&db).clone(), source)
+        }
+    }
+
+    fn docstring(info: &DefinitionInfo) -> Option<&str> {
+        match info {
+            DefinitionInfo::Function(sig) => sig.docstring.as_deref(),
+            DefinitionInfo::Class(class) => class.docstring.as_deref(),
+            DefinitionInfo::Method(method) => method.signature.docstring.as_deref(),
         }
     }
 
@@ -1695,13 +1800,17 @@ mod tests {
     }
 
     /// The stdlib is ahead of site-packages on `sys.path`, so Python imports
-    /// the stdlib `enum`, which stays unresolved like any other stdlib target.
+    /// the stdlib `enum`, not the copy in site-packages. With no `enum.py` in
+    /// the interpreter's stdlib it stays unresolved.
     #[test]
     fn test_site_packages_module_named_like_the_stdlib() {
         let layout = Layout::new();
         write_file(&layout.site_packages.join("enum.py"), "");
 
         assert_eq!(layout.resolve("enum"), None);
+
+        write_file(&layout.stdlib.join("enum.py"), "");
+        assert_eq!(layout.resolve("enum"), Some(vendored("stdlib/enum.pyi")));
     }
 
     /// ty always answers `typing_extensions` from its stdlib stubs, but Hydra
@@ -1731,11 +1840,114 @@ mod tests {
         assert_eq!(layout.resolve("builtins"), Some(builtins_stub()));
     }
 
+    /// Typeshed stubs modules this interpreter may not have, so a stub alone
+    /// does not resolve a stdlib module.
     #[test]
-    fn test_stdlib_targets_stay_unresolved() {
+    fn test_stdlib_module_without_source_is_unresolved() {
         let layout = Layout::new();
         assert_eq!(layout.resolve("collections"), None);
         assert_eq!(layout.resolve("os.path"), None);
+    }
+
+    /// A stdlib module the interpreter has resolves to its stub, which
+    /// signatures come from.
+    #[test]
+    fn test_stdlib_module_with_source_resolves_to_its_stub() {
+        let layout = Layout::new();
+        write_file(&layout.stdlib.join("collections").join("__init__.py"), "");
+
+        assert_eq!(
+            layout.resolve("collections"),
+            Some(vendored("stdlib/collections/__init__.pyi"))
+        );
+    }
+
+    /// A module compiled into the interpreter has no source to find, but every
+    /// interpreter of that version can import it.
+    #[test]
+    fn test_compiled_in_stdlib_module_resolves_without_source() {
+        let layout = Layout::new();
+        assert_eq!(
+            layout.resolve("itertools"),
+            Some(vendored("stdlib/itertools.pyi"))
+        );
+    }
+
+    #[test]
+    fn test_stdlib_definition_takes_docs_and_location_from_source() {
+        let layout = Layout::new();
+        let source = layout.stdlib.join("collections").join("__init__.py");
+        write_file(
+            &source,
+            "class OrderedDict(dict):\n    'Dictionary that remembers insertion order'\n",
+        );
+
+        let (info, typing, source_path) = layout.definition("collections.OrderedDict");
+        assert_eq!(typing, vendored("stdlib/collections/__init__.pyi"));
+        assert_eq!(source_path, Some(on_disk(&source)));
+        assert_eq!(
+            docstring(&info),
+            Some("Dictionary that remembers insertion order")
+        );
+    }
+
+    /// The stub hides private names, but with a source to confirm it a private
+    /// stdlib name is one Hydra can import.
+    #[test]
+    fn test_private_stdlib_name_with_source_resolves() {
+        let layout = Layout::new();
+        write_file(
+            &layout.stdlib.join("collections").join("__init__.py"),
+            "class _OrderedDictKeysView:\n    pass\n",
+        );
+
+        let (_, _, source) = layout.definition("collections._OrderedDictKeysView");
+        assert!(source.is_some());
+    }
+
+    /// The runtime module can re-export the definition from elsewhere, as
+    /// `pathlib` does from `pathlib._local` from Python 3.13.
+    #[test]
+    fn test_stdlib_source_follows_reexports() {
+        let layout = Layout::new();
+        let pathlib = layout.stdlib.join("pathlib");
+        write_file(&pathlib.join("__init__.py"), "from ._local import Path\n");
+        write_file(
+            &pathlib.join("_local.py"),
+            "class Path:\n    'PurePath subclass that can make system calls.'\n",
+        );
+
+        let (info, _, source) = layout.definition("pathlib.Path");
+        assert_eq!(source, Some(on_disk(&pathlib.join("_local.py"))));
+        assert_eq!(
+            docstring(&info),
+            Some("PurePath subclass that can make system calls.")
+        );
+    }
+
+    #[test]
+    fn test_stub_method_takes_docs_from_source() {
+        let layout = Layout::new();
+        write_file(
+            &layout.stdlib.join("pathlib").join("__init__.py"),
+            "class Path:\n    @classmethod\n    def home(cls):\n        'Return a new path pointing to the home directory.'\n",
+        );
+
+        let (info, _, source) = layout.definition("pathlib.Path.home");
+        assert!(source.is_some());
+        assert_eq!(
+            docstring(&info),
+            Some("Return a new path pointing to the home directory.")
+        );
+    }
+
+    /// A stub-only module has no source, so its definition keeps the stub.
+    #[test]
+    fn test_compiled_in_definition_has_no_source() {
+        let layout = Layout::new();
+        let (_, typing, source) = layout.definition("builtins.len");
+        assert_eq!(typing, builtins_stub());
+        assert_eq!(source, None);
     }
 
     #[test]
@@ -1824,6 +2036,59 @@ mod tests {
             layout.resolve("thing"),
             Some(on_disk(&layout.workspace.join("thing").join("__init__.py")))
         );
+    }
+
+    /// Types come from a `<name>-stubs` package, docstrings and navigation from
+    /// the package it stubs.
+    #[test]
+    fn test_stub_package_definition_takes_docs_from_the_package() {
+        let layout = Layout::new();
+        let package = layout.site_packages.join("acme").join("__init__.py");
+        write_file(&package, "def run(x):\n    'Run it.'\n");
+        let stub = layout.site_packages.join("acme-stubs").join("__init__.pyi");
+        write_file(&stub, "def run(x: int) -> None: ...\n");
+
+        let (info, typing, source) = layout.definition("acme.run");
+        assert_eq!(typing, on_disk(&stub));
+        assert_eq!(source, Some(on_disk(&package)));
+        let DefinitionInfo::Function(sig) = info else {
+            panic!("run is a function");
+        };
+        assert_eq!(sig.docstring.as_deref(), Some("Run it."));
+        assert_eq!(
+            sig.parameters[0].type_annotation.as_deref(),
+            Some("int"),
+            "the signature comes from the stub"
+        );
+    }
+
+    #[test]
+    fn test_stub_next_to_source_takes_docs_from_source() {
+        let layout = Layout::new();
+        let source = layout.workspace.join("typed.py");
+        write_file(&source, "def f(x):\n    'Documented.'\n");
+        write_file(
+            &layout.workspace.join("typed.pyi"),
+            "def f(x: int) -> int: ...\n",
+        );
+
+        let (info, _, source_path) = layout.definition("typed.f");
+        assert_eq!(source_path, Some(on_disk(&source)));
+        assert_eq!(docstring(&info), Some("Documented."));
+    }
+
+    /// A stub whose source keeps its own docstring keeps that one.
+    #[test]
+    fn test_stub_docstring_is_kept_without_one_in_source() {
+        let layout = Layout::new();
+        write_file(&layout.workspace.join("typed.py"), "def f(x):\n    pass\n");
+        write_file(
+            &layout.workspace.join("typed.pyi"),
+            "def f(x: int) -> int:\n    'From the stub.'\n",
+        );
+
+        let (info, _, _) = layout.definition("typed.f");
+        assert_eq!(docstring(&info), Some("From the stub."));
     }
 
     #[test]

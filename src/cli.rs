@@ -14,7 +14,7 @@ use anyhow::Context;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use colored::Colorize;
 use ignore::WalkBuilder;
-use ruff_db::files::FilePath;
+use ruff_db::files::{File, FilePath};
 use ruff_db::system::SystemPathBuf;
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
 use tracing::{Level, debug, error, info, warn};
@@ -655,12 +655,19 @@ fn trace_target_resolution(
         Ok(def) => {
             eprintln!("  {} {}", "Module:".dimmed(), def.module_name);
             eprintln!("  {} {}", "Symbol:".dimmed(), def.symbol_name);
-            let file_path = match def.file.path(db) {
+            let display_path = |file: File| match file.path(db) {
                 // A vendored typeshed stub has no path on disk.
                 FilePath::Vendored(path) => format!("<typeshed>/{}", path.as_str()),
                 path => path.to_string(),
             };
-            eprintln!("  {} {}", "Definition found:".green(), file_path);
+            eprintln!(
+                "  {} {}",
+                "Definition found:".green(),
+                display_path(def.file)
+            );
+            if let Some(source) = &def.source {
+                eprintln!("  {} {}", "Source:".dimmed(), display_path(source.file));
+            }
 
             let def_info = &def.definition_info;
             let implicit_param = def_info.implicit_param();

@@ -7,9 +7,11 @@
 - Python environment discovery now falls back to a `python3` or `python` on `PATH`, recognises Pixi environments, ignores an empty `VIRTUAL_ENV`, and skips a broken `.venv` instead of failing.
 - Module resolution now uses ty's resolver. Resolution now follows Python's import order more closely, so some `_target_` values resolve differently:
   - A `builtins.py` in the workspace no longer shadows the builtins stub.
-  - A site-packages module named like a stdlib module, such as `enum`, is now unresolved, because Python imports the stdlib one.
+  - A site-packages module named like a stdlib module, such as `enum`, no longer resolves, because Python imports the stdlib one.
   - A regular package in a later search root now hides a namespace package portion of the same name in an earlier root, so `pkg.sub` in the workspace is unresolved when site-packages has a `pkg/__init__.py`.
   - A PEP 561 `<name>-stubs` package is now preferred over `<name>`.
+- Stdlib targets such as `collections.OrderedDict` and `pathlib.Path` now resolve when the interpreter has the module, instead of reporting `unresolved-import`. Signatures come from typeshed. Hover docstrings and go-to-definition come from the interpreter's `.py` source. Modules compiled into the interpreter, such as `itertools`, resolve from the stub alone. With no interpreter found, other stdlib targets stay unresolved.
+- For a target typed by a stub (a `.pyi` beside its `.py`, or a `<name>-stubs` package), hover shows the implementation's docstring and go-to-definition opens the implementation.
 - Python files are now parsed for the interpreter's Python version, read from `pyvenv.cfg` or the site-packages layout.
 - Recognise `@builtins.staticmethod` and `@builtins.classmethod` when resolving Python method targets.
 - Fixed a class attribute chain target (`pkg.Outer.mid.inner`) that failed to resolve when a later step passed through a file an earlier step had already imported through.

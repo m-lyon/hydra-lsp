@@ -204,6 +204,41 @@ impl std::fmt::Display for ResolveError {
 impl std::error::Error for ResolveError {}
 
 impl DefinitionInfo {
+    /// Take the docstrings `source` has, keeping this definition's own where
+    /// `source` has none. A stub's definition takes them from its runtime
+    /// source, since stubs often leave docstrings out.
+    pub(crate) fn adopt_docstrings(&mut self, source: &DefinitionInfo) {
+        fn adopt(own: &mut Option<String>, source: Option<&String>) {
+            if let Some(docstring) = source {
+                *own = Some(docstring.clone());
+            }
+        }
+        fn adopt_signature(own: &mut FunctionSignature, source: &FunctionSignature) {
+            let source_docstring = source
+                .docstring
+                .as_ref()
+                .or_else(|| source.overloads.iter().find_map(|o| o.docstring.as_ref()));
+            adopt(&mut own.docstring, source_docstring);
+        }
+
+        match (self, source) {
+            (DefinitionInfo::Function(own), DefinitionInfo::Function(source)) => {
+                adopt_signature(own, source);
+            }
+            (DefinitionInfo::Class(own), DefinitionInfo::Class(source)) => {
+                adopt(&mut own.docstring, source.docstring.as_ref());
+                if let (Some(own), Some(source)) = (&mut own.init_signature, &source.init_signature)
+                {
+                    adopt_signature(own, source);
+                }
+            }
+            (DefinitionInfo::Method(own), DefinitionInfo::Method(source)) => {
+                adopt_signature(&mut own.signature, &source.signature);
+            }
+            _ => {}
+        }
+    }
+
     /// Where the definition sits in its file.
     pub fn range(&self) -> SourceRange {
         match self {
