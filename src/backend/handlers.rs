@@ -23,6 +23,7 @@ use crate::diagnostics;
 use crate::python::cache::{self as python_cache, ResolvedDefinition, TargetString};
 use crate::python::format::{format_class, format_function, format_method};
 use crate::python::model::{DefinitionInfo, FunctionSignature, ResolveError};
+use crate::python::typeshed::cached_vendored_path;
 use crate::yaml_cache::{self, DocumentInput};
 use crate::yaml_parser::{
     ARGS_KEY, CONVERT_KEY, CompletionContext, ConvertMode, HydraSemanticToken, PARTIAL_KEY,
@@ -255,33 +256,41 @@ impl HydraLspBackend {
             return Ok(None);
         };
 
-        // Extract definition info on a blocking thread (cached + non-blocking)
+        // Extract definition info on a blocking thread (cached + non-blocking).
+        // The implementation behind a stub is where the editor should land;
+        // without one, the stub itself, which for a vendored stub means a copy
+        // written to disk.
+        let narrow_against = target_info.clone();
         let extract_result = self
-            .spawn_definition_lookup(target_info.target.value.clone(), |db, def| {
-                let (definition_info, file) = def.navigation_target();
-                (definition_info.clone(), file.path(db).clone())
+            .spawn_definition_lookup(target_info.target.value.clone(), move |db, def| {
+                if let Some(source) = &def.source {
+                    let path = source
+                        .file
+                        .path(db)
+                        .as_system_path()
+                        .map(|p| p.to_path_buf());
+                    return (path, source.ranges.clone());
+                }
+                let mut definition_info = def.definition_info.clone();
+                diagnostics::narrow_overloads(&mut definition_info, &narrow_against);
+                let path = match def.file.path(db) {
+                    FilePath::System(path) => Some(path.to_path_buf()),
+                    FilePath::Vendored(path) => cached_vendored_path(db, path),
+                    FilePath::SystemVirtual(_) => None,
+                };
+                (path, definition_ranges(&definition_info))
             })
             .await;
         let (file_path, ranges) = match extract_result {
-            Ok((mut definition_info, file_path)) => {
-                diagnostics::narrow_overloads(&mut definition_info, &target_info);
-                (file_path, definition_ranges(&definition_info))
+            Ok((Some(file_path), ranges)) => (file_path, ranges),
+            Ok((None, _)) => {
+                tracing::debug!("goto_definition: the definition has no file to open");
+                return Ok(None);
             }
             Err(e) => {
                 self.log_lookup_failure(&e, None);
                 return Ok(None);
             }
-        };
-
-        // A definition inside the vendored typeshed archive has no file on disk
-        // to jump to. Hover and diagnostics still work; go-to-definition is a
-        // silent no-op rather than an error the user cannot act on.
-        let FilePath::System(file_path) = file_path else {
-            tracing::debug!(
-                path = %file_path,
-                "goto_definition: target is a vendored stub; nothing to open"
-            );
-            return Ok(None);
         };
 
         // Convert file path to URI

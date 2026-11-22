@@ -406,7 +406,7 @@ fn check_method_decorators(decorators: &[ast::Decorator]) -> (bool, bool) {
 }
 
 /// Convert a TextRange to line/column positions.
-fn source_range(range: TextRange, source: &str) -> SourceRange {
+pub(super) fn source_range(range: TextRange, source: &str) -> SourceRange {
     let line_index = LineIndex::from_source_text(source);
 
     // The server advertises no `positionEncoding`, so the LSP default of

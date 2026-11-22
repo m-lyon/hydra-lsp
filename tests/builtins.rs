@@ -246,12 +246,10 @@ thing:
     );
 }
 
-/// A stdlib module the interpreter has resolves from its stub, so Hydra's
-/// valid stdlib targets get no `unresolved-import`, and hover takes the
-/// docstring from the interpreter's own source.
+/// Stdlib modules resolve from their stubs, so a valid stdlib target gets
+/// no `unresolved-import`, with or without an interpreter.
 #[tokio::test]
-#[ignore = "Requires Python in PATH"]
-async fn test_stdlib_target_resolves_with_its_source_docstring() {
+async fn test_stdlib_target_resolves() {
     let content = r#"# @hydra
 ordered:
   _target_: collections.OrderedDict
@@ -262,6 +260,17 @@ ordered:
         "collections.OrderedDict should resolve, got: {:?}",
         summarize(&diagnostics)
     );
+}
+
+/// The `OrderedDict` stub has no docstring, so hover takes the one in the
+/// interpreter's own source.
+#[tokio::test]
+#[ignore = "Requires Python in PATH"]
+async fn test_stdlib_hover_takes_the_source_docstring() {
+    let content = r#"# @hydra
+ordered:
+  _target_: collections.OrderedDict
+"#;
 
     let hover = hover_for("stdlib_target_hover.yaml", content, 2).await;
     assert!(
@@ -495,10 +504,11 @@ handle:
     assert_eq!(sig_help.active_signature, Some(0));
 }
 
-/// A vendored stub has no file on disk, so there is nowhere to jump to.
-/// Go-to-definition returns nothing rather than a URI the editor cannot open.
+/// `builtins` has no source, and its vendored stub has no file on disk, so
+/// go-to-definition opens a copy of the stub written to the cache directory,
+/// as ty does.
 #[tokio::test]
-async fn test_goto_definition_into_a_vendored_stub_is_a_no_op() {
+async fn test_goto_definition_into_a_vendored_stub_opens_a_cached_copy() {
     let mut ctx = TestContext::new(TestWorkspace::Simple);
     ctx.initialize().await;
 
@@ -530,10 +540,21 @@ length:
         })
         .await;
 
+    let Some(GotoDefinitionResponse::Scalar(location)) = res else {
+        panic!("expected one location, got {res:?}");
+    };
+    let path = location.uri.to_file_path().expect("a file URI");
     assert!(
-        res.is_none(),
-        "expected no location for a vendored stub, got {res:?}"
+        path.ends_with("stdlib/builtins.pyi"),
+        "got {}",
+        path.display()
     );
+    let stub = std::fs::read_to_string(&path).expect("the cached stub exists");
+    let line = stub
+        .lines()
+        .nth(location.range.start.line as usize)
+        .expect("the range is inside the stub");
+    assert!(line.contains("def len("), "got: {line}");
 }
 
 #[tokio::test]

@@ -13,15 +13,38 @@
 //! the archive for those files instead of the OS.
 //!
 //! The resolver puts the stdlib stubs after the first-party roots and before
-//! site-packages, as the typing spec orders them. `resolved_module_file` keeps
-//! a stub-backed module only when the interpreter could import it: it is
-//! compiled in, like `builtins`, or the interpreter's stdlib has its source.
-//! Hover and go-to-definition then take docstrings and locations from that
-//! source.
+//! site-packages, as the typing spec orders them, and `resolved_module_file`
+//! keeps every stdlib module it finds there. Signatures come from the stub.
+//! Docstrings the stub lacks and go-to-definition come from the interpreter's
+//! own source where it has one (see `stub_mapping`).
 //!
-//! Nothing on disk corresponds to a vendored file, so `goto_definition` returns
-//! no location for a compiled-in module rather than handing the editor a URI
-//! it cannot open.
+//! A compiled-in module such as `builtins` has no source, so go-to-definition
+//! opens a copy of its stub written to the cache directory
+//! ([`cached_vendored_path`]).
+
+use ruff_db::system::SystemPathBuf;
+use ruff_db::vendored::VendoredPath;
+
+/// Where a vendored stub is copied on disk, so an editor can open it: the
+/// same place as ty's own copy, `<cache>/ty/vendored/typeshed/<commit>/`, which
+/// the typeshed commit keeps apart from any other version's. Copied from
+/// `ty_ide::cached_vendored_path`, which hydrust does not depend on. `None`
+/// when the system has no cache directory or the copy fails.
+pub(crate) fn cached_vendored_path(
+    db: &dyn ruff_db::Db,
+    path: &VendoredPath,
+) -> Option<SystemPathBuf> {
+    let writable = db.system().as_writable()?;
+    let relative_path = SystemPathBuf::from(format!(
+        "vendored/typeshed/{}/{}",
+        ty_vendored::SOURCE_COMMIT,
+        path.as_str()
+    ));
+    writable
+        .get_or_cache(&relative_path, &|| db.vendored().read_to_string(path))
+        .ok()
+        .flatten()
+}
 
 /// The `builtins` module name. Hydra requires this prefix on a builtin target.
 pub(crate) const BUILTINS_MODULE: &str = "builtins";
