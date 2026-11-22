@@ -9,7 +9,9 @@ use ruff_db::system::{SystemPath, SystemPathBuf};
 use ruff_python_ast::{self as ast, Expr, PythonVersion, Stmt, visitor::Visitor};
 use rustc_hash::FxHashSet;
 use std::path::{Component, Path};
-use ty_module_resolver::{ResolverEnvironment, system_module_search_paths};
+use ty_module_resolver::{
+    ImportingFile, ModuleName, ResolverEnvironment, system_module_search_paths,
+};
 
 const MAX_IMPORT_DEPTH: usize = 10;
 
@@ -127,8 +129,18 @@ impl<'db> ImportResolver<'db> {
         module: Option<&str>,
         level: u32,
     ) -> Option<File> {
-        // A vendored stub has no directory on disk to resolve against.
-        let current_path = current_file.path(self.db).as_system_path()?;
+        // A vendored stub has no directory on disk, so resolve its import by
+        // the absolute module name it stands for.
+        let Some(current_path) = current_file.path(self.db).as_system_path() else {
+            let name = ModuleName::from_identifier_parts(
+                self.db,
+                ImportingFile::File(current_file, self.environment),
+                module,
+                level,
+            )
+            .ok()?;
+            return self.resolve_module_file(&name);
+        };
         let current_dir = Self::relative_import_dir(current_path, level)?;
 
         // Resolve against the importing file's own directory, but only when
@@ -1581,5 +1593,22 @@ mod tests {
             resolve_relative(&resolver, Path::new("/root/pkg/__init__.py"), "/outside", 1),
             None,
         );
+    }
+
+    #[test]
+    fn test_relative_imports_inside_vendored_stubs_resolve() {
+        let db = test_db();
+        let resolver = resolver_for(&db, &[]);
+        for (module, symbol, expected) in [
+            ("json", "JSONDecoder", "stdlib/json/decoder.pyi"),
+            ("asyncio", "Queue", "stdlib/asyncio/queues.pyi"),
+        ] {
+            let init = resolver.resolve_module_file(module).expect("vendored stub");
+            let resolved = resolver
+                .resolve_symbol(init, symbol)
+                .unwrap_or_else(|| panic!("{module}.{symbol} should resolve"));
+            assert_eq!(resolved.file.path(&db).as_str(), expected);
+            assert_eq!(resolved.name, symbol);
+        }
     }
 }
