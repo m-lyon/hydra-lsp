@@ -982,17 +982,14 @@ impl YamlParser {
             }
         }
 
-        for (key, keyword) in [
-            (PARTIAL_KEY, hydra_obj.partial.as_ref().map(|hp| hp.line)),
-            (
-                RECURSIVE_KEY,
-                hydra_obj.recursive.as_ref().map(|hp| hp.line),
-            ),
-            (CONVERT_KEY, hydra_obj.convert.as_ref().map(|hp| hp.line)),
-        ] {
-            if let Some(line) = keyword {
+        for (key, hp) in hydra_obj.keywords() {
+            // `_args_` is mapped separately below.
+            if key == ARGS_KEY {
+                continue;
+            }
+            if let Some(hp) = hp {
                 param_line_map.insert(
-                    line,
+                    hp.line,
                     (target_idx, ParameterContext::Keyword(key.to_string())),
                 );
             }
