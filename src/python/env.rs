@@ -52,8 +52,8 @@ pub(super) fn discover_python_environment(
         .cloned()
         .or_else(|| site_packages_paths.python_version_from_layout())
         .unwrap_or_default();
-    // Like ty, a missing stdlib is not fatal: only hover and go-to-definition
-    // on stdlib targets need it.
+    // A missing stdlib is not fatal, only hover and go-to-definition on stdlib targets
+    // need it.
     let real_stdlib = env
         .real_stdlib_path(&system)
         .inspect_err(|err| tracing::debug!("no real stdlib found: {err}"))

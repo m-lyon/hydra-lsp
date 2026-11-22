@@ -68,8 +68,7 @@ fn implementation(
 }
 
 /// The implementation of a method the stub declares on its class but the
-/// implementation inherits from a base: the method as the implementation's
-/// class finds it in its MRO.
+/// implementation inherits from a base.
 fn inherited_implementation(
     db: &dyn ty_python_semantic::Db,
     stub: File,

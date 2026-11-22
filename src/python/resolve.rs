@@ -201,8 +201,7 @@ fn with_reexports<'db, T>(
 
 /// Extract definition info (function, class or method) from a target
 /// string, along with the file it was found in and the module name and
-/// symbol name the target resolved to. `source` is left for
-/// [`definition_with_source`](super::stub_mapping::definition_with_source).
+/// symbol name the target resolved to.
 pub(super) fn extract_definition_info<'db>(
     db: &'db dyn ty_module_resolver::Db,
     target: &str,

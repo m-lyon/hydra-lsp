@@ -492,8 +492,6 @@ impl<'a> Visitor<'a> for StarImportFinder {
     }
 }
 
-/// `sys.platform` as Python reports it on the platform hydrust runs on, which
-/// is where Hydra imports the module too.
 fn host_sys_platform() -> &'static str {
     match std::env::consts::OS {
         "windows" => "win32",

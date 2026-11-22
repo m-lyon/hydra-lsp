@@ -95,23 +95,17 @@ pub(super) struct SymbolName {
 const TYPE_ONLY_BASES: &[&str] = &["object", "ABC", "Protocol", "Generic"];
 
 /// Successfully resolved Python definition data.
-///
-/// `definition_info` and `file` come from the typing view, which prefers a
-/// stub, so signatures are the ones a type checker sees. When `file` is a stub,
-/// `source` locates the runtime implementation behind it, and
-/// `definition_info` already has its docstring if the stub had none.
-/// See [`super::stub_mapping`].
 #[derive(Clone)]
 pub struct ResolvedDefinition {
     pub definition_info: DefinitionInfo,
     pub file: File,
+    // The runtime implementation of the definition, if the definition was found in a
+    // stub.
     pub source: Option<SourceDefinition>,
     pub module_name: String,
     pub symbol_name: String,
 }
 
-/// Where the runtime implementation behind a stub definition is: one range
-/// per definition of the name in `file`, such as each overload.
 #[derive(Clone, Debug)]
 pub struct SourceDefinition {
     pub file: File,
@@ -222,8 +216,7 @@ pub(crate) fn python_version_with_source(
 /// Build a resolver environment from explicit roots. Directories that do not
 /// exist are skipped.
 ///
-/// `real_stdlib` is the interpreter's stdlib directory. ty searches it only in
-/// runtime mode, in place of the typeshed stubs.
+/// `real_stdlib` is the interpreter's stdlib directory.
 pub(super) fn resolver_environment_from_parts(
     db: &dyn ty_module_resolver::Db,
     src_roots: Vec<SystemPathBuf>,
@@ -356,9 +349,6 @@ pub fn resolved_definition<'db>(
     let environment = resolver_environment(db, config);
     let mut result = definition_with_source(db, target_str, environment);
 
-    // A stub declares names its module does not have at run time, such as the
-    // typevars its annotations use. With no runtime source that defines the
-    // name, a private one is taken to be one of those.
     if let Ok(def) = &result
         && def.source.is_none()
         && let Some(module) = vendored_module_name(db, def.file, environment)
@@ -667,12 +657,7 @@ fn class_parent_attribute_cycle(
 }
 
 /// The class that defines the method `method_key` for `class_key`: the class
-/// itself, or the first class in its MRO that does. Python looks a method up
-/// the same way, so `datetime.datetime.today` is `date.today`.
-///
-/// Memoised per `(class_key, method_key, environment)` like
-/// [`class_parent_attribute`], and `cycle_result` handles circular
-/// inheritance.
+/// itself, or the first class in its MRO that does.
 #[salsa::tracked(returns(copy), lru = 512, cycle_result = class_defining_method_cycle)]
 pub(super) fn class_defining_method<'db>(
     db: &'db dyn ty_module_resolver::Db,

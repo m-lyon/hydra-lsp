@@ -19,17 +19,12 @@
 //! own source where it has one (see `stub_mapping`).
 //!
 //! A compiled-in module such as `builtins` has no source, so go-to-definition
-//! opens a copy of its stub written to the cache directory
-//! ([`cached_vendored_path`]).
+//! opens a copy of its stub written to the cache directory.
 
 use ruff_db::system::SystemPathBuf;
 use ruff_db::vendored::VendoredPath;
 
-/// Where a vendored stub is copied on disk, so an editor can open it: the
-/// same place as ty's own copy, `<cache>/ty/vendored/typeshed/<commit>/`, which
-/// the typeshed commit keeps apart from any other version's. Copied from
-/// `ty_ide::cached_vendored_path`, which hydrust does not depend on. `None`
-/// when the system has no cache directory or the copy fails.
+/// Where a vendored stub is copied on disk, so an editor can open it.
 pub(crate) fn cached_vendored_path(
     db: &dyn ruff_db::Db,
     path: &VendoredPath,

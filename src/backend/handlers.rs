@@ -256,10 +256,6 @@ impl HydraLspBackend {
             return Ok(None);
         };
 
-        // Extract definition info on a blocking thread (cached + non-blocking).
-        // The implementation behind a stub is where the editor should land;
-        // without one, the stub itself, which for a vendored stub means a copy
-        // written to disk.
         let narrow_against = target_info.clone();
         let extract_result = self
             .spawn_definition_lookup(target_info.target.value.clone(), move |db, def| {
