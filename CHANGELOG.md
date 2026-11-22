@@ -6,6 +6,7 @@
 - Updated the ruff and ty crates to the revision behind ty 0.0.104, and salsa to 0.28.5.
 - Python environment discovery now falls back to a `python3` or `python` on `PATH`, recognises Pixi environments, ignores an empty `VIRTUAL_ENV`, and skips a broken `.venv` instead of failing.
 - Recognise `@builtins.staticmethod` and `@builtins.classmethod` when resolving Python method targets.
+- A hover, signature help, go-to-definition, semantic tokens or diagnostics request the client cancels now stops its analysis, rather than running to the end and occupying a thread.
 
 ## [0.7.0]
 

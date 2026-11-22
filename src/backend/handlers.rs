@@ -58,14 +58,14 @@ impl HydraLspBackend {
         };
         let SessionSnapshot { db, python_config } = snapshot;
 
-        let received = spawn_on_pool(&self.latency_pool, move || {
+        let received = spawn_on_pool(&self.latency_pool, db, move |db| {
             let start = Instant::now();
-            let target = TargetString::new(&db, target_value);
-            let cached = python_cache::cached_definition_info(&db, python_config, target);
+            let target = TargetString::new(db, target_value);
+            let cached = python_cache::cached_definition_info(db, python_config, target);
             let result = cached.get().cloned().map_err(Clone::clone);
             tracing::debug!(
                 elapsed_us = start.elapsed().as_micros() as u64,
-                target = target.value(&db),
+                target = target.value(db),
                 ok = result.is_ok(),
                 "definition lookup"
             );
@@ -779,11 +779,11 @@ impl LanguageServer for HydraLspBackend {
         // request after an edit needs a full YAML parse — holding the db lock
         // across that would block the next `did_change` write, which would then
         // immediately render the parse result stale.
-        let outcome = spawn_on_pool(&self.latency_pool, move || {
-            if !yaml_cache::is_hydra_file(&db, input) {
+        let outcome = spawn_on_pool(&self.latency_pool, db, move |db| {
+            if !yaml_cache::is_hydra_file(db, input) {
                 return None;
             }
-            let tokens = yaml_cache::semantic_tokens(&db, input);
+            let tokens = yaml_cache::semantic_tokens(db, input);
             Some(HydraSemanticToken::to_lsp_tokens(tokens))
         })
         .await;
@@ -850,11 +850,11 @@ impl LanguageServer for HydraLspBackend {
         // The push path's parse + validate, but on the worker pool, inside the
         // pool's catch_unwind so a `salsa::Cancelled` unwind is caught rather
         // than aborting the process.
-        let join_result = spawn_on_pool(&self.worker_pool, move || {
-            if !yaml_cache::is_hydra_file(&db_snapshot, input) {
+        let join_result = spawn_on_pool(&self.worker_pool, db_snapshot, move |db| {
+            if !yaml_cache::is_hydra_file(db, input) {
                 return Vec::new();
             }
-            validate_input(&db_snapshot, input, &disabled_rules, python_config)
+            validate_input(db, input, &disabled_rules, python_config)
         })
         .await;
 

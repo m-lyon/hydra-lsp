@@ -88,7 +88,7 @@ impl HydraLspBackend {
         };
         let cwd = SystemPath::new(&workspace_root);
         let db = HydraDatabase::new(cwd);
-        let python_config = PythonConfig::new(&db, Some(workspace_root), interpreter);
+        let python_config = PythonConfig::frozen(&db, Some(workspace_root), interpreter);
         *self.session.write() = Some(Session {
             db: parking_lot::Mutex::new(db),
             python_config,
@@ -267,7 +267,7 @@ mod tests {
         .unwrap();
 
         let db = HydraDatabase::new(SystemPath::new(venv.to_str().unwrap()));
-        let python_config = PythonConfig::new(
+        let python_config = PythonConfig::frozen(
             &db,
             Some(venv.to_string_lossy().into_owned()),
             Some(venv.to_string_lossy().into_owned()),
