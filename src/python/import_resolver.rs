@@ -1,14 +1,14 @@
 use super::cache::resolve_module_by_name;
 use super::extract::{
     assigned_value, extract_class_info, extract_function_signature, parsed_python_module,
-    path_is_file,
 };
 use super::model::{ClassInfo, FunctionSignature};
+use ruff_db::files::{File, system_path_to_file};
 use ruff_db::parsed::ParsedModuleRef;
+use ruff_db::system::{SystemPath, SystemPathBuf};
 use ruff_python_ast::{self as ast, Expr, PythonVersion, Stmt, visitor::Visitor};
 use rustc_hash::FxHashSet;
-use std::collections::HashSet;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, Path};
 use ty_module_resolver::{ResolverEnvironment, system_module_search_paths};
 
 const MAX_IMPORT_DEPTH: usize = 10;
@@ -18,7 +18,7 @@ const MAX_IMPORT_DEPTH: usize = 10;
 /// Returns `None` if a part is not a plain name. Module strings can come from
 /// user YAML (a `_target_` value), where `"/etc/x"` or `"../x"` would otherwise
 /// escape `base` — an absolute part would even replace it outright.
-fn join_module_parts(base: &Path, module: &str) -> Option<PathBuf> {
+fn join_module_parts(base: &SystemPath, module: &str) -> Option<SystemPathBuf> {
     let mut path = base.to_path_buf();
     for part in module.split('.') {
         if part.is_empty() {
@@ -26,7 +26,7 @@ fn join_module_parts(base: &Path, module: &str) -> Option<PathBuf> {
         }
         let mut components = Path::new(part).components();
         match (components.next(), components.next()) {
-            (Some(Component::Normal(name)), None) => path.push(name),
+            (Some(Component::Normal(name)), None) => path.push(name.to_str()?),
             _ => return None,
         }
     }
@@ -55,25 +55,26 @@ pub(super) struct ImportResolver<'db> {
 /// Where a symbol is defined: the file, and the symbol's name there.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ResolvedSymbol {
-    pub(super) file: PathBuf,
+    pub(super) file: File,
     pub(super) name: String,
 }
 
 /// The cycle and depth state of one [`ImportResolver::resolve_symbol`] call.
 #[derive(Default)]
 struct ImportWalk {
-    visited_files: HashSet<PathBuf>,
+    visited_files: FxHashSet<File>,
     depth: usize,
 }
 
 /// Try to find a module file given a base package path
 /// Returns the first existing file in priority order: __init__.pyi, __init__.py, module.pyi, module.py
 ///
-/// Existence checks go through `path_is_file` (salsa `system_path_to_file`)
-/// rather than `Path::exists`, so each probed candidate is interned as a
-/// tracked `File` and a later create/delete of that path invalidates the
-/// calling query. See [`path_is_file`].
-pub(super) fn find_module_file(db: &dyn ruff_db::Db, package_path: &Path) -> Option<PathBuf> {
+/// Existence checks go through salsa's `system_path_to_file` rather than
+/// `Path::exists`. It interns each probed candidate as a `File` *even when it
+/// does not exist* and records a dependency on that file's existence, so a
+/// later create or delete of the path, synced with `File::sync_path`,
+/// invalidates the calling query.
+pub(super) fn find_module_file(db: &dyn ruff_db::Db, package_path: &SystemPath) -> Option<File> {
     [
         package_path.join("__init__.pyi"),
         package_path.join("__init__.py"),
@@ -81,7 +82,7 @@ pub(super) fn find_module_file(db: &dyn ruff_db::Db, package_path: &Path) -> Opt
         package_path.with_extension("py"),
     ]
     .into_iter()
-    .find(|candidate| path_is_file(db, candidate))
+    .find_map(|candidate| system_path_to_file(db, candidate).ok())
 }
 
 impl<'db> ImportResolver<'db> {
@@ -96,19 +97,19 @@ impl<'db> ImportResolver<'db> {
         self.environment.python_version(self.db)
     }
 
-    fn parsed(&self, file_path: &Path) -> Option<ParsedModuleRef> {
-        parsed_python_module(self.db, file_path, self.python_version())
+    fn parsed(&self, file: File) -> ParsedModuleRef {
+        parsed_python_module(self.db, file, self.python_version())
     }
 
-    /// Resolve an absolute module name to a file path, through the memoised
+    /// Resolve an absolute module name to its file, through the memoised
     /// `resolved_module_file`.
-    pub(super) fn resolve_module_file(&self, module_path: &str) -> Option<PathBuf> {
+    pub(super) fn resolve_module_file(&self, module_path: &str) -> Option<File> {
         resolve_module_by_name(self.db, module_path, self.environment)
     }
 
     /// The directory a relative import is resolved against: the importing
     /// file's own directory for level 1, one directory up for each extra level.
-    fn relative_import_dir(current_file: &Path, level: u32) -> Option<&Path> {
+    fn relative_import_dir(current_file: &SystemPath, level: u32) -> Option<&SystemPath> {
         // level 1 = current package (.)
         // level 2 = parent package (..)
         // etc.
@@ -122,18 +123,20 @@ impl<'db> ImportResolver<'db> {
     /// Resolve a relative import (`from .module import name`) to the file it names.
     fn resolve_relative_module_file(
         &self,
-        current_file: &Path,
+        current_file: File,
         module: Option<&str>,
         level: u32,
-    ) -> Option<PathBuf> {
-        let current_dir = Self::relative_import_dir(current_file, level)?;
+    ) -> Option<File> {
+        // A vendored stub has no directory on disk to resolve against.
+        let current_path = current_file.path(self.db).as_system_path()?;
+        let current_dir = Self::relative_import_dir(current_path, level)?;
 
         // Resolve against the importing file's own directory, but only when
         // that directory is inside a search root. Otherwise the import reached
         // past the top-level package, which Python rejects, so there is nothing
         // valid left to resolve against.
         if !system_module_search_paths(self.db, self.environment)
-            .any(|search_path| current_dir.starts_with(search_path.as_std_path()))
+            .any(|search_path| current_dir.starts_with(search_path))
         {
             return None;
         }
@@ -144,7 +147,7 @@ impl<'db> ImportResolver<'db> {
 
     /// The file an import of `module` at `level` names, as seen from `from`:
     /// relative to `from` when `level > 0`, else through the search paths.
-    fn module_file(&self, from: &Path, module: &str, level: u32) -> Option<PathBuf> {
+    fn module_file(&self, from: File, module: &str, level: u32) -> Option<File> {
         if level > 0 {
             self.resolve_relative_module_file(from, Some(module), level)
         } else {
@@ -153,27 +156,24 @@ impl<'db> ImportResolver<'db> {
     }
 
     /// Extract __all__ from a module
-    fn extract_dunder_all(&self, file_path: &Path) -> Option<FxHashSet<String>> {
-        let parsed = self.parsed(file_path)?;
+    fn extract_dunder_all(&self, file: File) -> Option<FxHashSet<String>> {
+        let parsed = self.parsed(file);
         let mut dunder_all_finder = DunderAllFinder::default();
         dunder_all_finder.visit_body(parsed.suite());
         dunder_all_finder.names
     }
 
     /// Extract import information for a specific symbol from a module
-    fn find_import_for_symbol(&self, file_path: &Path, symbol_name: &str) -> Option<ImportInfo> {
-        find_import(self.parsed(file_path)?.suite(), symbol_name)
+    fn find_import_for_symbol(&self, file: File, symbol_name: &str) -> Option<ImportInfo> {
+        find_import(self.parsed(file).suite(), symbol_name)
     }
 
     /// Whether a module defines `__getattr__` at module level (PEP 562).
     /// Packages use this to lazily resolve attributes that were not bound at
     /// import time, which is how a name can be a valid runtime export
     /// without being assigned anywhere in the module body.
-    fn has_module_level_getattr(&self, file_path: &Path) -> bool {
-        let Some(parsed) = self.parsed(file_path) else {
-            return false;
-        };
-        parsed.suite().iter().any(|stmt| {
+    fn has_module_level_getattr(&self, file: File) -> bool {
+        self.parsed(file).suite().iter().any(|stmt| {
             matches!(stmt, Stmt::FunctionDef(func_def) if func_def.name.as_str() == "__getattr__")
         })
     }
@@ -182,10 +182,10 @@ impl<'db> ImportResolver<'db> {
     /// `if TYPE_CHECKING:` (or `if typing.TYPE_CHECKING:`) block.
     fn find_type_checking_import_for_symbol(
         &self,
-        file_path: &Path,
+        file: File,
         symbol_name: &str,
     ) -> Option<ImportInfo> {
-        let parsed = self.parsed(file_path)?;
+        let parsed = self.parsed(file);
         let mut typing_aliases: Option<FxHashSet<String>> = None;
         for stmt in parsed.suite() {
             let Stmt::If(if_stmt) = stmt else { continue };
@@ -215,27 +215,21 @@ impl<'db> ImportResolver<'db> {
     }
 
     /// Extract all star imports from a module, as `(module, level)` pairs
-    fn find_star_imports(&self, file_path: &Path) -> Vec<(String, u32)> {
-        let Some(parsed) = self.parsed(file_path) else {
-            return Vec::new();
-        };
+    fn find_star_imports(&self, file: File) -> Vec<(String, u32)> {
+        let parsed = self.parsed(file);
         let mut finder = StarImportFinder::default();
         finder.visit_body(parsed.suite());
         finder.star_imports
     }
 
     /// Check if a class is directly defined in the file
-    fn find_class_direct(&self, file_path: &Path, class_name: &str) -> Option<ClassInfo> {
-        extract_class_info(self.db, file_path, class_name, self.python_version())
+    fn find_class_direct(&self, file: File, class_name: &str) -> Option<ClassInfo> {
+        extract_class_info(self.db, file, class_name, self.python_version())
     }
 
     /// Check if a function is directly defined in the file
-    fn find_function_direct(
-        &self,
-        file_path: &Path,
-        function_name: &str,
-    ) -> Option<FunctionSignature> {
-        extract_function_signature(self.db, file_path, function_name, self.python_version())
+    fn find_function_direct(&self, file: File, function_name: &str) -> Option<FunctionSignature> {
+        extract_function_signature(self.db, file, function_name, self.python_version())
     }
 
     /// Resolve a symbol by following import chains.
@@ -246,7 +240,7 @@ impl<'db> ImportResolver<'db> {
     /// that module's file.
     pub(super) fn resolve_symbol(
         &self,
-        starting_file: &Path,
+        starting_file: File,
         symbol_name: &str,
     ) -> Option<ResolvedSymbol> {
         let (file, name) = self.resolve(&mut ImportWalk::default(), starting_file, symbol_name)?;
@@ -260,22 +254,17 @@ impl<'db> ImportResolver<'db> {
     /// check around it. The name is `None` when the chain ends on a module.
     ///
     /// A file is entered at most once per walk, even on a different branch
-    /// of the search.
+    /// of the search. Files are told apart by their lexical path, as ty does,
+    /// so a file reached again through a symlink is only stopped by the depth
+    /// limit.
     fn resolve(
         &self,
         walk: &mut ImportWalk,
-        starting_file: &Path,
+        starting_file: File,
         symbol_name: &str,
-    ) -> Option<(PathBuf, Option<String>)> {
+    ) -> Option<(File, Option<String>)> {
         // Check for cycles and depth limit
-        if walk.depth >= MAX_IMPORT_DEPTH {
-            return None;
-        }
-
-        let canonical_path = starting_file
-            .canonicalize()
-            .unwrap_or_else(|_| starting_file.to_path_buf());
-        if !walk.visited_files.insert(canonical_path) {
+        if walk.depth >= MAX_IMPORT_DEPTH || !walk.visited_files.insert(starting_file) {
             return None;
         }
 
@@ -290,16 +279,16 @@ impl<'db> ImportResolver<'db> {
     fn resolve_in_file(
         &self,
         walk: &mut ImportWalk,
-        starting_file: &Path,
+        starting_file: File,
         symbol_name: &str,
-    ) -> Option<(PathBuf, Option<String>)> {
+    ) -> Option<(File, Option<String>)> {
         // First, check if the symbol is directly defined in this file
         if self.find_class_direct(starting_file, symbol_name).is_some()
             || self
                 .find_function_direct(starting_file, symbol_name)
                 .is_some()
         {
-            return Some((starting_file.to_path_buf(), Some(symbol_name.to_string())));
+            return Some((starting_file, Some(symbol_name.to_string())));
         }
 
         // Look for an explicit import of this symbol
@@ -331,12 +320,12 @@ impl<'db> ImportResolver<'db> {
             // Check if this symbol is exported from the star-imported module.
             // If __all__ is defined, check if symbol is in it;
             // if not defined, check if symbol doesn't start with _
-            let is_exported = match self.extract_dunder_all(&module_file) {
+            let is_exported = match self.extract_dunder_all(module_file) {
                 Some(all_names) => all_names.contains(symbol_name),
                 None => !symbol_name.starts_with('_'),
             };
 
-            if is_exported && let Some(result) = self.resolve(walk, &module_file, symbol_name) {
+            if is_exported && let Some(result) = self.resolve(walk, module_file, symbol_name) {
                 return Some(result);
             }
         }
@@ -348,9 +337,9 @@ impl<'db> ImportResolver<'db> {
     fn follow_import(
         &self,
         walk: &mut ImportWalk,
-        current_file: &Path,
+        current_file: File,
         import: &ImportInfo,
-    ) -> Option<(PathBuf, Option<String>)> {
+    ) -> Option<(File, Option<String>)> {
         match import {
             ImportInfo::FromImport {
                 module,
@@ -360,7 +349,7 @@ impl<'db> ImportResolver<'db> {
                 let module_file = self.module_file(current_file, module, *level)?;
 
                 // Recursively resolve the symbol in the imported module
-                self.resolve(walk, &module_file, name)
+                self.resolve(walk, module_file, name)
             }
             ImportInfo::Import { module } => {
                 let module_file = self.resolve_module_file(module)?;
@@ -551,7 +540,10 @@ mod tests {
     use super::*;
     use crate::python::cache::{ResolvedDefinition, resolver_environment_for_roots};
     use crate::python::model::DefinitionInfo;
-    use crate::python::test_support::{extract_definition_info, test_db, write_file};
+    use crate::python::test_support::{
+        disk_path, extract_definition_info, system_file, test_db, write_file,
+    };
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
     /// Build a workspace whose interpreter search root lives inside the
@@ -597,7 +589,24 @@ mod tests {
             panic!("{symbol_path} should resolve when site-packages is nested inside the workspace")
         });
 
-        (def.definition_info, def.file_path, def.symbol_name)
+        (
+            def.definition_info,
+            disk_path(&db, def.file),
+            def.symbol_name,
+        )
+    }
+
+    /// `resolve_relative_module_file` for an import in the file at `importer`.
+    fn resolve_relative(
+        resolver: &ImportResolver,
+        importer: &Path,
+        module: &str,
+        level: u32,
+    ) -> Option<PathBuf> {
+        let importer = system_file(resolver.db, importer);
+        resolver
+            .resolve_relative_module_file(importer, Some(module), level)
+            .map(|file| disk_path(resolver.db, file))
     }
 
     fn resolver_for<'db>(
@@ -679,10 +688,10 @@ mod tests {
         let db = test_db();
         let search_paths = vec![root.to_path_buf()];
         let resolver = resolver_for(&db, &search_paths);
-        let init_file = root.join("example_pkg").join("__init__.py");
+        let init_file = system_file(&db, &root.join("example_pkg").join("__init__.py"));
         resolver
-            .resolve_symbol(&init_file, symbol_name)
-            .map(|resolved| (resolved.file, resolved.name))
+            .resolve_symbol(init_file, symbol_name)
+            .map(|resolved| (disk_path(&db, resolved.file), resolved.name))
     }
 
     #[test]
@@ -1071,11 +1080,12 @@ mod tests {
 
         let ResolvedDefinition {
             definition_info,
-            file_path,
+            file,
             symbol_name,
             ..
         } = extract_definition_info(&db, "example_pkg.ExportedClass", &search_paths)
             .expect("the lazy export should resolve end-to-end");
+        let file_path = disk_path(&db, file);
 
         assert_eq!(symbol_name, "ExportedClass");
         assert_exported_class(&definition_info, &file_path, "_implementation.py");
@@ -1093,9 +1103,8 @@ mod tests {
     /// if the parser stops recognising the syntax.
     fn package_init_has_lazy_import(root: &Path) -> bool {
         let db = test_db();
-        let init_file = root.join("example_pkg").join("__init__.py");
-        let parsed =
-            parsed_python_module(&db, &init_file, PythonVersion::latest_ty()).expect("init parses");
+        let init_file = system_file(&db, &root.join("example_pkg").join("__init__.py"));
+        let parsed = parsed_python_module(&db, init_file, PythonVersion::latest_ty());
         parsed.suite().iter().any(|stmt| match stmt {
             Stmt::Import(import) => import.is_lazy,
             Stmt::ImportFrom(import_from) => import_from.is_lazy,
@@ -1174,11 +1183,12 @@ mod tests {
 
         let ResolvedDefinition {
             definition_info,
-            file_path,
+            file,
             symbol_name,
             ..
         } = extract_definition_info(&db, "example_pkg.ExportedClass", &search_paths)
             .expect("the lazy re-export chain should resolve end-to-end");
+        let file_path = disk_path(&db, file);
 
         assert_eq!(symbol_name, "ExportedClass");
         assert_exported_class(&definition_info, &file_path, "_implementation.py");
@@ -1243,11 +1253,12 @@ mod tests {
 
         let ResolvedDefinition {
             definition_info,
-            file_path,
+            file,
             symbol_name,
             ..
         } = extract_definition_info(&db, "pkg.ExportedClass", &search_paths)
             .expect("ExportedClass should resolve through the sibling module");
+        let file_path = disk_path(&db, file);
 
         assert_eq!(symbol_name, "ExportedClass");
         assert!(
@@ -1284,7 +1295,7 @@ mod tests {
         assert!(
             result.is_err(),
             "expected no resolution, got {:?}",
-            result.map(|def| def.file_path)
+            result.map(|def| disk_path(&db, def.file))
         );
     }
 
@@ -1308,13 +1319,10 @@ mod tests {
         let importer = package.join("__init__.py");
 
         assert_eq!(
-            resolver.resolve_relative_module_file(&importer, Some("implementation"), 1),
+            resolve_relative(&resolver, &importer, "implementation", 1),
             Some(package.join("implementation.py")),
         );
-        assert_eq!(
-            resolver.resolve_relative_module_file(&importer, Some("missing"), 1),
-            None,
-        );
+        assert_eq!(resolve_relative(&resolver, &importer, "missing", 1), None,);
     }
 
     /// `from ..module import X` climbs one package per extra dot, and an empty
@@ -1336,15 +1344,15 @@ mod tests {
         let importer = sub_package.join("__init__.py");
 
         assert_eq!(
-            resolver.resolve_relative_module_file(&importer, Some("implementation"), 2),
+            resolve_relative(&resolver, &importer, "implementation", 2),
             Some(package.join("implementation.py")),
         );
         assert_eq!(
-            resolver.resolve_relative_module_file(&importer, Some(""), 1),
+            resolve_relative(&resolver, &importer, "", 1),
             Some(sub_package.join("__init__.py")),
         );
         assert_eq!(
-            resolver.resolve_relative_module_file(&importer, Some(""), 2),
+            resolve_relative(&resolver, &importer, "", 2),
             Some(package.join("__init__.py")),
         );
     }
@@ -1372,14 +1380,8 @@ mod tests {
         let importer = repo.join("pkg").join("__init__.py");
 
         // `from ...outside import ExportedClass` reaches above the root.
-        assert_eq!(
-            resolver.resolve_relative_module_file(&importer, Some("outside"), 3),
-            None,
-        );
-        assert_eq!(
-            resolver.resolve_relative_module_file(&importer, Some("inside"), 3),
-            None,
-        );
+        assert_eq!(resolve_relative(&resolver, &importer, "outside", 3), None,);
+        assert_eq!(resolve_relative(&resolver, &importer, "inside", 3), None,);
     }
 
     /// `join_module_parts` is tested directly because at the resolver level a
@@ -1387,7 +1389,7 @@ mod tests {
     /// assertion would hold with or without the guard.
     #[test]
     fn test_join_module_parts_rejects_parts_that_are_not_plain_names() {
-        let base = Path::new("/root");
+        let base = SystemPath::new("/root");
 
         assert_eq!(
             join_module_parts(base, "a.b"),
@@ -1430,7 +1432,9 @@ mod tests {
 
         // Positive control: a guard that rejected everything would fail here.
         assert_eq!(
-            resolver.resolve_module_file("pkg.inside"),
+            resolver
+                .resolve_module_file("pkg.inside")
+                .map(|file| disk_path(&db, file)),
             Some(PathBuf::from("/root/pkg/inside.py")),
         );
 
@@ -1441,11 +1445,7 @@ mod tests {
             "an absolute name must not replace the search root",
         );
         assert_eq!(
-            resolver.resolve_relative_module_file(
-                Path::new("/root/pkg/__init__.py"),
-                Some("/outside"),
-                1,
-            ),
+            resolve_relative(&resolver, Path::new("/root/pkg/__init__.py"), "/outside", 1),
             None,
         );
     }

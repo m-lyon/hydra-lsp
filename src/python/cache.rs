@@ -1,25 +1,23 @@
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use super::env::{DiscoveredEnvironment, discover_python_environment};
-use super::extract::{
-    extract_class_attribute, extract_class_info, module_defines_top_level, normalize_path_for_key,
-};
+use super::extract::{extract_class_attribute, extract_class_info, module_defines_top_level};
 use super::import_resolver::{ImportResolver, find_module_file};
 use super::model::{ClassAttributeInfo, DefinitionInfo, FunctionSignature, ResolveError};
 use super::resolve::{base_class_name, extract_definition_info, resolve_base_class};
 use super::typeshed::{
     BUILTINS_MODULE, is_builtins_module, is_runtime_builtin_name, is_stubbed_pypi_package,
-    is_vendored_path, vendored_module_name, vendored_sentinel_path,
 };
-use ruff_db::files::{File, FilePath, FileRootKind};
+use ruff_db::files::{File, FileRootKind};
 use ruff_db::system::{SystemPath, SystemPathBuf};
 use ruff_python_ast::PythonVersion;
 use salsa::Durability;
 use tracing::debug;
 use ty_module_resolver::{
-    ModuleName, ResolverEnvironment, SearchPath, SearchPathSettings, UseDefaultStrategy,
-    resolve_module_confident, system_module_search_paths,
+    ModuleName, ResolverEnvironment, ResolverFile, SearchPath, SearchPathSettings,
+    UseDefaultStrategy, file_to_module, resolve_module_confident, system_module_search_paths,
 };
 use ty_python_core::Program;
 use ty_python_core::platform::PythonPlatform;
@@ -70,19 +68,11 @@ pub struct TargetString {
 }
 
 /// The salsa key for a class: the file it is defined in and its name.
-///
-/// Build it with [`class_key`], which normalizes the path.
 #[salsa::interned]
 pub(super) struct ClassKey {
-    pub file: PathBuf,
+    #[returns(copy)]
+    pub file: File,
     pub class: String,
-}
-
-/// The [`ClassKey`] for `class` in `file`. The path is normalized lexically
-/// (see `normalize_path_for_key`), so the key stays a pure function of salsa
-/// inputs.
-pub(super) fn class_key<'db>(db: &'db dyn ruff_db::Db, file: &Path, class: &str) -> ClassKey<'db> {
-    ClassKey::new(db, normalize_path_for_key(db, file), class.to_string())
 }
 
 /// An interned dotted module name, such as `pkg.models`.
@@ -105,7 +95,7 @@ const TYPE_ONLY_BASES: &[&str] = &["object", "ABC", "Protocol", "Generic"];
 #[derive(Clone)]
 pub struct ResolvedDefinition {
     pub definition_info: DefinitionInfo,
-    pub file_path: PathBuf,
+    pub file: File,
     pub module_name: String,
     pub symbol_name: String,
 }
@@ -241,31 +231,21 @@ pub(super) fn resolver_environment_for_roots<'db>(
     resolver_environment_from_parts(db, src_roots, Vec::new(), PythonVersion::latest_ty())
 }
 
-/// The path a resolved module file is reported under. Files in the vendored
-/// typeshed archive get a sentinel path, see [`super::typeshed`].
-fn module_file_path(db: &dyn ruff_db::Db, file: File) -> Option<PathBuf> {
-    match file.path(db) {
-        FilePath::System(path) => Some(path.as_std_path().to_path_buf()),
-        FilePath::Vendored(path) => Some(vendored_sentinel_path(path)),
-        FilePath::SystemVirtual(_) => None,
-    }
-}
-
 /// [`resolved_module_file`] for a module name given as a string.
 pub(super) fn resolve_module_by_name<'db>(
     db: &'db dyn ty_module_resolver::Db,
     module: &str,
     environment: ResolverEnvironment<'db>,
-) -> Option<PathBuf> {
-    resolved_module_file(db, ModuleRef::new(db, module.to_string()), environment).clone()
+) -> Option<File> {
+    resolved_module_file(db, ModuleRef::new(db, module.to_string()), environment)
 }
 
-#[salsa::tracked(lru = 1024)]
+#[salsa::tracked(returns(copy), lru = 1024)]
 pub(super) fn resolved_module_file<'db>(
     db: &'db dyn ty_module_resolver::Db,
     module: ModuleRef<'db>,
     environment: ResolverEnvironment<'db>,
-) -> Option<PathBuf> {
+) -> Option<File> {
     let module_path_str = module.name(db);
     let module_name = ModuleName::new(module_path_str)?;
     let module = resolve_module_confident(db, environment, &module_name)?;
@@ -277,12 +257,12 @@ pub(super) fn resolved_module_file<'db>(
     {
         if is_stubbed_pypi_package(module_path_str) {
             return system_module_search_paths(db, environment)
-                .find_map(|root| find_module_file(db, &root.as_std_path().join(module_path_str)));
+                .find_map(|root| find_module_file(db, &root.join(module_path_str)));
         }
         return None;
     }
 
-    module_file_path(db, module.file(db)?)
+    module.file(db)
 }
 
 /// Whether the runtime module `module` exposes `symbol`, according to its
@@ -298,14 +278,14 @@ pub(super) fn vendored_module_exposes<'db>(
     if symbol.is_empty() || symbol.contains('.') || !is_runtime_builtin_name(symbol) {
         return false;
     }
-    let Some(stub) = resolved_module_file(db, module, environment).clone() else {
+    let Some(stub) = resolved_module_file(db, module, environment) else {
         return false;
     };
-    if !is_vendored_path(&stub) {
+    if stub.path(db).as_vendored_path().is_none() {
         return false;
     }
 
-    module_defines_top_level(db, &stub, symbol, environment.python_version(db))
+    module_defines_top_level(db, stub, symbol, environment.python_version(db))
 }
 
 /// Whether `name` is a symbol the runtime `builtins` module exposes.
@@ -349,7 +329,7 @@ pub fn resolved_definition<'db>(
     let mut result = extract_definition_info(db, target_str, environment);
 
     if let Ok(def) = &result
-        && let Some(module) = vendored_module_name(&def.file_path)
+        && let Some(module) = vendored_module_name(db, def.file, environment)
         && let Some(root_symbol) = target_str
             .strip_prefix(&module)
             .and_then(|rest| rest.strip_prefix('.'))
@@ -368,6 +348,21 @@ pub fn resolved_definition<'db>(
     }
 
     DefinitionResult::from_result(result)
+}
+
+/// The dotted name of the module the vendored stub `file` stands for, such as
+/// `builtins` for `stdlib/builtins.pyi`. `None` for a file on disk.
+///
+/// Lets a caller that has only a resolved file recover which module it came
+/// from, rather than assuming the target's own prefix names it.
+fn vendored_module_name(
+    db: &dyn ty_module_resolver::Db,
+    file: File,
+    environment: ResolverEnvironment<'_>,
+) -> Option<String> {
+    file.path(db).as_vendored_path()?;
+    let module = file_to_module(db, ResolverFile::new(db, file, environment))?;
+    Some(module.name(db).to_string())
 }
 
 /// Cached docstring + `__init__` resolution for a class, walking its MRO.
@@ -452,7 +447,7 @@ fn fill<T: Clone>(slot: &mut Option<T>, from: Option<&T>) {
 /// `None` for a base that did not resolve.
 fn parent_keys<'db, 'a>(
     db: &'db dyn ty_module_resolver::Db,
-    file_path: &'a Path,
+    file: File,
     base_classes: &'a [String],
     environment: ResolverEnvironment<'db>,
 ) -> impl Iterator<Item = Option<ClassKey<'db>>> + 'a
@@ -463,8 +458,8 @@ where
         .iter()
         .filter(|base| !TYPE_ONLY_BASES.contains(&base_class_name(base)))
         .map(move |base| {
-            let base = resolve_base_class(db, file_path, base, environment)?;
-            Some(class_key(db, &base.file, &base.name))
+            let base = resolve_base_class(db, file, base, environment)?;
+            Some(ClassKey::new(db, base.file, base.name))
         })
 }
 
@@ -480,7 +475,7 @@ impl Eq for InheritedClassMembers {}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct InheritedAttribute {
     pub info: ClassAttributeInfo,
-    pub file: PathBuf,
+    pub file: File,
     pub class: String,
 }
 
@@ -493,7 +488,7 @@ pub(super) struct ClassAttributeLookup {
 }
 
 impl ClassAttributeLookup {
-    fn found(info: ClassAttributeInfo, file: PathBuf, class: String) -> Self {
+    fn found(info: ClassAttributeInfo, file: File, class: String) -> Self {
         Self {
             inner: Arc::new(Some(InheritedAttribute { info, file, class })),
         }
@@ -534,17 +529,16 @@ pub(super) fn inherited_class_members<'db>(
     class_key: ClassKey<'db>,
     environment: ResolverEnvironment<'db>,
 ) -> InheritedClassMembers {
-    let file_path = class_key.file(db).as_path();
+    let file = class_key.file(db);
     let class_name = class_key.class(db).as_str();
     let python_version = environment.python_version(db);
 
-    let class_info = match extract_class_info(db, file_path, class_name, python_version) {
+    let class_info = match extract_class_info(db, file, class_name, python_version) {
         Some(class_info) => class_info,
         None => {
-            return match ImportResolver::new(db, environment).resolve_symbol(file_path, class_name)
-            {
+            return match ImportResolver::new(db, environment).resolve_symbol(file, class_name) {
                 Some(resolved) => {
-                    let resolved_key = self::class_key(db, &resolved.file, &resolved.name);
+                    let resolved_key = ClassKey::new(db, resolved.file, resolved.name);
                     if resolved_key == class_key {
                         return InheritedClassMembers::new(None, None, None, false);
                     }
@@ -567,7 +561,7 @@ pub(super) fn inherited_class_members<'db>(
     // finds no `__init__`.
     let mut all_bases_resolved = true;
 
-    for parent_key in parent_keys(db, file_path, &class_info.base_classes, environment) {
+    for parent_key in parent_keys(db, file, &class_info.base_classes, environment) {
         let Some(parent_key) = parent_key else {
             all_bases_resolved = false;
             continue;
@@ -605,26 +599,22 @@ pub(super) fn class_parent_attribute<'db>(
     attribute_key: SymbolName<'db>,
     environment: ResolverEnvironment<'db>,
 ) -> ClassAttributeLookup {
-    let file_path = class_key.file(db).as_path();
+    let file = class_key.file(db);
     let class_name = class_key.class(db).as_str();
     let attribute_name = attribute_key.value(db);
     let python_version = environment.python_version(db);
 
     if let Some(attr_info) =
-        extract_class_attribute(db, file_path, class_name, attribute_name, python_version)
+        extract_class_attribute(db, file, class_name, attribute_name, python_version)
     {
-        return ClassAttributeLookup::found(
-            attr_info,
-            file_path.to_path_buf(),
-            class_name.to_string(),
-        );
+        return ClassAttributeLookup::found(attr_info, file, class_name.to_string());
     }
 
-    let Some(class_info) = extract_class_info(db, file_path, class_name, python_version) else {
+    let Some(class_info) = extract_class_info(db, file, class_name, python_version) else {
         return ClassAttributeLookup::not_found();
     };
 
-    for parent_key in parent_keys(db, file_path, &class_info.base_classes, environment).flatten() {
+    for parent_key in parent_keys(db, file, &class_info.base_classes, environment).flatten() {
         let result = class_parent_attribute(db, parent_key, attribute_key, environment);
         if result.get().is_some() {
             return result;
@@ -651,20 +641,40 @@ mod tests {
     use crate::database::tests::TestDb;
     use crate::python::model::ParameterKind;
     use crate::python::test_support::{
-        canonicalize, filesystem_root, get_simple_test_dir, sig_for, sig_param, system_path,
-        test_db, write_file, write_venv,
+        canonicalize, filesystem_root, get_simple_test_dir, sig_for, sig_param, system_file,
+        system_path, test_db, write_file, write_venv,
     };
-    use crate::python::typeshed::stdlib_search_root;
     use ruff_db::Db;
+    use ruff_db::files::{FilePath, system_path_to_file};
+    use ruff_db::vendored::VendoredPathBuf;
     use salsa::Setter;
+    use std::path::Path;
+
+    /// The path of the vendored `builtins` stub.
+    fn builtins_stub() -> FilePath {
+        VendoredPathBuf::from("stdlib/builtins.pyi").into()
+    }
+
+    /// The path of the file at `path` on disk.
+    fn on_disk(path: &Path) -> FilePath {
+        system_path(path).into()
+    }
 
     #[test]
-    fn test_class_key_normalizes_the_file() {
-        let db = test_db();
-        let key = class_key(&db, Path::new("/work/pkg/../models.py"), "Model");
-        assert_eq!(key.file(&db), Path::new("/work/models.py"));
+    fn test_class_key_is_shared_across_path_spellings() {
+        use ruff_db::system::DbWithWritableSystem;
+
+        let mut db = TestDb::new();
+        db.write_file("/work/models.py", "").expect("write models");
+        let file = |path: &str| system_path_to_file(&db, path).expect("file exists");
+
+        let key = ClassKey::new(&db, file("/work/pkg/../models.py"), "Model");
+        assert_eq!(
+            key.file(&db).path(&db),
+            &FilePath::system("/work/models.py")
+        );
         assert_eq!(key.class(&db), "Model");
-        assert!(key == class_key(&db, Path::new("/work/models.py"), "Model"));
+        assert!(key == ClassKey::new(&db, file("/work/./models.py"), "Model"));
     }
 
     /// The editable roots the `.pth` files in `site_packages` list.
@@ -1152,24 +1162,29 @@ mod tests {
 
     #[test]
     fn test_cached_class_attribute_value_equality() {
+        use ruff_db::system::DbWithWritableSystem;
+
+        let mut db = TestDb::new();
+        db.write_file("/p.py", "").expect("write p");
+        db.write_file("/q.py", "").expect("write q");
+        let p = system_path_to_file(&db, "/p.py").expect("p exists");
+        let q = system_path_to_file(&db, "/q.py").expect("q exists");
         let attr = |v: &str| ClassAttributeInfo {
             name: "factory".to_string(),
             value: v.to_string(),
         };
-        let a = ClassAttributeLookup::found(attr("Foo"), PathBuf::from("/p.py"), "C".to_string());
-        let b = ClassAttributeLookup::found(attr("Foo"), PathBuf::from("/p.py"), "C".to_string());
+        let a = ClassAttributeLookup::found(attr("Foo"), p, "C".to_string());
+        let b = ClassAttributeLookup::found(attr("Foo"), p, "C".to_string());
         assert_eq!(a, b, "equal contents must compare equal (value equality)");
 
         // Each component participates in equality (no false negatives).
-        let diff_value =
-            ClassAttributeLookup::found(attr("Bar"), PathBuf::from("/p.py"), "C".to_string());
+        let diff_value = ClassAttributeLookup::found(attr("Bar"), p, "C".to_string());
         assert_ne!(
             a, diff_value,
             "different attribute value must compare unequal"
         );
-        let diff_path =
-            ClassAttributeLookup::found(attr("Foo"), PathBuf::from("/q.py"), "C".to_string());
-        assert_ne!(a, diff_path, "different file path must compare unequal");
+        let diff_file = ClassAttributeLookup::found(attr("Foo"), q, "C".to_string());
+        assert_ne!(a, diff_file, "different file must compare unequal");
 
         let n1 = ClassAttributeLookup::not_found();
         let n2 = ClassAttributeLookup::not_found();
@@ -1177,12 +1192,10 @@ mod tests {
         assert_ne!(a, n1, "found vs not-found must compare unequal");
     }
 
-    /// Sync `path` by its lexically-normalized form. The MRO queries open
-    /// files by that path, and the LSP client reports it the same way on a
-    /// `did_change_watched_files` event.
+    /// Sync `path` as the LSP client reports it on a `did_change_watched_files`
+    /// event: by its lexical path, not resolving symlinks.
     fn sync_lexical(db: &mut HydraDatabase, path: &Path) {
-        let lexical = normalize_path_for_key(db, path);
-        ruff_db::files::File::sync_path(db, SystemPath::from_std_path(&lexical).unwrap());
+        File::sync_path(db, &system_path(path));
     }
 
     /// Write a 3-file `Child -> Parent -> GrandParent` workspace and return the
@@ -1226,7 +1239,7 @@ mod tests {
 
         let r1 = {
             let sp = resolver_environment_for_roots(&db, &[workspace.to_path_buf()]);
-            let child_key = class_key(&db, &child, "Child");
+            let child_key = ClassKey::new(&db, system_file(&db, &child), "Child");
             inherited_class_members(&db, child_key, sp)
         };
         // Prove the MRO walk really resolved through to GrandParent — otherwise
@@ -1250,7 +1263,7 @@ mod tests {
 
         let r2 = {
             let sp = resolver_environment_for_roots(&db, &[workspace.to_path_buf()]);
-            let child_key = class_key(&db, &child, "Child");
+            let child_key = ClassKey::new(&db, system_file(&db, &child), "Child");
             inherited_class_members(&db, child_key, sp)
         };
 
@@ -1280,7 +1293,7 @@ mod tests {
         let mut db = test_db();
         let r1 = {
             let sp = resolver_environment_for_roots(&db, &[workspace.to_path_buf()]);
-            let child_key = class_key(&db, &child, "Child");
+            let child_key = ClassKey::new(&db, system_file(&db, &child), "Child");
             inherited_class_members(&db, child_key, sp)
         };
         assert_eq!(r1.init_signature().map(|s| s.parameters.len()), Some(2));
@@ -1297,7 +1310,7 @@ mod tests {
 
         let r2 = {
             let sp = resolver_environment_for_roots(&db, &[workspace.to_path_buf()]);
-            let child_key = class_key(&db, &child, "Child");
+            let child_key = ClassKey::new(&db, system_file(&db, &child), "Child");
             inherited_class_members(&db, child_key, sp)
         };
         assert_eq!(
@@ -1322,7 +1335,7 @@ mod tests {
         let mut db = test_db();
         let r1 = {
             let sp = resolver_environment_for_roots(&db, &[workspace.to_path_buf()]);
-            let child_key = class_key(&db, &child, "Child");
+            let child_key = ClassKey::new(&db, system_file(&db, &child), "Child");
             let attr_key = SymbolName::new(&db, "factory".to_string());
             class_parent_attribute(&db, child_key, attr_key, sp)
         };
@@ -1339,7 +1352,7 @@ mod tests {
 
         let r2 = {
             let sp = resolver_environment_for_roots(&db, &[workspace.to_path_buf()]);
-            let child_key = class_key(&db, &child, "Child");
+            let child_key = ClassKey::new(&db, system_file(&db, &child), "Child");
             let attr_key = SymbolName::new(&db, "factory".to_string());
             class_parent_attribute(&db, child_key, attr_key, sp)
         };
@@ -1364,7 +1377,7 @@ mod tests {
         let mut db = test_db();
         let r1 = {
             let sp = resolver_environment_for_roots(&db, &[workspace.to_path_buf()]);
-            let child_key = class_key(&db, &child, "Child");
+            let child_key = ClassKey::new(&db, system_file(&db, &child), "Child");
             let attr_key = SymbolName::new(&db, "factory".to_string());
             class_parent_attribute(&db, child_key, attr_key, sp)
         };
@@ -1377,7 +1390,7 @@ mod tests {
 
         let r2 = {
             let sp = resolver_environment_for_roots(&db, &[workspace.to_path_buf()]);
-            let child_key = class_key(&db, &child, "Child");
+            let child_key = ClassKey::new(&db, system_file(&db, &child), "Child");
             let attr_key = SymbolName::new(&db, "factory".to_string());
             class_parent_attribute(&db, child_key, attr_key, sp)
         };
@@ -1421,7 +1434,7 @@ mod tests {
         let child_via_link = link_ws.join("child.py");
         let query = |db: &HydraDatabase| {
             let sp = resolver_environment_for_roots(db, std::slice::from_ref(&link_ws));
-            let child_key = class_key(db, &child_via_link, "Child");
+            let child_key = ClassKey::new(db, system_file(db, &child_via_link), "Child");
             inherited_class_members(db, child_key, sp)
         };
 
@@ -1483,6 +1496,7 @@ mod tests {
         assert!(
             result2
                 .as_ref()
+                .and_then(FilePath::as_system_path)
                 .is_some_and(|p| p.ends_with("new_module.py")),
             "module must resolve after creation + sync_path, got {result2:?}"
         );
@@ -1514,7 +1528,7 @@ mod tests {
         // Positive control: a guard that rejected everything would fail here.
         assert_eq!(
             resolve("inside"),
-            Some(PathBuf::from("/root/inside.py")),
+            Some(FilePath::system("/root/inside.py")),
             "a plain module name must still resolve"
         );
 
@@ -1546,7 +1560,7 @@ mod tests {
         // must really be reachable under its correct name.
         assert_eq!(
             resolve("pkg.sub"),
-            Some(PathBuf::from("/root/pkg/sub.py")),
+            Some(FilePath::system("/root/pkg/sub.py")),
             "the nested module must resolve under its correct name"
         );
         assert_eq!(
@@ -1563,8 +1577,9 @@ mod tests {
         db: &dyn ty_module_resolver::Db,
         search_paths: &[PathBuf],
         module: &str,
-    ) -> Option<PathBuf> {
+    ) -> Option<FilePath> {
         resolve_module_by_name(db, module, resolver_environment_for_roots(db, search_paths))
+            .map(|file| file.path(db).clone())
     }
 
     #[test]
@@ -1572,7 +1587,7 @@ mod tests {
         let db = TestDb::new();
         assert_eq!(
             resolve_on(&db, &[PathBuf::from("/root")], "builtins"),
-            Some(stdlib_search_root().join("builtins.pyi")),
+            Some(builtins_stub()),
         );
     }
 
@@ -1596,7 +1611,7 @@ mod tests {
 
         assert_eq!(
             resolve_on(&db, &[PathBuf::from("/root")], "builtins"),
-            Some(stdlib_search_root().join("builtins.pyi")),
+            Some(builtins_stub()),
         );
     }
 
@@ -1642,7 +1657,7 @@ mod tests {
             }
         }
 
-        fn resolve(&self, module: &str) -> Option<PathBuf> {
+        fn resolve(&self, module: &str) -> Option<FilePath> {
             let db = HydraDatabase::new(SystemPath::from_std_path(&self.workspace).unwrap());
             let environment = resolver_environment_from_parts(
                 &db,
@@ -1650,7 +1665,7 @@ mod tests {
                 vec![SystemPathBuf::from_path_buf(self.site_packages.clone()).unwrap()],
                 PythonVersion::latest_ty(),
             );
-            resolve_module_by_name(&db, module, environment)
+            resolve_module_by_name(&db, module, environment).map(|file| file.path(&db).clone())
         }
     }
 
@@ -1662,7 +1677,7 @@ mod tests {
 
         assert_eq!(
             layout.resolve("shared"),
-            Some(layout.workspace.join("shared.py"))
+            Some(on_disk(&layout.workspace.join("shared.py")))
         );
     }
 
@@ -1675,7 +1690,7 @@ mod tests {
 
         assert_eq!(
             layout.resolve("json"),
-            Some(layout.workspace.join("json.py"))
+            Some(on_disk(&layout.workspace.join("json.py")))
         );
     }
 
@@ -1698,7 +1713,7 @@ mod tests {
 
         assert_eq!(
             layout.resolve("typing_extensions"),
-            Some(layout.site_packages.join("typing_extensions.py"))
+            Some(on_disk(&layout.site_packages.join("typing_extensions.py")))
         );
     }
 
@@ -1713,10 +1728,7 @@ mod tests {
     #[test]
     fn test_builtins_without_a_shadow_is_the_vendored_stub() {
         let layout = Layout::new();
-        assert_eq!(
-            layout.resolve("builtins"),
-            Some(stdlib_search_root().join("builtins.pyi"))
-        );
+        assert_eq!(layout.resolve("builtins"), Some(builtins_stub()));
     }
 
     #[test]
@@ -1740,11 +1752,11 @@ mod tests {
 
         assert_eq!(
             layout.resolve("editable_pkg"),
-            Some(editable.join("editable_pkg").join("__init__.py"))
+            Some(on_disk(&editable.join("editable_pkg").join("__init__.py")))
         );
         assert_eq!(
             layout.resolve("shadowed"),
-            Some(layout.site_packages.join("shadowed.py"))
+            Some(on_disk(&layout.site_packages.join("shadowed.py")))
         );
     }
 
@@ -1756,11 +1768,11 @@ mod tests {
 
         assert_eq!(
             layout.resolve("ns.first"),
-            Some(layout.workspace.join("ns").join("first.py"))
+            Some(on_disk(&layout.workspace.join("ns").join("first.py")))
         );
         assert_eq!(
             layout.resolve("ns.second"),
-            Some(layout.site_packages.join("ns").join("second.py"))
+            Some(on_disk(&layout.site_packages.join("ns").join("second.py")))
         );
         // A namespace package has no file of its own to point at.
         assert_eq!(layout.resolve("ns"), None);
@@ -1776,7 +1788,9 @@ mod tests {
 
         assert_eq!(
             layout.resolve("pkg"),
-            Some(layout.site_packages.join("pkg").join("__init__.py"))
+            Some(on_disk(
+                &layout.site_packages.join("pkg").join("__init__.py")
+            ))
         );
         assert_eq!(layout.resolve("pkg.sub"), None);
     }
@@ -1794,7 +1808,9 @@ mod tests {
 
         assert_eq!(
             layout.resolve("acme"),
-            Some(layout.site_packages.join("acme-stubs").join("__init__.pyi"))
+            Some(on_disk(
+                &layout.site_packages.join("acme-stubs").join("__init__.pyi")
+            ))
         );
     }
 
@@ -1806,7 +1822,7 @@ mod tests {
 
         assert_eq!(
             layout.resolve("thing"),
-            Some(layout.workspace.join("thing").join("__init__.py"))
+            Some(on_disk(&layout.workspace.join("thing").join("__init__.py")))
         );
     }
 
@@ -1818,7 +1834,7 @@ mod tests {
 
         assert_eq!(
             layout.resolve("typed"),
-            Some(layout.workspace.join("typed.pyi"))
+            Some(on_disk(&layout.workspace.join("typed.pyi")))
         );
     }
 
@@ -1831,7 +1847,13 @@ mod tests {
         let search_paths = vec![examples_dir.clone(), PathBuf::from(".")];
         let result = resolve_on(&db, &search_paths, "my_module");
         assert!(result.is_some());
-        assert!(result.unwrap().ends_with("my_module.py"));
+        assert!(
+            result
+                .unwrap()
+                .as_system_path()
+                .unwrap()
+                .ends_with("my_module.py")
+        );
     }
 
     #[test]
@@ -1841,7 +1863,13 @@ mod tests {
         let search_paths = vec![examples_dir.clone(), PathBuf::from(".")];
         let result = resolve_on(&db, &search_paths, "test_package");
         assert!(result.is_some());
-        assert!(result.unwrap().ends_with("__init__.py"));
+        assert!(
+            result
+                .unwrap()
+                .as_system_path()
+                .unwrap()
+                .ends_with("__init__.py")
+        );
     }
 
     #[test]
@@ -1851,7 +1879,13 @@ mod tests {
         let search_paths = vec![examples_dir.clone(), PathBuf::from(".")];
         let result = resolve_on(&db, &search_paths, "test_package.submodule");
         assert!(result.is_some());
-        assert!(result.unwrap().ends_with("submodule.py"));
+        assert!(
+            result
+                .unwrap()
+                .as_system_path()
+                .unwrap()
+                .ends_with("submodule.py")
+        );
     }
 
     #[test]
