@@ -7,82 +7,21 @@
 //! can come from is a stub file. `ty_vendored` already ships typeshed as a
 //! zipped [`VendoredFileSystem`], which `HydraDatabase` hands to `ruff_db`.
 //!
-//! # Sentinel paths
-//!
 //! Module resolution goes through `ty_module_resolver`, which hands back the
-//! vendored stub as a `File`, but the rest of the crate addresses files by
-//! `std::path::Path`. Rather than thread a `FilePath` enum through every
-//! signature, a vendored file is given a sentinel path rooted at
-//! [`VENDORED_ROOT`]: `<typeshed>/stdlib/builtins.pyi`
-//! ([`vendored_sentinel_path`]). Only the two functions that actually touch a
-//! file, `path_is_file` and `path_to_file` in `extract`, branch on
-//! [`is_vendored_path`] to reach the `VendoredFileSystem` instead of the OS.
+//! vendored stub as a `File` whose path is a `FilePath::Vendored`, such as
+//! `stdlib/builtins.pyi`. Reads and parses go through `ruff_db`, which reaches
+//! the archive for those files instead of the OS.
 //!
 //! The resolver puts the stdlib stubs after the first-party roots and before
 //! site-packages, as the typing spec orders them. `resolved_module_file` keeps
 //! a stub-backed module only when [`is_builtins_module`] is true for it, so the
 //! rest of the stdlib stays unresolved.
 //!
-//! `<typeshed>` is a relative single-component path containing characters that
-//! are illegal in Windows filenames, so it cannot collide with a real search
-//! root. Nothing on disk corresponds to it, so `Backend::goto_definition`
-//! checks [`is_vendored_path`] and returns no location rather than handing the
-//! editor a URI it cannot open.
-
-use ruff_db::vendored::{VendoredPath, VendoredPathBuf};
-use std::path::{Component, Path, PathBuf};
-
-/// First component of every sentinel path that addresses a vendored stub.
-const VENDORED_ROOT: &str = "<typeshed>";
+//! Nothing on disk corresponds to a vendored file, so `goto_definition` returns
+//! no location for one rather than handing the editor a URI it cannot open.
 
 /// The `builtins` module name. Hydra requires this prefix on a builtin target.
 pub(crate) const BUILTINS_MODULE: &str = "builtins";
-
-/// The root that vendored stdlib stubs are resolved against.
-///
-/// Typeshed's stdlib stubs live under `stdlib/` inside the archive, so the root
-/// is `<typeshed>/stdlib` and `builtins` resolves to
-/// `<typeshed>/stdlib/builtins.pyi`.
-pub(super) fn stdlib_search_root() -> PathBuf {
-    Path::new(VENDORED_ROOT).join("stdlib")
-}
-
-/// The sentinel path for a file in the vendored archive, the inverse of
-/// [`to_vendored_path`].
-pub(super) fn vendored_sentinel_path(path: &VendoredPath) -> PathBuf {
-    let mut sentinel = PathBuf::from(VENDORED_ROOT);
-    sentinel.extend(path.as_str().split('/'));
-    sentinel
-}
-
-/// Whether `path` addresses a file inside the vendored typeshed archive.
-pub(crate) fn is_vendored_path(path: &Path) -> bool {
-    path.components().next() == Some(Component::Normal(VENDORED_ROOT.as_ref()))
-}
-
-/// Convert a sentinel path to the archive-relative path the
-/// [`VendoredFileSystem`](ruff_db::vendored::VendoredFileSystem) understands.
-///
-/// Returns `None` when `path` is not a sentinel path or is not valid UTF-8.
-pub(super) fn to_vendored_path(path: &Path) -> Option<VendoredPathBuf> {
-    let parts = normal_parts(path.strip_prefix(VENDORED_ROOT).ok()?)?;
-    if parts.is_empty() {
-        return None;
-    }
-    // The archive always uses `/` as its separator, regardless of host OS.
-    Some(VendoredPath::new(&parts.join("/")).to_path_buf())
-}
-
-/// The components of `path` as UTF-8 strings, or `None` if any is not a plain
-/// name (a root, `.`, `..`) or not valid UTF-8.
-fn normal_parts(path: &Path) -> Option<Vec<&str>> {
-    path.components()
-        .map(|component| match component {
-            Component::Normal(part) => part.to_str(),
-            _ => None,
-        })
-        .collect()
-}
 
 /// Whether `name` is one the runtime module actually exposes.
 ///
@@ -97,30 +36,6 @@ pub(super) fn is_runtime_builtin_name(name: &str) -> bool {
         return true;
     }
     name.starts_with("__") && name.ends_with("__") && name.len() > 4
-}
-
-/// The dotted module name a vendored stub path stands for —
-/// `<typeshed>/stdlib/builtins.pyi` is `builtins`, and
-/// `<typeshed>/stdlib/os/path.pyi` is `os.path`.
-///
-/// Lets a caller that has only a resolved stub path recover which module it
-/// came from, rather than assuming the target's own prefix names it. Returns
-/// `None` for anything that is not a stub path under [`stdlib_search_root`].
-pub(super) fn vendored_module_name(path: &Path) -> Option<String> {
-    let mut parts = normal_parts(path.strip_prefix(stdlib_search_root()).ok()?)?;
-    // The last component carries the extension, and an `__init__` stub names
-    // the package directory rather than a module of its own.
-    let last = parts.pop()?;
-    let stem = last
-        .strip_suffix(".pyi")
-        .or_else(|| last.strip_suffix(".py"))?;
-    if stem != "__init__" {
-        parts.push(stem);
-    }
-    if parts.is_empty() {
-        return None;
-    }
-    Some(parts.join("."))
 }
 
 /// Whether `module_path` is `builtins` or one of its submodules.
@@ -144,64 +59,6 @@ pub(super) fn is_stubbed_pypi_package(module_path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn stdlib_root_is_a_sentinel_path() {
-        let root = stdlib_search_root();
-        assert!(is_vendored_path(&root));
-        assert!(!root.is_absolute());
-    }
-
-    #[test]
-    fn builtins_stub_maps_into_the_archive() {
-        let stub = stdlib_search_root().join("builtins.pyi");
-        assert_eq!(
-            to_vendored_path(&stub).unwrap().as_str(),
-            "stdlib/builtins.pyi"
-        );
-    }
-
-    #[test]
-    fn archive_paths_round_trip_through_sentinels() {
-        let sentinel = vendored_sentinel_path(VendoredPath::new("stdlib/os/path.pyi"));
-        assert_eq!(sentinel, stdlib_search_root().join("os").join("path.pyi"));
-        assert_eq!(
-            to_vendored_path(&sentinel).unwrap().as_str(),
-            "stdlib/os/path.pyi"
-        );
-    }
-
-    #[test]
-    fn non_sentinel_paths_are_not_vendored() {
-        assert!(!is_vendored_path(Path::new("/usr/lib/python3.12/os.py")));
-        assert!(!is_vendored_path(Path::new("src/typeshed/os.pyi")));
-        assert!(to_vendored_path(Path::new("/tmp/builtins.pyi")).is_none());
-    }
-
-    #[test]
-    fn traversal_components_are_rejected() {
-        assert!(to_vendored_path(Path::new("<typeshed>/../../etc/passwd")).is_none());
-        assert!(to_vendored_path(Path::new(VENDORED_ROOT)).is_none());
-    }
-
-    #[test]
-    fn stub_paths_map_back_to_module_names() {
-        let root = stdlib_search_root();
-        assert_eq!(
-            vendored_module_name(&root.join("builtins.pyi")).as_deref(),
-            Some("builtins")
-        );
-        assert_eq!(
-            vendored_module_name(&root.join("os").join("path.pyi")).as_deref(),
-            Some("os.path")
-        );
-        assert_eq!(
-            vendored_module_name(&root.join("os").join("__init__.pyi")).as_deref(),
-            Some("os"),
-            "an __init__ stub names the package, not a module of its own"
-        );
-        assert_eq!(vendored_module_name(Path::new("/tmp/builtins.pyi")), None);
-    }
 
     #[test]
     fn stub_internal_names_are_not_runtime_builtins() {

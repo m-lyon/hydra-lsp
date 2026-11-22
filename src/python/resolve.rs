@@ -2,28 +2,25 @@
 //! class attribute chains and base classes across files.
 
 use super::cache::{
-    ResolvedDefinition, SymbolName, class_key, class_parent_attribute, inherited_class_members,
+    ClassKey, ResolvedDefinition, SymbolName, class_parent_attribute, inherited_class_members,
     resolve_module_by_name,
 };
 use super::extract::{extract_class_info, extract_function_signature, extract_method_info};
 use super::import_resolver::{ImportResolver, ResolvedSymbol};
 use super::model::{ClassInfo, DefinitionInfo, FunctionSignature, MethodInfo, ResolveError};
-use std::path::{Path, PathBuf};
+use ruff_db::files::File;
 use ty_module_resolver::ResolverEnvironment;
 
 /// Result of resolving a class attribute chain
 enum ClassAttributeChainResult {
     /// Chain resolved to a method
     Method {
-        file_path: PathBuf,
+        file: File,
         class_name: String,
         method_name: String,
     },
     /// Chain resolved to a class
-    Class {
-        file_path: PathBuf,
-        class_name: String,
-    },
+    Class { file: File, class_name: String },
 }
 
 /// Split a dotted path at its last dot, into module path and symbol name.
@@ -39,12 +36,12 @@ fn split_target(target: &str) -> Option<(&str, &str)> {
 /// class, or a method on it when the last attribute names one.
 fn resolve_attribute_chain<'db>(
     db: &'db dyn ty_module_resolver::Db,
-    file_path: &Path,
+    file: File,
     starting_class: &str,
     attribute_chain: &[&str],
     environment: ResolverEnvironment<'db>,
 ) -> Option<ClassAttributeChainResult> {
-    let mut current_file = file_path.to_path_buf();
+    let mut current_file = file;
     let mut current_class = starting_class.to_string();
     let resolver = ImportResolver::new(db, environment);
     let python_version = environment.python_version(db);
@@ -54,11 +51,10 @@ fn resolve_attribute_chain<'db>(
 
         // The last attribute may be a method of the current class.
         if is_last
-            && extract_method_info(db, &current_file, &current_class, attr, python_version)
-                .is_some()
+            && extract_method_info(db, current_file, &current_class, attr, python_version).is_some()
         {
             return Some(ClassAttributeChainResult::Method {
-                file_path: current_file,
+                file: current_file,
                 class_name: current_class,
                 method_name: attr.to_string(),
             });
@@ -67,7 +63,7 @@ fn resolve_attribute_chain<'db>(
         // Otherwise it must be a class attribute, possibly inherited. The
         // salsa-tracked class_parent_attribute memoises each (class, attr)
         // pair so shared parent classes are only walked once per revision.
-        let class_key = class_key(db, &current_file, &current_class);
+        let class_key = ClassKey::new(db, current_file, current_class.as_str());
         let attr_key = SymbolName::new(db, attr.to_string());
         let cached_attr = class_parent_attribute(db, class_key, attr_key, environment);
         let value = cached_attr.get()?.info.value.as_str();
@@ -76,19 +72,19 @@ fn resolve_attribute_chain<'db>(
         if let Some((module_path, class_name)) = split_target(value) {
             current_file = resolver.resolve_module_file(module_path)?;
             current_class = class_name.to_string();
-        } else if extract_class_info(db, &current_file, value, python_version).is_some() {
+        } else if extract_class_info(db, current_file, value, python_version).is_some() {
             // A simple name defined in the same file
             current_class = value.to_string();
         } else {
             // A simple name imported into the file
-            let resolved = resolver.resolve_symbol(&current_file, value)?;
+            let resolved = resolver.resolve_symbol(current_file, value)?;
             current_file = resolved.file;
             current_class = resolved.name;
         }
     }
 
     Some(ClassAttributeChainResult::Class {
-        file_path: current_file,
+        file: current_file,
         class_name: current_class,
     })
 }
@@ -100,7 +96,7 @@ fn resolve_attribute_chain<'db>(
 /// - Qualified names: `module.ClassName` - resolves the module path
 pub(super) fn resolve_base_class<'db>(
     db: &'db dyn ty_module_resolver::Db,
-    current_file: &Path,
+    current_file: File,
     base_class_expr: &str,
     environment: ResolverEnvironment<'db>,
 ) -> Option<ResolvedSymbol> {
@@ -131,25 +127,25 @@ pub(super) fn resolve_base_class<'db>(
         environment.python_version(db),
     )
     .map(|_| ResolvedSymbol {
-        file: current_file.to_path_buf(),
+        file: current_file,
         name: base_class_expr.to_string(),
     })
 }
 
 /// Extract class information, following re-exports if necessary.
-/// Returns the ClassInfo and the file path where it was found.
+/// Returns the ClassInfo and the file where it was found.
 ///
 /// This also resolves missing properties (docstring, __init__) from parent classes
 /// when they are not defined in the child class.
 fn extract_class_info_with_imports<'db>(
     db: &'db dyn ty_module_resolver::Db,
-    file_path: &Path,
+    file: File,
     class_name: &str,
     environment: ResolverEnvironment<'db>,
-) -> Option<(ClassInfo, PathBuf)> {
+) -> Option<(ClassInfo, File)> {
     let python_version = environment.python_version(db);
     let (mut class_info, resolved_file) =
-        with_reexports(db, file_path, class_name, environment, |file, name| {
+        with_reexports(db, file, class_name, environment, |file, name| {
             extract_class_info(db, file, name, python_version)
         })?;
 
@@ -157,7 +153,7 @@ fn extract_class_info_with_imports<'db>(
     // inherited_class_members walks the MRO recursively and caches results per (class, environment),
     // so shared parent classes across different child-class lookups are resolved only once.
     if class_info.docstring.is_none() || class_info.init_signature.is_none() {
-        let class_key = class_key(db, &resolved_file, &class_info.name);
+        let class_key = ClassKey::new(db, resolved_file, class_info.name.as_str());
         let parent_docs = inherited_class_members(db, class_key, environment);
         parent_docs.fill_missing(
             &mut class_info.docstring,
@@ -175,35 +171,35 @@ fn extract_class_info_with_imports<'db>(
 }
 
 /// Extract function signature, following re-exports if necessary.
-/// Returns the FunctionSignature and the file path where it was found.
+/// Returns the FunctionSignature and the file where it was found.
 fn extract_function_signature_with_imports<'db>(
     db: &'db dyn ty_module_resolver::Db,
-    file_path: &Path,
+    file: File,
     function_name: &str,
     environment: ResolverEnvironment<'db>,
-) -> Option<(FunctionSignature, PathBuf)> {
+) -> Option<(FunctionSignature, File)> {
     let python_version = environment.python_version(db);
-    with_reexports(db, file_path, function_name, environment, |file, name| {
+    with_reexports(db, file, function_name, environment, |file, name| {
         extract_function_signature(db, file, name, python_version)
     })
 }
 
-/// Run `extract` for `name` in `file_path`, and if that finds nothing, again
+/// Run `extract` for `name` in `file`, and if that finds nothing, again
 /// where the file's imports say `name` really lives. Returns the result and
 /// the file it came from.
 fn with_reexports<'db, T>(
     db: &'db dyn ty_module_resolver::Db,
-    file_path: &Path,
+    file: File,
     name: &str,
     environment: ResolverEnvironment<'db>,
-    extract: impl Fn(&Path, &str) -> Option<T>,
-) -> Option<(T, PathBuf)> {
-    if let Some(found) = extract(file_path, name) {
-        return Some((found, file_path.to_path_buf()));
+    extract: impl Fn(File, &str) -> Option<T>,
+) -> Option<(T, File)> {
+    if let Some(found) = extract(file, name) {
+        return Some((found, file));
     }
 
-    let resolved = ImportResolver::new(db, environment).resolve_symbol(file_path, name)?;
-    let found = extract(&resolved.file, &resolved.name)?;
+    let resolved = ImportResolver::new(db, environment).resolve_symbol(file, name)?;
+    let found = extract(resolved.file, &resolved.name)?;
     Some((found, resolved.file))
 }
 
@@ -218,9 +214,9 @@ pub(super) fn extract_definition_info<'db>(
     let Some((module_name, symbol_name)) = split_target(target) else {
         return Err(ResolveError::InvalidFormat(target.to_string()));
     };
-    let found = |definition_info, file_path, symbol_name| ResolvedDefinition {
+    let found = |definition_info, file, symbol_name| ResolvedDefinition {
         definition_info,
-        file_path,
+        file,
         module_name: module_name.to_string(),
         symbol_name,
     };
@@ -229,12 +225,12 @@ pub(super) fn extract_definition_info<'db>(
     let mut module_found = false;
 
     // First try standard resolution: module.symbol where symbol is a function or class
-    if let Some(file_path) = resolve_module_by_name(db, module_name, environment) {
+    if let Some(file) = resolve_module_by_name(db, module_name, environment) {
         module_found = true;
 
         // Try to extract as function first (with import resolution)
         if let Some((func_sig, resolved_file)) =
-            extract_function_signature_with_imports(db, &file_path, symbol_name, environment)
+            extract_function_signature_with_imports(db, file, symbol_name, environment)
         {
             return Ok(found(
                 DefinitionInfo::Function(func_sig),
@@ -245,7 +241,7 @@ pub(super) fn extract_definition_info<'db>(
 
         // Try to extract as class (with import resolution)
         if let Some((class_info, resolved_file)) =
-            extract_class_info_with_imports(db, &file_path, symbol_name, environment)
+            extract_class_info_with_imports(db, file, symbol_name, environment)
         {
             return Ok(found(
                 DefinitionInfo::Class(class_info),
@@ -260,13 +256,13 @@ pub(super) fn extract_definition_info<'db>(
     // or nested class pattern (e.g., "my_module.OuterClass.nested.nested_class")
     match resolve_class_attribute_chain(db, target, environment) {
         Some(ClassAttributeChainResult::Method {
-            file_path: resolved_file,
+            file: resolved_file,
             class_name,
             method_name,
         }) => {
             if let Some((method_info, final_file)) = extract_method_info_with_imports(
                 db,
-                &resolved_file,
+                resolved_file,
                 &class_name,
                 &method_name,
                 environment,
@@ -279,11 +275,11 @@ pub(super) fn extract_definition_info<'db>(
             }
         }
         Some(ClassAttributeChainResult::Class {
-            file_path: resolved_file,
+            file: resolved_file,
             class_name,
         }) => {
             if let Some((class_info, final_file)) =
-                extract_class_info_with_imports(db, &resolved_file, &class_name, environment)
+                extract_class_info_with_imports(db, resolved_file, &class_name, environment)
             {
                 return Ok(found(
                     DefinitionInfo::Class(class_info),
@@ -340,7 +336,7 @@ fn resolve_class_attribute_chain<'db>(
 
         // Cached salsa lookup: same (module_path, environment) → cache hit on
         // second hover for any symbol in the same module.
-        let Some(file_path) = resolve_module_by_name(db, &module_path, environment) else {
+        let Some(file) = resolve_module_by_name(db, &module_path, environment) else {
             continue;
         };
 
@@ -349,7 +345,7 @@ fn resolve_class_attribute_chain<'db>(
 
         // Check if this is a class
         if let Some((class_info, resolved_file)) =
-            extract_class_info_with_imports(db, &file_path, first_symbol, environment)
+            extract_class_info_with_imports(db, file, first_symbol, environment)
         {
             if remaining_parts.len() == 2 {
                 // Simple case: Class.method
@@ -357,7 +353,7 @@ fn resolve_class_attribute_chain<'db>(
                 // Check if method exists (salsa-cached)
                 if extract_method_info(
                     db,
-                    &resolved_file,
+                    resolved_file,
                     &class_info.name,
                     method_name,
                     python_version,
@@ -365,7 +361,7 @@ fn resolve_class_attribute_chain<'db>(
                 .is_some()
                 {
                     return Some(ClassAttributeChainResult::Method {
-                        file_path: resolved_file,
+                        file: resolved_file,
                         class_name: class_info.name,
                         method_name: method_name.to_string(),
                     });
@@ -375,7 +371,7 @@ fn resolve_class_attribute_chain<'db>(
                 let attribute_chain = &remaining_parts[1..];
                 if let Some(result) = resolve_attribute_chain(
                     db,
-                    &resolved_file,
+                    resolved_file,
                     &class_info.name,
                     attribute_chain,
                     environment,
@@ -390,17 +386,17 @@ fn resolve_class_attribute_chain<'db>(
 }
 
 /// Extract method info, following re-exports if necessary.
-/// Returns the MethodInfo and the file path where it was found.
+/// Returns the MethodInfo and the file where it was found.
 fn extract_method_info_with_imports<'db>(
     db: &'db dyn ty_module_resolver::Db,
-    file_path: &Path,
+    file: File,
     class_name: &str,
     method_name: &str,
     environment: ResolverEnvironment<'db>,
-) -> Option<(MethodInfo, PathBuf)> {
+) -> Option<(MethodInfo, File)> {
     let python_version = environment.python_version(db);
     // The class is what gets re-exported, so it is the name to follow.
-    with_reexports(db, file_path, class_name, environment, |file, class| {
+    with_reexports(db, file, class_name, environment, |file, class| {
         extract_method_info(db, file, class, method_name, python_version)
     })
 }
@@ -420,23 +416,26 @@ pub(super) fn base_class_name(base_class_expr: &str) -> &str {
 mod tests {
     use super::*;
     use crate::python::cache::resolver_environment_for_roots;
-    use crate::python::extract::{module_defines_top_level, path_is_file, read_source};
+    use crate::python::extract::{module_defines_top_level, read_source};
     use crate::python::format::{format_class, format_function, format_method};
     use crate::python::model::ParameterKind;
     use ruff_python_ast::PythonVersion;
 
-    use crate::python::test_support::{extract_definition_info, get_simple_test_dir, test_db};
+    use crate::python::test_support::{
+        disk_path, extract_definition_info, get_simple_test_dir, system_file, test_db,
+    };
+    use std::path::{Path, PathBuf};
 
     /// `extract_class_info_with_imports` with `roots` as the search roots.
     fn extract_class_info_with_imports(
         db: &dyn ty_module_resolver::Db,
-        file_path: &Path,
+        file: File,
         class_name: &str,
         roots: &[PathBuf],
-    ) -> Option<(ClassInfo, PathBuf)> {
+    ) -> Option<(ClassInfo, File)> {
         super::extract_class_info_with_imports(
             db,
-            file_path,
+            file,
             class_name,
             resolver_environment_for_roots(db, roots),
         )
@@ -505,9 +504,10 @@ mod tests {
         let test_file = examples_dir.join("my_module.py");
 
         // First verify that direct extraction does NOT give us __init__
+        let db = test_db();
         let direct_info = extract_class_info(
-            &test_db(),
-            &test_file,
+            &db,
+            system_file(&db, &test_file),
             "ChildWithoutInit",
             PythonVersion::latest_ty(),
         )
@@ -522,8 +522,8 @@ mod tests {
         // Now verify that extract_class_info_with_imports gives us inherited __init__
         let search_paths = vec![examples_dir.clone()];
         let (class_info, _) = extract_class_info_with_imports(
-            &test_db(),
-            &test_file,
+            &db,
+            system_file(&db, &test_file),
             "ChildWithoutInit",
             &search_paths,
         )
@@ -560,9 +560,10 @@ mod tests {
         let test_file = examples_dir.join("my_module.py");
 
         let search_paths = vec![examples_dir.clone()];
+        let db = test_db();
         let (class_info, _) = extract_class_info_with_imports(
-            &test_db(),
-            &test_file,
+            &db,
+            system_file(&db, &test_file),
             "GrandchildWithoutInit",
             &search_paths,
         )
@@ -587,9 +588,10 @@ mod tests {
         let test_file = examples_dir.join("my_module.py");
 
         let search_paths = vec![examples_dir.clone()];
+        let db = test_db();
         let (class_info, _) = extract_class_info_with_imports(
-            &test_db(),
-            &test_file,
+            &db,
+            system_file(&db, &test_file),
             "ChildWithOwnInit",
             &search_paths,
         )
@@ -871,17 +873,14 @@ mod tests {
     // (`@overload`, `__new__`-only classes, positional-only parameters) are
     // exactly the ones a hand-written fixture would get subtly wrong.
 
-    use crate::python::typeshed::stdlib_search_root;
-
-    fn builtins_stub() -> PathBuf {
-        stdlib_search_root().join("builtins.pyi")
+    fn builtins_stub(db: &dyn ruff_db::Db) -> File {
+        ruff_db::files::vendored_path_to_file(db, "stdlib/builtins.pyi").expect("vendored stub")
     }
 
     #[test]
     fn test_vendored_builtins_stub_is_readable() {
         let db = test_db();
-        assert!(path_is_file(&db, &builtins_stub()));
-        let source = read_source(&db, &builtins_stub()).unwrap();
+        let source = read_source(&db, builtins_stub(&db)).unwrap();
         assert!(source.as_str().contains("def len("));
     }
 
@@ -889,7 +888,7 @@ mod tests {
     fn test_builtin_len_parameter_is_positional_only() {
         let db = test_db();
         let sig =
-            extract_function_signature(&db, &builtins_stub(), "len", PythonVersion::latest_ty())
+            extract_function_signature(&db, builtins_stub(&db), "len", PythonVersion::latest_ty())
                 .unwrap();
 
         assert!(!sig.is_overloaded);
@@ -907,7 +906,7 @@ mod tests {
     fn test_builtin_open_is_overloaded() {
         let db = test_db();
         let sig =
-            extract_function_signature(&db, &builtins_stub(), "open", PythonVersion::latest_ty())
+            extract_function_signature(&db, builtins_stub(&db), "open", PythonVersion::latest_ty())
                 .unwrap();
 
         assert!(
@@ -924,7 +923,7 @@ mod tests {
         // The `__new__` fallback is applied by `extract_class_info_with_imports`,
         // once the MRO has had its chance to supply an `__init__`.
         let (class_info, _) =
-            extract_class_info_with_imports(&db, &builtins_stub(), "int", &[]).unwrap();
+            extract_class_info_with_imports(&db, builtins_stub(&db), "int", &[]).unwrap();
 
         let init = class_info
             .init_signature
@@ -960,7 +959,8 @@ class Child(Base):
         let search_paths = vec![dir.path().to_path_buf()];
 
         let (class_info, _) =
-            extract_class_info_with_imports(&db, &path, "Child", &search_paths).unwrap();
+            extract_class_info_with_imports(&db, system_file(&db, &path), "Child", &search_paths)
+                .unwrap();
 
         let init = class_info.init_signature.as_ref().unwrap();
         assert_eq!(init.name, "__init__");
@@ -972,7 +972,8 @@ class Child(Base):
     fn test_builtin_dict_init_is_overloaded() {
         let db = test_db();
         let class_info =
-            extract_class_info(&db, &builtins_stub(), "dict", PythonVersion::latest_ty()).unwrap();
+            extract_class_info(&db, builtins_stub(&db), "dict", PythonVersion::latest_ty())
+                .unwrap();
 
         let init = class_info
             .init_signature
@@ -986,7 +987,7 @@ class Child(Base):
     fn test_builtin_tuple_new_is_not_flagged_overloaded() {
         let db = test_db();
         let (class_info, _) =
-            extract_class_info_with_imports(&db, &builtins_stub(), "tuple", &[]).unwrap();
+            extract_class_info_with_imports(&db, builtins_stub(&db), "tuple", &[]).unwrap();
 
         let init = class_info.init_signature.as_ref().unwrap();
         assert_eq!(init.name, "__new__");
@@ -1012,8 +1013,13 @@ class Child(Base):
         );
         let (_dir, path) = temp_module("stub.pyi", source);
 
-        let render =
-            extract_function_signature(&db, &path, "render", PythonVersion::latest_ty()).unwrap();
+        let render = extract_function_signature(
+            &db,
+            system_file(&db, &path),
+            "render",
+            PythonVersion::latest_ty(),
+        )
+        .unwrap();
         assert!(render.is_overloaded);
     }
 
@@ -1039,7 +1045,8 @@ class Child(Base):
         let search_paths = vec![dir.path().to_path_buf()];
 
         let (class_info, _) =
-            extract_class_info_with_imports(&db, &path, "Child", &search_paths).unwrap();
+            extract_class_info_with_imports(&db, system_file(&db, &path), "Child", &search_paths)
+                .unwrap();
 
         let init = class_info
             .init_signature
@@ -1067,18 +1074,26 @@ class Child(Base):
         );
         let (_dir, path) = temp_module("markers.py", source);
 
-        let with_varargs =
-            extract_function_signature(&db, &path, "with_varargs", PythonVersion::latest_ty())
-                .unwrap();
+        let with_varargs = extract_function_signature(
+            &db,
+            system_file(&db, &path),
+            "with_varargs",
+            PythonVersion::latest_ty(),
+        )
+        .unwrap();
         let rendered = format_function(&with_varargs);
         assert!(
             rendered.contains("with_varargs(a, *args, key = 1, **kw)"),
             "got:\n{rendered}"
         );
 
-        let without_varargs =
-            extract_function_signature(&db, &path, "without_varargs", PythonVersion::latest_ty())
-                .unwrap();
+        let without_varargs = extract_function_signature(
+            &db,
+            system_file(&db, &path),
+            "without_varargs",
+            PythonVersion::latest_ty(),
+        )
+        .unwrap();
         let rendered = format_function(&without_varargs);
         assert!(
             rendered.contains("without_varargs(a, *, key = 1)"),
@@ -1103,7 +1118,8 @@ class Thing(Widget):
         let search_paths = vec![dir.path().to_path_buf()];
 
         let (class_info, _) =
-            extract_class_info_with_imports(&db, &path, "Thing", &search_paths).unwrap();
+            extract_class_info_with_imports(&db, system_file(&db, &path), "Thing", &search_paths)
+                .unwrap();
 
         assert_eq!(class_info.init_signature.as_ref().unwrap().name, "__new__");
         assert!(!class_info.all_bases_resolved);
@@ -1127,7 +1143,8 @@ class Thing(Widget):
         let search_paths = vec![dir.path().to_path_buf()];
 
         let (class_info, _) =
-            extract_class_info_with_imports(&db, &path, "Thing", &search_paths).unwrap();
+            extract_class_info_with_imports(&db, system_file(&db, &path), "Thing", &search_paths)
+                .unwrap();
 
         assert_eq!(class_info.init_signature.as_ref().unwrap().name, "__new__");
         assert!(class_info.all_bases_resolved);
@@ -1158,7 +1175,8 @@ class Thing(Widget):
         let search_paths = vec![dir.path().to_path_buf()];
 
         let (class_info, _) =
-            extract_class_info_with_imports(&db, &path, "Thing", &search_paths).unwrap();
+            extract_class_info_with_imports(&db, system_file(&db, &path), "Thing", &search_paths)
+                .unwrap();
 
         let init = class_info
             .init_signature
@@ -1189,7 +1207,8 @@ class Thing(Widget):
         let search_paths = vec![dir.path().to_path_buf()];
 
         let (class_info, _) =
-            extract_class_info_with_imports(&db, &path, "Thing", &search_paths).unwrap();
+            extract_class_info_with_imports(&db, system_file(&db, &path), "Thing", &search_paths)
+                .unwrap();
 
         assert_eq!(class_info.init_signature.as_ref().unwrap().name, "__new__");
         assert!(!class_info.all_bases_resolved);
@@ -1215,8 +1234,14 @@ class Widget:
 "#;
         let (_dir, path) = temp_module("prop.py", source);
 
-        let method =
-            extract_method_info(&db, &path, "Widget", "value", PythonVersion::latest_ty()).unwrap();
+        let method = extract_method_info(
+            &db,
+            system_file(&db, &path),
+            "Widget",
+            "value",
+            PythonVersion::latest_ty(),
+        )
+        .unwrap();
         assert!(!method.signature.is_overloaded);
         assert!(!format_method(&method).contains("@overload"));
     }
@@ -1226,22 +1251,22 @@ class Widget:
         let db = test_db();
         assert!(module_defines_top_level(
             &db,
-            &builtins_stub(),
+            builtins_stub(&db),
             "len",
             PythonVersion::latest_ty()
         ));
         assert!(module_defines_top_level(
             &db,
-            &builtins_stub(),
+            builtins_stub(&db),
             "dict",
             PythonVersion::latest_ty()
         ));
         assert!(
-            !module_defines_top_level(&db, &builtins_stub(), "count", PythonVersion::latest_ty()),
+            !module_defines_top_level(&db, builtins_stub(&db), "count", PythonVersion::latest_ty()),
             "`count` is a method of `list`, not a builtin"
         );
         assert!(
-            module_defines_top_level(&db, &builtins_stub(), "aiter", PythonVersion::latest_ty()),
+            module_defines_top_level(&db, builtins_stub(&db), "aiter", PythonVersion::latest_ty()),
             "typeshed guards `aiter` behind `if sys.version_info >= (3, 10):`"
         );
     }
@@ -1268,14 +1293,24 @@ def plain(value, /, other, *, flag=False):
         // A `.py` overload set ends with the implementation, whose signature is
         // the one Hydra will call — so there is something definite to validate
         // against and the symbol is not reported as overloaded.
-        let render =
-            extract_function_signature(&db, &path, "render", PythonVersion::latest_ty()).unwrap();
+        let render = extract_function_signature(
+            &db,
+            system_file(&db, &path),
+            "render",
+            PythonVersion::latest_ty(),
+        )
+        .unwrap();
         assert!(!render.is_overloaded);
         assert_eq!(render.docstring.as_deref(), Some("Render a value."));
         assert!(render.parameters[0].type_annotation.is_none());
 
-        let plain =
-            extract_function_signature(&db, &path, "plain", PythonVersion::latest_ty()).unwrap();
+        let plain = extract_function_signature(
+            &db,
+            system_file(&db, &path),
+            "plain",
+            PythonVersion::latest_ty(),
+        )
+        .unwrap();
         assert!(!plain.is_overloaded);
         let kinds: Vec<_> = plain
             .parameters
@@ -1325,16 +1360,14 @@ def plain(value, /, other, *, flag=False):
         )
         .unwrap();
 
-        let resolved = extract_definition_info(
-            &test_db(),
-            "pkg.a.Outer.mid.inner",
-            &[dir.path().to_path_buf()],
-        )
-        .expect("the chain should resolve");
+        let db = test_db();
+        let resolved =
+            extract_definition_info(&db, "pkg.a.Outer.mid.inner", &[dir.path().to_path_buf()])
+                .expect("the chain should resolve");
         match resolved.definition_info {
             DefinitionInfo::Class(class_info) => assert_eq!(class_info.name, "Inner"),
             other => panic!("expected a class, got {other:?}"),
         }
-        assert_eq!(resolved.file_path, pkg.join("c.py"));
+        assert_eq!(disk_path(&db, resolved.file), pkg.join("c.py"));
     }
 }

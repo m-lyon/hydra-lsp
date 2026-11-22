@@ -6,75 +6,39 @@ use super::model::{
     ClassAttributeInfo, ClassInfo, FunctionSignature, MethodInfo, ParameterInfo, ParameterKind,
     SourcePosition, SourceRange,
 };
-use super::typeshed::{is_vendored_path, to_vendored_path};
 use ruff_db::PythonFile;
-use ruff_db::files::{File, system_path_to_file, vendored_path_to_file};
+use ruff_db::files::File;
 use ruff_db::parsed::{ParsedModuleRef, parsed_module};
 use ruff_db::source::{SourceText, source_text};
-use ruff_db::system::SystemPath;
 use ruff_python_ast::{self as ast, Expr, PythonVersion, Stmt, visitor::Visitor};
 use ruff_source_file::{LineIndex, PositionEncoding};
 use ruff_text_size::TextRange;
-use std::path::{Path, PathBuf};
-
-/// Intern `path` as a salsa `File`, routing sentinel paths to the vendored
-/// typeshed archive and everything else to the host filesystem.
-fn path_to_file(db: &dyn ruff_db::Db, path: &Path) -> Option<File> {
-    if is_vendored_path(path) {
-        return vendored_path_to_file(db, to_vendored_path(path)?).ok();
-    }
-    system_path_to_file(db, SystemPath::from_std_path(path)?).ok()
-}
-
-/// Tracked existence probe for a regular file.
-///
-/// Returns `true` when `path` is an existing regular file. Unlike
-/// `Path::exists`, the check goes through salsa's `system_path_to_file`, which
-/// interns `path` as a `File` *even when it does not exist* and records a
-/// dependency on that file's existence status. When the file is later created
-/// or deleted and the backend calls `File::sync_path`, every query that probed
-/// the path is invalidated on the next request.
-///
-/// Vendored typeshed paths are probed against the immutable in-binary archive
-/// instead.
-///
-/// Falls back to an untracked `Path::exists()` only for non-UTF-8 paths, which
-/// cannot be represented as a `SystemPath`.
-pub(super) fn path_is_file(db: &dyn ruff_db::Db, path: &Path) -> bool {
-    if is_vendored_path(path) {
-        return path_to_file(db, path).is_some();
-    }
-    match SystemPath::from_std_path(path) {
-        Some(sys_path) => system_path_to_file(db, sys_path).is_ok(),
-        None => path.exists(),
-    }
-}
 
 /// Read a Python source file through ruff_db's salsa-tracked `source_text`.
 ///
 /// File reads go through `source_text` (not `std::fs`) so that the lookup
 /// participates in salsa's dependency graph — when the file's revision is
 /// bumped (via `File::sync_path`), every memo that called this function for
-/// that path is invalidated.
+/// that file is invalidated.
 ///
 /// The returned `SourceText` is `Arc`-backed; callers should bind it to a
 /// local and call `.as_str()` to get a borrowed `&str`. `None` when the file
 /// does not exist or cannot be read.
-pub(super) fn read_source(db: &dyn ruff_db::Db, path: &Path) -> Option<SourceText> {
-    let source = source_text(db, path_to_file(db, path)?);
+pub(super) fn read_source(db: &dyn ruff_db::Db, file: File) -> Option<SourceText> {
+    let source = source_text(db, file);
     source.read_error().is_none().then_some(source)
 }
 
-/// Run `find` over the parsed module at `path` and its source text, through
-/// the salsa-tracked reads.
+/// Run `find` over the parsed `file` and its source text, through the
+/// salsa-tracked reads.
 fn find_in_module<T>(
     db: &dyn ruff_db::Db,
-    path: &Path,
+    file: File,
     python_version: PythonVersion,
     find: impl FnOnce(&[Stmt], &str) -> Option<T>,
 ) -> Option<T> {
-    let source = read_source(db, path)?;
-    let parsed = parsed_python_module(db, path, python_version)?;
+    let source = read_source(db, file)?;
+    let parsed = parsed_python_module(db, file, python_version);
     find(parsed.suite(), source.as_str())
 }
 
@@ -85,44 +49,20 @@ fn find_in_module<T>(
 /// for the same revision.
 pub(super) fn parsed_python_module(
     db: &dyn ruff_db::Db,
-    path: &Path,
+    file: File,
     python_version: PythonVersion,
-) -> Option<ParsedModuleRef> {
-    let file = PythonFile::new(db, path_to_file(db, path)?, python_version);
-    Some(parsed_module(db, file).load(db))
-}
-
-/// Lexically normalize a path for use in a salsa memo key, without touching the
-/// filesystem.
-///
-/// Collapses `.`/`..` and makes the path absolute against the database's current
-/// directory via `SystemPath::absolute`. This mirrors `ty`, which canonicalizes
-/// search-path *roots* at construction but keeps everything lexical downstream
-/// (module resolution + `File` keys).
-///
-/// Falls back to the original path for non-UTF8 paths that cannot be represented
-/// as a `SystemPath`.
-pub(super) fn normalize_path_for_key(db: &dyn ruff_db::Db, path: &Path) -> PathBuf {
-    // Vendored sentinel paths are already canonical.
-    if is_vendored_path(path) {
-        return path.to_path_buf();
-    }
-    match SystemPath::from_std_path(path) {
-        Some(sys_path) => {
-            SystemPath::absolute(sys_path, db.system().current_directory()).into_std_path_buf()
-        }
-        None => path.to_path_buf(),
-    }
+) -> ParsedModuleRef {
+    parsed_module(db, PythonFile::new(db, file, python_version)).load(db)
 }
 
 /// Extract function signature from source code via salsa-cached parsing.
 pub(super) fn extract_function_signature(
     db: &dyn ruff_db::Db,
-    path: &Path,
+    file: File,
     function_name: &str,
     python_version: PythonVersion,
 ) -> Option<FunctionSignature> {
-    find_in_module(db, path, python_version, |suite, source| {
+    find_in_module(db, file, python_version, |suite, source| {
         let mut visitor = FunctionExtractor {
             target_name: function_name,
             result: None,
@@ -133,10 +73,10 @@ pub(super) fn extract_function_signature(
     })
 }
 
-/// Whether `name` is bound at module scope in the module at `path`.
+/// Whether `name` is bound at module scope in `file`.
 pub(super) fn module_defines_top_level(
     db: &dyn ruff_db::Db,
-    path: &Path,
+    file: File,
     name: &str,
     python_version: PythonVersion,
 ) -> bool {
@@ -162,20 +102,17 @@ pub(super) fn module_defines_top_level(
         })
     }
 
-    let Some(parsed) = parsed_python_module(db, path, python_version) else {
-        return false;
-    };
-    body_binds(parsed.suite(), name)
+    body_binds(parsed_python_module(db, file, python_version).suite(), name)
 }
 
 /// Extract class information from source code via salsa-cached parsing.
 pub(super) fn extract_class_info(
     db: &dyn ruff_db::Db,
-    path: &Path,
+    file: File,
     class_name: &str,
     python_version: PythonVersion,
 ) -> Option<ClassInfo> {
-    find_in_module(db, path, python_version, |suite, source| {
+    find_in_module(db, file, python_version, |suite, source| {
         let mut visitor = ClassExtractor {
             target_name: class_name,
             result: None,
@@ -189,12 +126,12 @@ pub(super) fn extract_class_info(
 /// Extract method information from source code via salsa-cached parsing.
 pub(super) fn extract_method_info(
     db: &dyn ruff_db::Db,
-    path: &Path,
+    file: File,
     class_name: &str,
     method_name: &str,
     python_version: PythonVersion,
 ) -> Option<MethodInfo> {
-    find_in_module(db, path, python_version, |suite, source| {
+    find_in_module(db, file, python_version, |suite, source| {
         let mut visitor = MethodExtractor {
             class_name,
             method_name,
@@ -209,12 +146,12 @@ pub(super) fn extract_method_info(
 /// Extract class attribute from source code via salsa-cached parsing.
 pub(super) fn extract_class_attribute(
     db: &dyn ruff_db::Db,
-    path: &Path,
+    file: File,
     class_name: &str,
     attribute_name: &str,
     python_version: PythonVersion,
 ) -> Option<ClassAttributeInfo> {
-    let parsed = parsed_python_module(db, path, python_version)?;
+    let parsed = parsed_python_module(db, file, python_version);
 
     let mut visitor = ClassAttributeExtractor {
         class_name: class_name.to_string(),
@@ -636,8 +573,9 @@ mod tests {
 
     use crate::python::model::DefinitionInfo;
     use crate::python::test_support::{
-        extract_definition_info, get_simple_test_dir, test_db, write_file,
+        extract_definition_info, get_simple_test_dir, system_file, test_db, write_file,
     };
+    use std::path::PathBuf;
 
     // ==================== extract_function_signature tests ====================
 
@@ -649,7 +587,7 @@ mod tests {
 
         let sig = extract_function_signature(
             &db,
-            &test_file,
+            system_file(&db, &test_file),
             "simple_function",
             PythonVersion::latest_ty(),
         )
@@ -668,7 +606,7 @@ mod tests {
 
         let sig = extract_function_signature(
             &db,
-            &test_file,
+            system_file(&db, &test_file),
             "function_with_params",
             PythonVersion::latest_ty(),
         )
@@ -704,7 +642,7 @@ mod tests {
 
         let sig = extract_function_signature(
             &db,
-            &test_file,
+            system_file(&db, &test_file),
             "function_with_return",
             PythonVersion::latest_ty(),
         )
@@ -722,7 +660,7 @@ mod tests {
 
         let sig = extract_function_signature(
             &db,
-            &test_file,
+            system_file(&db, &test_file),
             "variadic_function",
             PythonVersion::latest_ty(),
         )
@@ -747,7 +685,7 @@ mod tests {
 
         let sig = extract_function_signature(
             &db,
-            &test_file,
+            system_file(&db, &test_file),
             "complex_function",
             PythonVersion::latest_ty(),
         )
@@ -775,8 +713,12 @@ mod tests {
         let test_file = examples_dir.join("my_module.py");
         let db = test_db();
 
-        let result =
-            extract_function_signature(&db, &test_file, "nonexistent", PythonVersion::latest_ty());
+        let result = extract_function_signature(
+            &db,
+            system_file(&db, &test_file),
+            "nonexistent",
+            PythonVersion::latest_ty(),
+        );
         assert!(result.is_none());
     }
 
@@ -788,8 +730,13 @@ mod tests {
         let test_file = examples_dir.join("my_module.py");
         let db = test_db();
 
-        let class_info =
-            extract_class_info(&db, &test_file, "SimpleClass", PythonVersion::latest_ty()).unwrap();
+        let class_info = extract_class_info(
+            &db,
+            system_file(&db, &test_file),
+            "SimpleClass",
+            PythonVersion::latest_ty(),
+        )
+        .unwrap();
         assert_eq!(class_info.name, "SimpleClass");
         assert!(class_info.docstring.is_some());
         assert!(class_info.init_signature.is_none());
@@ -801,9 +748,13 @@ mod tests {
         let test_file = examples_dir.join("my_module.py");
         let db = test_db();
 
-        let class_info =
-            extract_class_info(&db, &test_file, "ClassWithInit", PythonVersion::latest_ty())
-                .unwrap();
+        let class_info = extract_class_info(
+            &db,
+            system_file(&db, &test_file),
+            "ClassWithInit",
+            PythonVersion::latest_ty(),
+        )
+        .unwrap();
         assert_eq!(class_info.name, "ClassWithInit");
         assert!(class_info.docstring.is_some());
         assert!(class_info.init_signature.is_some());
@@ -837,9 +788,13 @@ mod tests {
         let test_file = examples_dir.join("my_module.py");
         let db = test_db();
 
-        let class_info =
-            extract_class_info(&db, &test_file, "ComplexClass", PythonVersion::latest_ty())
-                .unwrap();
+        let class_info = extract_class_info(
+            &db,
+            system_file(&db, &test_file),
+            "ComplexClass",
+            PythonVersion::latest_ty(),
+        )
+        .unwrap();
         assert_eq!(class_info.name, "ComplexClass");
         assert!(class_info.init_signature.is_some());
 
@@ -856,7 +811,7 @@ mod tests {
 
         let result = extract_class_info(
             &db,
-            &test_file,
+            system_file(&db, &test_file),
             "NonexistentClass",
             PythonVersion::latest_ty(),
         );
@@ -873,7 +828,7 @@ mod tests {
         let kinds = ["make", "from_value", "custom"].map(|name| {
             let method = extract_method_info(
                 &db,
-                &path,
+                system_file(&db, &path),
                 "QualifiedFactory",
                 name,
                 PythonVersion::latest_ty(),
@@ -896,9 +851,15 @@ mod tests {
 
     fn function_range(source: &str, name: &str) -> SourceRange {
         let (_dir, path) = write_module("module.py", source);
-        extract_function_signature(&test_db(), &path, name, PythonVersion::latest_ty())
-            .unwrap()
-            .range
+        let db = test_db();
+        extract_function_signature(
+            &db,
+            system_file(&db, &path),
+            name,
+            PythonVersion::latest_ty(),
+        )
+        .unwrap()
+        .range
     }
 
     fn position(line: u32, column: u32) -> SourcePosition {
@@ -945,8 +906,14 @@ class MyClass:
         pass
 "#;
         let (_dir, path) = write_module("module.py", source);
-        let class_info =
-            extract_class_info(&test_db(), &path, "MyClass", PythonVersion::latest_ty()).unwrap();
+        let db = test_db();
+        let class_info = extract_class_info(
+            &db,
+            system_file(&db, &path),
+            "MyClass",
+            PythonVersion::latest_ty(),
+        )
+        .unwrap();
 
         assert_eq!(class_info.range.start, position(6, 0));
         let init_sig = class_info.init_signature.expect("__init__ should be found");

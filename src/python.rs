@@ -12,6 +12,7 @@ pub(crate) mod typeshed;
 pub(crate) mod test_support {
     use super::model::{FunctionSignature, ParameterInfo, ParameterKind, SourceRange};
     use crate::database::HydraDatabase;
+    use ruff_db::files::{File, system_path_to_file};
     use ruff_db::system::SystemPathBuf;
     use std::path::{Path, PathBuf};
 
@@ -62,6 +63,17 @@ pub(crate) mod test_support {
     /// `path` as a `SystemPathBuf`.
     pub(crate) fn system_path(path: &Path) -> SystemPathBuf {
         SystemPathBuf::from_path_buf(path.to_path_buf()).expect("UTF-8 path")
+    }
+
+    /// The `File` for `path`, which must be an existing file.
+    pub(crate) fn system_file(db: &dyn ruff_db::Db, path: &Path) -> File {
+        system_path_to_file(db, system_path(path)).expect("file exists")
+    }
+
+    /// The host path of `file`, which must be on disk.
+    pub(crate) fn disk_path(db: &dyn ruff_db::Db, file: File) -> PathBuf {
+        let path = file.path(db).as_system_path().expect("a file on disk");
+        path.as_std_path().to_path_buf()
     }
 
     /// `path` canonicalized the way ty does it. On Windows this drops the

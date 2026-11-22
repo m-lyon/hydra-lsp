@@ -64,13 +64,14 @@ mod tests {
         PythonConfig, resolve_module_by_name, resolver_environment, resolver_environment_from_parts,
     };
     use crate::python::extract::extract_class_info;
+    use ruff_db::files::File;
     use ruff_python_ast::PythonVersion;
     use std::path::PathBuf;
     use ty_module_resolver::ResolverEnvironment;
     use ty_python_semantic::PythonVersionSource;
 
     use crate::python::test_support::{
-        canonicalize, extract_definition_info, get_simple_test_dir, system_path, test_db,
+        canonicalize, disk_path, extract_definition_info, get_simple_test_dir, system_path, test_db,
     };
 
     // ==================== Python Interpreter Priority Tests ====================
@@ -79,7 +80,7 @@ mod tests {
 
     /// Resolve `module` with `examples_dir` as the workspace and `interpreter`
     /// configured, the way the server builds its environment.
-    fn resolve_with_interpreter(interpreter: Option<&str>, module: &str) -> Option<PathBuf> {
+    fn resolve_with_interpreter(interpreter: Option<&str>, module: &str) -> Option<File> {
         let examples_dir = get_simple_test_dir();
         let db = test_db();
         let config = PythonConfig::new(
@@ -200,7 +201,7 @@ mod tests {
         let db = test_db();
         let result = resolve_module_by_name(&db, "editable_package.lib", editable_environment(&db));
 
-        let path = result.expect("Should resolve editable_package.lib");
+        let path = disk_path(&db, result.expect("Should resolve editable_package.lib"));
         assert!(
             path.ends_with("lib.py"),
             "Should resolve to lib.py: {:?}",
@@ -218,7 +219,7 @@ mod tests {
         // Extract the class info (salsa-cached)
         let class_info = extract_class_info(
             &db,
-            &module_path,
+            module_path,
             "EditableModel",
             PythonVersion::latest_ty(),
         )

@@ -6,7 +6,7 @@ use tower_lsp::LanguageServer;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 
-use ruff_db::files::File;
+use ruff_db::files::{File, FilePath};
 use ruff_db::system::SystemPath;
 
 use super::HydraLspBackend;
@@ -18,6 +18,7 @@ use super::diagnostics::{
 use super::pools::{PoolOutcome, spawn_on_pool};
 use super::presentation::{definition_ranges, signature_information};
 use super::session::SessionSnapshot;
+use crate::database::HydraDatabase;
 use crate::diagnostics;
 use crate::python::cache::{self as python_cache, ResolvedDefinition, TargetString};
 use crate::python::format::{format_class, format_function, format_method};
@@ -36,7 +37,9 @@ use crate::yaml_parser::{
 const WATCHED_PY_GLOB: &str = "**/*.{py,pyi,pth}";
 
 impl HydraLspBackend {
-    /// Run Python definition lookup on a blocking thread using a database snapshot.
+    /// Run Python definition lookup on a blocking thread using a database snapshot,
+    /// and return what `project` takes from the definition there, while the
+    /// database snapshot is still available.
     ///
     /// Takes a `SessionSnapshot` (cheap — salsa shares cached data via Arc) and
     /// moves it to `tokio::task::spawn_blocking` so that expensive Python
@@ -44,10 +47,11 @@ impl HydraLspBackend {
     ///
     /// On cache hits the blocking thread returns almost immediately; on misses
     /// it performs the full analysis without holding any locks.
-    async fn spawn_definition_lookup(
+    async fn spawn_definition_lookup<T: Send + 'static>(
         &self,
         target_value: String,
-    ) -> std::result::Result<ResolvedDefinition, LookupError> {
+        project: impl FnOnce(&HydraDatabase, &ResolvedDefinition) -> T + Send + 'static,
+    ) -> std::result::Result<T, LookupError> {
         let Some(snapshot) = self.snapshot() else {
             return Err(LookupError::NotInitialized);
         };
@@ -59,7 +63,7 @@ impl HydraLspBackend {
             let cached = python_cache::resolved_definition(db, python_config, target);
             let result = cached
                 .get()
-                .cloned()
+                .map(|definition| project(db, definition))
                 .map_err(|err| LookupError::Resolve(err.clone()));
             tracing::debug!(
                 elapsed_us = start.elapsed().as_micros() as u64,
@@ -119,7 +123,7 @@ impl HydraLspBackend {
 
         // Extract Python definition info on a blocking thread (cached + non-blocking)
         let extract_result = self
-            .spawn_definition_lookup(hydra_object.target.value.clone())
+            .spawn_definition_lookup(hydra_object.target.value.clone(), |_, def| def.clone())
             .await;
 
         match extract_result {
@@ -176,7 +180,9 @@ impl HydraLspBackend {
         };
 
         // Extract Python definition info on a blocking thread (cached + non-blocking)
-        let extract_result = self.spawn_definition_lookup(target_value.clone()).await;
+        let extract_result = self
+            .spawn_definition_lookup(target_value.clone(), |_, def| def.clone())
+            .await;
 
         match extract_result {
             Ok(ResolvedDefinition {
@@ -251,14 +257,12 @@ impl HydraLspBackend {
 
         // Extract definition info on a blocking thread (cached + non-blocking)
         let extract_result = self
-            .spawn_definition_lookup(target_info.target.value.clone())
+            .spawn_definition_lookup(target_info.target.value.clone(), |db, def| {
+                (def.definition_info.clone(), def.file.path(db).clone())
+            })
             .await;
         let (file_path, ranges) = match extract_result {
-            Ok(ResolvedDefinition {
-                mut definition_info,
-                file_path,
-                ..
-            }) => {
+            Ok((mut definition_info, file_path)) => {
                 diagnostics::narrow_overloads(&mut definition_info, &target_info);
                 (file_path, definition_ranges(&definition_info))
             }
@@ -271,21 +275,21 @@ impl HydraLspBackend {
         // A definition inside the vendored typeshed archive has no file on disk
         // to jump to. Hover and diagnostics still work; go-to-definition is a
         // silent no-op rather than an error the user cannot act on.
-        if crate::python::typeshed::is_vendored_path(&file_path) {
+        let FilePath::System(file_path) = file_path else {
             tracing::debug!(
-                path = %file_path.display(),
+                path = %file_path,
                 "goto_definition: target is a vendored stub; nothing to open"
             );
             return Ok(None);
-        }
+        };
 
         // Convert file path to URI
-        let target_uri = match Url::from_file_path(&file_path) {
+        let target_uri = match Url::from_file_path(file_path.as_std_path()) {
             Ok(uri) => uri,
             Err(_) => {
                 self.outbox.log(
                     MessageType::ERROR,
-                    format!("Could not convert path to URI: {}", file_path.display()),
+                    format!("Could not convert path to URI: {file_path}"),
                 );
                 return Ok(None);
             }
