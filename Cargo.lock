@@ -768,6 +768,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ty_module_resolver",
+ "ty_python_core",
  "ty_python_semantic",
  "ty_vendored",
  "which 7.0.3",

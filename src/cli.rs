@@ -270,7 +270,7 @@ fn run(args: &CheckCommand) -> anyhow::Result<i32> {
     let disabled_rules = parse_disabled_rules(&args.disable_rules);
 
     let db_root = workspace_root.to_str().unwrap_or(".");
-    let db = HydraDatabase::new(ruff_db::system::SystemPath::new(db_root));
+    let mut db = HydraDatabase::new(ruff_db::system::SystemPath::new(db_root));
     // A one-shot check never syncs files, so every file created from here on
     // can be `NEVER_CHANGE`.
     ruff_db::Db::files(&db).freeze();
@@ -279,6 +279,7 @@ fn run(args: &CheckCommand) -> anyhow::Result<i32> {
         SystemPathBuf::from(workspace_root.to_string_lossy().into_owned()),
         python_interpreter.clone().map(SystemPathBuf::from),
     );
+    db.set_python_config(python_config);
 
     let mut reports = Vec::with_capacity(targets.len());
     let mut not_hydra = 0usize;

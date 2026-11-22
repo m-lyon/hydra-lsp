@@ -21,6 +21,9 @@ use ty_module_resolver::{
     ModuleName, ResolverEnvironment, SearchPath, SearchPathSettings, UseDefaultStrategy,
     resolve_module_confident, system_module_search_paths,
 };
+use ty_python_core::Program;
+use ty_python_core::platform::PythonPlatform;
+use ty_python_semantic::PythonVersionWithSource;
 
 /// Salsa input for Python environment configuration.
 ///
@@ -161,7 +164,7 @@ pub(super) fn discovered_environment(
 
 /// The module-resolution environment for a `PythonConfig`: the workspace as
 /// the first-party root, the discovered site-packages, and the interpreter's
-/// Python version (the latest ty knows when discovery could not tell).
+/// Python version.
 ///
 /// Editable installs are not part of this value. `ty_module_resolver` reads
 /// the `.pth` files lazily through salsa, so creating, editing or deleting one
@@ -180,10 +183,27 @@ pub(crate) fn resolver_environment(
         db,
         vec![workspace_root],
         discovered.site_packages.clone(),
-        discovered
-            .python_version
-            .unwrap_or_else(PythonVersion::latest_ty),
+        discovered.python_version.version,
     )
+}
+
+/// The `ty_python_core::Program` for a `PythonConfig`. It wraps
+/// [`resolver_environment`], so ty resolves modules over the same search paths and
+/// parses files under the same `PythonFile` keys as hydrust does.
+#[salsa::tracked(returns(copy))]
+pub(crate) fn program(db: &dyn ty_python_core::Db, config: PythonConfig) -> Program<'_> {
+    Program::new(
+        db,
+        PythonPlatform::default(),
+        resolver_environment(db, config),
+    )
+}
+
+pub(crate) fn python_version_with_source(
+    db: &dyn ruff_db::Db,
+    config: PythonConfig,
+) -> &PythonVersionWithSource {
+    &discovered_environment(db, config).python_version
 }
 
 /// Build a resolver environment from explicit roots. Directories that do not
@@ -718,6 +738,10 @@ mod tests {
             resolver_environment(&db, config).python_version(&db),
             PythonVersion::latest_ty()
         );
+        assert_eq!(
+            python_version_with_source(&db, config).source,
+            ty_python_semantic::PythonVersionSource::Default
+        );
     }
 
     #[test]
@@ -732,6 +756,40 @@ mod tests {
         assert_eq!(
             resolver_environment(&db, config).python_version(&db),
             PythonVersion::PY39
+        );
+    }
+
+    /// ty must parse under the version hydrust parses under, or each file is
+    /// parsed twice, under two `PythonFile` keys.
+    #[test]
+    fn test_program_uses_the_resolver_environment() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let venv = canonicalize(tmp.path());
+        write_venv(&venv, "3.9.18");
+        let module = venv.join("module.py");
+        write_file(&module, "x = 1\n");
+
+        let mut db = test_db();
+        let venv = system_path(&venv);
+        let config = PythonConfig::frozen(&db, venv.clone(), Some(venv));
+        db.set_python_config(config);
+
+        let environment = resolver_environment(&db, config);
+        assert_eq!(program(&db, config).resolver_environment(&db), environment);
+        let file = ruff_db::files::system_path_to_file(&db, system_path(&module)).unwrap();
+        assert_eq!(
+            ty_python_semantic::Db::program_file(&db, file).python_file(&db),
+            ruff_db::PythonFile::new(&db, file, environment.python_version(&db))
+        );
+
+        let version = ty_python_semantic::Db::python_version_with_source(&db, file);
+        assert_eq!(version.version, PythonVersion::PY39);
+        assert!(
+            matches!(
+                version.source,
+                ty_python_semantic::PythonVersionSource::PyvenvCfgFile(_)
+            ),
+            "the version should come from pyvenv.cfg, got {version:?}"
         );
     }
 

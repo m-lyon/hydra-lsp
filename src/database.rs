@@ -1,7 +1,16 @@
-use ruff_db::files::Files;
+use std::sync::LazyLock;
+
+use ruff_db::diagnostic::Diagnostic;
+use ruff_db::files::{File, Files};
 use ruff_db::system::System;
 use ruff_db::system::{OsSystem, SystemPath};
 use ruff_db::vendored::VendoredFileSystem;
+use ty_python_core::ProgramFile;
+use ty_python_semantic::dependency::DependencyMetadata;
+use ty_python_semantic::lint::{LintRegistry, RuleSelection};
+use ty_python_semantic::{AnalysisSettings, PythonVersionWithSource, default_lint_registry};
+
+use crate::python::cache::{PythonConfig, program, python_version_with_source};
 
 /// The core Salsa database for hydrust.
 ///
@@ -20,6 +29,7 @@ pub struct HydraDatabase {
     files: Files,
     system: OsSystem,
     vendored: VendoredFileSystem,
+    python_config: Option<PythonConfig>,
 }
 
 impl HydraDatabase {
@@ -30,9 +40,84 @@ impl HydraDatabase {
             files: Files::default(),
             system: OsSystem::new(cwd),
             vendored: vendored_typeshed(),
+            python_config: None,
         }
     }
+
+    /// Set the config ty's semantic queries run under. Salsa does not track
+    /// this field, so set it once, before the first of those queries.
+    pub fn set_python_config(&mut self, config: PythonConfig) {
+        self.python_config = Some(config);
+    }
 }
+
+/// hydrust reports none of ty's lints, so none are enabled.
+static RULE_SELECTION: LazyLock<RuleSelection> = LazyLock::new(RuleSelection::default);
+
+static ANALYSIS_SETTINGS: LazyLock<AnalysisSettings> = LazyLock::new(AnalysisSettings::default);
+
+/// Implements ty's semantic database traits for a database with a
+/// `python_config: Option<PythonConfig>` field.
+///
+/// hydrust asks ty for types but does not run ty's checker, so no file is
+/// checked and ty collects no diagnostics.
+macro_rules! impl_semantic_db {
+    ($db:ty) => {
+        #[salsa::db]
+        impl ty_python_core::Db for $db {
+            fn should_check_file(&self, _file: File) -> bool {
+                false
+            }
+        }
+
+        #[salsa::db]
+        impl ty_python_semantic::Db for $db {
+            fn check_file(&self, _file: File) -> Vec<Diagnostic> {
+                Vec::new()
+            }
+
+            fn program_file(&self, file: File) -> ProgramFile<'_> {
+                let config = self.python_config.expect(NO_PYTHON_CONFIG);
+                program(self, config).program_file(self, file)
+            }
+
+            fn python_version_with_source(&self, _file: File) -> &PythonVersionWithSource {
+                let config = self.python_config.expect(NO_PYTHON_CONFIG);
+                python_version_with_source(self, config)
+            }
+
+            fn rule_selection(&self, _file: File) -> &RuleSelection {
+                &RULE_SELECTION
+            }
+
+            fn lint_registry(&self) -> &LintRegistry {
+                default_lint_registry()
+            }
+
+            fn analysis_settings(&self, _file: File) -> &AnalysisSettings {
+                &ANALYSIS_SETTINGS
+            }
+
+            fn dependency_metadata(&self, _file: File) -> Option<&DependencyMetadata> {
+                None
+            }
+
+            fn verbose(&self) -> bool {
+                false
+            }
+
+            fn is_open_file(&self, _file: File) -> bool {
+                false
+            }
+
+            fn dyn_clone(&self) -> Box<dyn ty_python_semantic::Db> {
+                Box::new(self.clone())
+            }
+        }
+    };
+}
+
+const NO_PYTHON_CONFIG: &str = "set_python_config must be called before ty's semantic queries";
 
 /// The vendored typeshed stubs, shared by every database instance.
 ///
@@ -60,6 +145,8 @@ impl ruff_db::Db for HydraDatabase {
 
 #[salsa::db]
 impl ty_module_resolver::Db for HydraDatabase {}
+
+impl_semantic_db!(HydraDatabase);
 
 #[salsa::db]
 impl salsa::Database for HydraDatabase {}
@@ -101,9 +188,8 @@ impl HydraDatabase {
 
 #[cfg(test)]
 pub mod tests {
-    use ruff_db::files::Files;
-    use ruff_db::system::{DbWithTestSystem, System, TestSystem};
-    use ruff_db::vendored::VendoredFileSystem;
+    use super::*;
+    use ruff_db::system::{DbWithTestSystem, TestSystem};
 
     /// Test database using an in-memory filesystem.
     #[salsa::db]
@@ -113,6 +199,7 @@ pub mod tests {
         files: Files,
         system: TestSystem,
         vendored: VendoredFileSystem,
+        python_config: Option<PythonConfig>,
     }
 
     impl Default for TestDb {
@@ -124,7 +211,8 @@ pub mod tests {
                 storage: salsa::Storage::default(),
                 files: Files::default(),
                 system: TestSystem::default(),
-                vendored: super::vendored_typeshed(),
+                vendored: vendored_typeshed(),
+                python_config: None,
             }
         }
     }
@@ -132,6 +220,11 @@ pub mod tests {
     impl TestDb {
         pub fn new() -> Self {
             Self::default()
+        }
+
+        /// See [`HydraDatabase::set_python_config`].
+        pub fn set_python_config(&mut self, config: PythonConfig) {
+            self.python_config = Some(config);
         }
     }
 
@@ -163,8 +256,72 @@ pub mod tests {
     #[salsa::db]
     impl ty_module_resolver::Db for TestDb {}
 
+    impl_semantic_db!(TestDb);
+
     #[salsa::db]
     impl salsa::Database for TestDb {}
+
+    /// The types ty infers for the values of `file`'s top-level assignments.
+    fn assigned_types(db: &dyn ty_python_semantic::Db, file: File) -> Vec<String> {
+        use ty_python_semantic::{HasType, ProgramEnvironment, SemanticModel};
+
+        let program_file = db.program_file(file);
+        let module = ruff_db::parsed::parsed_module(db, program_file.python_file(db)).load(db);
+        let model = SemanticModel::new(db, program_file);
+        let environment = ProgramEnvironment::from_program(model.program());
+        module
+            .suite()
+            .iter()
+            .filter_map(|statement| statement.as_assign_stmt())
+            .map(|assignment| {
+                let ty = assignment.value.inferred_type(&model).expect("a type");
+                ty.display(db, &environment).to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_ty_infers_types_across_workspace_and_stdlib() {
+        use crate::python::test_support::{canonicalize, system_path, test_db, write_file};
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let workspace = canonicalize(tmp.path());
+        write_file(&workspace.join("pkg/models.py"), "class Model: ...\n");
+        let main = workspace.join("main.py");
+        write_file(
+            &main,
+            "import os\nfrom pkg.models import Model\nmodel = Model()\nsep = os.sep\n",
+        );
+
+        let mut db = test_db();
+        let config = PythonConfig::frozen(
+            &db,
+            system_path(&workspace),
+            Some("/nonexistent/python".into()),
+        );
+        db.set_python_config(config);
+
+        let file = ruff_db::files::system_path_to_file(&db, system_path(&main)).unwrap();
+        assert_eq!(assigned_types(&db, file), ["Model", "LiteralString"]);
+    }
+
+    #[test]
+    fn test_testdb_infers_types() {
+        use ruff_db::system::DbWithWritableSystem;
+
+        // Discovery runs on the real filesystem, which needs an absolute root.
+        let workspace = crate::python::test_support::filesystem_root().join("workspace");
+        let main = workspace.join("main.py");
+
+        let mut db = TestDb::new();
+        db.write_file(&main, "value = len(\"ab\")\n")
+            .expect("write file");
+        let config = PythonConfig::frozen(&db, workspace, Some("/nonexistent/python".into()));
+        db.set_python_config(config);
+
+        let file = ruff_db::files::system_path_to_file(&db, &main).unwrap();
+        assert_eq!(assigned_types(&db, file), ["Literal[2]"]);
+    }
 
     #[test]
     fn test_hydra_database_creation() {
