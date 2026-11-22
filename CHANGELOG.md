@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Completion on `_partial_`, `_recursive_`, and `_convert_` now uses the parsed line lookup instead of falling back to scanning the document.
 - Updated the ruff and ty crates to the revision behind ty 0.0.104, and salsa to 0.28.5.
 - Python environment discovery now falls back to a `python3` or `python` on `PATH`, recognises Pixi environments, ignores an empty `VIRTUAL_ENV`, and skips a broken `.venv` instead of failing.
 - Module resolution now uses ty's resolver.
