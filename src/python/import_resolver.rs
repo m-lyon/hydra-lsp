@@ -1607,7 +1607,12 @@ mod tests {
             let resolved = resolver
                 .resolve_symbol(init, symbol)
                 .unwrap_or_else(|| panic!("{module}.{symbol} should resolve"));
-            assert_eq!(resolved.file.path(&db).as_str(), expected);
+            // ty joins vendored path components with the OS separator, so
+            // compare paths, not strings.
+            assert_eq!(
+                resolved.file.path(&db).as_vendored_path(),
+                Some(ruff_db::vendored::VendoredPath::new(expected))
+            );
             assert_eq!(resolved.name, symbol);
         }
     }
