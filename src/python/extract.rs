@@ -4,9 +4,9 @@
 
 use super::model::{
     ClassAttributeInfo, ClassInfo, FunctionSignature, MethodInfo, ParameterInfo, ParameterKind,
+    SourcePosition, SourceRange,
 };
 use super::typeshed::{is_vendored_path, to_vendored_path};
-use anyhow::{Context, Result};
 use ruff_db::PythonFile;
 use ruff_db::files::{File, system_path_to_file, vendored_path_to_file};
 use ruff_db::parsed::{ParsedModuleRef, parsed_module};
@@ -58,15 +58,24 @@ pub(super) fn path_is_file(db: &dyn ruff_db::Db, path: &Path) -> bool {
 /// that path is invalidated.
 ///
 /// The returned `SourceText` is `Arc`-backed; callers should bind it to a
-/// local and call `.as_str()` to get a borrowed `&str`.
-pub(super) fn read_source(db: &dyn ruff_db::Db, path: &Path) -> Result<SourceText> {
-    let file = path_to_file(db, path)
-        .with_context(|| format!("could not resolve file: {}", path.display()))?;
-    let source = source_text(db, file);
-    if let Some(err) = source.read_error() {
-        anyhow::bail!("failed to read {}: {}", path.display(), err);
-    }
-    Ok(source)
+/// local and call `.as_str()` to get a borrowed `&str`. `None` when the file
+/// does not exist or cannot be read.
+pub(super) fn read_source(db: &dyn ruff_db::Db, path: &Path) -> Option<SourceText> {
+    let source = source_text(db, path_to_file(db, path)?);
+    source.read_error().is_none().then_some(source)
+}
+
+/// Run `find` over the parsed module at `path` and its source text, through
+/// the salsa-tracked reads.
+fn find_in_module<T>(
+    db: &dyn ruff_db::Db,
+    path: &Path,
+    python_version: PythonVersion,
+    find: impl FnOnce(&[Stmt], &str) -> Option<T>,
+) -> Option<T> {
+    let source = read_source(db, path)?;
+    let parsed = parsed_python_module(db, path, python_version)?;
+    find(parsed.suite(), source.as_str())
 }
 
 /// Parse a Python source file through ruff_db's salsa-tracked `parsed_module`.
@@ -74,14 +83,13 @@ pub(super) fn read_source(db: &dyn ruff_db::Db, path: &Path) -> Result<SourceTex
 /// Returns the salsa-cached `ParsedModuleRef` (LRU 200). Callers that also need
 /// the raw source text should call `read_source` separately — both are cache hits
 /// for the same revision.
-pub(super) fn get_parsed_module(db: &dyn ruff_db::Db, path: &Path) -> Result<ParsedModuleRef> {
-    let file = path_to_file(db, path)
-        .with_context(|| format!("could not resolve file: {}", path.display()))?;
-    // The interpreter's version is not plumbed through yet, so every file is
-    // parsed as the latest dialect. It only affects which syntax the parser
-    // reports as unsupported, which nothing here reads.
-    let file = PythonFile::new(db, file, PythonVersion::latest_ty());
-    Ok(parsed_module(db, file).load(db))
+pub(super) fn parsed_python_module(
+    db: &dyn ruff_db::Db,
+    path: &Path,
+    python_version: PythonVersion,
+) -> Option<ParsedModuleRef> {
+    let file = PythonFile::new(db, path_to_file(db, path)?, python_version);
+    Some(parsed_module(db, file).load(db))
 }
 
 /// Lexically normalize a path for use in a salsa memo key, without touching the
@@ -108,27 +116,30 @@ pub(super) fn normalize_path_for_key(db: &dyn ruff_db::Db, path: &Path) -> PathB
 }
 
 /// Extract function signature from source code via salsa-cached parsing.
-pub fn extract_function_signature(
+pub(super) fn extract_function_signature(
     db: &dyn ruff_db::Db,
     path: &Path,
     function_name: &str,
-) -> Result<FunctionSignature> {
-    let source = read_source(db, path)?;
-    let parsed = get_parsed_module(db, path)?;
-
-    let mut visitor = FunctionExtractor {
-        target_name: function_name.to_string(),
-        result: None,
-        source: source.as_str().to_string(),
-    };
-    visitor.visit_body(parsed.suite());
-    visitor
-        .result
-        .ok_or_else(|| anyhow::anyhow!("Function '{}' not found", function_name))
+    python_version: PythonVersion,
+) -> Option<FunctionSignature> {
+    find_in_module(db, path, python_version, |suite, source| {
+        let mut visitor = FunctionExtractor {
+            target_name: function_name,
+            result: None,
+            source,
+        };
+        visitor.visit_body(suite);
+        visitor.result
+    })
 }
 
 /// Whether `name` is bound at module scope in the module at `path`.
-pub(super) fn module_defines_top_level(db: &dyn ruff_db::Db, path: &Path, name: &str) -> bool {
+pub(super) fn module_defines_top_level(
+    db: &dyn ruff_db::Db,
+    path: &Path,
+    name: &str,
+    python_version: PythonVersion,
+) -> bool {
     fn body_binds(body: &[Stmt], name: &str) -> bool {
         body.iter().any(|stmt| match stmt {
             Stmt::FunctionDef(func_def) => {
@@ -139,13 +150,7 @@ pub(super) fn module_defines_top_level(db: &dyn ruff_db::Db, path: &Path, name: 
                 class_def.name.as_str() == name
                     && !has_type_check_only_decorator(&class_def.decorator_list)
             }
-            Stmt::Assign(assign) => assign
-                .targets
-                .iter()
-                .any(|target| matches!(target, Expr::Name(n) if n.id.as_str() == name)),
-            Stmt::AnnAssign(ann_assign) => {
-                matches!(ann_assign.target.as_ref(), Expr::Name(n) if n.id.as_str() == name)
-            }
+            Stmt::Assign(_) | Stmt::AnnAssign(_) => assigned_value(stmt, name).is_some(),
             Stmt::If(if_stmt) => {
                 body_binds(&if_stmt.body, name)
                     || if_stmt
@@ -157,30 +162,28 @@ pub(super) fn module_defines_top_level(db: &dyn ruff_db::Db, path: &Path, name: 
         })
     }
 
-    let Ok(parsed) = get_parsed_module(db, path) else {
+    let Some(parsed) = parsed_python_module(db, path, python_version) else {
         return false;
     };
     body_binds(parsed.suite(), name)
 }
 
 /// Extract class information from source code via salsa-cached parsing.
-pub fn extract_class_info(
+pub(super) fn extract_class_info(
     db: &dyn ruff_db::Db,
     path: &Path,
     class_name: &str,
-) -> Result<ClassInfo> {
-    let source = read_source(db, path)?;
-    let parsed = get_parsed_module(db, path)?;
-
-    let mut visitor = ClassExtractor {
-        target_name: class_name.to_string(),
-        result: None,
-        source: source.as_str().to_string(),
-    };
-    visitor.visit_body(parsed.suite());
-    visitor
-        .result
-        .ok_or_else(|| anyhow::anyhow!("Class '{}' not found", class_name))
+    python_version: PythonVersion,
+) -> Option<ClassInfo> {
+    find_in_module(db, path, python_version, |suite, source| {
+        let mut visitor = ClassExtractor {
+            target_name: class_name,
+            result: None,
+            source,
+        };
+        visitor.visit_body(suite);
+        visitor.result
+    })
 }
 
 /// Extract method information from source code via salsa-cached parsing.
@@ -189,23 +192,17 @@ pub(super) fn extract_method_info(
     path: &Path,
     class_name: &str,
     method_name: &str,
-) -> Result<MethodInfo> {
-    let source = read_source(db, path)?;
-    let parsed = get_parsed_module(db, path)?;
-
-    let mut visitor = MethodExtractor {
-        class_name: class_name.to_string(),
-        method_name: method_name.to_string(),
-        result: None,
-        source: source.as_str().to_string(),
-    };
-    visitor.visit_body(parsed.suite());
-    visitor.result.ok_or_else(|| {
-        anyhow::anyhow!(
-            "Method '{}' not found in class '{}'",
+    python_version: PythonVersion,
+) -> Option<MethodInfo> {
+    find_in_module(db, path, python_version, |suite, source| {
+        let mut visitor = MethodExtractor {
+            class_name,
             method_name,
-            class_name
-        )
+            result: None,
+            source,
+        };
+        visitor.visit_body(suite);
+        visitor.result
     })
 }
 
@@ -215,8 +212,9 @@ pub(super) fn extract_class_attribute(
     path: &Path,
     class_name: &str,
     attribute_name: &str,
-) -> Result<ClassAttributeInfo> {
-    let parsed = get_parsed_module(db, path)?;
+    python_version: PythonVersion,
+) -> Option<ClassAttributeInfo> {
+    let parsed = parsed_python_module(db, path, python_version)?;
 
     let mut visitor = ClassAttributeExtractor {
         class_name: class_name.to_string(),
@@ -225,24 +223,30 @@ pub(super) fn extract_class_attribute(
     };
 
     visitor.visit_body(parsed.suite());
+    visitor.result
+}
 
-    visitor.result.ok_or_else(|| {
-        anyhow::anyhow!(
-            "Attribute '{}' not found in class '{}'",
-            attribute_name,
-            class_name
-        )
-    })
+/// What `stmt` assigns to the bare name `name`, if it is an assignment to it:
+/// `Some(None)` for an annotation with no value, such as `name: int`.
+pub(super) fn assigned_value<'a>(stmt: &'a Stmt, name: &str) -> Option<Option<&'a Expr>> {
+    let is_name = |target: &Expr| matches!(target, Expr::Name(n) if n.id.as_str() == name);
+    match stmt {
+        Stmt::Assign(assign) if assign.targets.iter().any(is_name) => Some(Some(&assign.value)),
+        Stmt::AnnAssign(ann_assign) if is_name(&ann_assign.target) => {
+            Some(ann_assign.value.as_deref())
+        }
+        _ => None,
+    }
 }
 
 /// Visitor to extract function signatures from AST
-struct FunctionExtractor {
-    target_name: String,
+struct FunctionExtractor<'s> {
+    target_name: &'s str,
     result: Option<FunctionSignature>,
-    source: String,
+    source: &'s str,
 }
 
-impl<'a> Visitor<'a> for FunctionExtractor {
+impl<'a> Visitor<'a> for FunctionExtractor<'_> {
     /// Matching is done per *body* rather than per statement so that the
     /// sibling declarations are in scope: a name declared more than once, or
     /// decorated with `@overload`, is overloaded, and this is only discernible through
@@ -254,7 +258,8 @@ impl<'a> Visitor<'a> for FunctionExtractor {
         if body.iter().any(|stmt| {
             matches!(stmt, Stmt::FunctionDef(func_def) if func_def.name.as_str() == self.target_name)
         }) {
-            self.result = extract_declared_signature(body, &self.target_name, &self.source);
+            self.result = extract_declared_signature(body, self.target_name, self.source)
+                .map(|(_, signature)| signature);
             return;
         }
         for stmt in body {
@@ -276,13 +281,13 @@ impl<'a> Visitor<'a> for FunctionExtractor {
 }
 
 /// Visitor to extract class information from AST
-struct ClassExtractor {
-    target_name: String,
-    source: String,
+struct ClassExtractor<'s> {
+    target_name: &'s str,
+    source: &'s str,
     result: Option<ClassInfo>,
 }
 
-impl<'a> Visitor<'a> for ClassExtractor {
+impl<'a> Visitor<'a> for ClassExtractor<'_> {
     fn visit_stmt(&mut self, stmt: &'a Stmt) {
         if self.result.is_some() {
             return; // Already found
@@ -291,7 +296,7 @@ impl<'a> Visitor<'a> for ClassExtractor {
         if let Stmt::ClassDef(class_def) = stmt
             && class_def.name.as_str() == self.target_name
         {
-            self.result = Some(extract_class_info_from_def(class_def, &self.source));
+            self.result = Some(extract_class_info_from_def(class_def, self.source));
             return;
         }
 
@@ -301,11 +306,11 @@ impl<'a> Visitor<'a> for ClassExtractor {
 }
 
 /// Visitor to extract a specific method from a class
-struct MethodExtractor {
-    class_name: String,
-    method_name: String,
+struct MethodExtractor<'s> {
+    class_name: &'s str,
+    method_name: &'s str,
     result: Option<MethodInfo>,
-    source: String,
+    source: &'s str,
 }
 
 /// Visitor to extract class attribute assignments from a class definition
@@ -324,28 +329,9 @@ impl<'a> Visitor<'a> for ClassAttributeExtractor {
         if let Stmt::ClassDef(class_def) = stmt
             && class_def.name.as_str() == self.class_name
         {
-            // Look for attribute assignments within the class body
+            // `attr = SomeClass` or `attr: Type = SomeClass` in the class body.
             for class_stmt in &class_def.body {
-                // Handle simple assignments: `attr = SomeClass`
-                if let Stmt::Assign(assign) = class_stmt {
-                    for target in &assign.targets {
-                        if let Expr::Name(name) = target
-                            && name.id.as_str() == self.attribute_name
-                        {
-                            self.result = Some(ClassAttributeInfo {
-                                name: self.attribute_name.clone(),
-                                value: expr_to_string(&assign.value),
-                            });
-                            return;
-                        }
-                    }
-                }
-                // Handle annotated assignments: `attr: Type = SomeClass`
-                if let Stmt::AnnAssign(ann_assign) = class_stmt
-                    && let Expr::Name(name) = ann_assign.target.as_ref()
-                    && name.id.as_str() == self.attribute_name
-                    && let Some(value) = &ann_assign.value
-                {
+                if let Some(Some(value)) = assigned_value(class_stmt, &self.attribute_name) {
                     self.result = Some(ClassAttributeInfo {
                         name: self.attribute_name.clone(),
                         value: expr_to_string(value),
@@ -360,7 +346,7 @@ impl<'a> Visitor<'a> for ClassAttributeExtractor {
     }
 }
 
-impl<'a> Visitor<'a> for MethodExtractor {
+impl<'a> Visitor<'a> for MethodExtractor<'_> {
     fn visit_stmt(&mut self, stmt: &'a Stmt) {
         if self.result.is_some() {
             return; // Already found
@@ -368,35 +354,21 @@ impl<'a> Visitor<'a> for MethodExtractor {
 
         if let Stmt::ClassDef(class_def) = stmt
             && class_def.name.as_str() == self.class_name
+            && let Some((declaration, signature)) =
+                extract_declared_signature(&class_def.body, self.method_name, self.source)
         {
-            // Look for the method within the class body
-            for class_stmt in &class_def.body {
-                if let Stmt::FunctionDef(func_def) = class_stmt
-                    && func_def.name.as_str() == self.method_name
-                    && let Some((declaration, is_overloaded)) =
-                        resolve_declaration(&class_def.body, &self.method_name)
-                {
-                    let mut signature =
-                        extract_function_signature_from_def(declaration, &self.source);
-                    signature.is_overloaded = is_overloaded;
-                    signature.overloads =
-                        overload_signatures(&class_def.body, &self.method_name, &self.source);
+            // Decorators come from the declaration actually chosen.
+            let (is_classmethod, is_staticmethod) =
+                check_method_decorators(&declaration.decorator_list);
 
-                    // Check decorators for @classmethod or @staticmethod, on the
-                    // declaration actually chosen rather than on this statement.
-                    let (is_classmethod, is_staticmethod) =
-                        check_method_decorators(&declaration.decorator_list);
-
-                    self.result = Some(MethodInfo {
-                        class_name: self.class_name.clone(),
-                        method_name: self.method_name.clone(),
-                        signature,
-                        is_classmethod,
-                        is_staticmethod,
-                    });
-                    return;
-                }
-            }
+            self.result = Some(MethodInfo {
+                class_name: self.class_name.to_string(),
+                method_name: self.method_name.to_string(),
+                signature,
+                is_classmethod,
+                is_staticmethod,
+            });
+            return;
         }
 
         // Continue walking to find nested classes
@@ -434,18 +406,18 @@ fn resolve_declaration<'a>(
     }
 }
 
-/// The signature of `name` as declared in `body`, resolved through any
-/// `@overload` set.
-fn extract_declared_signature(
-    body: &[Stmt],
+/// The declaration of `name` in `body` and its signature, resolved through
+/// any `@overload` set.
+fn extract_declared_signature<'a>(
+    body: &'a [Stmt],
     name: &str,
     source: &str,
-) -> Option<FunctionSignature> {
+) -> Option<(&'a ast::StmtFunctionDef, FunctionSignature)> {
     let (func_def, is_overloaded) = resolve_declaration(body, name)?;
     let mut signature = extract_function_signature_from_def(func_def, source);
     signature.is_overloaded = is_overloaded;
     signature.overloads = overload_signatures(body, name, source);
-    Some(signature)
+    Some((func_def, signature))
 }
 
 /// The signature of every `@overload` declaration of `name` in `body`, in
@@ -496,24 +468,25 @@ fn check_method_decorators(decorators: &[ast::Decorator]) -> (bool, bool) {
     )
 }
 
-/// Convert a TextRange to line/column position
-/// Returns (start_line, start_column, end_line, end_column)
-fn get_position_info(range: TextRange, source: &str) -> (u32, u32, u32, u32) {
+/// Convert a TextRange to line/column positions.
+fn source_range(range: TextRange, source: &str) -> SourceRange {
     let line_index = LineIndex::from_source_text(source);
 
     // The server advertises no `positionEncoding`, so the LSP default of
     // UTF-16 applies to every position we send to the client. Emitting UTF-32
     // (codepoint) columns here would mis-position ranges by one per non-BMP
     // character (codepoints >= U+10000) earlier on the line.
-    let start = line_index.source_location(range.start(), source, PositionEncoding::Utf16);
-    let end = line_index.source_location(range.end(), source, PositionEncoding::Utf16);
-
-    (
-        start.line.to_zero_indexed() as u32,
-        start.character_offset.to_zero_indexed() as u32,
-        end.line.to_zero_indexed() as u32,
-        end.character_offset.to_zero_indexed() as u32,
-    )
+    let position = |offset| {
+        let location = line_index.source_location(offset, source, PositionEncoding::Utf16);
+        SourcePosition {
+            line: location.line.to_zero_indexed() as u32,
+            column: location.character_offset.to_zero_indexed() as u32,
+        }
+    };
+    SourceRange {
+        start: position(range.start()),
+        end: position(range.end()),
+    }
 }
 
 /// Extract function signature from a function definition node
@@ -524,8 +497,6 @@ fn extract_function_signature_from_def(
     let parameters = extract_parameters(&func_def.parameters);
     let return_type = func_def.returns.as_ref().map(|e| expr_to_string(e));
     let docstring = extract_docstring(&func_def.body);
-    let (start_line, start_column, end_line, end_column) =
-        get_position_info(func_def.range, source);
 
     FunctionSignature {
         name: func_def.name.to_string(),
@@ -534,24 +505,21 @@ fn extract_function_signature_from_def(
         docstring,
         is_overloaded: false,
         overloads: Vec::new(),
-        start_line,
-        start_column,
-        end_line,
-        end_column,
+        range: source_range(func_def.range, source),
     }
 }
 
 /// Extract class info from a class definition node
 fn extract_class_info_from_def(class_def: &ast::StmtClassDef, source: &str) -> ClassInfo {
     let docstring = extract_docstring(&class_def.body);
-    let (start_line, start_column, end_line, end_column) =
-        get_position_info(class_def.range, source);
 
     // Extract base classes
     let base_classes: Vec<String> = class_def.bases().iter().map(expr_to_string).collect();
 
-    let init_signature = extract_declared_signature(&class_def.body, "__init__", source);
-    let new_signature = extract_declared_signature(&class_def.body, "__new__", source);
+    let init_signature = extract_declared_signature(&class_def.body, "__init__", source)
+        .map(|(_, signature)| signature);
+    let new_signature = extract_declared_signature(&class_def.body, "__new__", source)
+        .map(|(_, signature)| signature);
 
     ClassInfo {
         name: class_def.name.to_string(),
@@ -559,11 +527,8 @@ fn extract_class_info_from_def(class_def: &ast::StmtClassDef, source: &str) -> C
         docstring,
         init_signature,
         new_signature,
-        unresolved_base_classes: false,
-        start_line,
-        start_column,
-        end_line,
-        end_column,
+        all_bases_resolved: true,
+        range: source_range(class_def.range, source),
     }
 }
 
@@ -669,7 +634,10 @@ fn expr_to_string(expr: &Expr) -> String {
 mod tests {
     use super::*;
 
-    use crate::python::test_support::{get_simple_test_dir, test_db};
+    use crate::python::model::DefinitionInfo;
+    use crate::python::test_support::{
+        extract_definition_info, get_simple_test_dir, test_db, write_file,
+    };
 
     // ==================== extract_function_signature tests ====================
 
@@ -679,7 +647,13 @@ mod tests {
         let test_file = examples_dir.join("my_module.py");
         let db = test_db();
 
-        let sig = extract_function_signature(&db, &test_file, "simple_function").unwrap();
+        let sig = extract_function_signature(
+            &db,
+            &test_file,
+            "simple_function",
+            PythonVersion::latest_ty(),
+        )
+        .unwrap();
         assert_eq!(sig.name, "simple_function");
         assert_eq!(sig.parameters.len(), 0);
         assert!(sig.docstring.is_some());
@@ -692,7 +666,13 @@ mod tests {
         let test_file = examples_dir.join("my_module.py");
         let db = test_db();
 
-        let sig = extract_function_signature(&db, &test_file, "function_with_params").unwrap();
+        let sig = extract_function_signature(
+            &db,
+            &test_file,
+            "function_with_params",
+            PythonVersion::latest_ty(),
+        )
+        .unwrap();
         assert_eq!(sig.name, "function_with_params");
         assert_eq!(sig.parameters.len(), 3);
 
@@ -722,7 +702,13 @@ mod tests {
         let test_file = examples_dir.join("my_module.py");
         let db = test_db();
 
-        let sig = extract_function_signature(&db, &test_file, "function_with_return").unwrap();
+        let sig = extract_function_signature(
+            &db,
+            &test_file,
+            "function_with_return",
+            PythonVersion::latest_ty(),
+        )
+        .unwrap();
         assert_eq!(sig.name, "function_with_return");
         assert!(sig.return_type.is_some());
         assert_eq!(sig.return_type.as_ref().unwrap(), "int");
@@ -734,7 +720,13 @@ mod tests {
         let test_file = examples_dir.join("my_module.py");
         let db = test_db();
 
-        let sig = extract_function_signature(&db, &test_file, "variadic_function").unwrap();
+        let sig = extract_function_signature(
+            &db,
+            &test_file,
+            "variadic_function",
+            PythonVersion::latest_ty(),
+        )
+        .unwrap();
         assert_eq!(sig.name, "variadic_function");
         assert_eq!(sig.parameters.len(), 2);
 
@@ -753,7 +745,13 @@ mod tests {
         let test_file = examples_dir.join("my_module.py");
         let db = test_db();
 
-        let sig = extract_function_signature(&db, &test_file, "complex_function").unwrap();
+        let sig = extract_function_signature(
+            &db,
+            &test_file,
+            "complex_function",
+            PythonVersion::latest_ty(),
+        )
+        .unwrap();
         assert_eq!(sig.name, "complex_function");
 
         // Should have: pos_only, regular, *args, keyword_only, another_kw, **kwargs
@@ -777,8 +775,9 @@ mod tests {
         let test_file = examples_dir.join("my_module.py");
         let db = test_db();
 
-        let result = extract_function_signature(&db, &test_file, "nonexistent");
-        assert!(result.is_err());
+        let result =
+            extract_function_signature(&db, &test_file, "nonexistent", PythonVersion::latest_ty());
+        assert!(result.is_none());
     }
 
     // ==================== extract_class_info tests ====================
@@ -789,7 +788,8 @@ mod tests {
         let test_file = examples_dir.join("my_module.py");
         let db = test_db();
 
-        let class_info = extract_class_info(&db, &test_file, "SimpleClass").unwrap();
+        let class_info =
+            extract_class_info(&db, &test_file, "SimpleClass", PythonVersion::latest_ty()).unwrap();
         assert_eq!(class_info.name, "SimpleClass");
         assert!(class_info.docstring.is_some());
         assert!(class_info.init_signature.is_none());
@@ -801,7 +801,9 @@ mod tests {
         let test_file = examples_dir.join("my_module.py");
         let db = test_db();
 
-        let class_info = extract_class_info(&db, &test_file, "ClassWithInit").unwrap();
+        let class_info =
+            extract_class_info(&db, &test_file, "ClassWithInit", PythonVersion::latest_ty())
+                .unwrap();
         assert_eq!(class_info.name, "ClassWithInit");
         assert!(class_info.docstring.is_some());
         assert!(class_info.init_signature.is_some());
@@ -835,7 +837,9 @@ mod tests {
         let test_file = examples_dir.join("my_module.py");
         let db = test_db();
 
-        let class_info = extract_class_info(&db, &test_file, "ComplexClass").unwrap();
+        let class_info =
+            extract_class_info(&db, &test_file, "ComplexClass", PythonVersion::latest_ty())
+                .unwrap();
         assert_eq!(class_info.name, "ComplexClass");
         assert!(class_info.init_signature.is_some());
 
@@ -850,8 +854,13 @@ mod tests {
         let test_file = examples_dir.join("my_module.py");
         let db = test_db();
 
-        let result = extract_class_info(&db, &test_file, "NonexistentClass");
-        assert!(result.is_err());
+        let result = extract_class_info(
+            &db,
+            &test_file,
+            "NonexistentClass",
+            PythonVersion::latest_ty(),
+        );
+        assert!(result.is_none());
     }
 
     // ==================== extract_method_info tests ====================
@@ -862,9 +871,205 @@ mod tests {
         let db = test_db();
 
         let kinds = ["make", "from_value", "custom"].map(|name| {
-            let method = extract_method_info(&db, &path, "QualifiedFactory", name).unwrap();
+            let method = extract_method_info(
+                &db,
+                &path,
+                "QualifiedFactory",
+                name,
+                PythonVersion::latest_ty(),
+            )
+            .unwrap();
             (method.is_classmethod, method.is_staticmethod)
         });
         assert_eq!(kinds, [(false, true), (true, false), (false, false)]);
+    }
+
+    // ==================== source range tests ====================
+
+    /// Write `source` to `name` in a new temporary directory.
+    fn write_module(name: &str, source: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join(name);
+        write_file(&path, source);
+        (dir, path)
+    }
+
+    fn function_range(source: &str, name: &str) -> SourceRange {
+        let (_dir, path) = write_module("module.py", source);
+        extract_function_signature(&test_db(), &path, name, PythonVersion::latest_ty())
+            .unwrap()
+            .range
+    }
+
+    fn position(line: u32, column: u32) -> SourcePosition {
+        SourcePosition { line, column }
+    }
+
+    #[test]
+    fn test_function_line_number_conversion() {
+        let source = r#"# This is line 0
+# This is line 1
+
+def my_function(x: int, y: int) -> int:
+    """A test function."""
+    return x + y
+
+class MyClass:
+    """A test class."""
+    
+    def __init__(self, value: int):
+        """Initialize the class."""
+        self.value = value
+"#;
+        let range = function_range(source, "my_function");
+        assert_eq!(range.start, position(3, 0));
+        assert!(range.end.line >= range.start.line);
+    }
+
+    #[test]
+    fn test_class_line_number_conversion() {
+        let source = r#"# This is line 0
+# This is line 1
+# This is line 2
+# This is line 3
+# This is line 4
+
+class MyClass:
+    """A test class on line 6."""
+
+    def __init__(self, value: int):
+        """Initialize the class."""
+        self.value = value
+
+    def method(self):
+        pass
+"#;
+        let (_dir, path) = write_module("module.py", source);
+        let class_info =
+            extract_class_info(&test_db(), &path, "MyClass", PythonVersion::latest_ty()).unwrap();
+
+        assert_eq!(class_info.range.start, position(6, 0));
+        let init_sig = class_info.init_signature.expect("__init__ should be found");
+        assert_eq!(init_sig.range.start.line, 9);
+    }
+
+    #[test]
+    fn test_indented_function() {
+        let source = r#"class Container:
+    def nested_function(self, arg: str) -> str:
+        """A nested function."""
+        return arg.upper()
+"#;
+        assert_eq!(
+            function_range(source, "nested_function").start,
+            position(1, 4)
+        );
+    }
+
+    #[test]
+    fn test_multiline_function() {
+        let source = r#"def multiline_function(
+    param1: int,
+    param2: str,
+    param3: bool
+) -> tuple[int, str, bool]:
+    """A function with multiple lines."""
+    return (param1, param2, param3)
+"#;
+        let range = function_range(source, "multiline_function");
+        assert_eq!(range.start, position(0, 0));
+        assert_eq!(range.end.line, 6);
+    }
+
+    /// Long comment lines make byte offsets and line numbers differ a lot.
+    #[test]
+    fn test_byte_offset_not_line_number() {
+        let source = r#"# Line 0: This is a comment with some content to increase byte offset
+# Line 1: More comments to push the byte offset higher
+# Line 2: Even more comments
+# Line 3: Keep adding comments
+# Line 4: One more comment line
+
+def target_function() -> None:
+    """This function is at line 6."""
+    pass
+"#;
+        assert_eq!(function_range(source, "target_function").start.line, 6);
+    }
+
+    #[test]
+    fn test_utf8_multibyte_characters() {
+        let source = r#"# 中文注释
+# Another comment: 日本語
+
+def unicode_function(name: str) -> str:
+    """Function with unicode: émojis 🚀 こんにちは"""
+    return f"Hello, {name}!"
+"#;
+        assert_eq!(
+            function_range(source, "unicode_function").start,
+            position(3, 0)
+        );
+    }
+
+    #[test]
+    fn test_extract_definition_info_function_range() {
+        let source = r#"# Line 0
+# Line 1
+
+def test_function(x: int) -> int:
+    """Test function at line 3."""
+    return x * 2
+"#;
+        let dir = tempfile::TempDir::new().unwrap();
+        write_file(&dir.path().join("workspace/test_module.py"), source);
+
+        let definition = extract_definition_info(
+            &test_db(),
+            "workspace.test_module.test_function",
+            &[dir.path().to_path_buf()],
+        )
+        .unwrap()
+        .definition_info;
+        match definition {
+            DefinitionInfo::Function(sig) => {
+                assert_eq!(sig.name, "test_function");
+                assert_eq!(sig.range.start.line, 3);
+            }
+            other => panic!("expected a function, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_extract_definition_info_class_range() {
+        let source = r#"# Line 0
+# Line 1
+# Line 2
+
+class TestClass:
+    """Test class at line 4."""
+    
+    def __init__(self):
+        """Initialize at line 7."""
+        pass
+"#;
+        let dir = tempfile::TempDir::new().unwrap();
+        write_file(&dir.path().join("workspace/test_class_module.py"), source);
+
+        let definition = extract_definition_info(
+            &test_db(),
+            "workspace.test_class_module.TestClass",
+            &[dir.path().to_path_buf()],
+        )
+        .unwrap()
+        .definition_info;
+        match definition {
+            DefinitionInfo::Class(class_info) => {
+                assert_eq!(class_info.name, "TestClass");
+                assert_eq!(class_info.range.start.line, 4);
+                assert_eq!(class_info.init_signature.unwrap().range.start.line, 7);
+            }
+            other => panic!("expected a class, got {other:?}"),
+        }
     }
 }

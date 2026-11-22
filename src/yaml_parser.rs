@@ -3,7 +3,7 @@ use saphyr::{LoadableYamlNode, MarkedYamlOwned};
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
-use tower_lsp::lsp_types::Position;
+use tower_lsp::lsp_types::{Position, Range};
 
 use crate::rules::DiagnosticRule;
 
@@ -305,6 +305,23 @@ impl HydraObject {
     /// Get the end position (UTF-16 column) of the target value
     pub fn target_value_end(&self) -> u32 {
         self.target.value_start + utf16_len(&self.target.value)
+    }
+
+    /// The range of the target value.
+    pub(crate) fn target_range(&self) -> Range {
+        Range::new(
+            Position::new(self.target.line, self.target.value_start),
+            Position::new(self.target.line, self.target_value_end()),
+        )
+    }
+
+    /// Whether `rule` is off.
+    pub(crate) fn rule_suppressed(
+        &self,
+        rule: DiagnosticRule,
+        file: &HashSet<DiagnosticRule>,
+    ) -> bool {
+        file.contains(&rule) || self.suppressed_rules.contains(&rule)
     }
 
     /// Check if this HydraObject is marked as partial

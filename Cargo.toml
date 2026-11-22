@@ -37,6 +37,7 @@ ruff_db = { git = "https://github.com/astral-sh/ruff", rev = "16a5a7e3e6299f3d4e
     "os",
 ] }
 ruff_source_file = { git = "https://github.com/astral-sh/ruff", rev = "16a5a7e3e6299f3d4e1c532aef37e0ed4b0ee761" }
+ty_module_resolver = { git = "https://github.com/astral-sh/ruff", rev = "16a5a7e3e6299f3d4e1c532aef37e0ed4b0ee761" }
 ty_python_semantic = { git = "https://github.com/astral-sh/ruff", rev = "16a5a7e3e6299f3d4e1c532aef37e0ed4b0ee761" }
 ty_vendored = { git = "https://github.com/astral-sh/ruff", rev = "16a5a7e3e6299f3d4e1c532aef37e0ed4b0ee761" }
 salsa = { version = "0.28.5", default-features = false, features = [

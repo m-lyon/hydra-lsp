@@ -48,7 +48,7 @@ fn format_parameters(params: &[ParameterInfo]) -> Vec<String> {
 }
 
 /// Format a function signature for display (e.g., in hover)
-pub fn format_function(sig: &FunctionSignature) -> String {
+pub(crate) fn format_function(sig: &FunctionSignature) -> String {
     let mut result = String::new();
     result.push_str("```python\n");
     result.push_str(&format_callable(sig, None, None));
@@ -60,7 +60,7 @@ pub fn format_function(sig: &FunctionSignature) -> String {
 /// Format a class for display (e.g., in hover)
 /// Shows class definition with base classes, class docstring,
 /// then __init__ method definition with its docstring
-pub fn format_class(class: &ClassInfo) -> String {
+pub(crate) fn format_class(class: &ClassInfo) -> String {
     let mut result = String::new();
     result.push_str("```python\n");
 
@@ -88,7 +88,7 @@ pub fn format_class(class: &ClassInfo) -> String {
 
 /// Format a method for display (e.g., in hover)
 /// Shows the method signature with @classmethod or @staticmethod decorator if applicable
-pub fn format_method(method: &MethodInfo) -> String {
+pub(crate) fn format_method(method: &MethodInfo) -> String {
     let decorator = if method.is_classmethod {
         Some("classmethod")
     } else if method.is_staticmethod {
@@ -207,6 +207,7 @@ fn format_definition(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::python::model::SourceRange;
 
     // ==================== format_signature tests ====================
 
@@ -219,10 +220,7 @@ mod tests {
             docstring: None,
             is_overloaded: false,
             overloads: Vec::new(),
-            start_line: 0,
-            start_column: 0,
-            end_line: 5,
-            end_column: 5,
+            range: SourceRange::default(),
         };
 
         let formatted = format_function(&sig);
@@ -253,10 +251,7 @@ mod tests {
             docstring: Some("Test docstring".to_string()),
             is_overloaded: false,
             overloads: Vec::new(),
-            start_line: 0,
-            start_column: 0,
-            end_line: 5,
-            end_column: 5,
+            range: SourceRange::default(),
         };
 
         let formatted = format_function(&sig);
@@ -286,10 +281,7 @@ mod tests {
             docstring: None,
             is_overloaded: false,
             overloads: Vec::new(),
-            start_line: 0,
-            start_column: 0,
-            end_line: 5,
-            end_column: 5,
+            range: SourceRange::default(),
         };
 
         let formatted = format_function(&sig);
@@ -307,11 +299,8 @@ mod tests {
             docstring: Some("A test class".to_string()),
             init_signature: None,
             new_signature: None,
-            unresolved_base_classes: false,
-            start_line: 0,
-            start_column: 0,
-            end_line: 5,
-            end_column: 5,
+            all_bases_resolved: true,
+            range: SourceRange::default(),
         };
 
         let formatted = format_class(&class_info);
@@ -326,10 +315,7 @@ mod tests {
             name: "TestClass".to_string(),
             base_classes: vec![],
             docstring: Some("A test class".to_string()),
-            start_line: 0,
-            start_column: 0,
-            end_line: 5,
-            end_column: 5,
+            range: SourceRange::default(),
             init_signature: Some(FunctionSignature {
                 name: "__init__".to_string(),
                 parameters: vec![
@@ -350,13 +336,10 @@ mod tests {
                 docstring: None,
                 is_overloaded: false,
                 overloads: Vec::new(),
-                start_line: 0,
-                start_column: 0,
-                end_line: 5,
-                end_column: 5,
+                range: SourceRange::default(),
             }),
             new_signature: None,
-            unresolved_base_classes: false,
+            all_bases_resolved: true,
         };
 
         let formatted = format_class(&class_info);
@@ -375,10 +358,7 @@ mod tests {
             name: "TestClass".to_string(),
             base_classes: vec![],
             docstring: None,
-            start_line: 0,
-            start_column: 0,
-            end_line: 5,
-            end_column: 5,
+            range: SourceRange::default(),
             init_signature: Some(FunctionSignature {
                 name: "__init__".to_string(),
                 parameters: vec![
@@ -399,13 +379,10 @@ mod tests {
                 docstring: None,
                 is_overloaded: false,
                 overloads: Vec::new(),
-                start_line: 0,
-                start_column: 0,
-                end_line: 5,
-                end_column: 5,
+                range: SourceRange::default(),
             }),
             new_signature: None,
-            unresolved_base_classes: false,
+            all_bases_resolved: true,
         };
 
         let formatted = format_class(&class_info);
@@ -437,10 +414,7 @@ mod tests {
                 docstring: Some("Create from config".to_string()),
                 is_overloaded: false,
                 overloads: Vec::new(),
-                start_line: 0,
-                start_column: 0,
-                end_line: 5,
-                end_column: 5,
+                range: SourceRange::default(),
             },
             is_classmethod: true,
             is_staticmethod: false,
@@ -469,10 +443,7 @@ mod tests {
                 docstring: None,
                 is_overloaded: false,
                 overloads: Vec::new(),
-                start_line: 0,
-                start_column: 0,
-                end_line: 5,
-                end_column: 5,
+                range: SourceRange::default(),
             },
             is_classmethod: false,
             is_staticmethod: true,

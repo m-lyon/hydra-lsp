@@ -53,7 +53,9 @@ fn test_check_is_a_subcommand() {
     let output = Command::new(HYDRUST).arg("--help").output().unwrap();
     let stdout = String::from_utf8(output.stdout).unwrap();
 
-    assert!(stdout.contains("Usage: hydrust <COMMAND>"), "got: {stdout}");
+    // clap names the binary after the executable, `hydrust.exe` on Windows.
+    let usage = format!("Usage: hydrust{} <COMMAND>", std::env::consts::EXE_SUFFIX);
+    assert!(stdout.contains(&usage), "got: {stdout}");
     assert!(stdout.contains("check"), "got: {stdout}");
 }
 
@@ -774,7 +776,11 @@ fn test_relative_python_resolves_against_the_current_directory() {
     let dir = TempDir::new().unwrap();
     let home = dir.path().join("base/bin");
     fs::create_dir_all(&home).unwrap();
-    let site_packages = dir.path().join("venv/lib/python3.12/site-packages");
+    let site_packages = if cfg!(windows) {
+        dir.path().join(r"venv\Lib\site-packages")
+    } else {
+        dir.path().join("venv/lib/python3.12/site-packages")
+    };
     fs::create_dir_all(&site_packages).unwrap();
     fs::write(
         dir.path().join("venv/pyvenv.cfg"),

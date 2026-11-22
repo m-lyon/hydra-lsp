@@ -87,14 +87,14 @@ Note it limits handlers *started*, not messages *read*. tower-lsp builds each ha
 
 **The db mutex is the real serializer.** `Session::db` is a single `parking_lot::Mutex`. Pools give you parallelism only for the stretch of a job that is not holding it. Adding threads does not help work that is queued on the lock.
 
-**The pools isolate threads, not work.** Both pools reach `python::cache::cached_definition_info`. When two requests want the same key, salsa blocks one until the other finishes, regardless of which pool they came from. Separating the pools stops a diagnostics burst from occupying every thread and leaving a hover waiting; it does not stop them contending on shared queries.
+**The pools isolate threads, not work.** Both pools reach `python::cache::resolved_definition`. When two requests want the same key, salsa blocks one until the other finishes, regardless of which pool they came from. Separating the pools stops a diagnostics burst from occupying every thread and leaving a hover waiting; it does not stop them contending on shared queries.
 
 **Salsa cancellation is coarse.** A write bumps the revision and in-flight queries unwind with `salsa::Cancelled`. `spawn_on_pool` catches that and reports `PoolOutcome::Cancelled`; handlers turn it into
 `ContentModified` (or `ServerCancelled` with `retrigger_request` for pull diagnostics) so the client re-asks. During fast typing the pools are therefore bursty — a lot of started-and-abandoned work.
 
 **A dropped request cancels its own job.** On `$/cancelRequest` tower-lsp drops the handler future, and with it the `PoolJob` that `spawn_on_pool` returned. Dropping the job cancels the salsa `CancellationToken` of the snapshot the job queries through, so the job unwinds at its next cancellation check instead of holding a pool thread to the end. The job runs inside a single `attach`, because salsa clears the token each time the outermost attached scope exits, and a cancel that lands inside one top-level query call would otherwise be cleared before the next call checks. That reaches only the one snapshot, and needs no revision bump. It adds to revision cancellation rather than replacing it: a write still has to unwind every handle before it can take the database.
 
-The token is disabled while a cycle-recovering query runs (`class_parent_docs` and `class_parent_attribute` in `python::cache`), so a job inside one stops once it leaves. A job blocked on a query another thread is computing waits for that thread to finish.
+The token is disabled while a cycle-recovering query runs (`inherited_class_members` and `class_parent_attribute` in `python::cache`), so a job inside one stops once it leaves. A job blocked on a query another thread is computing waits for that thread to finish.
 
 ## Design decisions, and the alternatives rejected
 
@@ -104,8 +104,8 @@ The default is 2 + 3 however large the machine is. Scaling with cores is the obv
 
 Neither pool's useful width grows with cores:
 
-- **Latency = 2.** `semanticTokens/full` and `signatureHelp` fire together on an edit and are badly matched in cost — token extraction is nearly free once the document is parsed, while signature help can sit in a cold `cached_definition_info` reading and parsing Python. Two threads stop the cheap one queueing behind the expensive one. A third would need a third concurrent request, and in practice that means hover, which happens when the pointer rests rather than while typing.
-- **Worker = 3.** The one real fan-out is re-validating every open Hydra document after a watched `.py` file changes. That fan-out is already well below the open-document count, because documents sharing a `_target_` share one `cached_definition_info` key. Three rather than two because this pool absorbs whole-workspace bursts while the latency pool only ever has one cursor position to answer for.
+- **Latency = 2.** `semanticTokens/full` and `signatureHelp` fire together on an edit and are badly matched in cost — token extraction is nearly free once the document is parsed, while signature help can sit in a cold `resolved_definition` reading and parsing Python. Two threads stop the cheap one queueing behind the expensive one. A third would need a third concurrent request, and in practice that means hover, which happens when the pointer rests rather than while typing.
+- **Worker = 3.** The one real fan-out is re-validating every open Hydra document after a watched `.py` file changes. That fan-out is already well below the open-document count, because documents sharing a `_target_` share one `resolved_definition` key. Three rather than two because this pool absorbs whole-workspace bursts while the latency pool only ever has one cursor position to answer for.
 
 Reference point: ruff and ty cap their background pool at `min(available_parallelism, 4)` and run a single fmt thread (`ty_server/src/lib.rs`, `ty_server/src/server/schedule.rs`).
 
@@ -230,8 +230,7 @@ In `hydra-lsp`:
 - `src/backend/handlers.rs` — the `LanguageServer` impl, including `initialize`, and `spawn_definition_lookup`.
 - `src/backend/diagnostics.rs` — `compute_diagnostics` and the publish helpers, and the pull path's report building.
 - `src/outbox.rs` — the outbound queue and its drain task.
-- `tests/server_cli.rs` — `EXIT_TIMEOUT`, the guard against the outbox hang
-  coming back.
+- `tests/server_cli.rs` — `EXIT_TIMEOUT`, the guard against the outbox hang coming back.
 
 In `hydrust-vscode`:
 

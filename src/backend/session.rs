@@ -1,7 +1,7 @@
 //! The analysis session: the salsa database behind its lock, snapshots of it for
 //! the pools, and the per-document inputs.
 
-use ruff_db::system::SystemPath;
+use ruff_db::system::SystemPathBuf;
 use salsa::Setter;
 use tower_lsp::jsonrpc::{Error, Result};
 use tower_lsp::lsp_types::Url;
@@ -54,26 +54,21 @@ pub(super) struct SessionSnapshot {
 
 impl HydraLspBackend {
     fn fallback_workspace_root() -> Result<String> {
-        std::env::current_dir()
-            .map_err(|error| Error {
-                code: Error::internal_error().code,
-                message: format!(
-                    "failed to determine workspace root from current directory: {}",
-                    error
-                )
+        let failed = |reason: String| Error {
+            code: Error::internal_error().code,
+            message: format!("failed to determine workspace root from current directory: {reason}")
                 .into(),
-                data: None,
-            })?
+            data: None,
+        };
+        std::env::current_dir()
+            .map_err(|error| failed(error.to_string()))?
             .into_os_string()
             .into_string()
-            .map_err(|path| Error {
-                code: Error::internal_error().code,
-                message: format!(
-                    "failed to determine workspace root from current directory: non-utf8 path {}",
+            .map_err(|path| {
+                failed(format!(
+                    "non-utf8 path {}",
                     std::path::PathBuf::from(path).display()
-                )
-                .into(),
-                data: None,
+                ))
             })
     }
 
@@ -86,9 +81,10 @@ impl HydraLspBackend {
             Some(workspace_root) => workspace_root,
             None => Self::fallback_workspace_root()?,
         };
-        let cwd = SystemPath::new(&workspace_root);
-        let db = HydraDatabase::new(cwd);
-        let python_config = PythonConfig::frozen(&db, Some(workspace_root), interpreter);
+        let workspace_root = SystemPathBuf::from(workspace_root);
+        let db = HydraDatabase::new(&workspace_root);
+        let python_config =
+            PythonConfig::frozen(&db, workspace_root, interpreter.map(SystemPathBuf::from));
         *self.session.write() = Some(Session {
             db: parking_lot::Mutex::new(db),
             python_config,
@@ -136,28 +132,25 @@ impl HydraLspBackend {
     ///
     /// These are the site-packages and `.pth`-target directories the resolver
     /// reads from but that a workspace-relative watcher glob would miss (see
-    /// `initialized`). Shares the exact `search_paths_for_config` list the
-    /// resolver uses, so each watched root equals the path the resolver interns
-    /// under. Nested paths are collapsed so a parent `**` watcher isn't
-    /// duplicated by one of its children.
+    /// `initialized`). Taken from the resolver's own search paths, so each
+    /// watched root equals the path the resolver interns under. Nested paths
+    /// are collapsed so a parent `**` watcher isn't duplicated by one of its
+    /// children.
     pub(super) fn out_of_workspace_search_roots(&self) -> Vec<std::path::PathBuf> {
-        self.with_session("computing watched search paths", |s| {
+        self.with_session("out_of_workspace_search_roots", |s| {
             let db = s.db.lock();
             let workspace = s
                 .python_config
                 .workspace_root(&*db)
-                .as_deref()
-                .map(std::path::PathBuf::from);
+                .as_std_path()
+                .to_path_buf();
+            let environment = python_cache::resolver_environment(&*db, s.python_config);
             let roots: Vec<ruff_db::system::SystemPathBuf> =
-                python_cache::search_paths_for_config(&*db, s.python_config)
-                    .iter()
-                    // Drop the relative "." entry and anything under the
-                    // workspace (already covered by the workspace-relative glob).
-                    .filter(|path| path.is_absolute())
-                    .filter(|path| workspace.as_ref().is_none_or(|w| !path.starts_with(w)))
-                    .filter_map(|path| {
-                        ruff_db::system::SystemPathBuf::from_path_buf(path.clone()).ok()
-                    })
+                ty_module_resolver::system_module_search_paths(&*db, environment)
+                    // Drop anything under the workspace (already covered by
+                    // the workspace-relative glob).
+                    .filter(|path| !path.as_std_path().starts_with(&workspace))
+                    .map(ToOwned::to_owned)
                     .collect();
             ruff_db::system::deduplicate_nested_paths(roots)
                 .map(|path| path.as_std_path().to_path_buf())
@@ -183,7 +176,7 @@ impl HydraLspBackend {
         uri: &Url,
         context: &'static str,
     ) -> Option<ParsedYaml> {
-        let input = *self.document_inputs.get(uri)?;
+        let input = self.document_input(uri)?;
         self.with_session(context, |s| {
             let db = s.db.lock();
             if yaml_cache::is_hydra_file(&*db, input) {
@@ -195,6 +188,13 @@ impl HydraLspBackend {
         .flatten()
     }
 
+    /// The `DocumentInput` for `uri`. The shard guard is released before this
+    /// returns, so a caller can take the db lock next without inverting the
+    /// lock order `get_or_create_input` uses.
+    pub(super) fn document_input(&self, uri: &Url) -> Option<DocumentInput> {
+        self.document_inputs.get(uri).map(|entry| *entry)
+    }
+
     /// Get or create a `DocumentInput` for a given URI.
     ///
     /// Holds the dashmap entry guard across the salsa write so that concurrent
@@ -203,28 +203,28 @@ impl HydraLspBackend {
     /// text leak through). Lock order: dashmap shard → `Session::db.lock()`.
     ///
     /// Returns `None` when the session is not yet initialized; callers
-    /// (notification handlers) should treat that as a no-op.
+    /// (notification handlers) should treat that as a no-op. `context` names
+    /// the caller in the no-session warning.
     pub(super) fn get_or_create_input(
         &self,
         uri: &Url,
         text: &str,
         version: i32,
+        context: &'static str,
     ) -> Option<DocumentInput> {
-        self.with_session("opening documents", |s| {
-            match self.document_inputs.entry(uri.clone()) {
-                dashmap::Entry::Occupied(occ) => {
-                    let input = *occ.get();
-                    let mut db = s.db.lock();
-                    input.set_text(&mut *db).to(text.to_string());
-                    input.set_version(&mut *db).to(version);
-                    input
-                }
-                dashmap::Entry::Vacant(vac) => {
-                    let db = s.db.lock();
-                    let input = DocumentInput::new(&*db, text.to_string(), version);
-                    vac.insert(input);
-                    input
-                }
+        self.with_session(context, |s| match self.document_inputs.entry(uri.clone()) {
+            dashmap::Entry::Occupied(occ) => {
+                let input = *occ.get();
+                let mut db = s.db.lock();
+                input.set_text(&mut *db).to(text.to_string());
+                input.set_version(&mut *db).to(version);
+                input
+            }
+            dashmap::Entry::Vacant(vac) => {
+                let db = s.db.lock();
+                let input = DocumentInput::new(&*db, text.to_string(), version);
+                vac.insert(input);
+                input
             }
         })
     }
@@ -233,50 +233,25 @@ impl HydraLspBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ruff_db::system::SystemPath;
 
     /// Build a minimal on-disk venv so `discover_python_environment` returns a
-    /// real site-packages directory, and register its `FileRoot`s exactly as
-    /// production does (via `python_cache::site_packages_paths`). Discovery uses
-    /// a real `OsSystem` (not the db's system), so this must be an actual
-    /// filesystem layout, not an in-memory one — it mirrors `python::env`'s
-    /// in-memory `create_mock_venv`. The returned `TempDir` must be kept alive
-    /// for the venv to persist.
+    /// real site-packages directory. Discovery uses a real `OsSystem`, not the
+    /// db's system, so this must be an actual filesystem layout. The returned
+    /// `TempDir` must be kept alive for the venv to persist.
     fn session_with_real_venv() -> (Session, std::path::PathBuf, tempfile::TempDir) {
-        use std::fs;
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let venv = tmp.path().to_path_buf();
-        let version = "3.11";
-        let (exe, site_packages) = if cfg!(target_os = "windows") {
-            (
-                venv.join(r"Scripts\python.exe"),
-                venv.join(r"Lib\site-packages"),
-            )
-        } else {
-            (
-                venv.join("bin/python"),
-                venv.join(format!("lib/python{version}/site-packages")),
-            )
-        };
-        fs::create_dir_all(exe.parent().unwrap()).unwrap();
-        fs::write(&exe, "").unwrap();
-        fs::create_dir_all(&site_packages).unwrap();
-        fs::write(
-            venv.join("pyvenv.cfg"),
-            format!("home = {}\nversion = {version}\n", venv.display()),
-        )
-        .unwrap();
+        let site_packages = crate::python::test_support::write_venv(&venv, "3.11");
 
         let db = HydraDatabase::new(SystemPath::new(venv.to_str().unwrap()));
-        let python_config = PythonConfig::frozen(
-            &db,
-            Some(venv.to_string_lossy().into_owned()),
-            Some(venv.to_string_lossy().into_owned()),
-        );
+        let venv_path = SystemPathBuf::from(venv.to_string_lossy().into_owned());
+        let python_config = PythonConfig::frozen(&db, venv_path.clone(), Some(venv_path));
         // Discovery canonicalizes the sys.prefix (e.g. macOS `/var` →
         // `/private/var`), so return the canonical path: simulated watch
         // events then name the same directory the resolver listed, exactly as
         // real events do.
-        let site_packages = std::fs::canonicalize(&site_packages).expect("canonicalize venv");
+        let site_packages = crate::python::test_support::canonicalize(&site_packages);
         let session = Session {
             db: parking_lot::Mutex::new(db),
             python_config,
@@ -291,16 +266,16 @@ mod tests {
         use ruff_db::files::File;
 
         let (session, site_packages, tmp) = session_with_real_venv();
-        let editable = std::fs::canonicalize(tmp.path())
-            .unwrap()
-            .join("editable_src");
+        let editable = crate::python::test_support::canonicalize(tmp.path()).join("editable_src");
         std::fs::create_dir_all(&editable).unwrap();
         let pth = site_packages.join("editable.pth");
         let pth_sys = SystemPath::from_std_path(&pth).unwrap();
 
         let has_editable = |session: &Session| {
             let db = session.db.lock();
-            python_cache::search_paths_for_config(&*db, session.python_config).contains(&editable)
+            let environment = python_cache::resolver_environment(&*db, session.python_config);
+            ty_module_resolver::editable_search_paths(&*db, environment)
+                .any(|path| path.as_std_path() == editable)
         };
         assert!(!has_editable(&session));
 

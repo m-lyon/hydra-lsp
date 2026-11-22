@@ -16,7 +16,7 @@ use super::diagnostics::{
     server_cancelled_error, validate_input,
 };
 use super::pools::{PoolOutcome, spawn_on_pool};
-use super::presentation::{definition_positions, signature_information};
+use super::presentation::{definition_ranges, signature_information};
 use super::session::SessionSnapshot;
 use crate::diagnostics;
 use crate::python::cache::{self as python_cache, ResolvedDefinition, TargetString};
@@ -44,25 +44,23 @@ impl HydraLspBackend {
     ///
     /// On cache hits the blocking thread returns almost immediately; on misses
     /// it performs the full analysis without holding any locks.
-    ///
-    /// Failures that are not about the target itself (no session yet, a
-    /// superseded or panicked lookup) come back as `ResolveError::Other`.
     async fn spawn_definition_lookup(
         &self,
         target_value: String,
-    ) -> std::result::Result<ResolvedDefinition, ResolveError> {
-        let superseded =
-            || ResolveError::Other("definition lookup superseded by a newer edit".to_string());
+    ) -> std::result::Result<ResolvedDefinition, LookupError> {
         let Some(snapshot) = self.snapshot() else {
-            return Err(ResolveError::Other("session not initialized".to_string()));
+            return Err(LookupError::NotInitialized);
         };
         let SessionSnapshot { db, python_config } = snapshot;
 
         let received = spawn_on_pool(&self.latency_pool, db, move |db| {
             let start = Instant::now();
             let target = TargetString::new(db, target_value);
-            let cached = python_cache::cached_definition_info(db, python_config, target);
-            let result = cached.get().cloned().map_err(Clone::clone);
+            let cached = python_cache::resolved_definition(db, python_config, target);
+            let result = cached
+                .get()
+                .cloned()
+                .map_err(|err| LookupError::Resolve(err.clone()));
             tracing::debug!(
                 elapsed_us = start.elapsed().as_micros() as u64,
                 target = target.value(db),
@@ -76,25 +74,271 @@ impl HydraLspBackend {
         // request is stale.
         match PoolOutcome::from_received(received) {
             PoolOutcome::Completed(result) => result,
-            PoolOutcome::Cancelled => Err(superseded()),
+            PoolOutcome::Cancelled => Err(LookupError::Superseded),
             PoolOutcome::Panicked(msg) => {
                 tracing::error!(%msg, "definition lookup panicked");
-                Err(ResolveError::Other(format!(
-                    "definition lookup panicked: {msg}"
-                )))
+                Err(LookupError::Panicked(msg))
             }
         }
     }
 
+    /// Store `text` as the document's contents, then refresh its diagnostics.
+    /// Returns `false`, having logged, when called before `initialize`.
+    /// `context` names the calling handler in that log.
+    fn update_document(&self, uri: &Url, text: &str, version: i32, context: &'static str) -> bool {
+        let Some(input) = self.get_or_create_input(uri, text, version, context) else {
+            return false;
+        };
+        self.refresh_after_edit(uri, input, context);
+        true
+    }
+
+    async fn hover_response(&self, params: HoverParams) -> Result<Option<Hover>> {
+        if !self.settings.read().features.hover {
+            return Ok(None);
+        }
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+
+        // Cached salsa lookups: skip if not a Hydra file. Both calls are O(1)
+        // hashmap probes on the warm path.
+        let Some(parsed) = self.cached_parsed_yaml(&uri, "hover") else {
+            return Ok(None);
+        };
+        let Ok(content) = parsed.result() else {
+            return Ok(None);
+        };
+        let Some(hydra_object) = content.target_at_position(position) else {
+            return Ok(None);
+        };
+
+        self.outbox.log(
+            MessageType::LOG,
+            format!("Found target at position: {:?}", hydra_object),
+        );
+
+        // Extract Python definition info on a blocking thread (cached + non-blocking)
+        let extract_result = self
+            .spawn_definition_lookup(hydra_object.target.value.clone())
+            .await;
+
+        match extract_result {
+            Ok(ResolvedDefinition {
+                mut definition_info,
+                ..
+            }) => {
+                diagnostics::narrow_overloads(&mut definition_info, hydra_object);
+                let hover_content = match definition_info {
+                    DefinitionInfo::Function(sig) => format_function(&sig),
+                    DefinitionInfo::Class(class_info) => format_class(&class_info),
+                    DefinitionInfo::Method(method_info) => format_method(&method_info),
+                };
+                let range = hydra_object.target_range();
+
+                Ok(Some(Hover {
+                    contents: HoverContents::Markup(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: hover_content,
+                    }),
+                    range: Some(range),
+                }))
+            }
+            Err(e) => {
+                // If Python analysis fails, don't show any hover, but log it
+                self.log_lookup_failure(&e, None);
+                Ok(None)
+            }
+        }
+    }
+
+    async fn signature_help_response(
+        &self,
+        params: SignatureHelpParams,
+    ) -> Result<Option<SignatureHelp>> {
+        if !self.settings.read().features.signature_help {
+            return Ok(None);
+        }
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+
+        let Some(parsed) = self.cached_parsed_yaml(&uri, "signature_help") else {
+            return Ok(None);
+        };
+        let Ok(content) = parsed.result() else {
+            return Ok(None);
+        };
+        let Some((target_value, param_context)) = content.target_for_parameter_line(position)
+        else {
+            return Ok(None);
+        };
+        let Some(hydra_object) = content.hydra_object_for_parameter_line(position) else {
+            return Ok(None);
+        };
+
+        // Extract Python definition info on a blocking thread (cached + non-blocking)
+        let extract_result = self.spawn_definition_lookup(target_value.clone()).await;
+
+        match extract_result {
+            Ok(ResolvedDefinition {
+                definition_info, ..
+            }) => {
+                let implicit_param = definition_info.implicit_param();
+                let label_prefix = match &definition_info {
+                    DefinitionInfo::Function(sig) => sig.name.clone(),
+                    DefinitionInfo::Class(class_info) => class_info.name.clone(),
+                    DefinitionInfo::Method(method_info) => {
+                        format!("{}.{}", method_info.class_name, method_info.signature.name)
+                    }
+                };
+                let call_signature = definition_info.call_signature();
+
+                // An overloaded target lists every overload, with the first one
+                // the YAML node's arguments match made active. Otherwise there is just
+                // the one signature, or a bare `Name()` for a class with no constructor
+                // at all.
+                let (shown, active_signature): (Vec<Option<&FunctionSignature>>, usize) =
+                    match call_signature {
+                        Some(sig) if !sig.overloads.is_empty() => (
+                            sig.overloads.iter().map(Some).collect(),
+                            diagnostics::matching_overloads(hydra_object, sig, implicit_param)
+                                .first()
+                                .copied()
+                                .unwrap_or(0),
+                        ),
+                        other => (vec![other], 0),
+                    };
+
+                let signatures: Vec<SignatureInformation> = shown
+                    .into_iter()
+                    .map(|sig| {
+                        signature_information(&label_prefix, sig, implicit_param, &param_context)
+                    })
+                    .collect();
+                let active_parameter = signatures[active_signature].active_parameter;
+
+                Ok(Some(SignatureHelp {
+                    signatures,
+                    active_signature: Some(active_signature as u32),
+                    active_parameter,
+                }))
+            }
+            Err(e) => {
+                self.log_lookup_failure(&e, Some("Python analysis failed for signature help"));
+                Ok(None)
+            }
+        }
+    }
+
+    async fn goto_definition_response(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> Result<Option<GotoDefinitionResponse>> {
+        if !self.settings.read().features.goto_definition {
+            return Ok(None);
+        }
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+
+        let Some(parsed) = self.cached_parsed_yaml(&uri, "goto_definition") else {
+            return Ok(None);
+        };
+        let Ok(content) = parsed.result() else {
+            return Ok(None);
+        };
+        let Some(target_info) = content.target_at_position(position).cloned() else {
+            return Ok(None);
+        };
+
+        // Extract definition info on a blocking thread (cached + non-blocking)
+        let extract_result = self
+            .spawn_definition_lookup(target_info.target.value.clone())
+            .await;
+        let (file_path, ranges) = match extract_result {
+            Ok(ResolvedDefinition {
+                mut definition_info,
+                file_path,
+                ..
+            }) => {
+                diagnostics::narrow_overloads(&mut definition_info, &target_info);
+                (file_path, definition_ranges(&definition_info))
+            }
+            Err(e) => {
+                self.log_lookup_failure(&e, None);
+                return Ok(None);
+            }
+        };
+
+        // A definition inside the vendored typeshed archive has no file on disk
+        // to jump to. Hover and diagnostics still work; go-to-definition is a
+        // silent no-op rather than an error the user cannot act on.
+        if crate::python::typeshed::is_vendored_path(&file_path) {
+            tracing::debug!(
+                path = %file_path.display(),
+                "goto_definition: target is a vendored stub; nothing to open"
+            );
+            return Ok(None);
+        }
+
+        // Convert file path to URI
+        let target_uri = match Url::from_file_path(&file_path) {
+            Ok(uri) => uri,
+            Err(_) => {
+                self.outbox.log(
+                    MessageType::ERROR,
+                    format!("Could not convert path to URI: {}", file_path.display()),
+                );
+                return Ok(None);
+            }
+        };
+
+        let mut locations: Vec<Location> = ranges
+            .into_iter()
+            .map(|range| Location {
+                uri: target_uri.clone(),
+                range: range.into(),
+            })
+            .collect();
+        Ok(Some(if locations.len() == 1 {
+            GotoDefinitionResponse::Scalar(locations.remove(0))
+        } else {
+            GotoDefinitionResponse::Array(locations)
+        }))
+    }
+
     /// Log a failed `spawn_definition_lookup` for hover, signature help or
     /// go-to-definition, which then return no result.
-    fn log_lookup_failure(&self, err: &ResolveError, context: Option<&str>) {
+    fn log_lookup_failure(&self, err: &LookupError, context: Option<&str>) {
         match (err, context) {
-            (ResolveError::InvalidFormat(_), _) => self.outbox.log(MessageType::ERROR, err),
+            (LookupError::Resolve(ResolveError::InvalidFormat(_)), _) => {
+                self.outbox.log(MessageType::ERROR, err)
+            }
             (_, Some(context)) => self
                 .outbox
                 .log(MessageType::WARNING, format!("{context}: {err}")),
             (_, None) => self.outbox.log(MessageType::WARNING, err),
+        }
+    }
+}
+
+/// Why `spawn_definition_lookup` returned no definition.
+#[derive(Debug)]
+enum LookupError {
+    /// The target itself did not resolve.
+    Resolve(ResolveError),
+    /// `initialize` has not built the session yet.
+    NotInitialized,
+    /// A newer edit cancelled the lookup.
+    Superseded,
+    Panicked(String),
+}
+
+impl std::fmt::Display for LookupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Resolve(err) => err.fmt(f),
+            Self::NotInitialized => f.write_str("session not initialized"),
+            Self::Superseded => f.write_str("definition lookup superseded by a newer edit"),
+            Self::Panicked(msg) => write!(f, "definition lookup panicked: {msg}"),
         }
     }
 }
@@ -215,16 +459,10 @@ impl LanguageServer for HydraLspBackend {
         let text = params.text_document.text;
         let version = params.text_document.version;
 
-        // Create a salsa input for this document. Returns None (and logs)
-        // when called before initialize.
-        let Some(input) = self.get_or_create_input(&uri, &text, version) else {
-            return;
-        };
-
-        self.refresh_after_edit(&uri, input, "opening documents");
-
-        self.outbox
-            .log(MessageType::INFO, format!("Document opened: {}", uri));
+        if self.update_document(&uri, &text, version, "did_open") {
+            self.outbox
+                .log(MessageType::INFO, format!("Document opened: {}", uri));
+        }
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
@@ -232,15 +470,9 @@ impl LanguageServer for HydraLspBackend {
         let version = params.text_document.version;
 
         // Full sync: take the first change which is the entire document
-        if let Some(change) = params.content_changes.into_iter().next() {
-            // Update the salsa input (invalidates cached queries). Returns
-            // None (and logs) when called before initialize.
-            let Some(input) = self.get_or_create_input(&uri, &change.text, version) else {
-                return;
-            };
-
-            self.refresh_after_edit(&uri, input, "changing documents");
-
+        if let Some(change) = params.content_changes.into_iter().next()
+            && self.update_document(&uri, &change.text, version, "did_change")
+        {
             self.outbox
                 .log(MessageType::INFO, format!("Document changed: {}", uri));
         }
@@ -258,9 +490,9 @@ impl LanguageServer for HydraLspBackend {
         // (typically Python sources outside the editor). For each changed
         // path we call `File::sync_path`, which bumps the per-file revision
         // inside ruff_db so that any salsa query reading that file's
-        // `source_text` is invalidated on the next request. A file that was
-        // created or deleted also bumps its parent directory, which is what
-        // makes `parse_pth_files` re-scan site-packages for a new `.pth`.
+        // `source_text` is invalidated on the next request. A created or
+        // deleted file also bumps its ancestor directories, whose listings
+        // module resolution and the `.pth` scan read.
         //
         // We filter to Python analysis inputs before locking: `.py`, `.pyi`,
         // and watched `.pth` files all participate in analysis. These extensions
@@ -268,7 +500,7 @@ impl LanguageServer for HydraLspBackend {
         if params.changes.is_empty() {
             return;
         }
-        let tracked_paths: Vec<std::path::PathBuf> = params
+        let tracked_paths: Vec<(std::path::PathBuf, FileChangeType)> = params
             .changes
             .iter()
             .filter_map(|change| {
@@ -279,7 +511,7 @@ impl LanguageServer for HydraLspBackend {
                     .map(str::to_ascii_lowercase)
                     .as_deref()
                 {
-                    Some("py") | Some("pyi") | Some("pth") => Some(path),
+                    Some("py") | Some("pyi") | Some("pth") => Some((path, change.typ)),
                     _ => None,
                 }
             })
@@ -292,14 +524,18 @@ impl LanguageServer for HydraLspBackend {
             return;
         }
         let synced = self
-            .with_session("watching files", |s| {
+            .with_session("did_change_watched_files", |s| {
                 let mut synced = 0usize;
                 let mut db = s.db.lock();
-                for std_path in &tracked_paths {
+                // The reported path is synced as is. ty canonicalizes
+                // site-packages roots, so a `.pth` change reported through a
+                // symlink (e.g. a symlinked `.venv`) does not invalidate the
+                // editable scan. Known gap, left unfixed as niche.
+                for (std_path, typ) in &tracked_paths {
                     let Some(sys_path) = SystemPath::from_std_path(std_path) else {
                         continue;
                     };
-                    File::sync_path(&mut *db, sys_path);
+                    sync_watched_path(&mut *db, sys_path, *typ != FileChangeType::CHANGED);
                     synced += 1;
                 }
                 synced
@@ -353,7 +589,7 @@ impl LanguageServer for HydraLspBackend {
             .map(|entry| (entry.key().clone(), *entry.value()))
             .collect();
         let hydra_uris: Vec<Url> = self
-            .with_session("refreshing diagnostics", |s| {
+            .with_session("did_change_watched_files", |s| {
                 let db = s.db.lock();
                 candidates
                     .into_iter()
@@ -381,9 +617,8 @@ impl LanguageServer for HydraLspBackend {
         // reuse on a subsequent `did_open` for the same URI. Salsa exposes
         // no input-deletion API, so this is the minimum-footprint
         // equivalent (matches `ruff_db::files::VirtualFile::close`).
-        let input = self.document_inputs.get(&uri).map(|entry| *entry);
-        if let Some(input) = input {
-            self.with_session("closing documents", |s| {
+        if let Some(input) = self.document_input(&uri) {
+            self.with_session("did_close", |s| {
                 let mut db = s.db.lock();
                 input.close(&mut *db);
             });
@@ -400,73 +635,7 @@ impl LanguageServer for HydraLspBackend {
     }
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
-        let start = Instant::now();
-        if !self.settings.read().features.hover {
-            return Ok(None);
-        }
-        let uri = params.text_document_position_params.text_document.uri;
-        let position = params.text_document_position_params.position;
-
-        // Cached salsa lookups: skip if not a Hydra file. Both calls are O(1)
-        // hashmap probes on the warm path.
-        let Some(parsed) = self.cached_parsed_yaml(&uri, "hover") else {
-            return Ok(None);
-        };
-        let Ok(content) = parsed.result() else {
-            return Ok(None);
-        };
-        let Some(hydra_object) = content.target_at_position(position) else {
-            return Ok(None);
-        };
-
-        self.outbox.log(
-            MessageType::LOG,
-            format!("Found target at position: {:?}", hydra_object),
-        );
-
-        // Extract Python definition info on a blocking thread (cached + non-blocking)
-        let extract_result = self
-            .spawn_definition_lookup(hydra_object.target.value.clone())
-            .await;
-
-        let result = match extract_result {
-            Ok(ResolvedDefinition {
-                mut definition_info,
-                ..
-            }) => {
-                diagnostics::narrow_overloads(&mut definition_info, hydra_object);
-                let hover_content = match definition_info {
-                    DefinitionInfo::Function(sig) => format_function(&sig),
-                    DefinitionInfo::Class(class_info) => format_class(&class_info),
-                    DefinitionInfo::Method(method_info) => format_method(&method_info),
-                };
-                let range = Range {
-                    start: Position {
-                        line: hydra_object.target.line,
-                        character: hydra_object.target.value_start,
-                    },
-                    end: Position {
-                        line: hydra_object.target.line,
-                        character: hydra_object.target_value_end(),
-                    },
-                };
-
-                Ok(Some(Hover {
-                    contents: HoverContents::Markup(MarkupContent {
-                        kind: MarkupKind::Markdown,
-                        value: hover_content,
-                    }),
-                    range: Some(range),
-                }))
-            }
-            Err(e) => {
-                // If Python analysis fails, don't show any hover, but log it
-                self.log_lookup_failure(&e, None);
-                Ok(None)
-            }
-        };
-        tracing::debug!(elapsed_ms = start.elapsed().as_millis() as u64, "hover");
-        result
+        timed("hover", self.hover_response(params)).await
     }
 
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
@@ -476,7 +645,7 @@ impl LanguageServer for HydraLspBackend {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
 
-        let Some(input) = self.document_inputs.get(&uri).map(|e| *e) else {
+        let Some(input) = self.document_input(&uri) else {
             return Ok(None);
         };
 
@@ -584,175 +753,14 @@ impl LanguageServer for HydraLspBackend {
     }
 
     async fn signature_help(&self, params: SignatureHelpParams) -> Result<Option<SignatureHelp>> {
-        let start = Instant::now();
-        if !self.settings.read().features.signature_help {
-            return Ok(None);
-        }
-        let uri = params.text_document_position_params.text_document.uri;
-        let position = params.text_document_position_params.position;
-
-        let Some(parsed) = self.cached_parsed_yaml(&uri, "signature_help") else {
-            return Ok(None);
-        };
-        let Ok(content) = parsed.result() else {
-            return Ok(None);
-        };
-        let Some((target_value, param_context)) = content.target_for_parameter_line(position)
-        else {
-            return Ok(None);
-        };
-        let Some(hydra_object) = content.hydra_object_for_parameter_line(position) else {
-            return Ok(None);
-        };
-
-        // Extract Python definition info on a blocking thread (cached + non-blocking)
-        let extract_result = self.spawn_definition_lookup(target_value.clone()).await;
-
-        let result = match extract_result {
-            Ok(ResolvedDefinition {
-                definition_info, ..
-            }) => {
-                let implicit_param = definition_info.implicit_param();
-                let label_prefix = match &definition_info {
-                    DefinitionInfo::Function(sig) => sig.name.clone(),
-                    DefinitionInfo::Class(class_info) => class_info.name.clone(),
-                    DefinitionInfo::Method(method_info) => {
-                        format!("{}.{}", method_info.class_name, method_info.signature.name)
-                    }
-                };
-                let call_signature = definition_info.call_signature();
-
-                // An overloaded target lists every overload, with the first one
-                // the YAML node's arguments match made active. Otherwise there is just
-                // the one signature, or a bare `Name()` for a class with no constructor
-                // at all.
-                let (shown, active_signature): (Vec<Option<&FunctionSignature>>, usize) =
-                    match call_signature {
-                        Some(sig) if !sig.overloads.is_empty() => (
-                            sig.overloads.iter().map(Some).collect(),
-                            diagnostics::matching_overloads(hydra_object, sig, implicit_param)
-                                .first()
-                                .copied()
-                                .unwrap_or(0),
-                        ),
-                        other => (vec![other], 0),
-                    };
-
-                let signatures: Vec<SignatureInformation> = shown
-                    .into_iter()
-                    .map(|sig| {
-                        signature_information(&label_prefix, sig, implicit_param, &param_context)
-                    })
-                    .collect();
-                let active_parameter = signatures[active_signature].active_parameter;
-
-                Ok(Some(SignatureHelp {
-                    signatures,
-                    active_signature: Some(active_signature as u32),
-                    active_parameter,
-                }))
-            }
-            Err(e) => {
-                self.log_lookup_failure(&e, Some("Python analysis failed for signature help"));
-                Ok(None)
-            }
-        };
-        tracing::debug!(
-            elapsed_ms = start.elapsed().as_millis() as u64,
-            "signature_help"
-        );
-        result
+        timed("signature_help", self.signature_help_response(params)).await
     }
 
     async fn goto_definition(
         &self,
         params: GotoDefinitionParams,
     ) -> Result<Option<GotoDefinitionResponse>> {
-        let start = Instant::now();
-        if !self.settings.read().features.goto_definition {
-            return Ok(None);
-        }
-        let uri = params.text_document_position_params.text_document.uri;
-        let position = params.text_document_position_params.position;
-
-        let Some(parsed) = self.cached_parsed_yaml(&uri, "goto_definition") else {
-            return Ok(None);
-        };
-        let Ok(content) = parsed.result() else {
-            return Ok(None);
-        };
-        let Some(target_info) = content.target_at_position(position).cloned() else {
-            return Ok(None);
-        };
-
-        // Extract definition info on a blocking thread (cached + non-blocking)
-        let extract_result = self
-            .spawn_definition_lookup(target_info.target.value.clone())
-            .await;
-        let (file_path, positions) = match extract_result {
-            Ok(ResolvedDefinition {
-                mut definition_info,
-                file_path,
-                ..
-            }) => {
-                diagnostics::narrow_overloads(&mut definition_info, &target_info);
-                (file_path, definition_positions(&definition_info))
-            }
-            Err(e) => {
-                self.log_lookup_failure(&e, None);
-                return Ok(None);
-            }
-        };
-
-        // A definition inside the vendored typeshed archive has no file on disk
-        // to jump to. Hover and diagnostics still work; go-to-definition is a
-        // silent no-op rather than an error the user cannot act on.
-        if crate::python::typeshed::is_vendored_path(&file_path) {
-            tracing::debug!(
-                path = %file_path.display(),
-                "goto_definition: target is a vendored stub; nothing to open"
-            );
-            return Ok(None);
-        }
-
-        // Convert file path to URI
-        let target_uri = match Url::from_file_path(&file_path) {
-            Ok(uri) => uri,
-            Err(_) => {
-                self.outbox.log(
-                    MessageType::ERROR,
-                    format!("Could not convert path to URI: {}", file_path.display()),
-                );
-                return Ok(None);
-            }
-        };
-
-        let mut locations: Vec<Location> = positions
-            .into_iter()
-            .map(|(start_line, start_col, end_line, end_col)| Location {
-                uri: target_uri.clone(),
-                range: Range {
-                    start: Position {
-                        line: start_line,
-                        character: start_col,
-                    },
-                    end: Position {
-                        line: end_line,
-                        character: end_col,
-                    },
-                },
-            })
-            .collect();
-        let result = Ok(Some(if locations.len() == 1 {
-            GotoDefinitionResponse::Scalar(locations.remove(0))
-        } else {
-            GotoDefinitionResponse::Array(locations)
-        }));
-        tracing::debug!(
-            elapsed_ms = start.elapsed().as_millis() as u64,
-            "goto_definition"
-        );
-        result
+        timed("goto_definition", self.goto_definition_response(params)).await
     }
 
     async fn semantic_tokens_full(
@@ -763,7 +771,7 @@ impl LanguageServer for HydraLspBackend {
             return Ok(None);
         }
         let uri = params.text_document.uri;
-        let Some(input) = self.document_inputs.get(&uri).map(|e| *e) else {
+        let Some(input) = self.document_input(&uri) else {
             return Ok(None);
         };
 
@@ -832,11 +840,9 @@ impl LanguageServer for HydraLspBackend {
         if !self.settings.read().features.diagnostics {
             return Ok(empty_full_report());
         }
-        let Some(input_ref) = self.document_inputs.get(&uri) else {
+        let Some(input) = self.document_input(&uri) else {
             return Ok(empty_full_report());
         };
-        let input = *input_ref;
-        drop(input_ref);
 
         let Some(SessionSnapshot {
             db: db_snapshot,
@@ -870,6 +876,24 @@ impl LanguageServer for HydraLspBackend {
                 tracing::error!(%msg, "validate_document task panicked (pull)");
                 Ok(empty_full_report())
             }
+        }
+    }
+}
+
+/// Await `work`, then log at debug level how long it took under `name`.
+async fn timed<T>(name: &'static str, work: impl std::future::Future<Output = T>) -> T {
+    let start = Instant::now();
+    let result = work.await;
+    tracing::debug!(elapsed_ms = start.elapsed().as_millis() as u64, "{name}");
+    result
+}
+
+fn sync_watched_path(db: &mut dyn ruff_db::Db, path: &SystemPath, created_or_deleted: bool) {
+    File::sync_path(db, path);
+    if created_or_deleted {
+        let absolute = SystemPath::absolute(path, db.system().current_directory());
+        for ancestor in absolute.ancestors().skip(1) {
+            File::sync_path_only(db, ancestor);
         }
     }
 }
