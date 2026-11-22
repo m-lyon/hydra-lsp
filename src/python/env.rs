@@ -7,6 +7,9 @@ use ty_python_semantic::{PythonEnvironment, PythonVersionWithSource, SysPrefixPa
 pub(super) struct DiscoveredEnvironment {
     pub(super) site_packages: Vec<SystemPathBuf>,
     pub(super) python_version: PythonVersionWithSource,
+    /// The interpreter's own stdlib directory, holding the `.py` sources that
+    /// typeshed stubs. `None` when discovery could not find it.
+    pub(super) real_stdlib: Option<SystemPathBuf>,
 }
 
 /// Discover the Python environment, its site-packages paths and its version.
@@ -49,10 +52,17 @@ pub(super) fn discover_python_environment(
         .cloned()
         .or_else(|| site_packages_paths.python_version_from_layout())
         .unwrap_or_default();
+    // A missing stdlib is not fatal, only hover and go-to-definition on stdlib targets
+    // need it.
+    let real_stdlib = env
+        .real_stdlib_path(&system)
+        .inspect_err(|err| tracing::debug!("no real stdlib found: {err}"))
+        .ok();
 
     Ok(DiscoveredEnvironment {
         site_packages: site_packages_paths.into_vec(),
         python_version,
+        real_stdlib,
     })
 }
 
@@ -162,6 +172,7 @@ mod tests {
             db,
             vec![SystemPathBuf::from_path_buf(workspace_dir).unwrap()],
             vec![SystemPathBuf::from_path_buf(site_packages).unwrap()],
+            None,
             PythonVersion::latest_ty(),
         )
     }
@@ -188,6 +199,7 @@ mod tests {
             &db,
             Vec::new(),
             vec![SystemPathBuf::from("/nonexistent/path/site-packages")],
+            None,
             PythonVersion::latest_ty(),
         );
         assert_eq!(

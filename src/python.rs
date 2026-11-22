@@ -5,6 +5,7 @@ pub(crate) mod format;
 mod import_resolver;
 pub(crate) mod model;
 mod resolve;
+mod stub_mapping;
 pub(crate) mod typeshed;
 
 /// Helpers shared by the unit tests of the modules above.

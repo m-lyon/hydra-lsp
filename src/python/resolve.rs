@@ -2,8 +2,8 @@
 //! class attribute chains and base classes across files.
 
 use super::cache::{
-    ClassKey, ResolvedDefinition, SymbolName, class_parent_attribute, inherited_class_members,
-    resolve_module_by_name,
+    ClassKey, ResolvedDefinition, SymbolName, class_defining_method, class_parent_attribute,
+    inherited_class_members, resolve_module_by_name,
 };
 use super::extract::{extract_class_info, extract_function_signature, extract_method_info};
 use super::import_resolver::{ImportResolver, ResolvedSymbol};
@@ -51,13 +51,9 @@ fn resolve_attribute_chain<'db>(
 
         // The last attribute may be a method of the current class.
         if is_last
-            && extract_method_info(db, current_file, &current_class, attr, python_version).is_some()
+            && let Some(method) = method_in_mro(db, current_file, &current_class, attr, environment)
         {
-            return Some(ClassAttributeChainResult::Method {
-                file: current_file,
-                class_name: current_class,
-                method_name: attr.to_string(),
-            });
+            return Some(method);
         }
 
         // Otherwise it must be a class attribute, possibly inherited. The
@@ -217,6 +213,7 @@ pub(super) fn extract_definition_info<'db>(
     let found = |definition_info, file, symbol_name| ResolvedDefinition {
         definition_info,
         file,
+        source: None,
         module_name: module_name.to_string(),
         symbol_name,
     };
@@ -328,8 +325,6 @@ fn resolve_class_attribute_chain<'db>(
     //   module="a.b.c", attr_chain=["D", "e", "f"] (D is a class, e.f is attr chain + method)
     //   etc.
 
-    let python_version = environment.python_version(db);
-
     for module_end_idx in (1..parts.len() - 1).rev() {
         let module_path = parts[..module_end_idx].join(".");
         let remaining_parts = &parts[module_end_idx..];
@@ -349,22 +344,14 @@ fn resolve_class_attribute_chain<'db>(
         {
             if remaining_parts.len() == 2 {
                 // Simple case: Class.method
-                let method_name = remaining_parts[1];
-                // Check if method exists (salsa-cached)
-                if extract_method_info(
+                if let Some(method) = method_in_mro(
                     db,
                     resolved_file,
                     &class_info.name,
-                    method_name,
-                    python_version,
-                )
-                .is_some()
-                {
-                    return Some(ClassAttributeChainResult::Method {
-                        file: resolved_file,
-                        class_name: class_info.name,
-                        method_name: method_name.to_string(),
-                    });
+                    remaining_parts[1],
+                    environment,
+                ) {
+                    return Some(method);
                 }
             } else if remaining_parts.len() > 2 {
                 // Nested case: Class.attr1.attr2...method_or_class
@@ -383,6 +370,28 @@ fn resolve_class_attribute_chain<'db>(
     }
 
     None
+}
+
+/// The method `method_name` of the class `class_name` in `file`, found on the
+/// class itself or the first class in its MRO that defines it.
+fn method_in_mro<'db>(
+    db: &'db dyn ty_module_resolver::Db,
+    file: File,
+    class_name: &str,
+    method_name: &str,
+    environment: ResolverEnvironment<'db>,
+) -> Option<ClassAttributeChainResult> {
+    let defining = class_defining_method(
+        db,
+        ClassKey::new(db, file, class_name),
+        SymbolName::new(db, method_name.to_string()),
+        environment,
+    )?;
+    Some(ClassAttributeChainResult::Method {
+        file: defining.file(db),
+        class_name: defining.class(db).to_string(),
+        method_name: method_name.to_string(),
+    })
 }
 
 /// Extract method info, following re-exports if necessary.

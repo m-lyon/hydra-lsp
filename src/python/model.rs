@@ -204,6 +204,22 @@ impl std::fmt::Display for ResolveError {
 impl std::error::Error for ResolveError {}
 
 impl DefinitionInfo {
+    /// Give the definition `docstring` when it has none of its own. A stub's
+    /// definition takes it from the implementation behind the stub.
+    pub(crate) fn fill_missing_docstring(&mut self, docstring: String) {
+        let own = match self {
+            DefinitionInfo::Function(sig) => {
+                if sig.overloads.iter().any(|o| o.docstring.is_some()) {
+                    return;
+                }
+                &mut sig.docstring
+            }
+            DefinitionInfo::Class(class) => &mut class.docstring,
+            DefinitionInfo::Method(method) => &mut method.signature.docstring,
+        };
+        own.get_or_insert(docstring);
+    }
+
     /// Where the definition sits in its file.
     pub fn range(&self) -> SourceRange {
         match self {

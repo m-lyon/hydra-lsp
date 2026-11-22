@@ -13,12 +13,33 @@
 //! the archive for those files instead of the OS.
 //!
 //! The resolver puts the stdlib stubs after the first-party roots and before
-//! site-packages, as the typing spec orders them. `resolved_module_file` keeps
-//! a stub-backed module only when [`is_builtins_module`] is true for it, so the
-//! rest of the stdlib stays unresolved.
+//! site-packages, as the typing spec orders them, and `resolved_module_file`
+//! keeps every stdlib module it finds there. Signatures come from the stub.
+//! Docstrings the stub lacks and go-to-definition come from the interpreter's
+//! own source where it has one (see `stub_mapping`).
 //!
-//! Nothing on disk corresponds to a vendored file, so `goto_definition` returns
-//! no location for one rather than handing the editor a URI it cannot open.
+//! A compiled-in module such as `builtins` has no source, so go-to-definition
+//! opens a copy of its stub written to the cache directory.
+
+use ruff_db::system::SystemPathBuf;
+use ruff_db::vendored::VendoredPath;
+
+/// Where a vendored stub is copied on disk, so an editor can open it.
+pub(crate) fn cached_vendored_path(
+    db: &dyn ruff_db::Db,
+    path: &VendoredPath,
+) -> Option<SystemPathBuf> {
+    let writable = db.system().as_writable()?;
+    let relative_path = SystemPathBuf::from(format!(
+        "vendored/typeshed/{}/{}",
+        ty_vendored::SOURCE_COMMIT,
+        path.as_str()
+    ));
+    writable
+        .get_or_cache(&relative_path, &|| db.vendored().read_to_string(path))
+        .ok()
+        .flatten()
+}
 
 /// The `builtins` module name. Hydra requires this prefix on a builtin target.
 pub(crate) const BUILTINS_MODULE: &str = "builtins";
@@ -36,17 +57,6 @@ pub(super) fn is_runtime_builtin_name(name: &str) -> bool {
         return true;
     }
     name.starts_with("__") && name.ends_with("__") && name.len() > 4
-}
-
-/// Whether `module_path` is `builtins` or one of its submodules.
-///
-/// The resolver makes the whole stdlib reachable, but only builtins is relevant
-/// for Hydra, so these are the only stdlib modules `resolved_module_file` keeps.
-pub(super) fn is_builtins_module(module_path: &str) -> bool {
-    module_path == BUILTINS_MODULE
-        || module_path
-            .strip_prefix(BUILTINS_MODULE)
-            .is_some_and(|rest| rest.starts_with('.'))
 }
 
 /// Whether `module_path` is a PyPI package that the vendored stdlib stubs. ty doesn't
@@ -74,14 +84,5 @@ mod tests {
         assert!(!is_runtime_builtin_name("_SupportsRound1"));
         assert!(!is_runtime_builtin_name("_Opener"));
         assert!(!is_runtime_builtin_name("__"), "not a dunder name");
-    }
-
-    #[test]
-    fn only_builtins_resolves_in_the_vendored_root() {
-        assert!(is_builtins_module("builtins"));
-        assert!(is_builtins_module("builtins.submodule"));
-        assert!(!is_builtins_module("datetime"));
-        assert!(!is_builtins_module("os.path"));
-        assert!(!is_builtins_module("builtinsish"));
     }
 }

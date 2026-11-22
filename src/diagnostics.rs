@@ -54,7 +54,7 @@ fn diagnostic_in(
 ///
 /// Routes through `resolved_definition`.
 fn validate_target(
-    db: &dyn ty_module_resolver::Db,
+    db: &dyn ty_python_semantic::Db,
     hydra_obj: &HydraObject,
     file_suppressions: &HashSet<DiagnosticRule>,
     python_config: PythonConfig,
@@ -495,7 +495,7 @@ fn validate_hydra_keywords(
 /// caller can inject globally-disabled rules (e.g. from user settings) without
 /// mutating the cached `ParsedContent`.
 pub fn validate_document(
-    db: &dyn ty_module_resolver::Db,
+    db: &dyn ty_python_semantic::Db,
     parsed_content: &ParsedContent,
     disabled_rules: &HashSet<DiagnosticRule>,
     python_config: PythonConfig,
