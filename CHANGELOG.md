@@ -5,7 +5,11 @@
 - Completion on `_partial_`, `_recursive_`, and `_convert_` now uses the parsed line lookup instead of falling back to scanning the document.
 - Updated the ruff and ty crates to the revision behind ty 0.0.104, and salsa to 0.28.5.
 - Python environment discovery now falls back to a `python3` or `python` on `PATH`, recognises Pixi environments, ignores an empty `VIRTUAL_ENV`, and skips a broken `.venv` instead of failing.
-- Module resolution now uses ty's resolver.
+- Module resolution now uses ty's resolver. Resolution now follows Python's import order more closely, so some `_target_` values resolve differently:
+  - A `builtins.py` in the workspace no longer shadows the builtins stub.
+  - A site-packages module named like a stdlib module, such as `enum`, is now unresolved, because Python imports the stdlib one.
+  - A regular package in a later search root now hides a namespace package portion of the same name in an earlier root, so `pkg.sub` in the workspace is unresolved when site-packages has a `pkg/__init__.py`.
+  - A PEP 561 `<name>-stubs` package is now preferred over `<name>`.
 - Python files are now parsed for the interpreter's Python version, read from `pyvenv.cfg` or the site-packages layout.
 - Recognise `@builtins.staticmethod` and `@builtins.classmethod` when resolving Python method targets.
 - Fixed a class attribute chain target (`pkg.Outer.mid.inner`) that failed to resolve when a later step passed through a file an earlier step had already imported through.
