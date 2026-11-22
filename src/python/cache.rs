@@ -3,7 +3,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use super::env::{DiscoveredEnvironment, discover_python_environment};
-use super::extract::{extract_class_attribute, extract_class_info, module_defines_top_level};
+use super::extract::{
+    extract_class_attribute, extract_class_info, extract_method_info, module_defines_top_level,
+};
 use super::import_resolver::{ImportResolver, find_module_file};
 use super::model::{
     ClassAttributeInfo, DefinitionInfo, FunctionSignature, ResolveError, SourceRange,
@@ -662,6 +664,43 @@ fn class_parent_attribute_cycle(
     _environment: ResolverEnvironment,
 ) -> ClassAttributeLookup {
     ClassAttributeLookup::not_found()
+}
+
+/// The class that defines the method `method_key` for `class_key`: the class
+/// itself, or the first class in its MRO that does. Python looks a method up
+/// the same way, so `datetime.datetime.today` is `date.today`.
+///
+/// Memoised per `(class_key, method_key, environment)` like
+/// [`class_parent_attribute`], and `cycle_result` handles circular
+/// inheritance.
+#[salsa::tracked(returns(copy), lru = 512, cycle_result = class_defining_method_cycle)]
+pub(super) fn class_defining_method<'db>(
+    db: &'db dyn ty_module_resolver::Db,
+    class_key: ClassKey<'db>,
+    method_key: SymbolName<'db>,
+    environment: ResolverEnvironment<'db>,
+) -> Option<ClassKey<'db>> {
+    let file = class_key.file(db);
+    let class_name = class_key.class(db).as_str();
+    let python_version = environment.python_version(db);
+
+    if extract_method_info(db, file, class_name, method_key.value(db), python_version).is_some() {
+        return Some(class_key);
+    }
+    let class_info = extract_class_info(db, file, class_name, python_version)?;
+    parent_keys(db, file, &class_info.base_classes, environment)
+        .flatten()
+        .find_map(|parent_key| class_defining_method(db, parent_key, method_key, environment))
+}
+
+fn class_defining_method_cycle<'db>(
+    _db: &'db dyn ty_module_resolver::Db,
+    _id: salsa::Id,
+    _class_key: ClassKey<'db>,
+    _method_key: SymbolName<'db>,
+    _environment: ResolverEnvironment<'db>,
+) -> Option<ClassKey<'db>> {
+    None
 }
 
 #[cfg(test)]
@@ -1939,6 +1978,56 @@ mod tests {
             "stdlib/posixpath.pyi"
         };
         assert_eq!(typing, vendored(expected));
+    }
+
+    /// A method the class inherits resolves to the base that defines it.
+    #[test]
+    fn test_inherited_method_resolves_to_the_defining_base() {
+        let layout = Layout::new();
+        let source = layout.workspace.join("typed.py");
+        write_file(
+            &source,
+            "class Base:\n    def run(self):\n        'Run it.'\n\nclass Child(Base):\n    pass\n",
+        );
+        write_file(
+            &layout.workspace.join("typed.pyi"),
+            "class Base:\n    def run(self) -> None: ...\n\nclass Child(Base): ...\n",
+        );
+
+        let (info, _, source_path) = layout.definition("typed.Child.run");
+        let DefinitionInfo::Method(method) = &info else {
+            panic!("run is a method");
+        };
+        assert_eq!(method.class_name, "Base");
+        assert_eq!(source_path, Some(on_disk(&source)));
+        assert_eq!(docstring(&info), Some("Run it."));
+    }
+
+    /// The stub declares the method on the class, while the implementation
+    /// inherits it from a base.
+    #[test]
+    fn test_method_the_implementation_inherits_maps_to_the_base() {
+        let layout = Layout::new();
+        let source = layout.workspace.join("typed.py");
+        write_file(
+            &source,
+            "class Base:\n    def run(self):\n        'Run it.'\n\nclass Child(Base):\n    pass\n",
+        );
+        write_file(
+            &layout.workspace.join("typed.pyi"),
+            "class Base: ...\n\nclass Child(Base):\n    def run(self) -> None: ...\n",
+        );
+
+        let db = layout.db();
+        let def = definition_with_source(&db, "typed.Child.run", layout.environment(&db))
+            .expect("typed.Child.run should resolve");
+        let source_def = def.source.expect("the implementation is found");
+        assert_eq!(source_def.file.path(&db), &on_disk(&source));
+        assert_eq!(
+            source_def.ranges[0].start.line, 1,
+            "the range is `Base.run`"
+        );
+        assert_eq!(docstring(&def.definition_info), Some("Run it."));
     }
 
     /// A stub-only module has no source, so its definition keeps the stub.

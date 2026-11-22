@@ -13,6 +13,8 @@
 - Stdlib targets such as `collections.OrderedDict` and `pathlib.Path` now resolve, instead of reporting `unresolved-import`. Signatures come from typeshed.
 - For a target typed by a stub (a typeshed stub, a `.pyi` beside its `.py`, or a `<name>-stubs` package), go-to-definition opens the implementation, and hover shows the implementation's docstring when the stub has none. For the stdlib the implementation is the interpreter's own source.
 - Go-to-definition on a target with no source, such as `builtins.len`, opens a copy of its typeshed stub in ty's cache directory.
+- A `Class.method` target now resolves when the class inherits the method, as `datetime.datetime.today` does from `date`. Go-to-definition also finds the method when the stub declares it on the class but the implementation inherits it.
+- `os.path` targets such as `os.path.join` now resolve. A star import inside an `if sys.platform` branch is followed for the platform hydrust runs on.
 - Python files are now parsed for the interpreter's Python version, read from `pyvenv.cfg` or the site-packages layout.
 - Recognise `@builtins.staticmethod` and `@builtins.classmethod` when resolving Python method targets.
 - Fixed a class attribute chain target (`pkg.Outer.mid.inner`) that failed to resolve when a later step passed through a file an earlier step had already imported through.

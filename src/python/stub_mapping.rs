@@ -22,9 +22,11 @@ use ty_python_core::platform::PythonPlatform;
 use ty_python_core::{Program, ProgramFile, semantic_index};
 use ty_python_semantic::{ResolvedDefinition as TyDefinition, map_stub_definition};
 
-use super::cache::{ResolvedDefinition, SourceDefinition};
-use super::extract::source_range;
-use super::model::{ResolveError, SourcePosition};
+use super::cache::{
+    ClassKey, ResolvedDefinition, SourceDefinition, SymbolName, class_defining_method,
+};
+use super::extract::{extract_class_info, extract_method_info, source_range};
+use super::model::{DefinitionInfo, MethodInfo, ResolveError, SourcePosition};
 use super::resolve::extract_definition_info;
 
 /// [`extract_definition_info`], with the definition's runtime implementation
@@ -44,6 +46,8 @@ pub(crate) fn definition_with_source<'db>(
     Ok(definition)
 }
 
+type Implementation = (SourceDefinition, Option<String>);
+
 /// Where `definition`'s implementation is, and its docstring, if any. `None`
 /// when `definition` is not in a stub or nothing on disk implements it, as for
 /// a module compiled into the interpreter such as `builtins`.
@@ -51,11 +55,63 @@ fn implementation(
     db: &dyn ty_python_semantic::Db,
     definition: &ResolvedDefinition,
     environment: ResolverEnvironment<'_>,
-) -> Option<(SourceDefinition, Option<String>)> {
+) -> Option<Implementation> {
     let stub = definition.file;
     if !stub.is_stub(db) {
         return None;
     }
+    let start = definition.definition_info.range().start;
+    map_definition_at(db, stub, start, environment).or_else(|| match &definition.definition_info {
+        DefinitionInfo::Method(method) => inherited_implementation(db, stub, method, environment),
+        _ => None,
+    })
+}
+
+/// The implementation of a method the stub declares on its class but the
+/// implementation inherits from a base: the method as the implementation's
+/// class finds it in its MRO.
+fn inherited_implementation(
+    db: &dyn ty_python_semantic::Db,
+    stub: File,
+    method: &MethodInfo,
+    environment: ResolverEnvironment<'_>,
+) -> Option<Implementation> {
+    let python_version = environment.python_version(db);
+    let class = extract_class_info(db, stub, &method.class_name, python_version)?;
+    let (class_source, _) = map_definition_at(db, stub, class.range.start, environment)?;
+    let defining = class_defining_method(
+        db,
+        ClassKey::new(db, class_source.file, method.class_name.as_str()),
+        SymbolName::new(db, method.method_name.clone()),
+        environment,
+    )?;
+    let file = defining.file(db);
+    let found = extract_method_info(
+        db,
+        file,
+        defining.class(db).as_str(),
+        &method.method_name,
+        python_version,
+    )?;
+    // A base imported from a module with a stub resolves to that stub.
+    if file.is_stub(db) {
+        return map_definition_at(db, file, found.signature.range.start, environment);
+    }
+    let source = SourceDefinition {
+        file,
+        ranges: vec![found.signature.range],
+    };
+    Some((source, found.signature.docstring))
+}
+
+/// [`map_stub_definition`] for the `def` or `class` statement at `start` in
+/// the stub `stub`.
+fn map_definition_at(
+    db: &dyn ty_python_semantic::Db,
+    stub: File,
+    start: SourcePosition,
+    environment: ResolverEnvironment<'_>,
+) -> Option<Implementation> {
     // Checked first so a stub with no implementation, such as `builtins.pyi`,
     // is never given a semantic index.
     stub_file_to_real_module(db, ResolverFile::new(db, stub, environment))?;
@@ -65,7 +121,7 @@ fn implementation(
     let program = Program::new(db, PythonPlatform::default(), environment);
     let program_file = ProgramFile::new(db, stub, program);
     let parsed = parsed_module(db, program_file.python_file(db)).load(db);
-    let start = text_offset(db, stub, definition.definition_info.range().start);
+    let start = text_offset(db, stub, start);
     let stub_definition = match definition_statement_at(&parsed, start)? {
         DefinitionStatement::Function(function) => {
             semantic_index(db, program_file).expect_single_definition(function)
