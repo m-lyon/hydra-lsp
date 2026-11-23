@@ -53,6 +53,7 @@ diagnostic_rules! {
     TooManyPositionalArguments => "too-many-positional-arguments",
     PositionalOnlyParameter => "positional-only-parameter",
     YamlSyntaxError => "yaml-syntax-error",
+    InvalidArgumentType => "invalid-argument-type",
 }
 
 impl fmt::Display for DiagnosticRule {

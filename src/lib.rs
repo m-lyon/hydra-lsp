@@ -16,6 +16,7 @@ pub use diagnostics::validate_document;
 pub use python::cache::{
     DefinitionResult, PythonConfig, ResolvedDefinition, TargetString, resolved_definition,
 };
+pub use python::call_check::{DocumentCallChecks, call_checks};
 pub use python::format::render_params;
 pub use python::model::{
     ClassInfo, DefaultStyle, DefinitionInfo, FunctionSignature, MethodInfo, ParameterInfo,
@@ -23,4 +24,7 @@ pub use python::model::{
 };
 pub use rules::DiagnosticRule;
 pub use server::serve;
-pub use yaml_parser::{CompletionContext, HydraObject, SemanticTokenType, YamlParser};
+pub use yaml_cache::{DocumentInput, parsed_yaml};
+pub use yaml_parser::{
+    CompletionContext, ConvertMode, HydraDefaults, HydraObject, SemanticTokenType, YamlParser,
+};

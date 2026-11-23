@@ -10,7 +10,7 @@ use crate::rules::DiagnosticRule;
 
 mod scalar;
 
-pub use scalar::Scalar;
+pub use scalar::{ConfigScalar, Scalar};
 
 /// Represents a semantic token in the document (internal representation)
 #[derive(Debug, Clone, PartialEq, Eq)]

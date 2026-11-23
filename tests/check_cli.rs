@@ -812,3 +812,63 @@ fn test_relative_python_resolves_against_the_current_directory() {
         result.stdout, result.stderr
     );
 }
+
+/// `hydrust check` on the `types` fixture, with `args` added.
+fn check_types(args: &[&str]) -> CheckOutput {
+    let dir = TempDir::new().unwrap();
+    let options = fs_extra::dir::CopyOptions::new().content_only(true);
+    fs_extra::dir::copy(Path::new("tests/workspace/types"), dir.path(), &options).unwrap();
+    let mut all_args = vec!["config.yaml", "--output-format", "compact"];
+    all_args.extend(args);
+    check_in(dir.path(), &all_args)
+}
+
+#[test]
+fn test_check_reports_invalid_argument_types() {
+    let result = check_types(&[]);
+    assert_eq!(result.code, 1, "got: {}", result.stderr);
+    let codes: Vec<_> = result
+        .stdout
+        .lines()
+        .filter(|line| line.contains("[invalid-argument-type]"))
+        .map(|line| line.split(": error").next().unwrap())
+        .collect();
+    assert_eq!(
+        codes,
+        [
+            "config.yaml:6:12",
+            "config.yaml:7:5",
+            "config.yaml:9:14",
+            "config.yaml:13:3"
+        ],
+        "got: {}",
+        result.stdout
+    );
+}
+
+#[test]
+fn test_check_default_convert_and_recursive() {
+    let result = check_types(&["--default-convert", "all"]);
+    assert!(
+        !result.stdout.contains("ListConfig"),
+        "got: {}",
+        result.stdout
+    );
+
+    let result = check_types(&["--default-recursive", "false"]);
+    assert!(
+        result.stdout.contains(
+            "Invalid value for 'encoder' of 'train': expected 'Encoder', found 'DictConfig'"
+        ),
+        "got: {}",
+        result.stdout
+    );
+
+    let result = check_types(&["--default-convert", "everything"]);
+    assert_eq!(result.code, 2, "clap rejects an invalid value");
+    assert!(
+        result.stderr.contains("none, partial, all, object"),
+        "got: {}",
+        result.stderr
+    );
+}

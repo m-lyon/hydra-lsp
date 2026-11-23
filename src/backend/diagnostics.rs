@@ -8,8 +8,10 @@ use super::pools::PoolOutcome;
 use crate::database::HydraDatabase;
 use crate::diagnostics;
 use crate::python::cache::PythonConfig;
+use crate::python::call_check::call_checks;
 use crate::rules::DiagnosticRule;
 use crate::yaml_cache::{self, DocumentInput};
+use crate::yaml_parser::HydraDefaults;
 
 /// What to do with the result of the diagnostics validation task.
 #[derive(Debug, PartialEq, Eq)]
@@ -101,13 +103,16 @@ impl HydraLspBackend {
     /// handler, which is why no cancellation (and therefore no retry) is
     /// possible here.
     fn compute_diagnostics(&self, input: DocumentInput) -> Option<Vec<Diagnostic>> {
-        let disabled_rules = self.settings.read().disabled_rules.clone();
+        let (disabled_rules, defaults) = {
+            let settings = self.settings.read();
+            (settings.disabled_rules.clone(), settings.hydra_defaults)
+        };
         self.with_session("compute_diagnostics", |s| {
             // Hold the lock across the whole compute: with no interleaved
             // `set_text`, the revision can't move under us, so `parsed_yaml`
             // and `validate_document` never observe a `salsa::Cancelled`.
             let db = s.db.lock();
-            validate_input(&db, input, &disabled_rules, s.python_config)
+            validate_input(&db, input, &disabled_rules, defaults, s.python_config)
         })
     }
 
@@ -139,18 +144,29 @@ impl HydraLspBackend {
     }
 }
 
-/// Parse `input` and validate it: the diagnostics for one document, shared by
-/// the push path (under the db lock) and the pull path (on a snapshot, on the
-/// worker pool). The caller decides whether the document is a Hydra file.
+/// Parse `input` and validate it, argument types included: the diagnostics for
+/// one document, shared by the push path (under the db lock) and the pull path
+/// (on a snapshot, on the worker pool). The caller decides whether the document
+/// is a Hydra file.
 pub(super) fn validate_input(
     db: &HydraDatabase,
     input: DocumentInput,
     disabled_rules: &HashSet<DiagnosticRule>,
+    defaults: HydraDefaults,
     python_config: PythonConfig,
 ) -> Vec<Diagnostic> {
     let parsed_yaml = yaml_cache::parsed_yaml(db, input);
     match parsed_yaml.result() {
-        Ok(content) => diagnostics::validate_document(db, content, disabled_rules, python_config),
+        Ok(content) => {
+            let checks = call_checks(db, input, python_config, defaults);
+            diagnostics::validate_document(
+                db,
+                content,
+                disabled_rules,
+                python_config,
+                Some(&checks),
+            )
+        }
         // A document that fails to parse has no suppression comments to read,
         // so `disabledRules` is the only way to silence this one.
         Err(_) if disabled_rules.contains(&DiagnosticRule::YamlSyntaxError) => Vec::new(),

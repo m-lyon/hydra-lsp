@@ -1,4 +1,5 @@
 pub(crate) mod cache;
+pub(crate) mod call_check;
 #[cfg(test)]
 mod call_check_spike;
 mod env;
@@ -9,6 +10,7 @@ pub(crate) mod model;
 mod resolve;
 mod stub_mapping;
 pub(crate) mod typeshed;
+mod value_type;
 
 /// Helpers shared by the unit tests of the modules above.
 #[cfg(test)]

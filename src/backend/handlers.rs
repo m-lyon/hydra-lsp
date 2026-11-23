@@ -861,7 +861,10 @@ impl LanguageServer for HydraLspBackend {
         else {
             return Ok(empty_full_report());
         };
-        let disabled_rules = self.settings.read().disabled_rules.clone();
+        let (disabled_rules, defaults) = {
+            let settings = self.settings.read();
+            (settings.disabled_rules.clone(), settings.hydra_defaults)
+        };
 
         // The push path's parse + validate, but on the worker pool, inside the
         // pool's catch_unwind so a `salsa::Cancelled` unwind is caught rather
@@ -870,7 +873,7 @@ impl LanguageServer for HydraLspBackend {
             if !yaml_cache::is_hydra_file(db, input) {
                 return Vec::new();
             }
-            validate_input(db, input, &disabled_rules, python_config)
+            validate_input(db, input, &disabled_rules, defaults, python_config)
         })
         .await;
 

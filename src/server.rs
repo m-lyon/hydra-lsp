@@ -13,11 +13,20 @@ use crate::backend::{HydraLspBackend, MAX_CONCURRENT_REQUESTS};
 /// Separate from `hydrust check`'s init (`cli.rs`, ANSI on, level from
 /// `--verbosity`) because only one subscriber is allowed per process, so each
 /// subcommand installs its own. Here the writer is stderr and ANSI is off.
+/// salsa logs every query ty runs at info level, so it is kept to warnings.
 fn init_tracing() {
+    use tracing::Level;
+    use tracing_subscriber::filter::Targets;
+    use tracing_subscriber::prelude::*;
+
+    let filter = Targets::new()
+        .with_default(Level::INFO)
+        .with_target("salsa", Level::WARN);
     tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
         .with_writer(std::io::stderr)
         .with_ansi(false)
+        .finish()
+        .with(filter)
         .try_init()
         .ok();
 }

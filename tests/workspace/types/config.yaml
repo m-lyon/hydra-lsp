@@ -1,0 +1,20 @@
+# @hydra
+train:
+  _target_: models.train
+  encoder:
+    _target_: models.Encoder
+    width: "64"
+    layers: [1, 2]
+  lr: 1e-3
+  optimizer: adamw
+  verbose: yes
+factory:
+  _target_: models.build
+  factory:
+    _target_: models.make_point
+    _partial_: true
+    x: 1
+point:
+  _target_: models.Point
+  _args_: [1, "a"]  # hydrust: ignore[invalid-argument-type]
+  y: ${train.lr}
