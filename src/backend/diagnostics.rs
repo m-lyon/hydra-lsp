@@ -158,13 +158,14 @@ pub(super) fn validate_input(
     let parsed_yaml = yaml_cache::parsed_yaml(db, input);
     match parsed_yaml.result() {
         Ok(content) => {
-            let checks = call_checks(db, input, python_config, defaults);
+            let checks = (!disabled_rules.contains(&DiagnosticRule::InvalidArgumentType))
+                .then(|| call_checks(db, input, python_config, defaults));
             diagnostics::validate_document(
                 db,
                 content,
                 disabled_rules,
                 python_config,
-                Some(&checks),
+                checks.as_ref(),
             )
         }
         // A document that fails to parse has no suppression comments to read,

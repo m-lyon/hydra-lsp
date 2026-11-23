@@ -244,10 +244,12 @@ fn main() {
     let filter = Targets::new()
         .with_default(level)
         .with_target("salsa", salsa_level);
-    tracing_subscriber::fmt()
-        .with_writer(stderr)
-        .with_ansi(true)
-        .finish()
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(stderr)
+                .with_ansi(true),
+        )
         .with(filter)
         .init();
 
@@ -660,13 +662,14 @@ fn check_target(
     }
 
     debug!("Running diagnostics...");
-    let checks = call_checks(db, input, python_config, defaults);
+    let checks = (!disabled_rules.contains(&DiagnosticRule::InvalidArgumentType))
+        .then(|| call_checks(db, input, python_config, defaults));
     let diagnostics = validate_document(
         db,
         parsed_content,
         disabled_rules,
         python_config,
-        Some(&checks),
+        checks.as_ref(),
     );
 
     CheckOutcome::Report(FileReport {
