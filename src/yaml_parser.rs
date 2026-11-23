@@ -1,11 +1,16 @@
 use hashlink::LinkedHashMap;
-use saphyr::{LoadableYamlNode, MarkedYamlOwned};
+use saphyr::{MarkedYamlOwned, YamlDataOwned, YamlLoader};
+use saphyr_parser::Parser;
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
 use tower_lsp::lsp_types::{Position, Range};
 
 use crate::rules::DiagnosticRule;
+
+mod scalar;
+
+pub use scalar::Scalar;
 
 /// Represents a semantic token in the document (internal representation)
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,7 +126,7 @@ pub const HYDRA_KEYWORDS: &[&str] = &[
     CONVERT_KEY,
 ];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ConvertMode {
     None,
     Partial,
@@ -158,6 +163,89 @@ impl std::str::FromStr for ConvertMode {
             _ => Err(()),
         }
     }
+}
+
+/// The `_convert_` and `_recursive_` a node takes from its own keys, from the nearest
+/// ancestor mapping that sets them, or else from the file's `# hydrust:` directives. Hydra
+/// passes both down to every node it instantiates below the one that sets them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HydraModes {
+    pub convert: Option<ConvertMode>,
+    pub recursive: Option<bool>,
+}
+
+impl HydraModes {
+    /// These modes, overridden by the valid `_convert_` and `_recursive_` keys of `map`.
+    fn with_keys_of(self, map: &LinkedHashMap<MarkedYamlOwned, MarkedYamlOwned>) -> Self {
+        let value = |key| find_entry(map, key).map(|(_, value)| value);
+        HydraModes {
+            convert: value(CONVERT_KEY).and_then(convert_value).or(self.convert),
+            recursive: value(RECURSIVE_KEY)
+                .and_then(|value| value.data.as_bool())
+                .or(self.recursive),
+        }
+    }
+
+    /// Each mode that is unset here, taken from `fallback`.
+    fn or(self, fallback: HydraModes) -> Self {
+        HydraModes {
+            convert: self.convert.or(fallback.convert),
+            recursive: self.recursive.or(fallback.recursive),
+        }
+    }
+}
+
+/// The `_convert_` and `_recursive_` of a node that neither the YAML nor the file's
+/// directives set: the `defaultConvert` and `defaultRecursive` settings, which default to
+/// Hydra's own `none` and `true`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HydraDefaults {
+    pub convert: ConvertMode,
+    pub recursive: bool,
+}
+
+impl Default for HydraDefaults {
+    fn default() -> Self {
+        HydraDefaults {
+            convert: ConvertMode::None,
+            recursive: true,
+        }
+    }
+}
+
+/// The file-wide `# hydrust: convert[...]` and `# hydrust: recursive[...]` directives in the
+/// header comments. The key range of each is the directive's name, the value range the text
+/// between its brackets.
+#[derive(Debug, Clone, Default)]
+pub struct ModeDirectives {
+    pub convert: Option<HydraParameter<ConvertMode>>,
+    pub recursive: Option<HydraParameter<bool>>,
+}
+
+impl ModeDirectives {
+    pub const CONVERT: &str = "convert";
+    pub const RECURSIVE: &str = "recursive";
+
+    /// The modes the valid directives set.
+    fn modes(&self) -> HydraModes {
+        HydraModes {
+            convert: self
+                .convert
+                .as_ref()
+                .filter(|hp| !hp.invalid)
+                .map(|hp| hp.value),
+            recursive: self
+                .recursive
+                .as_ref()
+                .filter(|hp| !hp.invalid)
+                .map(|hp| hp.value),
+        }
+    }
+}
+
+/// A `_convert_` value, or `None` if it is not one Hydra accepts.
+fn convert_value(node: &MarkedYamlOwned) -> Option<ConvertMode> {
+    node.data.as_str()?.parse().ok()
 }
 
 /// A YAML value paired with its source position, used for sequence elements.
@@ -223,6 +311,11 @@ pub enum ArgKind {
 pub struct Parameter {
     pub kind: ArgKind,
     pub value: YamlValue,
+    /// The value as written, when it is an untagged scalar.
+    pub scalar: Option<Scalar>,
+    /// The index in [`ParsedContent::hydra_objects`] of the node this value instantiates,
+    /// when it is a mapping with a `_target_`.
+    pub child: Option<usize>,
     pub line: u32,
     pub value_start: u32,
     pub value_end: u32,
@@ -299,6 +392,9 @@ pub struct HydraObject {
     /// The value is `Some(InlineArgsText)` for inline flow sequences,
     /// `None` for block sequences or invalid values.
     pub args: Option<HydraParameter<Option<InlineArgsText>>>,
+    /// The `_convert_` and `_recursive_` Hydra applies to this node's arguments, where the
+    /// file sets them.
+    pub modes: HydraModes,
 }
 
 impl HydraObject {
@@ -322,6 +418,17 @@ impl HydraObject {
         file: &HashSet<DiagnosticRule>,
     ) -> bool {
         file.contains(&rule) || self.suppressed_rules.contains(&rule)
+    }
+
+    /// The `_convert_` Hydra applies to this node's arguments.
+    pub fn convert_mode(&self, defaults: HydraDefaults) -> ConvertMode {
+        self.modes.convert.unwrap_or(defaults.convert)
+    }
+
+    /// Whether Hydra instantiates the `_target_` mappings among this node's arguments
+    /// (`_recursive_`).
+    pub fn is_recursive(&self, defaults: HydraDefaults) -> bool {
+        self.modes.recursive.unwrap_or(defaults.recursive)
     }
 
     /// Check if this HydraObject is marked as partial
@@ -364,6 +471,8 @@ pub struct ParsedContent {
     pub(crate) param_line_map: HashMap<u32, (usize, ParameterContext)>,
     /// File-wide diagnostic suppressions from header comments
     pub file_suppressions: HashSet<DiagnosticRule>,
+    /// File-wide `_convert_` and `_recursive_` directives from header comments
+    pub mode_directives: ModeDirectives,
 }
 
 /// Convert an LSP column (`Position::character`, UTF-16 units) into a UTF-8 byte offset
@@ -718,6 +827,69 @@ fn node_to_yaml_value(node: &MarkedYamlOwned, lines: &[&str], enclosing_line: u3
     }
 }
 
+/// Load the documents in `content`, as `MarkedYamlOwned::load_from_str` does, along with
+/// each untagged scalar as it is written, by the codepoint index it starts at.
+fn load_documents(
+    content: &str,
+) -> Result<(Vec<MarkedYamlOwned>, HashMap<usize, Scalar>), saphyr::ScanError> {
+    let mut loader = YamlLoader::default();
+    loader.early_parse(false);
+    Parser::new_from_iter(content.chars()).load(&mut loader, true)?;
+    let mut docs: Vec<MarkedYamlOwned> = loader.into_documents();
+    let mut scalars = HashMap::new();
+    for doc in &mut docs {
+        resolve_scalars(doc, &mut scalars);
+    }
+    Ok((docs, scalars))
+}
+
+/// Resolve each scalar below `node` into its YAML 1.2 value, recording its text and style in
+/// `scalars` first.
+///
+/// saphyr's own `parse_representation_recursive` drops a tagged node, so this walks the
+/// tree itself.
+fn resolve_scalars(node: &mut MarkedYamlOwned, scalars: &mut HashMap<usize, Scalar>) {
+    match &mut node.data {
+        YamlDataOwned::Representation(text, style, tag) => {
+            if tag.is_none() {
+                scalars
+                    .entry(node.span.start.index())
+                    .or_insert_with(|| Scalar {
+                        text: text.clone(),
+                        style: *style,
+                    });
+            }
+            node.data.parse_representation();
+        }
+        YamlDataOwned::Sequence(items) => {
+            for item in items {
+                resolve_scalars(item, scalars);
+            }
+        }
+        YamlDataOwned::Mapping(map) => {
+            *map = std::mem::take(map)
+                .into_iter()
+                .map(|(mut key, mut value)| {
+                    resolve_scalars(&mut key, scalars);
+                    resolve_scalars(&mut value, scalars);
+                    (key, value)
+                })
+                .collect();
+        }
+        YamlDataOwned::Tagged(_, inner) => resolve_scalars(inner, scalars),
+        YamlDataOwned::Value(_) | YamlDataOwned::Alias(_) | YamlDataOwned::BadValue => {}
+    }
+}
+
+/// The scalar `node` as it is written, or `None` for a collection or a tagged scalar.
+fn scalar_of(node: &MarkedYamlOwned, scalars: &HashMap<usize, Scalar>) -> Option<Scalar> {
+    // A collection has no position of its own, so its index would name another node.
+    let YamlDataOwned::Value(_) = node.data else {
+        return None;
+    };
+    scalars.get(&node.span.start.index()).cloned()
+}
+
 #[derive(Debug)]
 pub struct YamlParser;
 
@@ -725,13 +897,14 @@ impl YamlParser {
     /// Parse YAML content and extract all `_target_` references with their parameters
     /// Returns a vector of `TargetInfo` and a line-to-index lookup map
     pub fn parse(content: &str) -> Result<ParsedContent, YamlParseError> {
-        let docs = MarkedYamlOwned::load_from_str(content)?;
+        let (docs, scalars) = load_documents(content)?;
         if content.trim().is_empty() {
             return Ok(ParsedContent {
                 hydra_objects: Vec::new(),
                 target_line_map: HashMap::new(),
                 param_line_map: HashMap::new(),
                 file_suppressions: HashSet::new(),
+                mode_directives: ModeDirectives::default(),
             });
         }
 
@@ -744,10 +917,21 @@ impl YamlParser {
         let lines: Vec<&str> = content.lines().collect();
 
         let mut hydra_objects = Vec::new();
-        Self::extract_hydra_objects(&docs[0], &lines, &mut hydra_objects);
+        Self::extract_hydra_objects(
+            &docs[0],
+            &lines,
+            &scalars,
+            HydraModes::default(),
+            &mut hydra_objects,
+        );
 
         // Parse file-wide suppressions from header comments before any YAML content
         let file_suppressions = Self::get_filewide_suppressions(content);
+        let mode_directives = Self::get_mode_directives(content);
+        let file_modes = mode_directives.modes();
+        for hydra_object in &mut hydra_objects {
+            hydra_object.modes = hydra_object.modes.or(file_modes);
+        }
 
         // Build line-to-index and param-line-to-index lookup maps
         let mut target_line_map = HashMap::new();
@@ -765,6 +949,7 @@ impl YamlParser {
             target_line_map,
             param_line_map,
             file_suppressions,
+            mode_directives,
         })
     }
 
@@ -892,24 +1077,91 @@ impl YamlParser {
         Self::parse_ignore_comment(comment_part)
     }
 
+    /// The comment lines of the header, with their 0-based line numbers.
+    fn header_comments(content: &str) -> impl Iterator<Item = (u32, &str)> {
+        // Header = leading blanks + comment lines. Stop once we see real YAML content.
+        content
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| !line.trim().is_empty())
+            .map_while(|(index, line)| {
+                line.trim_start()
+                    .starts_with('#')
+                    .then_some((index as u32, line))
+            })
+    }
+
     fn get_filewide_suppressions(content: &str) -> HashSet<DiagnosticRule> {
         let mut file_wide = HashSet::new();
-
-        // Header = leading blanks + comment lines. Stop once we see real YAML content.
-        for line in content.lines() {
-            let trimmed = line.trim_start();
-            if trimmed.is_empty() {
-                continue;
+        for (_, line) in Self::header_comments(content) {
+            if let Some(rules) = Self::parse_ignore_comment(line.trim_start()) {
+                file_wide.extend(rules);
             }
-            if trimmed.starts_with('#') {
-                if let Some(rules) = Self::parse_ignore_comment(trimmed) {
-                    file_wide.extend(rules);
-                }
-                continue;
-            }
-            break;
         }
         file_wide
+    }
+
+    /// The `# hydrust: convert[...]` and `# hydrust: recursive[...]` directives in the header.
+    /// A later directive of the same name wins.
+    fn get_mode_directives(content: &str) -> ModeDirectives {
+        let mut directives = ModeDirectives::default();
+        for (line_number, line) in Self::header_comments(content) {
+            let parse_bool = |value: &str| match value {
+                "true" => Some(true),
+                "false" => Some(false),
+                _ => None,
+            };
+            if let Some(convert) = Self::parse_mode_directive(
+                line_number,
+                line,
+                ModeDirectives::CONVERT,
+                |value| value.parse().ok(),
+                ConvertMode::None,
+            ) {
+                directives.convert = Some(convert);
+            } else if let Some(recursive) = Self::parse_mode_directive(
+                line_number,
+                line,
+                ModeDirectives::RECURSIVE,
+                parse_bool,
+                true,
+            ) {
+                directives.recursive = Some(recursive);
+            }
+        }
+        directives
+    }
+
+    /// The directive `# hydrust: <name>[<value>]` on `line`, if that is what the line holds.
+    /// `parse` reads the value; when it returns `None` the directive is marked invalid and
+    /// carries `fallback` instead.
+    fn parse_mode_directive<T>(
+        line_number: u32,
+        line: &str,
+        name: &str,
+        parse: impl FnOnce(&str) -> Option<T>,
+        fallback: T,
+    ) -> Option<HydraParameter<T>> {
+        let comment = line.trim_end();
+        let indent = &comment[..comment.len() - comment.trim_start().len()];
+        let value = comment
+            .trim_start()
+            .strip_prefix("# hydrust: ")?
+            .strip_prefix(name)?
+            .strip_prefix('[')?
+            .strip_suffix(']')?;
+        let key_start = utf16_len(indent) + utf16_len("# hydrust: ");
+        let value_start = key_start + utf16_len(name) + 1;
+        let span = EntrySpan {
+            line: line_number,
+            key_start,
+            value_start,
+            value_end: value_start + utf16_len(value),
+        };
+        Some(match parse(value.trim()) {
+            Some(value) => HydraParameter::new(value, false, span),
+            None => HydraParameter::new(fallback, true, span),
+        })
     }
 
     /// Attach suppression comments from raw content to the parsed targets and parameters.
@@ -1068,6 +1320,7 @@ impl YamlParser {
     fn extract_args_keyword(
         map: &LinkedHashMap<MarkedYamlOwned, MarkedYamlOwned>,
         lines: &[&str],
+        scalars: &HashMap<usize, Scalar>,
     ) -> Option<(HydraParameter<Option<InlineArgsText>>, Vec<Parameter>)> {
         let (key_node, val_node) = find_entry(map, ARGS_KEY)?;
         let span = entry_span(key_node, val_node, lines);
@@ -1083,6 +1336,8 @@ impl YamlParser {
                     Parameter {
                         kind: ArgKind::Positional,
                         value: node_to_yaml_value(item, lines, arg_line),
+                        scalar: scalar_of(item, scalars),
+                        child: None,
                         line: arg_line,
                         value_start: arg_value_start,
                         value_end: arg_value_end,
@@ -1118,13 +1373,18 @@ impl YamlParser {
 
     /// Recursively extract all `_target_` references and their parameters
     /// from a marked YAML node
+    ///
+    /// `modes` are the `_convert_` and `_recursive_` that `node` inherits from its ancestors.
     fn extract_hydra_objects(
         node: &MarkedYamlOwned,
         lines: &[&str],
+        scalars: &HashMap<usize, Scalar>,
+        modes: HydraModes,
         hydra_objects: &mut Vec<HydraObject>,
     ) {
         if node.data.contains_mapping_key(TARGET_KEY) {
             let map = node.data.as_mapping().expect("Expected a mapping node");
+            let modes = modes.with_keys_of(map);
             let (key_node, value_node) =
                 find_entry(map, TARGET_KEY).expect("Expected _target_ key");
 
@@ -1138,7 +1398,7 @@ impl YamlParser {
                 |node| node.data.as_str()?.parse::<ConvertMode>().ok(),
                 ConvertMode::None,
             );
-            let args_result = Self::extract_args_keyword(map, lines);
+            let args_result = Self::extract_args_keyword(map, lines, scalars);
 
             if let Some(target_str) = value_node.data.as_str() {
                 let span = entry_span(key_node, value_node, lines);
@@ -1169,22 +1429,25 @@ impl YamlParser {
                     recursive,
                     convert,
                     args,
+                    modes,
                 });
 
                 // Extract keyword parameters from all other keys in this mapping
-                let mut parameters = Self::extract_parameters(map, lines, hydra_objects);
+                let mut parameters =
+                    Self::extract_parameters(map, lines, scalars, modes, hydra_objects);
                 // Add positional parameters from _args_
                 parameters.extend(positional_params);
                 hydra_objects[obj_index].parameters = parameters;
             }
         } else if let Some(map) = node.data.as_mapping() {
             // No _target_ found, recursively process nested mappings
+            let modes = modes.with_keys_of(map);
             for (_key, val) in map {
-                Self::extract_hydra_objects(val, lines, hydra_objects);
+                Self::extract_hydra_objects(val, lines, scalars, modes, hydra_objects);
             }
         } else if let Some(seq) = node.data.as_sequence() {
             for item in seq {
-                Self::extract_hydra_objects(item, lines, hydra_objects);
+                Self::extract_hydra_objects(item, lines, scalars, modes, hydra_objects);
             }
         }
     }
@@ -1213,6 +1476,8 @@ impl YamlParser {
     fn extract_parameters(
         map_entries: &LinkedHashMap<MarkedYamlOwned, MarkedYamlOwned>,
         lines: &[&str],
+        scalars: &HashMap<usize, Scalar>,
+        modes: HydraModes,
         hydra_objects: &mut Vec<HydraObject>,
     ) -> Vec<Parameter> {
         let mut parameters = Vec::new();
@@ -1221,8 +1486,13 @@ impl YamlParser {
             if let Some(key_str) = key_node.data.as_str()
                 && !HYDRA_KEYWORDS.contains(&key_str)
             {
-                // Recursively check for nested targets
-                Self::extract_hydra_objects(val_node, lines, hydra_objects);
+                // Recursively check for nested targets. A `_target_` mapping is pushed
+                // first, ahead of the nodes nested in it.
+                let child = hydra_objects.len();
+                Self::extract_hydra_objects(val_node, lines, scalars, modes, hydra_objects);
+                let child = (val_node.data.contains_mapping_key(TARGET_KEY)
+                    && hydra_objects.len() > child)
+                    .then_some(child);
 
                 let span = entry_span(key_node, val_node, lines);
                 parameters.push(Parameter {
@@ -1231,6 +1501,8 @@ impl YamlParser {
                         key_start: span.key_start,
                     },
                     value: node_to_yaml_value(val_node, lines, span.line),
+                    scalar: scalar_of(val_node, scalars),
+                    child,
                     line: span.line,
                     value_start: span.value_start,
                     value_end: span.value_end,
@@ -1633,6 +1905,7 @@ pub enum CompletionContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use saphyr::ScalarStyle;
 
     fn positional(index: u32, num_args: u32, keyword_keys: &[&str]) -> ResolvedParameterContext {
         ResolvedParameterContext::Positional {
@@ -3997,5 +4270,225 @@ model:
             positional(0, 2, &[]),
             "cursor before the first comma is positional arg 0 of 2"
         );
+    }
+
+    /// The parameters of the first node, by key or `_args_` index.
+    fn first_parameters(content: &str) -> Vec<Parameter> {
+        YamlParser::parse(content).unwrap().hydra_objects[0]
+            .parameters
+            .clone()
+    }
+
+    #[test]
+    fn test_parameters_keep_scalars_as_written() {
+        let parameters = first_parameters(
+            "\
+anchors:
+  a: &n 017
+m:
+  _target_: pkg.f
+  plain: 017
+  double: \"yes\"
+  single: 'on'
+  block: |-
+    yes
+  alias: *n
+  tagged: !!str 12
+  empty:
+  list: [1]
+  _args_: [0o17, 'x']
+",
+        );
+        let scalar = |text: &str, style| {
+            Some(Scalar {
+                text: text.to_string(),
+                style,
+            })
+        };
+        let scalars: Vec<_> = parameters.iter().map(|p| p.scalar.clone()).collect();
+        assert_eq!(
+            scalars,
+            [
+                scalar("017", ScalarStyle::Plain),
+                scalar("yes", ScalarStyle::DoubleQuoted),
+                scalar("on", ScalarStyle::SingleQuoted),
+                scalar("yes", ScalarStyle::Literal),
+                scalar("017", ScalarStyle::Plain),
+                None,
+                scalar("~", ScalarStyle::Plain),
+                None,
+                scalar("0o17", ScalarStyle::Plain),
+                scalar("x", ScalarStyle::SingleQuoted),
+            ]
+        );
+        // The values the existing rules read are still typed by YAML 1.2.
+        assert_eq!(parameters[0].value, YamlValue::Integer(17));
+        assert_eq!(parameters[5].value, YamlValue::String("12".to_string()));
+        assert_eq!(parameters[8].value, YamlValue::Integer(15));
+    }
+
+    #[test]
+    fn test_tagged_collection_is_kept() {
+        let parameters = first_parameters("m:\n  _target_: pkg.f\n  xs: !custom [1, 2]\n");
+        assert_eq!(parameters.len(), 1);
+        assert_eq!(parameters[0].scalar, None);
+    }
+
+    #[test]
+    fn test_parameter_links_nested_target() {
+        let parsed = YamlParser::parse(
+            "\
+m:
+  _target_: pkg.Outer
+  inner:
+    _target_: pkg.Inner
+    deep:
+      _target_: pkg.Deep
+  plain:
+    a: 1
+  listed:
+    - _target_: pkg.Listed
+  bad:
+    _target_: 3
+",
+        )
+        .unwrap();
+        let targets: Vec<_> = parsed
+            .hydra_objects
+            .iter()
+            .map(|object| object.target.value.as_str())
+            .collect();
+        assert_eq!(
+            targets,
+            ["pkg.Outer", "pkg.Inner", "pkg.Deep", "pkg.Listed"]
+        );
+        let children: Vec<_> = parsed.hydra_objects[0]
+            .parameters
+            .iter()
+            .map(|p| p.child)
+            .collect();
+        assert_eq!(children, [Some(1), None, None, None]);
+        assert_eq!(parsed.hydra_objects[1].parameters[0].child, Some(2));
+    }
+
+    /// `(target, convert, recursive)` for each node of `content`.
+    fn modes(content: &str) -> Vec<(String, Option<ConvertMode>, Option<bool>)> {
+        YamlParser::parse(content)
+            .unwrap()
+            .hydra_objects
+            .into_iter()
+            .map(|object| {
+                (
+                    object.target.value,
+                    object.modes.convert,
+                    object.modes.recursive,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_modes_are_inherited_from_the_nearest_ancestor() {
+        let content = "\
+root:
+  _convert_: all
+  a:
+    _target_: pkg.A
+    _recursive_: false
+    b:
+      _target_: pkg.B
+      _convert_: partial
+      c:
+        _target_: pkg.C
+    d:
+      - _target_: pkg.D
+        _convert_: bogus
+other:
+  _target_: pkg.E
+";
+        let entry = |target: &str, convert, recursive| (target.to_string(), convert, recursive);
+        assert_eq!(
+            modes(content),
+            [
+                entry("pkg.A", Some(ConvertMode::All), Some(false)),
+                entry("pkg.B", Some(ConvertMode::Partial), Some(false)),
+                entry("pkg.C", Some(ConvertMode::Partial), Some(false)),
+                // An invalid `_convert_` is reported on its own; the node inherits.
+                entry("pkg.D", Some(ConvertMode::All), Some(false)),
+                entry("pkg.E", None, None),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_mode_directives_apply_below_the_yaml() {
+        let content = "\
+# @package _global_
+# hydrust: convert[object]
+# hydrust: recursive[false]
+a:
+  _target_: pkg.A
+b:
+  _target_: pkg.B
+  _convert_: none
+  _recursive_: true
+";
+        let parsed = YamlParser::parse(content).unwrap();
+        let convert = parsed.mode_directives.convert.as_ref().unwrap();
+        assert_eq!(
+            (convert.value, convert.invalid, convert.line),
+            (ConvertMode::Object, false, 1)
+        );
+        assert_eq!(
+            (convert.key_start, convert.value_start, convert.value_end),
+            (11, 19, 25)
+        );
+        let entry = |target: &str, convert, recursive| (target.to_string(), convert, recursive);
+        assert_eq!(
+            modes(content),
+            [
+                entry("pkg.A", Some(ConvertMode::Object), Some(false)),
+                entry("pkg.B", Some(ConvertMode::None), Some(true)),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_invalid_mode_directives() {
+        let content = "\
+# hydrust: convert[everything]
+# hydrust: recursive[yes]
+a:
+  _target_: pkg.A
+# hydrust: convert[all]
+";
+        let parsed = YamlParser::parse(content).unwrap();
+        let directives = &parsed.mode_directives;
+        let convert = directives.convert.as_ref().unwrap();
+        assert!(convert.invalid);
+        assert_eq!(
+            (convert.line, convert.value_start, convert.value_end),
+            (0, 19, 29)
+        );
+        assert!(directives.recursive.as_ref().unwrap().invalid);
+        // Invalid directives, and one below the header, set nothing.
+        assert_eq!(parsed.hydra_objects[0].modes, HydraModes::default());
+    }
+
+    #[test]
+    fn test_effective_modes_fall_back_to_defaults() {
+        let parsed = YamlParser::parse("a:\n  _target_: pkg.A\n").unwrap();
+        let object = &parsed.hydra_objects[0];
+        assert_eq!(
+            object.convert_mode(HydraDefaults::default()),
+            ConvertMode::None
+        );
+        assert!(object.is_recursive(HydraDefaults::default()));
+        let defaults = HydraDefaults {
+            convert: ConvertMode::All,
+            recursive: false,
+        };
+        assert_eq!(object.convert_mode(defaults), ConvertMode::All);
+        assert!(!object.is_recursive(defaults));
     }
 }

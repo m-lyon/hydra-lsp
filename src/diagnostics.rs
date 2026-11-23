@@ -7,7 +7,8 @@ use crate::python::model::{
 use crate::python::typeshed::BUILTINS_MODULE;
 use crate::rules::DiagnosticRule;
 use crate::yaml_parser::{
-    ARGS_KEY, ArgKind, CONVERT_KEY, ConvertMode, HydraObject, Parameter, ParsedContent, utf16_len,
+    ARGS_KEY, ArgKind, CONVERT_KEY, ConvertMode, HydraObject, HydraParameter, ModeDirectives,
+    Parameter, ParsedContent, RECURSIVE_KEY, utf16_len,
 };
 use std::collections::HashSet;
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
@@ -457,14 +458,6 @@ fn validate_hydra_keywords(
         return Vec::new();
     }
 
-    // What a valid value for each keyword looks like.
-    let expected = |keyword: &str| match keyword {
-        CONVERT_KEY => format!("one of: {}", ConvertMode::variants().join(", ")),
-        ARGS_KEY => "a list".to_string(),
-        // _partial_ and _recursive_
-        _ => "a boolean (true or false)".to_string(),
-    };
-
     hydra_obj
         .keywords()
         .into_iter()
@@ -479,11 +472,67 @@ fn validate_hydra_keywords(
                 format!(
                     "Invalid value for '{}': must be {}",
                     keyword,
-                    expected(keyword)
+                    expected_value(keyword)
                 ),
             )
         })
         .collect()
+}
+
+/// What a valid value for the Hydra keyword `keyword` looks like.
+fn expected_value(keyword: &str) -> String {
+    match keyword {
+        CONVERT_KEY => format!("one of: {}", ConvertMode::variants().join(", ")),
+        ARGS_KEY => "a list".to_string(),
+        // _partial_ and _recursive_
+        _ => "a boolean (true or false)".to_string(),
+    }
+}
+
+/// Validate the values of the file's `# hydrust: convert[...]` and
+/// `# hydrust: recursive[...]` directives.
+fn validate_mode_directives(
+    directives: &ModeDirectives,
+    file_suppressions: &HashSet<DiagnosticRule>,
+) -> Vec<Diagnostic> {
+    let rule = DiagnosticRule::InvalidHydraParameter;
+    if file_suppressions.contains(&rule) {
+        return Vec::new();
+    }
+    [
+        (
+            ModeDirectives::CONVERT,
+            CONVERT_KEY,
+            directives
+                .convert
+                .as_ref()
+                .map(HydraParameter::without_value),
+        ),
+        (
+            ModeDirectives::RECURSIVE,
+            RECURSIVE_KEY,
+            directives
+                .recursive
+                .as_ref()
+                .map(HydraParameter::without_value),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(name, keyword, hp)| Some((name, keyword, hp.filter(|hp| hp.invalid)?)))
+    .map(|(name, keyword, hp)| {
+        create_diagnostic(
+            hp.line,
+            hp.value_start,
+            hp.value_end,
+            DiagnosticSeverity::ERROR,
+            Some(rule),
+            format!(
+                "Invalid value for the '{name}' directive: must be {}",
+                expected_value(keyword)
+            ),
+        )
+    })
+    .collect()
 }
 
 /// Validate all targets in a document.
@@ -512,6 +561,11 @@ pub fn validate_document(
             .chain(disabled_rules.iter().copied())
             .collect()
     };
+
+    diagnostics.extend(validate_mode_directives(
+        &parsed_content.mode_directives,
+        &suppressions,
+    ));
 
     for target in &parsed_content.hydra_objects {
         let (target_diagnostics, definition_info) =
@@ -564,7 +618,7 @@ mod tests {
     use super::*;
     use crate::database::HydraDatabase;
     use crate::python::model::ParameterInfo;
-    use crate::yaml_parser::{HydraParameter, Parameter, YamlValue};
+    use crate::yaml_parser::{Parameter, YamlParser, YamlValue};
     use hashlink::LinkedHashMap;
     use std::collections::HashMap;
     use std::path::Path;
@@ -617,6 +671,7 @@ mod tests {
             recursive: None,
             convert: None,
             args: None,
+            modes: Default::default(),
         }
     }
 
@@ -628,6 +683,8 @@ mod tests {
                 key_start: 0,
             },
             value,
+            scalar: None,
+            child: None,
             line,
             value_start: 0,
             value_end: 0,
@@ -1028,6 +1085,7 @@ mod tests {
             target_line_map: HashMap::new(),
             param_line_map: HashMap::new(),
             file_suppressions: HashSet::new(),
+            mode_directives: Default::default(),
         };
 
         let resources_dir = get_simple_test_dir();
@@ -1082,6 +1140,7 @@ mod tests {
             target_line_map: HashMap::new(),
             param_line_map: HashMap::new(),
             file_suppressions: HashSet::new(),
+            mode_directives: Default::default(),
         };
 
         let (db, config) = test_env(Some(dir.path()));
@@ -1124,6 +1183,7 @@ mod tests {
             target_line_map: HashMap::new(),
             param_line_map: HashMap::new(),
             file_suppressions: HashSet::new(),
+            mode_directives: Default::default(),
         };
 
         let (db, config) = test_env(Some(dir.path()));
@@ -1154,6 +1214,7 @@ mod tests {
             target_line_map: HashMap::new(),
             param_line_map: HashMap::new(),
             file_suppressions: HashSet::new(),
+            mode_directives: Default::default(),
         };
 
         let resources_dir = get_simple_test_dir();
@@ -1184,6 +1245,7 @@ mod tests {
             target_line_map: HashMap::new(),
             param_line_map: HashMap::new(),
             file_suppressions: HashSet::new(),
+            mode_directives: Default::default(),
         };
 
         let resources_dir = get_simple_test_dir();
@@ -1224,6 +1286,7 @@ mod tests {
             target_line_map: HashMap::new(),
             param_line_map: HashMap::new(),
             file_suppressions: HashSet::new(),
+            mode_directives: Default::default(),
         };
 
         let (db, config) = test_env(Some(&resources_dir));
@@ -1495,6 +1558,8 @@ mod tests {
                 Parameter {
                     kind: ArgKind::Positional,
                     value: YamlValue::Integer(1),
+                    scalar: None,
+                    child: None,
                     line: 2,
                     value_start: 0,
                     value_end: 0,
@@ -1575,6 +1640,53 @@ mod tests {
     // ==================== validate_document with disabled rules ====================
 
     #[test]
+    fn test_invalid_mode_directives_are_reported() {
+        let content = "\
+# hydrust: convert[everything]
+# hydrust: recursive[yes]
+a:
+  _target_: pkg.A
+";
+        let parsed_content = YamlParser::parse(content).unwrap();
+        let (db, config) = test_env(None);
+        let invalid: Vec<_> = validate_document(&db, &parsed_content, &HashSet::new(), config)
+            .into_iter()
+            .filter(|d| {
+                d.code
+                    == Some(tower_lsp::lsp_types::NumberOrString::String(
+                        "invalid-hydra-parameter".to_string(),
+                    ))
+            })
+            .map(|d| (d.range.start.line, d.range.start.character, d.message))
+            .collect();
+        assert_eq!(
+            invalid,
+            [
+                (
+                    0,
+                    19,
+                    "Invalid value for the 'convert' directive: must be one of: none, partial, all, object"
+                        .to_string()
+                ),
+                (
+                    1,
+                    21,
+                    "Invalid value for the 'recursive' directive: must be a boolean (true or false)"
+                        .to_string()
+                ),
+            ]
+        );
+
+        let suppressed = format!("# hydrust: ignore[invalid-hydra-parameter]\n{content}");
+        let parsed_content = YamlParser::parse(&suppressed).unwrap();
+        assert!(
+            validate_document(&db, &parsed_content, &HashSet::new(), config)
+                .iter()
+                .all(|d| !d.message.contains("directive"))
+        );
+    }
+
+    #[test]
     fn test_validate_document_with_file_suppression() {
         let vs = 10 + "_target_:".len() as u32 + 1;
         let hydra_object = build_hydra_object("InvalidTarget", Vec::new(), 2, 10, vs, false);
@@ -1586,6 +1698,7 @@ mod tests {
             target_line_map: HashMap::new(),
             param_line_map: HashMap::new(),
             file_suppressions,
+            mode_directives: Default::default(),
         };
 
         let (db, config) = test_env(None);
@@ -1611,6 +1724,7 @@ mod tests {
             target_line_map: HashMap::new(),
             param_line_map: HashMap::new(),
             file_suppressions: HashSet::new(),
+            mode_directives: Default::default(),
         };
 
         let (db, config) = test_env(None);
@@ -1641,6 +1755,7 @@ mod tests {
             target_line_map: HashMap::new(),
             param_line_map: HashMap::new(),
             file_suppressions: HashSet::new(),
+            mode_directives: Default::default(),
         };
 
         let (db, config) = test_env(None);
@@ -1675,6 +1790,7 @@ mod tests {
             target_line_map: HashMap::new(),
             param_line_map: HashMap::new(),
             file_suppressions: HashSet::new(),
+            mode_directives: Default::default(),
         };
 
         let (db, config) = test_env(None);
@@ -1713,6 +1829,7 @@ mod tests {
             target_line_map: HashMap::new(),
             param_line_map: HashMap::new(),
             file_suppressions: HashSet::new(),
+            mode_directives: Default::default(),
         };
 
         let (db, config) = test_env(None);
@@ -1757,6 +1874,7 @@ mod tests {
             target_line_map: HashMap::new(),
             param_line_map: HashMap::new(),
             file_suppressions: HashSet::new(),
+            mode_directives: Default::default(),
         };
 
         let (db, config) = test_env(None);
