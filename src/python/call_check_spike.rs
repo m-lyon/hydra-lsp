@@ -10,8 +10,8 @@ use ruff_db::system::SystemPathBuf;
 use ty_module_resolver::ModuleName;
 use ty_python_semantic::ProgramEnvironment;
 use ty_python_semantic::embed::{
-    Arg, CallCheck, check_call, dict_of_str_unknown, float_instance, int_literal, list_of_unknown,
-    module_member, str_literal,
+    Arg, CallCheck, check_call, check_partial_call, dict_of_str_unknown, float_instance,
+    int_literal, list_of_unknown, module_member, str_literal,
 };
 use ty_python_semantic::types::Type;
 
@@ -92,16 +92,16 @@ fn nested_call<'db>(
     partial: bool,
 ) -> Option<CallCheck<'db>> {
     let callable = target_type(db, config, env, target)?;
-    let mut args: Vec<_> = keywords
+    let args: Vec<_> = keywords
         .iter()
         .map(|(key, ty)| (Arg::Keyword(key), *ty))
         .collect();
-    if partial {
-        args.insert(0, (Arg::Positional, callable));
-        let partial = module_member(db, env, &ModuleName::new_static("functools")?, &["partial"])?;
-        return Some(check_call(db, env, partial, &args));
-    }
-    Some(check_call(db, env, callable, &args))
+    let check = if partial {
+        check_partial_call
+    } else {
+        check_call
+    };
+    Some(check(db, env, callable, &args))
 }
 
 /// `key: expected <- found` for each argument type error in each `_target_` of `yaml`.
@@ -125,7 +125,12 @@ fn check_yaml(db: &HydraDatabase, config: PythonConfig, yaml: &str) -> Vec<Strin
                 (arg, value_type(db, config, &env, &parameter.value))
             })
             .collect();
-        let check = check_call(db, &env, callable, &args);
+        let partial = object.partial.as_ref().is_some_and(|partial| partial.value);
+        let check = if partial {
+            check_partial_call(db, &env, callable, &args)
+        } else {
+            check_call(db, &env, callable, &args)
+        };
         for error in &check.errors {
             let parameter = &object.parameters[error.argument_index];
             reports.push(format!(
@@ -264,6 +269,12 @@ wrong_partial:
     _target_: shapes.make_point
     _partial_: true
     x: 1
+wrong_class_partial:
+  _target_: shapes.build
+  factory:
+    _target_: shapes.Point
+    _partial_: true
+    x: 1
 wrong_return:
   _target_: shapes.train
   model:
@@ -282,12 +293,13 @@ wrong_return:
             "class_methods.ModelFactory.from_config:21 config: dict[Unknown, Unknown] <- list[Unknown]",
             "shapes.Model:34 width: int <- Literal[\"wide\"]",
             "shapes.build:43 factory: () -> Model <- partial[(*, x: float = 1) -> Point]",
-            "shapes.train:49 model: Model <- Point",
+            "shapes.build:49 factory: () -> Model <- partial[Point]",
+            "shapes.train:55 model: Model <- Point",
         ]
     );
 
-    // `_partial_: true` is typed through `functools.partial`. ty reduces a function's
-    // signature, but gives a class `partial[Unknown]`, which any parameter accepts.
+    // `_partial_: true` is typed as `functools.partial`: a function's signature is reduced, and
+    // a class gives `partial[<instance>]`.
     let env = environment(&db, config);
     let parsed = YamlParser::parse(yaml).expect("valid YAML");
     let factories: Vec<_> = parsed
@@ -302,10 +314,11 @@ wrong_return:
     assert_eq!(
         factories,
         [
-            "partial[Unknown]",
-            "partial[Unknown]",
+            "partial[Model]",
+            "partial[Model]",
             "partial[(*, width: int = 3) -> Model]",
             "partial[(*, x: float = 1) -> Point]",
+            "partial[Point]",
         ]
     );
 }
