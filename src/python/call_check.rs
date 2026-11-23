@@ -207,6 +207,10 @@ from omegaconf import DictConfig
 class WithNew:
     def __new__(cls, size: int) -> 'WithNew': ...
 
+class WithBoth:
+    def __new__(cls, size: int) -> 'WithBoth': ...
+    def __init__(self, size: int) -> None: ...
+
 @dataclass
 class Point:
     x: float
@@ -291,6 +295,9 @@ aliased:
 new:
   _target_: shapes.WithNew
   size: 1.5
+both:
+  _target_: shapes.WithBoth
+  size: 1.5
 point:
   _target_: shapes.Point
   y: 2
@@ -320,11 +327,13 @@ stdlib:
                 "mylib.Linear:4 out_features: int <- Literal[\"64\"]",
                 "mylib.AliasedClass:8 param: str <- Literal[3]",
                 "shapes.WithNew:11 size: int <- float",
-                "shapes.Point:15 x: float <- Literal[\"a\"]",
+                // Reported once, although both `__new__` and `__init__` take `size`.
+                "shapes.WithBoth:14 size: int <- float",
+                "shapes.Point:18 x: float <- Literal[\"a\"]",
                 "overloaded.Reader: no matching overload",
-                "class_methods.ModelFactory.from_config:21 config: dict[Unknown, Unknown] <- ListConfig",
+                "class_methods.ModelFactory.from_config:24 config: dict[Unknown, Unknown] <- ListConfig",
                 "nowhere.Thing: unchecked",
-                "mylib.StarExportedClass:30 size: int <- Literal[\"big\"]",
+                "mylib.StarExportedClass:33 size: int <- Literal[\"big\"]",
                 "os.path.join: no matching overload",
             ]
         );
