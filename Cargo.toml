@@ -69,6 +69,18 @@ serde_json = "1.0"
 which = "7.0"
 filetime = "0.2"
 
+# Temporary: builds against a local checkout of the m-lyon/ruff fork's `hydrust-embed`
+# branch until the fork is published.
+[patch."https://github.com/astral-sh/ruff"]
+ruff_python_ast = { path = "/home/matt/git/hydrust-dev/ruff/crates/ruff_python_ast" }
+ruff_text_size = { path = "/home/matt/git/hydrust-dev/ruff/crates/ruff_text_size" }
+ruff_db = { path = "/home/matt/git/hydrust-dev/ruff/crates/ruff_db" }
+ruff_source_file = { path = "/home/matt/git/hydrust-dev/ruff/crates/ruff_source_file" }
+ty_module_resolver = { path = "/home/matt/git/hydrust-dev/ruff/crates/ty_module_resolver" }
+ty_python_core = { path = "/home/matt/git/hydrust-dev/ruff/crates/ty_python_core" }
+ty_python_semantic = { path = "/home/matt/git/hydrust-dev/ruff/crates/ty_python_semantic" }
+ty_vendored = { path = "/home/matt/git/hydrust-dev/ruff/crates/ty_vendored" }
+
 # The profile that 'dist' will build with
 [profile.dist]
 inherits = "release"

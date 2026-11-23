@@ -1,4 +1,6 @@
 pub(crate) mod cache;
+#[cfg(test)]
+mod call_check_spike;
 mod env;
 mod extract;
 pub(crate) mod format;
