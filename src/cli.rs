@@ -239,7 +239,7 @@ fn main() {
     let level: Level = args.verbosity.into();
     let salsa_level = match args.verbosity {
         Verbosity::Trace => Level::TRACE,
-        _ => Level::WARN,
+        _ => level.min(Level::WARN),
     };
     let filter = Targets::new()
         .with_default(level)
