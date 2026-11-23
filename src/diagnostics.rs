@@ -1,13 +1,15 @@
 use crate::python::cache::{
     PythonConfig, TargetString, is_builtin_symbol, resolved_definition, resolver_environment,
 };
+use crate::python::call_check::{ConfigContainer, DocumentCallChecks, TargetCallCheck};
 use crate::python::model::{
     DefinitionInfo, FunctionSignature, ParameterInfo, ParameterKind, ResolveError,
 };
 use crate::python::typeshed::BUILTINS_MODULE;
 use crate::rules::DiagnosticRule;
 use crate::yaml_parser::{
-    ARGS_KEY, ArgKind, CONVERT_KEY, ConvertMode, HydraObject, Parameter, ParsedContent, utf16_len,
+    ARGS_KEY, ArgKind, CONVERT_KEY, ConvertMode, HydraObject, HydraParameter, ModeDirectives,
+    Parameter, ParsedContent, RECURSIVE_KEY, utf16_len,
 };
 use std::collections::HashSet;
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
@@ -457,14 +459,6 @@ fn validate_hydra_keywords(
         return Vec::new();
     }
 
-    // What a valid value for each keyword looks like.
-    let expected = |keyword: &str| match keyword {
-        CONVERT_KEY => format!("one of: {}", ConvertMode::variants().join(", ")),
-        ARGS_KEY => "a list".to_string(),
-        // _partial_ and _recursive_
-        _ => "a boolean (true or false)".to_string(),
-    };
-
     hydra_obj
         .keywords()
         .into_iter()
@@ -479,11 +473,146 @@ fn validate_hydra_keywords(
                 format!(
                     "Invalid value for '{}': must be {}",
                     keyword,
-                    expected(keyword)
+                    expected_value(keyword)
                 ),
             )
         })
         .collect()
+}
+
+/// What a valid value for the Hydra keyword `keyword` looks like.
+fn expected_value(keyword: &str) -> String {
+    match keyword {
+        CONVERT_KEY => format!("one of: {}", ConvertMode::variants().join(", ")),
+        ARGS_KEY => "a list".to_string(),
+        // _partial_ and _recursive_
+        _ => "a boolean (true or false)".to_string(),
+    }
+}
+
+/// Validate the values of the file's `# hydrust: convert[...]` and
+/// `# hydrust: recursive[...]` directives.
+fn validate_mode_directives(
+    directives: &ModeDirectives,
+    file_suppressions: &HashSet<DiagnosticRule>,
+) -> Vec<Diagnostic> {
+    let rule = DiagnosticRule::InvalidHydraParameter;
+    if file_suppressions.contains(&rule) {
+        return Vec::new();
+    }
+    [
+        (
+            ModeDirectives::CONVERT,
+            CONVERT_KEY,
+            directives
+                .convert
+                .as_ref()
+                .map(HydraParameter::without_value),
+        ),
+        (
+            ModeDirectives::RECURSIVE,
+            RECURSIVE_KEY,
+            directives
+                .recursive
+                .as_ref()
+                .map(HydraParameter::without_value),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(name, keyword, hp)| Some((name, keyword, hp.filter(|hp| hp.invalid)?)))
+    .map(|(name, keyword, hp)| {
+        create_diagnostic(
+            hp.line,
+            hp.value_start,
+            hp.value_end,
+            DiagnosticSeverity::ERROR,
+            Some(rule),
+            format!(
+                "Invalid value for the '{name}' directive: must be {}",
+                expected_value(keyword)
+            ),
+        )
+    })
+    .collect()
+}
+
+/// Report the argument types `check` found wrong in `hydra_obj`'s call.
+///
+/// ty's finding that no overload accepts the argument types is only reported when
+/// `keys_match_an_overload`: otherwise the rules on keys already explain why no overload
+/// matches.
+fn argument_type_diagnostics(
+    hydra_obj: &HydraObject,
+    check: &TargetCallCheck,
+    keys_match_an_overload: bool,
+    file_suppressions: &HashSet<DiagnosticRule>,
+) -> Vec<Diagnostic> {
+    let rule = DiagnosticRule::InvalidArgumentType;
+    if hydra_obj.rule_suppressed(rule, file_suppressions) {
+        return Vec::new();
+    }
+    let mut diagnostics = Vec::new();
+    for mismatch in &check.mismatches {
+        let param = &hydra_obj.parameters[mismatch.argument];
+        if param.suppressed_rules.contains(&rule) {
+            continue;
+        }
+        let argument = match (&param.kind, &mismatch.parameter) {
+            (ArgKind::Keyword { key, .. }, _) => format!("'{key}'"),
+            (ArgKind::Positional, parameter) => {
+                let position = hydra_obj.parameters[..mismatch.argument]
+                    .iter()
+                    .filter(|p| p.is_positional())
+                    .count();
+                match parameter {
+                    Some(name) => format!("'{name}' ({ARGS_KEY}[{position}])"),
+                    None => format!("{ARGS_KEY}[{position}]"),
+                }
+            }
+        };
+        let mut message = format!(
+            "Invalid value for {argument} of '{}': expected '{}', found '{}'",
+            check.callable, mismatch.expected, mismatch.found
+        );
+        if let Some(container) = mismatch.config_container {
+            let (value, config, plain) = match container {
+                ConfigContainer::ListConfig => ("list", "ListConfig", "list"),
+                ConfigContainer::DictConfig => ("mapping", "DictConfig", "dict"),
+            };
+            message.push_str(&format!(
+                ". Hydra passes this {value} as a '{config}' because '{CONVERT_KEY}' is 'none'. \
+                 Set '{CONVERT_KEY}: all' (or 'partial') on this node or a parent, or \
+                 '# hydrust: convert[all]' for the file, to pass a plain '{plain}'"
+            ));
+        }
+        // A list or mapping value has no columns of its own, so a keyword's key stands in.
+        let (start, end) = match &param.kind {
+            ArgKind::Keyword { key, key_start } if param.value_end <= param.value_start => {
+                (*key_start, key_start + utf16_len(key))
+            }
+            _ => (param.value_start, param.value_end),
+        };
+        diagnostics.push(create_diagnostic(
+            param.line,
+            start,
+            end,
+            DiagnosticSeverity::ERROR,
+            Some(rule),
+            message,
+        ));
+    }
+    if check.no_matching_overload && keys_match_an_overload {
+        diagnostics.push(diagnostic_in(
+            hydra_obj.target_range(),
+            DiagnosticSeverity::ERROR,
+            Some(rule),
+            format!(
+                "No overload of '{}' accepts these argument types",
+                check.callable
+            ),
+        ));
+    }
+    diagnostics
 }
 
 /// Validate all targets in a document.
@@ -494,11 +623,15 @@ fn validate_hydra_keywords(
 /// `disabled_rules` is unioned with the file's own suppressions so the
 /// caller can inject globally-disabled rules (e.g. from user settings) without
 /// mutating the cached `ParsedContent`.
+///
+/// `call_checks`, from [`call_checks`](crate::python::call_check::call_checks) for the
+/// same document, adds the argument type diagnostics.
 pub fn validate_document(
     db: &dyn ty_python_semantic::Db,
     parsed_content: &ParsedContent,
     disabled_rules: &HashSet<DiagnosticRule>,
     python_config: PythonConfig,
+    call_checks: Option<&DocumentCallChecks>,
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
 
@@ -513,10 +646,29 @@ pub fn validate_document(
             .collect()
     };
 
-    for target in &parsed_content.hydra_objects {
+    diagnostics.extend(validate_mode_directives(
+        &parsed_content.mode_directives,
+        &suppressions,
+    ));
+
+    for (index, target) in parsed_content.hydra_objects.iter().enumerate() {
         let (target_diagnostics, definition_info) =
             validate_target(db, target, &suppressions, python_config);
         diagnostics.extend(target_diagnostics);
+
+        if let Some(check) = call_checks.and_then(|checks| checks.get(index)) {
+            let keys_match_an_overload = definition_info.as_ref().is_some_and(|info| {
+                info.call_signature().is_some_and(|signature| {
+                    !matching_overloads(target, signature, info.implicit_param()).is_empty()
+                })
+            });
+            diagnostics.extend(argument_type_diagnostics(
+                target,
+                check,
+                keys_match_an_overload,
+                &suppressions,
+            ));
+        }
 
         // Try to resolve the target and validate parameters. `None` here means
         // there is nothing sound to validate against.
@@ -564,7 +716,7 @@ mod tests {
     use super::*;
     use crate::database::HydraDatabase;
     use crate::python::model::ParameterInfo;
-    use crate::yaml_parser::{HydraParameter, Parameter, YamlValue};
+    use crate::yaml_parser::{Parameter, YamlParser, YamlValue};
     use hashlink::LinkedHashMap;
     use std::collections::HashMap;
     use std::path::Path;
@@ -617,6 +769,7 @@ mod tests {
             recursive: None,
             convert: None,
             args: None,
+            modes: Default::default(),
         }
     }
 
@@ -628,6 +781,8 @@ mod tests {
                 key_start: 0,
             },
             value,
+            scalar: None,
+            child: None,
             line,
             value_start: 0,
             value_end: 0,
@@ -1028,11 +1183,12 @@ mod tests {
             target_line_map: HashMap::new(),
             param_line_map: HashMap::new(),
             file_suppressions: HashSet::new(),
+            mode_directives: Default::default(),
         };
 
         let resources_dir = get_simple_test_dir();
         let (db, config) = test_env(Some(&resources_dir));
-        let diagnostics = validate_document(&db, &parsed_content, &HashSet::new(), config);
+        let diagnostics = validate_document(&db, &parsed_content, &HashSet::new(), config, None);
 
         // Should have at least 2 errors (invalid format and module not found)
         let errors: Vec<_> = diagnostics
@@ -1082,10 +1238,11 @@ mod tests {
             target_line_map: HashMap::new(),
             param_line_map: HashMap::new(),
             file_suppressions: HashSet::new(),
+            mode_directives: Default::default(),
         };
 
         let (db, config) = test_env(Some(dir.path()));
-        let diagnostics = validate_document(&db, &parsed_content, &HashSet::new(), config);
+        let diagnostics = validate_document(&db, &parsed_content, &HashSet::new(), config, None);
         assert!(
             diagnostics.is_empty(),
             "`__new__(cls)` may not be the constructor Hydra calls, got: {:?}",
@@ -1124,10 +1281,11 @@ mod tests {
             target_line_map: HashMap::new(),
             param_line_map: HashMap::new(),
             file_suppressions: HashSet::new(),
+            mode_directives: Default::default(),
         };
 
         let (db, config) = test_env(Some(dir.path()));
-        let diagnostics = validate_document(&db, &parsed_content, &HashSet::new(), config);
+        let diagnostics = validate_document(&db, &parsed_content, &HashSet::new(), config, None);
         assert_eq!(
             codes(&diagnostics),
             vec![DiagnosticRule::UnknownArgument.as_code().to_string()],
@@ -1154,11 +1312,12 @@ mod tests {
             target_line_map: HashMap::new(),
             param_line_map: HashMap::new(),
             file_suppressions: HashSet::new(),
+            mode_directives: Default::default(),
         };
 
         let resources_dir = get_simple_test_dir();
         let (db, config) = test_env(Some(&resources_dir));
-        let diagnostics = validate_document(&db, &parsed_content, &HashSet::new(), config);
+        let diagnostics = validate_document(&db, &parsed_content, &HashSet::new(), config, None);
 
         assert!(
             diagnostics.iter().any(|d| d.message.contains(CONVERT_KEY)),
@@ -1184,11 +1343,12 @@ mod tests {
             target_line_map: HashMap::new(),
             param_line_map: HashMap::new(),
             file_suppressions: HashSet::new(),
+            mode_directives: Default::default(),
         };
 
         let resources_dir = get_simple_test_dir();
         let (db, config) = test_env(Some(&resources_dir));
-        let diagnostics = validate_document(&db, &parsed_content, &HashSet::new(), config);
+        let diagnostics = validate_document(&db, &parsed_content, &HashSet::new(), config, None);
 
         let missing_param_diag = diagnostics.iter().find(|d| {
             d.message.contains("Missing required parameter") && d.message.contains("name")
@@ -1224,10 +1384,11 @@ mod tests {
             target_line_map: HashMap::new(),
             param_line_map: HashMap::new(),
             file_suppressions: HashSet::new(),
+            mode_directives: Default::default(),
         };
 
         let (db, config) = test_env(Some(&resources_dir));
-        let diagnostics = validate_document(&db, &parsed_content, &HashSet::new(), config);
+        let diagnostics = validate_document(&db, &parsed_content, &HashSet::new(), config, None);
 
         assert!(
             !diagnostics
@@ -1495,6 +1656,8 @@ mod tests {
                 Parameter {
                     kind: ArgKind::Positional,
                     value: YamlValue::Integer(1),
+                    scalar: None,
+                    child: None,
                     line: 2,
                     value_start: 0,
                     value_end: 0,
@@ -1574,6 +1737,196 @@ mod tests {
 
     // ==================== validate_document with disabled rules ====================
 
+    fn mismatch(
+        argument: usize,
+        parameter: Option<&str>,
+        config_container: Option<ConfigContainer>,
+    ) -> crate::python::call_check::ArgumentTypeMismatch {
+        crate::python::call_check::ArgumentTypeMismatch {
+            argument,
+            parameter: parameter.map(str::to_string),
+            expected: "list[int]".to_string(),
+            found: "ListConfig".to_string(),
+            config_container,
+        }
+    }
+
+    /// `(line, start, end, message)` of each argument type diagnostic for the first node of
+    /// `yaml`.
+    fn argument_types(
+        yaml: &str,
+        check: &TargetCallCheck,
+        keys_match_an_overload: bool,
+        disabled: &[DiagnosticRule],
+    ) -> Vec<(u32, u32, u32, String)> {
+        let parsed = YamlParser::parse(yaml).unwrap();
+        let suppressions: HashSet<_> = parsed
+            .file_suppressions
+            .iter()
+            .chain(disabled)
+            .copied()
+            .collect();
+        argument_type_diagnostics(
+            &parsed.hydra_objects[0],
+            check,
+            keys_match_an_overload,
+            &suppressions,
+        )
+        .into_iter()
+        .map(|d| {
+            assert_eq!(
+                d.code,
+                Some(tower_lsp::lsp_types::NumberOrString::String(
+                    "invalid-argument-type".to_string()
+                ))
+            );
+            assert_eq!(d.severity, Some(DiagnosticSeverity::ERROR));
+            (
+                d.range.start.line,
+                d.range.start.character,
+                d.range.end.character,
+                d.message,
+            )
+        })
+        .collect()
+    }
+
+    #[test]
+    fn test_argument_type_diagnostics() {
+        let yaml = "\
+m:
+  _target_: pkg.f
+  xs: [1]
+  n: \"3\"
+  _args_: [a, b]
+";
+        let check = TargetCallCheck {
+            callable: "f".to_string(),
+            mismatches: vec![
+                mismatch(0, Some("xs"), Some(ConfigContainer::ListConfig)),
+                mismatch(1, Some("n"), None),
+                mismatch(3, Some("b"), None),
+                mismatch(2, None, Some(ConfigContainer::DictConfig)),
+            ],
+            no_matching_overload: true,
+        };
+        let expected = |text: &str| {
+            format!("Invalid value for {text}: expected 'list[int]', found 'ListConfig'")
+        };
+        let hint = |value: &str, config: &str, plain: &str| {
+            format!(
+                ". Hydra passes this {value} as a '{config}' because '_convert_' is 'none'. \
+                 Set '_convert_: all' (or 'partial') on this node or a parent, or \
+                 '# hydrust: convert[all]' for the file, to pass a plain '{plain}'"
+            )
+        };
+        assert_eq!(
+            argument_types(yaml, &check, true, &[]),
+            [
+                // A list value has no columns, so the key stands in.
+                (
+                    2,
+                    2,
+                    4,
+                    expected("'xs' of 'f'") + &hint("list", "ListConfig", "list")
+                ),
+                (3, 5, 8, expected("'n' of 'f'")),
+                (4, 14, 15, expected("'b' (_args_[1]) of 'f'")),
+                (
+                    4,
+                    11,
+                    12,
+                    expected("_args_[0] of 'f'") + &hint("mapping", "DictConfig", "dict")
+                ),
+                (
+                    1,
+                    12,
+                    17,
+                    "No overload of 'f' accepts these argument types".to_string()
+                ),
+            ]
+        );
+
+        // The overload finding needs the keys to match an overload.
+        assert_eq!(argument_types(yaml, &check, false, &[]).len(), 4);
+    }
+
+    #[test]
+    fn test_argument_type_diagnostics_are_suppressible() {
+        let check = TargetCallCheck {
+            callable: "f".to_string(),
+            mismatches: vec![mismatch(0, Some("a"), None), mismatch(1, Some("b"), None)],
+            no_matching_overload: true,
+        };
+        let yaml = "\
+m:
+  _target_: pkg.f
+  a: 1  # hydrust: ignore[invalid-argument-type]
+  b: 2
+";
+        let lines: Vec<_> = argument_types(yaml, &check, true, &[])
+            .into_iter()
+            .map(|(line, ..)| line)
+            .collect();
+        assert_eq!(lines, [3, 1]);
+
+        let on_target = yaml.replace("pkg.f", "pkg.f  # hydrust: ignore[invalid-argument-type]");
+        assert!(argument_types(&on_target, &check, true, &[]).is_empty());
+        let file = format!("# hydrust: ignore[invalid-argument-type]\n{yaml}");
+        assert!(argument_types(&file, &check, true, &[]).is_empty());
+        assert!(
+            argument_types(yaml, &check, true, &[DiagnosticRule::InvalidArgumentType]).is_empty()
+        );
+    }
+
+    #[test]
+    fn test_invalid_mode_directives_are_reported() {
+        let content = "\
+# hydrust: convert[everything]
+# hydrust: recursive[yes]
+a:
+  _target_: pkg.A
+";
+        let parsed_content = YamlParser::parse(content).unwrap();
+        let (db, config) = test_env(None);
+        let invalid: Vec<_> =
+            validate_document(&db, &parsed_content, &HashSet::new(), config, None)
+                .into_iter()
+                .filter(|d| {
+                    d.code
+                        == Some(tower_lsp::lsp_types::NumberOrString::String(
+                            "invalid-hydra-parameter".to_string(),
+                        ))
+                })
+                .map(|d| (d.range.start.line, d.range.start.character, d.message))
+                .collect();
+        assert_eq!(
+            invalid,
+            [
+                (
+                    0,
+                    19,
+                    "Invalid value for the 'convert' directive: must be one of: none, partial, all, object"
+                        .to_string()
+                ),
+                (
+                    1,
+                    21,
+                    "Invalid value for the 'recursive' directive: must be a boolean (true or false)"
+                        .to_string()
+                ),
+            ]
+        );
+
+        let suppressed = format!("# hydrust: ignore[invalid-hydra-parameter]\n{content}");
+        let parsed_content = YamlParser::parse(&suppressed).unwrap();
+        assert!(
+            validate_document(&db, &parsed_content, &HashSet::new(), config, None)
+                .iter()
+                .all(|d| !d.message.contains("directive"))
+        );
+    }
+
     #[test]
     fn test_validate_document_with_file_suppression() {
         let vs = 10 + "_target_:".len() as u32 + 1;
@@ -1586,10 +1939,11 @@ mod tests {
             target_line_map: HashMap::new(),
             param_line_map: HashMap::new(),
             file_suppressions,
+            mode_directives: Default::default(),
         };
 
         let (db, config) = test_env(None);
-        let diagnostics = validate_document(&db, &parsed_content, &HashSet::new(), config);
+        let diagnostics = validate_document(&db, &parsed_content, &HashSet::new(), config, None);
 
         assert!(
             diagnostics.is_empty(),
@@ -1611,10 +1965,11 @@ mod tests {
             target_line_map: HashMap::new(),
             param_line_map: HashMap::new(),
             file_suppressions: HashSet::new(),
+            mode_directives: Default::default(),
         };
 
         let (db, config) = test_env(None);
-        let diagnostics = validate_document(&db, &parsed_content, &HashSet::new(), config);
+        let diagnostics = validate_document(&db, &parsed_content, &HashSet::new(), config, None);
 
         assert!(
             diagnostics.is_empty(),
@@ -1641,10 +1996,11 @@ mod tests {
             target_line_map: HashMap::new(),
             param_line_map: HashMap::new(),
             file_suppressions: HashSet::new(),
+            mode_directives: Default::default(),
         };
 
         let (db, config) = test_env(None);
-        let diagnostics = validate_document(&db, &parsed_content, &HashSet::new(), config);
+        let diagnostics = validate_document(&db, &parsed_content, &HashSet::new(), config, None);
         let keyword_diags: Vec<_> = diagnostics
             .iter()
             .filter(|d| d.message.contains("_recursive_"))
@@ -1675,10 +2031,11 @@ mod tests {
             target_line_map: HashMap::new(),
             param_line_map: HashMap::new(),
             file_suppressions: HashSet::new(),
+            mode_directives: Default::default(),
         };
 
         let (db, config) = test_env(None);
-        let diagnostics = validate_document(&db, &parsed_content, &HashSet::new(), config);
+        let diagnostics = validate_document(&db, &parsed_content, &HashSet::new(), config, None);
         let keyword_diags: Vec<_> = diagnostics
             .iter()
             .filter(|d| d.message.contains("_convert_"))
@@ -1713,10 +2070,11 @@ mod tests {
             target_line_map: HashMap::new(),
             param_line_map: HashMap::new(),
             file_suppressions: HashSet::new(),
+            mode_directives: Default::default(),
         };
 
         let (db, config) = test_env(None);
-        let diagnostics = validate_document(&db, &parsed_content, &HashSet::new(), config);
+        let diagnostics = validate_document(&db, &parsed_content, &HashSet::new(), config, None);
         let keyword_diags: Vec<_> = diagnostics
             .iter()
             .filter(|d| d.message.contains("_args_"))
@@ -1757,10 +2115,11 @@ mod tests {
             target_line_map: HashMap::new(),
             param_line_map: HashMap::new(),
             file_suppressions: HashSet::new(),
+            mode_directives: Default::default(),
         };
 
         let (db, config) = test_env(None);
-        let diagnostics = validate_document(&db, &parsed_content, &HashSet::new(), config);
+        let diagnostics = validate_document(&db, &parsed_content, &HashSet::new(), config, None);
         let keyword_diags: Vec<_> = diagnostics
             .iter()
             .filter(|d| {

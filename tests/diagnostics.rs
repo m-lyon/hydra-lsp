@@ -1516,3 +1516,67 @@ async fn test_pull_diagnostic_skips_non_hydra_file() {
         "a Hydra file with invalid YAML should still report the syntax error, got: {hydra:?}"
     );
 }
+
+/// `line:start-end code: message` for each diagnostic of `config.yaml` in the
+/// `types` fixture, opened after initializing with `settings`.
+async fn type_diagnostics(settings: serde_json::Value) -> Vec<String> {
+    let mut ctx = TestContext::new(TestWorkspace::Types);
+    ctx.initialize_with_settings(settings).await;
+    let content = fs::read_to_string(ctx.workspace.path().join("config.yaml")).unwrap();
+    ctx.open_document("config.yaml", content).await;
+    let dp = ctx.recv::<PublishDiagnosticsParams>().await;
+    dp.diagnostics
+        .iter()
+        .map(|d| {
+            format!(
+                "{}:{}-{} {}: {}",
+                d.range.start.line,
+                d.range.start.character,
+                d.range.end.character,
+                extract_code(d),
+                d.message
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn test_invalid_argument_types() {
+    assert_eq!(
+        type_diagnostics(serde_json::json!({})).await,
+        [
+            "5:11-15 invalid-argument-type: Invalid value for 'width' of 'Encoder': expected 'int', found 'Literal[\"64\"]'",
+            "6:4-10 invalid-argument-type: Invalid value for 'layers' of 'Encoder': expected 'list[int] | None', found 'ListConfig'. Hydra passes this list as a 'ListConfig' because '_convert_' is 'none'. Set '_convert_: all' (or 'partial') on this node or a parent, or '# hydrust: convert[all]' for the file, to pass a plain 'list'",
+            "8:13-18 invalid-argument-type: Invalid value for 'optimizer' of 'train': expected 'Literal[\"adam\", \"sgd\"]', found 'Literal[\"adamw\"]'",
+            "12:2-9 invalid-argument-type: Invalid value for 'factory' of 'build': expected '() -> Encoder', found 'partial[(*, x: float = 1) -> Point]'",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn test_invalid_argument_types_follow_default_settings() {
+    let diagnostics = type_diagnostics(serde_json::json!({
+        "defaultConvert": "all",
+        "defaultRecursive": false,
+    }))
+    .await;
+    // Under `_recursive_: false` the nested nodes are passed as plain dicts.
+    assert_eq!(
+        diagnostics,
+        [
+            "3:2-9 invalid-argument-type: Invalid value for 'encoder' of 'train': expected 'Encoder', found 'dict[str, Unknown]'",
+            "5:11-15 invalid-argument-type: Invalid value for 'width' of 'Encoder': expected 'int', found 'Literal[\"64\"]'",
+            "8:13-18 invalid-argument-type: Invalid value for 'optimizer' of 'train': expected 'Literal[\"adam\", \"sgd\"]', found 'Literal[\"adamw\"]'",
+            "12:2-9 invalid-argument-type: Invalid value for 'factory' of 'build': expected '() -> Encoder', found 'dict[str, Unknown]'",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn test_invalid_argument_type_can_be_disabled() {
+    let diagnostics = type_diagnostics(serde_json::json!({
+        "disabledRules": ["invalid-argument-type"],
+    }))
+    .await;
+    assert!(diagnostics.is_empty(), "got: {diagnostics:?}");
+}

@@ -42,6 +42,8 @@ fn test_capability_block_shape_with_all_features() {
                 "pythonInterpreter",
                 "disabledRules",
                 "numThreads",
+                "defaultConvert",
+                "defaultRecursive",
                 "enableHover",
                 "enableCompletion",
                 "enableSignatureHelp",
@@ -58,7 +60,8 @@ fn test_capability_block_shape_with_all_features() {
                 "parameter-already-assigned",
                 "too-many-positional-arguments",
                 "positional-only-parameter",
-                "yaml-syntax-error"
+                "yaml-syntax-error",
+                "invalid-argument-type"
             ],
             "features": ["pullDiagnostics", "watchedFiles", "diagnosticRefresh"]
         })
@@ -82,7 +85,7 @@ fn test_capability_block_shape_with_no_features() {
 
     // The rest of the block does not depend on negotiation.
     assert_eq!(value["protocolVersion"], 1);
-    assert_eq!(value["supportedSettings"].as_array().unwrap().len(), 9);
+    assert_eq!(value["supportedSettings"].as_array().unwrap().len(), 11);
     assert_eq!(
         value["supportedRules"].as_array().unwrap().len(),
         DiagnosticRule::all().len()
@@ -135,6 +138,8 @@ fn test_supported_settings_are_read_by_the_server() {
         "pythonInterpreter",
         "disabledRules",
         "numThreads",
+        "defaultConvert",
+        "defaultRecursive",
         "enableHover",
         "enableCompletion",
         "enableSignatureHelp",
@@ -147,7 +152,7 @@ fn test_supported_settings_are_read_by_the_server() {
             "setting '{key}' is read by the server but not advertised"
         );
     }
-    assert_eq!(caps.supported_settings.len(), 9);
+    assert_eq!(caps.supported_settings.len(), 11);
 }
 
 #[tokio::test]
@@ -173,7 +178,7 @@ async fn test_initialize_advertises_no_features_for_a_bare_client() {
     let hydrust = hydrust_block(&result);
     assert_eq!(hydrust["features"], serde_json::json!([]));
     // The settings and rules lists are unaffected by negotiation.
-    assert_eq!(hydrust["supportedSettings"].as_array().unwrap().len(), 9);
+    assert_eq!(hydrust["supportedSettings"].as_array().unwrap().len(), 11);
     assert_eq!(
         hydrust["supportedRules"].as_array().unwrap().len(),
         DiagnosticRule::all().len()

@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+- Added the `invalid-argument-type` diagnostic: a value in a config whose type its `_target_`'s parameter does not accept, such as `"64"` for `width: int` or `adamw` for `Literal["adam", "sgd"]`, is now an error, checked with ty. A nested `_target_` is checked by the type it builds, and a nested `_partial_: true` as a `functools.partial`. With several overloads, a node whose keys match an overload but whose values fit none is reported on its `_target_`.
+  - Values are typed as Hydra passes them. Scalars follow OmegaConf's YAML 1.1 rules, so `yes` and `off` are booleans, `017` is the octal int 15 and `1e5` is a float. Interpolations and `???` are not checked. Under `_convert_: none`, Hydra's default, a list is passed as a `ListConfig` and a mapping as a `DictConfig`, and a mismatch against them is reported with a hint to set `_convert_`. The elements of a list or mapping are not checked yet.
+  - `_convert_` and `_recursive_` apply to the node that sets them and to every node below it.
+- Added the `# hydrust: convert[...]` and `# hydrust: recursive[...]` header directives, which set `_convert_` and `_recursive_` for every node in the file that neither sets nor inherits them, such as when your code passes `_convert_="all"` to `instantiate`. An invalid value is reported as `invalid-hydra-parameter`.
+- Added the `defaultConvert` and `defaultRecursive` settings, and the `--default-convert` and `--default-recursive` options of `hydrust check`, which do the same for every file that has no directive. They default to Hydra's `none` and `true`.
+- `hydrust check` and the server no longer log each of salsa's queries at the info level.
 - Completion on `_partial_`, `_recursive_`, and `_convert_` now uses the parsed line lookup instead of falling back to scanning the document.
 - Updated the ruff and ty crates to the revision behind ty 0.0.104, and salsa to 0.28.5.
 - Python environment discovery now falls back to a `python3` or `python` on `PATH`, recognises Pixi environments, ignores an empty `VIRTUAL_ENV`, and skips a broken `.venv` instead of failing.

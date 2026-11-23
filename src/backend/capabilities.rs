@@ -7,7 +7,7 @@ use tower_lsp::lsp_types::*;
 use super::HydraLspBackend;
 use super::pools::clamp_num_threads;
 use crate::rules::DiagnosticRule;
-use crate::yaml_parser::SEMANTIC_TOKEN_LEGEND;
+use crate::yaml_parser::{ConvertMode, HydraDefaults, SEMANTIC_TOKEN_LEGEND};
 
 /// Declare the per-capability feature toggles once, as
 /// `field => "settingKey", "logName"` triples.
@@ -71,14 +71,17 @@ pub struct Settings {
     pub python_interpreter: Option<String>,
     pub disabled_rules: HashSet<DiagnosticRule>,
     pub features: FeatureToggles,
+    /// `defaultConvert` and `defaultRecursive`.
+    pub hydra_defaults: HydraDefaults,
 }
 
 impl Settings {
     /// Parse the `initializationOptions.settings` object. Unknown keys, and
-    /// values of the wrong type, are ignored. `numThreads` is not kept here: it
-    /// only sizes the pools, once, so `HydraLspBackend::apply_settings` reads
-    /// it itself.
-    fn from_json(settings: &serde_json::Value) -> Self {
+    /// values of the wrong type, are ignored, except that an invalid
+    /// `defaultConvert` or `defaultRecursive` is returned as a warning to log.
+    /// `numThreads` is not kept here: it only sizes the pools, once, so
+    /// `HydraLspBackend::apply_settings` reads it itself.
+    fn from_json(settings: &serde_json::Value) -> (Self, Vec<String>) {
         let python_interpreter = settings
             .get("pythonInterpreter")
             .and_then(|v| v.as_str())
@@ -97,11 +100,34 @@ impl Settings {
             }
         }
 
-        Self {
+        let mut warnings = Vec::new();
+        let mut hydra_defaults = HydraDefaults::default();
+        if let Some(value) = settings.get("defaultConvert") {
+            match value.as_str().and_then(|mode| mode.parse().ok()) {
+                Some(mode) => hydra_defaults.convert = mode,
+                None => warnings.push(format!(
+                    "Invalid value for 'defaultConvert': must be one of: {}",
+                    ConvertMode::variants().join(", ")
+                )),
+            }
+        }
+        if let Some(value) = settings.get("defaultRecursive") {
+            match value.as_bool() {
+                Some(recursive) => hydra_defaults.recursive = recursive,
+                None => warnings.push(
+                    "Invalid value for 'defaultRecursive': must be a boolean (true or false)"
+                        .to_string(),
+                ),
+            }
+        }
+
+        let settings = Self {
             python_interpreter,
             disabled_rules,
             features: FeatureToggles::from_json(settings),
-        }
+            hydra_defaults,
+        };
+        (settings, warnings)
     }
 }
 
@@ -122,7 +148,13 @@ const HYDRUST_PROTOCOL_VERSION: u32 = 1;
 /// `numThreads`); the feature toggles alongside it come from
 /// [`FeatureToggles::SETTING_KEYS`], which is generated with the toggles
 /// themselves.
-const CORE_SETTINGS: &[&str] = &["pythonInterpreter", "disabledRules", "numThreads"];
+const CORE_SETTINGS: &[&str] = &[
+    "pythonInterpreter",
+    "disabledRules",
+    "numThreads",
+    "defaultConvert",
+    "defaultRecursive",
+];
 
 /// Every key the server actually reads out of `initializationOptions.settings`.
 /// Anything else a client sends is silently ignored.
@@ -348,7 +380,10 @@ impl HydraLspBackend {
     /// Without a `settings` object everything keeps its default.
     pub(super) fn apply_settings(&self, init_options: Option<&serde_json::Value>) -> Option<usize> {
         let settings = init_options?.get("settings")?;
-        let parsed = Settings::from_json(settings);
+        let (parsed, warnings) = Settings::from_json(settings);
+        for warning in warnings {
+            self.outbox.log(MessageType::WARNING, warning);
+        }
 
         // Parse optional thread-count override (every thread the server
         // runs, the protocol loop's included), clamped to a range the server
@@ -387,6 +422,7 @@ impl HydraLspBackend {
             }
             s.disabled_rules = parsed.disabled_rules;
             s.features = parsed.features;
+            s.hydra_defaults = parsed.hydra_defaults;
         }
 
         if let Some(warning) = num_threads_warning {
@@ -394,5 +430,43 @@ impl HydraLspBackend {
         }
 
         num_threads
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_hydra_defaults_settings() {
+        let (settings, warnings) = Settings::from_json(&serde_json::json!({}));
+        assert_eq!(settings.hydra_defaults, HydraDefaults::default());
+        assert!(warnings.is_empty());
+
+        let (settings, warnings) = Settings::from_json(&serde_json::json!({
+            "defaultConvert": "partial",
+            "defaultRecursive": false,
+        }));
+        assert_eq!(
+            settings.hydra_defaults,
+            HydraDefaults {
+                convert: ConvertMode::Partial,
+                recursive: false,
+            }
+        );
+        assert!(warnings.is_empty());
+
+        let (settings, warnings) = Settings::from_json(&serde_json::json!({
+            "defaultConvert": "everything",
+            "defaultRecursive": "no",
+        }));
+        assert_eq!(settings.hydra_defaults, HydraDefaults::default());
+        assert_eq!(
+            warnings,
+            [
+                "Invalid value for 'defaultConvert': must be one of: none, partial, all, object",
+                "Invalid value for 'defaultRecursive': must be a boolean (true or false)",
+            ]
+        );
     }
 }

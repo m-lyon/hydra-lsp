@@ -2,8 +2,8 @@
 //! class attribute chains and base classes across files.
 
 use super::cache::{
-    ClassKey, ResolvedDefinition, SymbolName, class_defining_method, class_parent_attribute,
-    inherited_class_members, resolve_module_by_name,
+    ClassKey, ResolvedDefinition, SymbolName, TargetPath, class_defining_method,
+    class_parent_attribute, inherited_class_members, resolve_module_by_name,
 };
 use super::extract::{extract_class_info, extract_function_signature, extract_method_info};
 use super::import_resolver::{ImportResolver, ResolvedSymbol};
@@ -210,13 +210,22 @@ pub(super) fn extract_definition_info<'db>(
     let Some((module_name, symbol_name)) = split_target(target) else {
         return Err(ResolveError::InvalidFormat(target.to_string()));
     };
-    let found = |definition_info, file, symbol_name| ResolvedDefinition {
+    let parts: Vec<&str> = target.split('.').collect();
+    let found = |definition_info, file, symbol_name, module_end: usize| ResolvedDefinition {
         definition_info,
         file,
         source: None,
         module_name: module_name.to_string(),
         symbol_name,
+        target_path: TargetPath {
+            module: parts[..module_end].join("."),
+            attributes: parts[module_end..]
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+        },
     };
+    let symbol_start = parts.len() - 1;
 
     // Track whether we found the module but not the symbol
     let mut module_found = false;
@@ -233,6 +242,7 @@ pub(super) fn extract_definition_info<'db>(
                 DefinitionInfo::Function(func_sig),
                 resolved_file,
                 symbol_name.to_string(),
+                symbol_start,
             ));
         }
 
@@ -244,6 +254,7 @@ pub(super) fn extract_definition_info<'db>(
                 DefinitionInfo::Class(class_info),
                 resolved_file,
                 symbol_name.to_string(),
+                symbol_start,
             ));
         }
     }
@@ -252,11 +263,14 @@ pub(super) fn extract_definition_info<'db>(
     // or nested pattern (e.g., "my_module.OuterClass.nested.nested_class.method")
     // or nested class pattern (e.g., "my_module.OuterClass.nested.nested_class")
     match resolve_class_attribute_chain(db, target, environment) {
-        Some(ClassAttributeChainResult::Method {
-            file: resolved_file,
-            class_name,
-            method_name,
-        }) => {
+        Some((
+            module_end,
+            ClassAttributeChainResult::Method {
+                file: resolved_file,
+                class_name,
+                method_name,
+            },
+        )) => {
             if let Some((method_info, final_file)) = extract_method_info_with_imports(
                 db,
                 resolved_file,
@@ -268,13 +282,17 @@ pub(super) fn extract_definition_info<'db>(
                     DefinitionInfo::Method(method_info),
                     final_file,
                     format!("{}.{}", class_name, method_name),
+                    module_end,
                 ));
             }
         }
-        Some(ClassAttributeChainResult::Class {
-            file: resolved_file,
-            class_name,
-        }) => {
+        Some((
+            module_end,
+            ClassAttributeChainResult::Class {
+                file: resolved_file,
+                class_name,
+            },
+        )) => {
             if let Some((class_info, final_file)) =
                 extract_class_info_with_imports(db, resolved_file, &class_name, environment)
             {
@@ -282,6 +300,7 @@ pub(super) fn extract_definition_info<'db>(
                     DefinitionInfo::Class(class_info),
                     final_file,
                     class_name,
+                    module_end,
                 ));
             }
         }
@@ -306,12 +325,13 @@ pub(super) fn extract_definition_info<'db>(
 /// - Nested method: `module.OuterClass.nested_attr.nested_attr.method`
 /// - Nested class: `module.OuterClass.nested_attr.nested_class`
 ///
-/// Returns either a Method or Class result depending on what the chain resolves to.
+/// Returns either a Method or Class result depending on what the chain resolves to, with the
+/// number of the target's dotted parts that name the module.
 fn resolve_class_attribute_chain<'db>(
     db: &'db dyn ty_module_resolver::Db,
     target: &str,
     environment: ResolverEnvironment<'db>,
-) -> Option<ClassAttributeChainResult> {
+) -> Option<(usize, ClassAttributeChainResult)> {
     let parts: Vec<&str> = target.split('.').collect();
     if parts.len() < 3 {
         return None;
@@ -351,7 +371,7 @@ fn resolve_class_attribute_chain<'db>(
                     remaining_parts[1],
                     environment,
                 ) {
-                    return Some(method);
+                    return Some((module_end_idx, method));
                 }
             } else if remaining_parts.len() > 2 {
                 // Nested case: Class.attr1.attr2...method_or_class
@@ -363,7 +383,7 @@ fn resolve_class_attribute_chain<'db>(
                     attribute_chain,
                     environment,
                 ) {
-                    return Some(result);
+                    return Some((module_end_idx, result));
                 }
             }
         }
@@ -804,6 +824,41 @@ mod tests {
     }
 
     // ==================== classmethod and staticmethod tests ====================
+
+    /// The module and attribute path each target resolves through.
+    #[test]
+    fn test_target_path_splits_off_the_module() {
+        let split = |target: &str| {
+            let path = extract_definition_info(&test_db(), target, &[get_simple_test_dir()])
+                .unwrap_or_else(|e| panic!("{target} should resolve: {e:?}"))
+                .target_path;
+            (path.module, path.attributes)
+        };
+        let path = |module: &str, attributes: &[&str]| {
+            (
+                module.to_string(),
+                attributes
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(
+            split("my_module.DataLoader"),
+            path("my_module", &["DataLoader"])
+        );
+        assert_eq!(
+            split("class_methods.ModelFactory.from_config"),
+            path("class_methods", &["ModelFactory", "from_config"])
+        );
+        assert_eq!(
+            split("class_methods.NestedTwice.nested.nested_class.from_config"),
+            path(
+                "class_methods",
+                &["NestedTwice", "nested", "nested_class", "from_config"]
+            )
+        );
+    }
 
     #[test]
     fn test_extract_classmethod() {

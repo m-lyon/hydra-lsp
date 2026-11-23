@@ -104,6 +104,16 @@ pub struct ResolvedDefinition {
     pub source: Option<SourceDefinition>,
     pub module_name: String,
     pub symbol_name: String,
+    pub target_path: TargetPath,
+}
+
+/// A `_target_` split into the module it names and the attribute path after that module:
+/// `pkg.mod` and `["Outer", "method"]` for `pkg.mod.Outer.method`. Re-exports are not
+/// followed, so the module need not be the one that defines the symbol.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TargetPath {
+    pub module: String,
+    pub attributes: Vec<String>,
 }
 
 #[derive(Clone, Debug)]

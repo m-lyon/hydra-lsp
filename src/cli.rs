@@ -18,10 +18,12 @@ use ruff_db::files::{File, FilePath};
 use ruff_db::system::SystemPathBuf;
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
 use tracing::{Level, debug, error, info, warn};
+use tracing_subscriber::filter::Targets;
+use tracing_subscriber::prelude::*;
 
 use hydrust::{
-    DiagnosticRule, HydraDatabase, PythonConfig, ResolveError, YamlParser, render_params,
-    validate_document,
+    ConvertMode, DiagnosticRule, DocumentInput, HydraDatabase, HydraDefaults, PythonConfig,
+    ResolveError, YamlParser, call_checks, parsed_yaml, render_params, validate_document,
 };
 
 use std::collections::{HashMap, HashSet};
@@ -103,6 +105,21 @@ struct CheckCommand {
         ),
     )]
     disable_rules: Vec<String>,
+
+    /// The `_convert_` of nodes whose YAML and `# hydrust: convert[...]` directive set none,
+    /// such as one your Python code passes to `instantiate`
+    #[arg(
+        long,
+        value_name = "MODE",
+        default_value = "none",
+        value_parser = clap::builder::PossibleValuesParser::new(ConvertMode::variants()),
+    )]
+    default_convert: String,
+
+    /// The `_recursive_` of nodes whose YAML and `# hydrust: recursive[...]` directive set
+    /// none, such as one your Python code passes to `instantiate`
+    #[arg(long, value_name = "BOOL", default_value_t = true, action = clap::ArgAction::Set)]
+    default_recursive: bool,
 }
 
 struct OptionalPath<'a>(Option<&'a PathBuf>);
@@ -127,6 +144,8 @@ impl fmt::Debug for CheckCommand {
             .field("format", &self.format)
             .field("trace_resolution", &self.trace_resolution)
             .field("disable_rules", &self.disable_rules)
+            .field("default_convert", &self.default_convert)
+            .field("default_recursive", &self.default_recursive)
             .finish()
     }
 }
@@ -215,12 +234,23 @@ fn main() {
         }
     };
 
-    // Initialize tracing with the specified verbosity
+    // Initialize tracing with the specified verbosity. salsa logs every query ty
+    // runs at info level, so it is only shown at trace.
     let level: Level = args.verbosity.into();
-    tracing_subscriber::fmt()
-        .with_max_level(level)
-        .with_writer(stderr)
-        .with_ansi(true)
+    let salsa_level = match args.verbosity {
+        Verbosity::Trace => Level::TRACE,
+        _ => level.min(Level::WARN),
+    };
+    let filter = Targets::new()
+        .with_default(level)
+        .with_target("salsa", salsa_level);
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(stderr)
+                .with_ansi(true),
+        )
+        .with(filter)
         .init();
 
     info!("hydrust starting");
@@ -269,6 +299,10 @@ fn run(args: &CheckCommand) -> anyhow::Result<i32> {
     }
 
     let disabled_rules = parse_disabled_rules(&args.disable_rules);
+    let defaults = HydraDefaults {
+        convert: args.default_convert.parse().expect("validated by clap"),
+        recursive: args.default_recursive,
+    };
 
     let db_root = workspace_root.to_str().unwrap_or(".");
     let mut db = HydraDatabase::new(ruff_db::system::SystemPath::new(db_root));
@@ -286,7 +320,7 @@ fn run(args: &CheckCommand) -> anyhow::Result<i32> {
     let mut not_hydra = 0usize;
     let mut vanished = 0usize;
     for target in &targets {
-        match check_target(target, args, &db, python_config, &disabled_rules) {
+        match check_target(target, args, &db, python_config, &disabled_rules, defaults) {
             CheckOutcome::Report(report) => reports.push(report),
             CheckOutcome::NotHydra => not_hydra += 1,
             CheckOutcome::Vanished => vanished += 1,
@@ -541,6 +575,7 @@ fn check_target(
     db: &HydraDatabase,
     python_config: PythonConfig,
     disabled_rules: &HashSet<DiagnosticRule>,
+    defaults: HydraDefaults,
 ) -> CheckOutcome {
     let file_path = &target.path;
     debug!("Checking file: {}", target.display);
@@ -593,7 +628,9 @@ fn check_target(
     }
 
     debug!("Parsing YAML content...");
-    let parsed_content = match YamlParser::parse(&content) {
+    let input = DocumentInput::new(db, content, 0);
+    let parsed = parsed_yaml(db, input);
+    let parsed_content = match parsed.result() {
         Ok(result) => result,
         Err(e) => {
             error!("Failed to parse YAML: {}", e);
@@ -625,7 +662,15 @@ fn check_target(
     }
 
     debug!("Running diagnostics...");
-    let diagnostics = validate_document(db, &parsed_content, disabled_rules, python_config);
+    let checks = (!disabled_rules.contains(&DiagnosticRule::InvalidArgumentType))
+        .then(|| call_checks(db, input, python_config, defaults));
+    let diagnostics = validate_document(
+        db,
+        parsed_content,
+        disabled_rules,
+        python_config,
+        checks.as_ref(),
+    );
 
     CheckOutcome::Report(FileReport {
         path: target.display.clone(),
